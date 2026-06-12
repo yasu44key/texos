@@ -472,21 +472,38 @@ function App() {
             }),
         });
       } else {
-        // 外部コマンドの逃げ道（{in}/{out} プレースホルダ）
-        setPrompt({
-          title: "外部コマンド（{in} と {out} を使用）",
-          initial: "",
-          onConfirm: (cmd) =>
-            setPrompt({
-              title: "出力ファイルの拡張子（空欄=入力と同じ）",
-              initial: "",
-              onConfirm: (ext) => {
-                const spec: Record<string, unknown> = { cmd, accept_mime: "*/*" };
-                if (ext.trim()) spec.output_ext = ext.trim().replace(/^\./, "");
-                create(`コマンド: ${cmd.slice(0, 20)}`, spec);
-              },
-            }),
-        });
+        // 外部プログラム: exe をファイル選択してコマンドラインを自動構成する
+        // （プレースホルダの手書きは現実的でない — v1.4 実機指摘）。
+        (async () => {
+          const exe = await open({
+            multiple: false,
+            title:
+              builtin === "external_stdio"
+                ? "プログラムを選択（標準入出力フィルタ型: prog < 入力 > 出力）"
+                : "プログラムを選択（引数型: prog 入力 出力）",
+            filters: [{ name: "プログラム", extensions: ["exe", "bat", "cmd", "com"] }],
+          });
+          if (!exe || Array.isArray(exe)) return;
+          const name = exe.split(/[\\/]/).pop() ?? "program";
+          const initialCmd =
+            builtin === "external_stdio"
+              ? `"${exe}" < "{in}" > "{out}"`
+              : `"${exe}" "{in}" "{out}"`;
+          setPrompt({
+            title: "コマンドライン（必要なら引数を編集）",
+            initial: initialCmd,
+            onConfirm: (cmd) =>
+              setPrompt({
+                title: "出力ファイルの拡張子（空欄=入力と同じ）",
+                initial: "txt",
+                onConfirm: (ext) => {
+                  const spec: Record<string, unknown> = { cmd, accept_mime: "*/*" };
+                  if (ext.trim()) spec.output_ext = ext.trim().replace(/^\./, "");
+                  create(name, spec);
+                },
+              }),
+          });
+        })();
       }
     },
     [refresh, pushUndo]

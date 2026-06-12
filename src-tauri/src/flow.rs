@@ -137,8 +137,13 @@ pub fn run_external(
     #[cfg(windows)]
     let status = {
         use std::os::windows::process::CommandExt;
+        // コマンドライン全体を raw_arg で「素のまま」cmd に渡す。
+        // std の自動クォート（\" エスケープ）は cmd.exe の解釈と非互換で、
+        // 引用符を含むコマンドが exit 1 で壊れる（v1.4 実機指摘）。
+        // さらに全体を "..." で包む — cmd /C は先頭が引用符のとき最初と最後の
+        // 引用符を剥がすため、内側のクォートを無傷で残す定石。
         std::process::Command::new("cmd")
-            .args(["/C", &cmd])
+            .raw_arg(format!("/C \"{cmd}\""))
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW（コンソールを出さない）
             .status()
     };
@@ -209,6 +214,22 @@ mod tests {
         assert_eq!(ext, "bmp");
         assert_eq!(mime, "image/bmp");
         assert!(image::load_from_memory(&out).is_ok());
+    }
+
+    /// 引用符付きパスのコマンドが cmd /C 経由で動くこと（raw_arg 修正の回帰テスト）。
+    #[cfg(windows)]
+    #[test]
+    fn external_with_quoted_paths_runs() {
+        let out = run_external("copy \"{in}\" \"{out}\"", b"hello", "txt", "txt").unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    /// 標準入出力フィルタの形（`prog < {in} > {out}`）がリダイレクトで動くこと。
+    #[cfg(windows)]
+    #[test]
+    fn external_stdio_redirection_runs() {
+        let out = run_external("sort < \"{in}\" > \"{out}\"", b"b\r\na\r\n", "txt", "txt").unwrap();
+        assert!(String::from_utf8_lossy(&out).starts_with('a'));
     }
 
     #[test]

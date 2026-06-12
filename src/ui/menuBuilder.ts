@@ -484,7 +484,8 @@ export function buildCanvasMenu(
           { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
           { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
           { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
-          { label: "外部コマンド（{in} {out}）...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
+          { label: "外部プログラム（標準入出力型）...", onClick: () => a.addFilter("external_stdio", pos.canvasX, pos.canvasY) },
+          { label: "外部プログラム（引数型）...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
         ]),
     },
     {
