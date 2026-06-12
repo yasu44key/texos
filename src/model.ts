@@ -102,6 +102,23 @@ export function mimeMatches(accept: string, mime: string): boolean {
   return accept === mime;
 }
 
+// v1.4 連鎖: フィルタ→フィルタ接続の型チェック用に、フィルタの出力MIMEを静的に推定。
+// null = 不明（チェックしない。外部コマンドの出力は実行時にバックエンドが判定）。
+export function filterOutputMime(filterRef: string | null): string | null {
+  try {
+    const s = JSON.parse(filterRef ?? "{}");
+    if (s.builtin === "text_grep" || s.builtin === "text_replace") return "text/plain";
+    if (s.builtin === "img_resize") return "image/png";
+    if (s.builtin === "img_convert") {
+      const f = String(s.format ?? "png").toLowerCase();
+      return f === "jpg" || f === "jpeg" ? "image/jpeg" : `image/${f}`;
+    }
+  } catch {
+    /* 壊れた定義は不明扱い */
+  }
+  return null;
+}
+
 // Estimated footprint of a note (used for links, selection, layout).
 // 実測値（ResizeObserver）が取れるまでのフォールバック。
 export function noteSize(n: NoteInfo): { w: number; h: number } {

@@ -780,6 +780,7 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
             || it.url_ref.is_some()
             || it.folder_ref.is_some()
             || it.filter_ref.is_some()
+            || it.real_id.starts_with("drop:")
         {
             continue;
         }
@@ -1482,11 +1483,11 @@ fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Result<CommitAll
         errors: vec![],
     };
     for r in rows {
-        // v1.4: フィルタカードはTexoS内の道具であり持ち出し対象のファイルを持たない
-        if r.kind.as_deref() == Some("filter") {
+        // v1.4: フィルタ・ドロップポイントはTexoS内の道具であり持ち出し対象ではない
+        if r.kind.as_deref() == Some("filter") || r.kind.as_deref() == Some("drop") {
             report.warnings.push(CommitAllWarning {
                 label: r.label,
-                kind: "filter".into(),
+                kind: r.kind.clone().unwrap_or_default(),
                 detail: String::new(),
             });
             continue;
@@ -2039,34 +2040,46 @@ pub struct FlowReport {
     pub errors: Vec<String>,
 }
 
-/// フローを実行（手動トリガー — 確定方針4）。
-/// 入力＝このフィルタへ入る flow 矢印の元カード。各入力の「窓の今」（v1.3-⑩の
-/// 解決順）を読んでフィルタを通し、結果をプロジェクト直下のコミット済み実身として
-/// カード化（緑シグナルで誕生）し、フィルタ→結果の flow 矢印を張る。
-/// 実行ログはフィルタカードの memo に記録する。
-#[tauri::command]
-fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
-    let guard = state.current.lock().unwrap();
-    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+/// パイプラインの中間結果。中間ファイル・中間カードは作らず、メモリで次段へ渡す
+/// （外部コマンドの一時ファイルは flow.rs 側で即削除）。
+struct FlowPayload {
+    bytes: Vec<u8>,
+    ext: String,
+    mime: String,
+    /// 連鎖の起点データのファイル名語幹（最終出力の命名に使う）
+    stem: String,
+}
 
-    let (spec_json, fx, fy, flabel): (Option<String>, f64, f64, String) = p
+/// フィルタを再帰評価する（pull型連鎖 — 実行モデル3）。
+/// 入力にフィルタカードが繋がっていれば先にそれを評価し、結果をこのフィルタに通す。
+/// `visited` は評価中パスのスタックで、循環を検出したらエラー。
+fn eval_filter(
+    p: &Project,
+    fid: &str,
+    visited: &mut std::collections::HashSet<String>,
+    report: &mut FlowReport,
+) -> Result<Vec<FlowPayload>, String> {
+    if !visited.insert(fid.to_string()) {
+        return Err("フローに循環があります".into());
+    }
+    let spec_json: Option<String> = p
         .conn
         .query_row(
-            "SELECT filter_ref, pos_x, pos_y, label FROM virtual_bodies
+            "SELECT filter_ref FROM virtual_bodies
              WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            rusqlite::params![fid],
+            |r| r.get(0),
         )
         .map_err(|_| "フィルタカードが見つかりません".to_string())?;
     let spec = flow::parse_spec(spec_json.as_deref().unwrap_or("{}"))?;
     let accept = spec.accept_mime.clone().unwrap_or_else(|| "*/*".into());
 
     // 入力: このフィルタへ入る flow 矢印（生きているカードのみ・接続順）
-    let inputs: Vec<(String, String, String, String, Option<String>)> = {
+    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
         let mut stmt = p
             .conn
             .prepare(
-                "SELECT v.id, v.real_id, v.label, r.mime_type, r.ext
+                "SELECT v.id, v.real_id, v.label, r.mime_type, r.ext, v.kind
                  FROM relations rel
                  JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
                  JOIN real_bodies r ON r.id = v.real_id
@@ -2075,13 +2088,117 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            .query_map(rusqlite::params![fid], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
     };
-    if inputs.is_empty() {
+
+    let mut produced = Vec::new();
+    for (vid, real_id, vlabel, mime, ext, kind) in &inputs {
+        // 入力ペイロードを集める: 上流フィルタ＝再帰評価／データカード＝窓の今を読む
+        let payloads: Vec<FlowPayload> = if kind.as_deref() == Some("filter") {
+            match eval_filter(p, vid, visited, report) {
+                Ok(v) => v,
+                Err(e) => {
+                    report.errors.push(format!("{vlabel}: {e}"));
+                    continue;
+                }
+            }
+        } else if real_id.starts_with("drop:") {
+            report
+                .skipped
+                .push(format!("{vlabel}（まだファイルが投入されていません）"));
+            continue;
+        } else {
+            refresh_origin_snapshot(p, vid);
+            let path = resolve_view_path(p, vid, real_id);
+            match std::fs::read(&path) {
+                Ok(d) => {
+                    let stem = std::path::Path::new(vlabel)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("output")
+                        .to_string();
+                    vec![FlowPayload {
+                        bytes: d,
+                        ext: ext.clone().unwrap_or_else(|| "bin".into()),
+                        mime: mime.clone(),
+                        stem,
+                    }]
+                }
+                Err(e) => {
+                    report.errors.push(format!("{vlabel}: 読み込み失敗 ({e})"));
+                    continue;
+                }
+            }
+        };
+        // 集めたペイロードをこのフィルタに通す
+        for pl in payloads {
+            if !flow::mime_matches(&accept, &pl.mime) {
+                report
+                    .skipped
+                    .push(format!("{}（{} は受け入れ対象外）", pl.stem, pl.mime));
+                continue;
+            }
+            let result: Result<(Vec<u8>, String, String), String> = if let Some(b) = &spec.builtin
+            {
+                flow::run_builtin(&spec, b, &pl.bytes)
+            } else if let Some(cmd) = &spec.cmd {
+                let out_ext = spec.output_ext.clone().unwrap_or_else(|| pl.ext.clone());
+                let out_mime = mime_for_ext(&out_ext)
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                flow::run_external(cmd, &pl.bytes, &pl.ext, &out_ext)
+                    .map(|b| (b, out_ext, out_mime))
+            } else {
+                Err("フィルタ定義に builtin も cmd もありません".into())
+            };
+            match result {
+                Ok((bytes, ext, mime)) => produced.push(FlowPayload {
+                    bytes,
+                    ext,
+                    mime,
+                    stem: pl.stem,
+                }),
+                Err(e) => report.errors.push(format!("{}: {e}", pl.stem)),
+            }
+        }
+    }
+    visited.remove(fid);
+    Ok(produced)
+}
+
+/// フローを実行（手動トリガー — 確定方針4）。
+/// このフィルタを終端としてパイプラインを pull 評価し（上流のフィルタ連鎖は
+/// メモリ上で通過）、最終結果だけをプロジェクト直下のコミット済み実身として
+/// カード化（緑シグナルで誕生）。フィルタ→結果の flow 矢印を張り、
+/// 実行ログはフィルタカードの memo に記録する。
+#[tauri::command]
+fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+
+    let (fx, fy, flabel): (f64, f64, String) = p
+        .conn
+        .query_row(
+            "SELECT pos_x, pos_y, label FROM virtual_bodies
+             WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| "フィルタカードが見つかりません".to_string())?;
+
+    let mut report = FlowReport {
+        created: vec![],
+        outputs: vec![],
+        skipped: vec![],
+        errors: vec![],
+    };
+    let mut visited = std::collections::HashSet::new();
+    let payloads = eval_filter(p, &id, &mut visited, &mut report)?;
+    if payloads.is_empty() && report.skipped.is_empty() && report.errors.is_empty() {
         return Err("入力がありません。データカードからフィルタへ矢印を引いてください".into());
     }
 
@@ -2096,71 +2213,25 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         .take(24)
         .collect();
 
-    let mut report = FlowReport {
-        created: vec![],
-        outputs: vec![],
-        skipped: vec![],
-        errors: vec![],
-    };
     let mut out_i = 0usize;
-    for (vid, real_id, vlabel, mime, ext) in &inputs {
-        if !flow::mime_matches(&accept, mime) {
-            report
-                .skipped
-                .push(format!("{vlabel}（{mime} は受け入れ対象外）"));
-            continue;
-        }
-        // 仮身の窓の「今」を読む（閲覧時スナップショット更新 → 解決順で実体パス）
-        refresh_origin_snapshot(p, vid);
-        let path = resolve_view_path(p, vid, real_id);
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(e) => {
-                report.errors.push(format!("{vlabel}: 読み込み失敗 ({e})"));
-                continue;
-            }
-        };
-        let in_ext = ext.clone().unwrap_or_else(|| "bin".into());
-        let result: Result<(Vec<u8>, String, String), String> = if let Some(b) = &spec.builtin {
-            flow::run_builtin(&spec, b, &data)
-        } else if let Some(cmd) = &spec.cmd {
-            let out_ext = spec.output_ext.clone().unwrap_or_else(|| in_ext.clone());
-            let out_mime = mime_for_ext(&out_ext)
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            flow::run_external(cmd, &data, &in_ext, &out_ext).map(|b| (b, out_ext, out_mime))
-        } else {
-            Err("フィルタ定義に builtin も cmd もありません".into())
-        };
-        let (out_bytes, out_ext, out_mime) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                report.errors.push(format!("{vlabel}: {e}"));
-                continue;
-            }
-        };
-
+    for pl in &payloads {
         // 結果＝プロジェクト直下のコミット済み実身（CASにも保存＝保険）
-        let stem = std::path::Path::new(vlabel)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output");
-        let dest = unique_file_path(&p.root, &format!("{stem}_{safe_flabel}.{out_ext}"));
-        if let Err(e) = std::fs::write(&dest, &out_bytes) {
-            report.errors.push(format!("{vlabel}: 書き出し失敗 ({e})"));
+        let dest = unique_file_path(&p.root, &format!("{}_{safe_flabel}.{}", pl.stem, pl.ext));
+        if let Err(e) = std::fs::write(&dest, &pl.bytes) {
+            report.errors.push(format!("{}: 書き出し失敗 ({e})", pl.stem));
             continue;
         }
-        let hash = match cas::store_bytes(&p.cas_root, &out_bytes) {
+        let hash = match cas::store_bytes(&p.cas_root, &pl.bytes) {
             Ok(h) => h,
             Err(e) => {
-                report.errors.push(format!("{vlabel}: CAS保存失敗 ({e})"));
+                report.errors.push(format!("{}: CAS保存失敗 ({e})", pl.stem));
                 continue;
             }
         };
         if let Err(e) =
-            db::insert_real_body(&p.conn, &hash, &out_mime, out_bytes.len() as u64, Some(&out_ext))
+            db::insert_real_body(&p.conn, &hash, &pl.mime, pl.bytes.len() as u64, Some(&pl.ext))
         {
-            report.errors.push(format!("{vlabel}: {e}"));
+            report.errors.push(format!("{}: {e}", pl.stem));
             continue;
         }
         let new_vid = uuid();
@@ -2187,7 +2258,7 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
                 file_mtime_ms(&dest)
             ],
         ) {
-            report.errors.push(format!("{vlabel}: {e}"));
+            report.errors.push(format!("{}: {e}", pl.stem));
             continue;
         }
         // フィルタ → 結果 の flow 矢印（パイプラインの連鎖が目に見える）
@@ -2202,11 +2273,7 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
     }
 
     // 実行ログを memo に記録（最後の実行が常に見える — 確定方針4）
-    let mut log = format!(
-        "▶ 実行: 入力{} → 出力{}",
-        inputs.len(),
-        report.outputs.len()
-    );
+    let mut log = format!("▶ 実行: 出力{}", report.outputs.len());
     if !report.skipped.is_empty() {
         log.push_str(&format!("・スキップ{}", report.skipped.len()));
     }
@@ -2219,6 +2286,65 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
     );
 
     Ok(report)
+}
+
+const DROP_MIME: &str = "application/vnd.texos.drop";
+
+/// ドロップポイント（データ入口カード）を作成。中身は空（sentinel）で始まり、
+/// ファイルを投入するたびに「最後に投入したファイルへの窓」になる仮身。
+#[tauri::command]
+fn create_drop_point(x: f64, y: f64, state: State<AppState>) -> Result<String, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    p.conn
+        .execute(
+            "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+             VALUES ('drop:empty', ?1, 0, ?2)",
+            rusqlite::params![DROP_MIME, db::now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+    let vid = uuid();
+    p.conn
+        .execute(
+            "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind)
+             VALUES (?1, 'drop:empty', 'ドロップポイント', ?2, ?3, ?4, 'drop')",
+            rusqlite::params![vid, x, y, db::now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(vid)
+}
+
+/// ドロップポイントへファイルを投入: CASスナップショット＋窓の付け替え。
+/// （取り込み = import_file と同じ意味論。カードは増えず、入口の中身が入れ替わる）
+#[tauri::command]
+fn drop_into_point(id: String, path: String, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let src = std::path::Path::new(&path);
+    if !src.is_file() {
+        return Err("ファイルではありません（フォルダは投入できません）".into());
+    }
+    let mime = mime_from_path(src);
+    let ext = src
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
+    let hash = cas::store_file(&p.cas_root, src).map_err(|e| e.to_string())?;
+    let size = src.metadata().map_err(|e| e.to_string())?.len();
+    db::insert_real_body(&p.conn, &hash, &mime, size, ext.as_deref())
+        .map_err(|e| e.to_string())?;
+    let n = p
+        .conn
+        .execute(
+            "UPDATE virtual_bodies SET real_id = ?1, origin_path = ?2
+             WHERE id = ?3 AND kind = 'drop' AND deleted_at IS NULL",
+            rusqlite::params![hash, path, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("ドロップポイントが見つかりません".into());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2801,6 +2927,8 @@ pub fn run() {
             create_filter,
             update_filter,
             run_flow,
+            create_drop_point,
+            drop_into_point,
             set_panel_width,
             create_shape,
             list_shapes,

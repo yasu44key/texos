@@ -21,6 +21,8 @@ export interface MenuActions {
   addFilter: (builtin: string, x: number, y: number) => void;
   runFlow: (id: string) => void;
   editFilter: (id: string, current: string) => void;
+  feedDrop: (id: string) => void;
+  runDrop: (id: string) => void;
   newSubproject: (sibling: boolean, x: number, y: number) => void;
   linkProject: (x: number, y: number) => void;
   autoLayout: () => void;
@@ -190,6 +192,17 @@ export function buildObjectMenu(
       { label: "URLを変更...", onClick: () => a.changeUrl(targetId, obj.url_ref!) },
       ...zItems,
       { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
+      { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
+      { label: "削除", danger: true, onClick: () => a.deleteObject(targetId) },
+    ];
+  }
+  // v1.4 オートフロー: ドロップポイント（パイプラインのデータ入口）
+  if (obj && obj.kind === "drop") {
+    return [
+      { label: `📥「${obj.label}」`, onClick: () => {}, disabled: true },
+      { label: "ファイルを選んで投入（→自動実行）...", onClick: () => a.feedDrop(targetId) },
+      { label: "▶ 下流のフローを実行", onClick: () => a.runDrop(targetId) },
+      ...zItems,
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
       { label: "削除", danger: true, onClick: () => a.deleteObject(targetId) },
     ];
@@ -480,6 +493,7 @@ export function buildCanvasMenu(
       label: "フィルタカードを追加 ...",
       onClick: () =>
         a.openSubmenu([
+          { label: "ドロップポイント（データ入口・自動実行）", onClick: () => a.addFilter("drop_point", pos.canvasX, pos.canvasY) },
           { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
           { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
           { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },

@@ -14,6 +14,7 @@ import { ConfirmDialog } from "./ui/ConfirmDialog";
 import { ProjectChooser, type ProjectInfo } from "./ui/ProjectChooser";
 import {
   PROJECT_MIME,
+  filterOutputMime,
   isTextMime,
   lostOf,
   mimeMatches,
@@ -121,6 +122,9 @@ function App() {
   const mtimeBaseRef = useRef<Map<string, number>>(new Map());
   // Canvas imperative API (fitTo) — 選択範囲にフォーカス等で使う。
   const canvasApi = useRef<CanvasApi | null>(null);
+  // v1.4 ドロップポイント: 先に定義される handleDropFiles から、後方で定義される
+  // パイプライン実行関数を呼ぶための間接参照（TDZ回避。refミラーの既存イディオム）。
+  const runDownstreamFlowsRef = useRef<(startId: string) => Promise<void>>(async () => {});
 
   // 選択状態（カード・コメント・図形）— useSelection に分離（v1.3.2 リファクタ）。
   const {
@@ -250,6 +254,29 @@ function App() {
 
   const handleDropFiles = useCallback(
     async (paths: string[], canvasX: number, canvasY: number) => {
+      // v1.4: ドロップポイントの上に落とされたら取り込みではなく「投入」。
+      // 入口の窓を入れ替え、下流のパイプラインを末端まで自動実行する。
+      const dropCard = objectsRef.current.find(
+        (o) =>
+          o.kind === "drop" &&
+          canvasX >= o.pos_x &&
+          canvasX <= o.pos_x + CARD_W &&
+          canvasY >= o.pos_y &&
+          canvasY <= o.pos_y + CARD_H
+      );
+      if (dropCard) {
+        for (const path of paths) {
+          try {
+            await invoke("drop_into_point", { id: dropCard.id, path });
+            await refresh();
+            await runDownstreamFlowsRef.current(dropCard.id);
+          } catch (e) {
+            console.error("drop_into_point failed", path, e);
+          }
+        }
+        await refresh();
+        return;
+      }
       const offset = 170;
       const imported: string[] = [];
       for (let i = 0; i < paths.length; i++) {
@@ -405,6 +432,19 @@ function App() {
   // フィルタカードを作成。引数はプロンプトの連鎖で聞く（フォーム自動生成はフェーズ2）。
   const handleAddFilter = useCallback(
     (builtin: string, canvasX: number, canvasY: number) => {
+      // ドロップポイント＝パイプラインのデータ入口カード（投入で下流が自動実行）
+      if (builtin === "drop_point") {
+        (async () => {
+          try {
+            const vid = await invoke<string>("create_drop_point", { x: canvasX, y: canvasY });
+            pushUndo([{ kind: "delete", ids: [vid] }]);
+            await refresh();
+          } catch (e) {
+            console.error("create_drop_point failed", e);
+          }
+        })();
+        return;
+      }
       const create = async (label: string, spec: Record<string, unknown>) => {
         try {
           const vid = await invoke<string>("create_filter", {
@@ -573,6 +613,69 @@ function App() {
     [refresh]
   );
 
+  // ドロップポイントから flow 矢印を下流へ辿り、末端のフィルタ（その先に
+  // フィルタが繋がっていないもの）を実行する。中間のフィルタ連鎖は run_flow の
+  // pull 評価がメモリ上で通過させる（中間ファイル・中間カードは生まれない）。
+  const runDownstreamFlows = useCallback(
+    async (startId: string) => {
+      const isFilterId = (vid: string) => {
+        const o = objectsRef.current.find((x) => x.id === vid);
+        return !!o && (o.kind === "filter" || !!o.filter_ref);
+      };
+      const rels = await invoke<RelationInfo[]>("list_relations");
+      const terminals = new Set<string>();
+      const queue = [startId];
+      const seen = new Set<string>([startId]);
+      while (queue.length) {
+        const cur = queue.shift()!;
+        const outs = rels.filter(
+          (r) => r.kind === "flow" && r.from_id === cur && isFilterId(r.to_id)
+        );
+        if (!outs.length && cur !== startId && isFilterId(cur)) terminals.add(cur);
+        for (const r of outs) {
+          if (!seen.has(r.to_id)) {
+            seen.add(r.to_id);
+            queue.push(r.to_id);
+          }
+        }
+      }
+      if (!terminals.size) {
+        setConfirm({
+          title: "フローがありません",
+          message: "ドロップポイントからフィルタへ矢印を引いてください",
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+      for (const t of terminals) await handleRunFlow(t);
+    },
+    [handleRunFlow]
+  );
+  runDownstreamFlowsRef.current = runDownstreamFlows;
+
+  // ドロップポイントへファイルを選んで投入（D&Dの代替。ダブルクリックでも呼ぶ）。
+  const handleFeedDrop = useCallback(
+    async (id: string) => {
+      const file = await open({ multiple: false, title: "投入するファイルを選択（下流のフローを自動実行）" });
+      if (!file || Array.isArray(file)) return;
+      try {
+        await invoke("drop_into_point", { id, path: file });
+        await refresh();
+        await runDownstreamFlows(id);
+      } catch (e) {
+        console.error("drop_into_point failed", e);
+        setConfirm({
+          title: "投入できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh, runDownstreamFlows]
+  );
+
   // Rename = change the virtual body's display label only. 実身(CAS)は不変。
   const handleRenameObject = useCallback((id: string, current: string) => {
     setPrompt({
@@ -632,6 +735,11 @@ function App() {
         handleRunFlow(id);
         return;
       }
+      // v1.4: ドロップポイントのダブルクリック＝ファイルを選んで投入（→自動実行）。
+      if (obj?.kind === "drop") {
+        handleFeedDrop(id);
+        return;
+      }
       if (obj?.project_ref) {
         try {
           const info = await invoke<ProjectInfo>("open_project_object", { id });
@@ -686,7 +794,7 @@ function App() {
         });
       }
     },
-    [refresh, handleRunFlow]
+    [refresh, handleRunFlow, handleFeedDrop]
   );
 
   // Place a reference to an existing project as a project-object card.
@@ -845,6 +953,8 @@ function App() {
         ? "リンクフォルダ"
         : k === "filter"
         ? "フィルタカード"
+        : k === "drop"
+        ? "ドロップポイント"
         : "プログラム";
     try {
       const plan = await invoke<CommitAllReport>("commit_all", { dryRun: true });
@@ -1926,6 +2036,8 @@ function App() {
         addFilter: handleAddFilter,
         runFlow: handleRunFlow,
         editFilter: handleEditFilter,
+        feedDrop: handleFeedDrop,
+        runDrop: runDownstreamFlows,
         newSubproject: handleNewSubproject,
         linkProject: handleLinkProject,
         autoLayout: handleAutoLayout,
@@ -2067,6 +2179,8 @@ function App() {
       handleAddFilter,
       handleRunFlow,
       handleEditFilter,
+      handleFeedDrop,
+      runDownstreamFlows,
       theme,
       expanded,
       notes,
@@ -2108,7 +2222,8 @@ function App() {
 
   // v1.4 オートフロー: 接続時型チェック（確定方針3）。フィルタへ入る flow 矢印の
   // 入力MIMEが accept_mime に合わない場合は赤矢印で警告（実行前に分かる）。
-  // 付箋からのフロー接続も入力にできないため赤。flow.rs と同じ判定規則。
+  // 上流がフィルタなら「そのフィルタの出力MIME」で照合（連鎖対応）。
+  // 空のドロップポイントは保留（中身が入った時点で判定）。付箋は入力不可＝赤。
   const objById = new Map(objects.map((o) => [o.id, o]));
   const invalidFlowIds = new Set<number>();
   for (const r of relations) {
@@ -2122,7 +2237,17 @@ function App() {
       /* 壊れた定義は全受け入れ扱い（実行時にエラーで分かる） */
     }
     const src = objById.get(r.from_id);
-    if (!src || !mimeMatches(accept, src.mime_type)) invalidFlowIds.add(r.id);
+    if (!src) {
+      invalidFlowIds.add(r.id); // 付箋など、フロー入力にできないノード
+      continue;
+    }
+    if (src.kind === "filter" || src.filter_ref) {
+      const outMime = filterOutputMime(src.filter_ref);
+      if (outMime && !mimeMatches(accept, outMime)) invalidFlowIds.add(r.id);
+      continue; // 出力MIME不明（外部コマンド）はチェックしない
+    }
+    if (src.kind === "drop" && src.real_id.startsWith("drop:")) continue; // 空の入口
+    if (!mimeMatches(accept, src.mime_type)) invalidFlowIds.add(r.id);
   }
 
   return (
@@ -2183,6 +2308,7 @@ function App() {
             isUrl={!!obj.url_ref}
             isFolder={!!obj.folder_ref}
             isFilter={obj.kind === "filter" || !!obj.filter_ref}
+            isDrop={obj.kind === "drop"}
             memo={obj.memo}
             ext={obj.ext}
             expanded={expanded.has(obj.id)}

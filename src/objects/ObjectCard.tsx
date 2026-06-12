@@ -31,6 +31,8 @@ interface Props {
   isFolder?: boolean;
   /** v1.4 オートフロー: this card is a filter (pipeline processor) */
   isFilter?: boolean;
+  /** v1.4 オートフロー: this card is a drop point (pipeline data inlet) */
+  isDrop?: boolean;
   /** stacking order (computed by the parent; expanded cards come to front) */
   zIndex?: number;
   /** part of the current rubber-band selection */
@@ -106,6 +108,7 @@ function iconFor(mime: string, ext?: string | null): string {
   if (mime === "application/vnd.texos.url") return "🔗";
   if (mime === "application/vnd.texos.folder") return "📂";
   if (mime === "application/vnd.texos.filter") return "⚗️";
+  if (mime === "application/vnd.texos.drop") return "📥";
   // Extension first — most specific for unknown MIME types.
   if (ext) {
     const hit = EXT_ICON[ext.toLowerCase()];
@@ -124,7 +127,7 @@ function iconFor(mime: string, ext?: string | null): string {
 export function ObjectCard({
   id, realId, label, mimeType, x, y,
   committed = false, active = false, lost = null,
-  isProject = false, isUrl = false, isFolder = false, isFilter = false,
+  isProject = false, isUrl = false, isFolder = false, isFilter = false, isDrop = false,
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onGroupDragStart,
@@ -250,8 +253,10 @@ export function ObjectCard({
           ? "var(--card-bg-folder, #2a2418)"
           : isFilter
           ? "var(--card-bg-filter, #14281e)"
+          : isDrop
+          ? "var(--card-bg-drop, #102030)"
           : "var(--card-bg, #111120)",
-        border: `1px solid ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? "#3a7a5a" : status.border}`,
+        border: `1px ${isDrop ? "dashed" : "solid"} ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? "#3a7a5a" : isDrop ? "#4a90d9" : status.border}`,
         outline: selected ? "2px solid var(--accent, #4a90d9)" : "none",
         outlineOffset: 1,
         borderRadius: 10,
@@ -348,6 +353,9 @@ export function ObjectCard({
             )}
             {isFilter && (
               <span style={{ fontSize: 9, color: "#7fd8b0" }}>⚙ フィルタ（Wクリックで実行）</span>
+            )}
+            {isDrop && (
+              <span style={{ fontSize: 9, color: "#7fb0d8" }}>📥 ここにドロップ→自動実行</span>
             )}
             {memo && (
               <span
