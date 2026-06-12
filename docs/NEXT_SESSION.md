@@ -5,9 +5,12 @@
 - 全バージョンの変更内容: `docs/更新履歴.md` ／ 今後の計画: `docs/バージョンアップ計画.md`
 - **①git管理の導入は完了（2026-06-12）**: GitHub プライベートリポジトリ
   https://github.com/yasu44key/texos（main ブランチ）。gh CLI 認証済み。以後 `git push` で同期。
-- **次セッションの作業（2026-06-12 合意）:
-  ②App.tsx の小リファクタリング（useUndo / useSelection / メニュービルダー分離）→
-  ③V1.3後半フェーズ1（オートフローMVP）の実装**。
+- **②App.tsx リファクタリングは完了（2026-06-12）**: 2755行→2038行。
+  src/model.ts（共有型・ヘルパー）/ src/hooks/useUndo.ts / src/hooks/useSelection.ts /
+  src/ui/menuBuilder.ts に分離。挙動変更なし。tsc・vite build 通過、push済み。
+  **実機回帰チェック（次回起動時に推奨）**: 右クリックメニュー全種（付箋/カード/図形/空き）、
+  Ctrl+Z/REDO、矩形選択・Ctrl+クリック・Escでの解除、UIカラー切替。
+- **次セッションの作業: ③V1.3後半フェーズ1（オートフローMVP）の実装**。
   確定方針は `docs/V1.3後半_オートフロー設計.md` の「★確定方針」参照。要点:
   フロー矢印＝フィルタカード接続で自動判定 / filter_ref JSON / 接続時MIME型チェック
   （不一致は赤矢印）/ 手動「フローを実行」/ 内蔵フィルタ（テキストgrep・置換、
