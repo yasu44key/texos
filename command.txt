@@ -1,0 +1,8 @@
+データベースクリア
+
+C:\Users\yoshi\dev\texos>del /f "%APPDATA%\com.yoshi.texos\texos.db" "%APPDATA%\com.yoshi.texos\texos.db-shm" "%APPDATA%\com.yoshi.texos\texos.db-wal"
+
+
+起動
+
+C:\Users\yoshi\dev\texos>npm run tauri dev
