@@ -29,6 +29,8 @@ interface Props {
   isUrl?: boolean;
   /** this card is a link to an OS folder */
   isFolder?: boolean;
+  /** v1.4 オートフロー: this card is a filter (pipeline processor) */
+  isFilter?: boolean;
   /** stacking order (computed by the parent; expanded cards come to front) */
   zIndex?: number;
   /** part of the current rubber-band selection */
@@ -103,6 +105,7 @@ function iconFor(mime: string, ext?: string | null): string {
   if (mime === "application/vnd.texos.project") return "📁";
   if (mime === "application/vnd.texos.url") return "🔗";
   if (mime === "application/vnd.texos.folder") return "📂";
+  if (mime === "application/vnd.texos.filter") return "⚗️";
   // Extension first — most specific for unknown MIME types.
   if (ext) {
     const hit = EXT_ICON[ext.toLowerCase()];
@@ -121,7 +124,7 @@ function iconFor(mime: string, ext?: string | null): string {
 export function ObjectCard({
   id, realId, label, mimeType, x, y,
   committed = false, active = false, lost = null,
-  isProject = false, isUrl = false, isFolder = false,
+  isProject = false, isUrl = false, isFolder = false, isFilter = false,
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onGroupDragStart,
@@ -245,8 +248,10 @@ export function ObjectCard({
           ? "var(--card-bg-project, #241f33)"
           : isFolder
           ? "var(--card-bg-folder, #2a2418)"
+          : isFilter
+          ? "var(--card-bg-filter, #14281e)"
           : "var(--card-bg, #111120)",
-        border: `1px solid ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : status.border}`,
+        border: `1px solid ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? "#3a7a5a" : status.border}`,
         outline: selected ? "2px solid var(--accent, #4a90d9)" : "none",
         outlineOffset: 1,
         borderRadius: 10,
@@ -341,6 +346,9 @@ export function ObjectCard({
             {isFolder && (
               <span style={{ fontSize: 9, color: "#d8c47f" }}>🔗 リンクフォルダ ▸</span>
             )}
+            {isFilter && (
+              <span style={{ fontSize: 9, color: "#7fd8b0" }}>⚙ フィルタ（Wクリックで実行）</span>
+            )}
             {memo && (
               <span
                 style={{
@@ -362,7 +370,7 @@ export function ObjectCard({
       </div>
 
       {/* status dot (top-left): 琥珀=仮身 / 緑=実身(今セッション変更) / グレー=実身 */}
-      {!isProject && !isUrl && !isFolder && (
+      {!isProject && !isUrl && !isFolder && !isFilter && (
       <div
         title={status.title}
         style={{

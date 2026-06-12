@@ -17,6 +17,10 @@ export interface MenuActions {
   paste: (x: number, y: number) => void;
   shapeAdd: (kind: string, x: number, y: number) => void;
   addUrl: (x: number, y: number) => void;
+  // v1.4 オートフロー
+  addFilter: (builtin: string, x: number, y: number) => void;
+  runFlow: (id: string) => void;
+  editFilter: (id: string, current: string) => void;
   newSubproject: (sibling: boolean, x: number, y: number) => void;
   linkProject: (x: number, y: number) => void;
   autoLayout: () => void;
@@ -186,6 +190,20 @@ export function buildObjectMenu(
       { label: "URLを変更...", onClick: () => a.changeUrl(targetId, obj.url_ref!) },
       ...zItems,
       { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
+      { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
+      { label: "削除", danger: true, onClick: () => a.deleteObject(targetId) },
+    ];
+  }
+  // v1.4 オートフロー: フィルタカード（パイプラインの処理ノード）
+  if (obj && (obj.kind === "filter" || obj.filter_ref)) {
+    return [
+      { label: `⚗「${obj.label}」`, onClick: () => {}, disabled: true },
+      { label: "▶ フローを実行", onClick: () => a.runFlow(targetId) },
+      {
+        label: "フィルタ設定を編集（JSON）...",
+        onClick: () => a.editFilter(targetId, obj.filter_ref ?? "{}"),
+      },
+      ...zItems,
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
       { label: "削除", danger: true, onClick: () => a.deleteObject(targetId) },
     ];
@@ -456,6 +474,18 @@ export function buildCanvasMenu(
     {
       label: "URLリンクを追加...",
       onClick: () => a.addUrl(pos.canvasX, pos.canvasY),
+    },
+    // v1.4 オートフロー⑤: フィルタカード（データ→フィルタ→結果のパイプ）
+    {
+      label: "フィルタカードを追加 ...",
+      onClick: () =>
+        a.openSubmenu([
+          { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
+          { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
+          { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
+          { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
+          { label: "外部コマンド（{in} {out}）...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
+        ]),
     },
     {
       label: "新規プロジェクトを内包（コミット）...",

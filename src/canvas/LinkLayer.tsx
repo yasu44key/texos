@@ -20,6 +20,8 @@ interface LinkLayerProps {
   /** Temporary line while dragging a new link (canvas coords). */
   tempLine?: { x1: number; y1: number; x2: number; y2: number } | null;
   onDeleteRelation?: (id: number) => void;
+  /** v1.4 オートフロー: 型チェック不合格のフロー矢印（赤で警告表示）。 */
+  invalidIds?: Set<number>;
 }
 
 function center(n: NodeBox) {
@@ -38,7 +40,7 @@ function edgePoint(n: NodeBox, toward: { x: number; y: number }) {
   return { x: c.x + dx * t, y: c.y + dy * t };
 }
 
-export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation }: LinkLayerProps) {
+export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation, invalidIds }: LinkLayerProps) {
   const byId = new Map(nodes.map((n) => [n.id, n]));
 
   // Large symmetric viewBox so canvas coords (incl. negatives) map 1:1 and
@@ -70,6 +72,29 @@ export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation }: Link
         >
           <path d="M0,0 L6,3 L0,6 Z" style={{ fill: "var(--arrow-color, #5a9fe0)" }} />
         </marker>
+        {/* v1.4: フロー矢印（パイプ）と型不一致警告のマーカー */}
+        <marker
+          id="arrowhead-flow"
+          markerWidth="8"
+          markerHeight="8"
+          refX="6"
+          refY="3"
+          orient="auto"
+          markerUnits="strokeWidth"
+        >
+          <path d="M0,0 L6,3 L0,6 Z" style={{ fill: "var(--arrow-flow, #57c7a3)" }} />
+        </marker>
+        <marker
+          id="arrowhead-bad"
+          markerWidth="8"
+          markerHeight="8"
+          refX="6"
+          refY="3"
+          orient="auto"
+          markerUnits="strokeWidth"
+        >
+          <path d="M0,0 L6,3 L0,6 Z" style={{ fill: "var(--arrow-bad, #d96a6a)" }} />
+        </marker>
       </defs>
 
       {relations.map((r) => {
@@ -78,6 +103,15 @@ export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation }: Link
         if (!from || !to) return null;
         const p1 = edgePoint(from, center(to));
         const p2 = edgePoint(to, center(from));
+        // v1.4: flow矢印はパイプの見た目（破線・緑系）、型不一致は赤で実行前に分かる。
+        const isFlow = r.kind === "flow";
+        const bad = invalidIds?.has(r.id) ?? false;
+        const stroke = bad
+          ? "var(--arrow-bad, #d96a6a)"
+          : isFlow
+          ? "var(--arrow-flow, #57c7a3)"
+          : "var(--arrow-color, #5a9fe0)";
+        const markerId = bad ? "arrowhead-bad" : isFlow ? "arrowhead-flow" : "arrowhead";
         return (
           <g key={r.id}>
             {/* invisible fat line for easier click-to-delete */}
@@ -97,10 +131,11 @@ export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation }: Link
               x2={p2.x}
               y2={p2.y}
               style={{
-                stroke: "var(--arrow-color, #5a9fe0)",
+                stroke,
                 strokeWidth: "var(--arrow-width, 2)",
               }}
-              markerEnd="url(#arrowhead)"
+              strokeDasharray={isFlow ? "9 5" : undefined}
+              markerEnd={`url(#${markerId})`}
             />
           </g>
         );

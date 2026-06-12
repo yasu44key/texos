@@ -3917,6 +3917,7 @@ dependencies = [
  "dirs 5.0.1",
  "hex",
  "image",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

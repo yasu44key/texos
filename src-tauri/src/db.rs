@@ -163,6 +163,25 @@ fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE shapes ADD COLUMN deleted_at INTEGER", []);
     let _ = conn.execute("ALTER TABLE relations ADD COLUMN deleted_at INTEGER", []);
 
+    // v1.4: カード統一モデル §1 — 変種を kind で明示する（カード統一モデル検討結果.md）。
+    // filter_ref は kind='filter' のフィルタ定義 JSON（オートフロー⑤）。
+    // 既存行は ref 列から推定してバックフィル（repair_mime_types と同じ「開くたび修復」方式）。
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN kind TEXT", []);
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN filter_ref TEXT", []);
+    let _ = conn.execute(
+        "UPDATE virtual_bodies SET kind='project' WHERE kind IS NULL AND project_ref IS NOT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE virtual_bodies SET kind='url' WHERE kind IS NULL AND url_ref IS NOT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE virtual_bodies SET kind='folder' WHERE kind IS NULL AND folder_ref IS NOT NULL",
+        [],
+    );
+    let _ = conn.execute("UPDATE virtual_bodies SET kind='file' WHERE kind IS NULL", []);
+
     Ok(())
 }
 

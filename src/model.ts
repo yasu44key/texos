@@ -22,6 +22,10 @@ export interface VirtualBodyInfo {
   cur_mtime: number | null;
   view_source: string | null;
   panel_w: number | null;
+  /** カード変種（v1.4 カード統一モデル §1）: file|url|project|folder|filter */
+  kind: string | null;
+  /** kind='filter' のフィルタ定義 JSON（v1.4 オートフロー⑤） */
+  filter_ref: string | null;
 }
 
 export interface NoteInfo {
@@ -83,6 +87,19 @@ export function shapeCenterOn(child: ShapeInfo, parent: ShapeInfo): boolean {
     cx >= parent.pos_x && cx <= parent.pos_x + parent.width &&
     cy >= parent.pos_y && cy <= parent.pos_y + parent.height
   );
+}
+
+// v1.4 オートフロー⑤: 接続時型チェック。バックエンド flow.rs の mime_matches と
+// 同じ規則を保つこと: 空・"*/*" は全受け入れ / "text/*" は text/ 系＋JSON /
+// その他は前方一致 or 完全一致。
+export function mimeMatches(accept: string, mime: string): boolean {
+  if (!accept || accept === "*/*") return true;
+  if (accept.endsWith("/*")) {
+    const prefix = accept.slice(0, -2);
+    if (prefix === "text" && mime === "application/json") return true;
+    return mime.startsWith(prefix + "/");
+  }
+  return accept === mime;
 }
 
 // Estimated footprint of a note (used for links, selection, layout).

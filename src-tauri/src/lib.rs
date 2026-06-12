@@ -2,6 +2,7 @@ mod cas;
 mod db;
 #[cfg(windows)]
 mod drag_drop;
+mod flow;
 mod os_icon;
 
 use base64::Engine;
@@ -74,6 +75,10 @@ pub struct VirtualBodyInfo {
     pub view_source: Option<String>,
     /// Width of the in-canvas text editor panel (v1.3.1, user-resizable).
     pub panel_w: Option<f64>,
+    /// カード変種（v1.4 カード統一モデル §1）: file|url|project|folder|filter（拡張予定: note 等）
+    pub kind: Option<String>,
+    /// kind='filter' のフィルタ定義 JSON（v1.4 オートフロー⑤）
+    pub filter_ref: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -246,10 +251,10 @@ fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), String> {
              INSERT INTO fork.virtual_bodies
                (id,real_id,label,pos_x,pos_y,desktop_id,created_at,etag,last_modified,
                 committed_path,committed_mtime,project_ref,expanded,url_ref,memo,
-                z_order,folder_ref,origin_path)
+                z_order,folder_ref,origin_path,kind,filter_ref)
                SELECT id,real_id,label,pos_x,pos_y,desktop_id,created_at,etag,last_modified,
                 NULL,NULL,project_ref,expanded,url_ref,memo,
-                z_order,folder_ref,origin_path FROM main.virtual_bodies
+                z_order,folder_ref,origin_path,kind,filter_ref FROM main.virtual_bodies
                WHERE deleted_at IS NULL;
              INSERT INTO fork.relations (id,from_id,to_id,kind,created_at)
                SELECT id,from_id,to_id,kind,created_at FROM main.relations rel
@@ -717,7 +722,8 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
         .prepare(
             "SELECT v.id, v.real_id, v.label, r.mime_type, v.pos_x, v.pos_y,
                     v.committed_path, v.committed_mtime, v.project_ref, r.ext, v.expanded,
-                    v.url_ref, v.memo, v.z_order, v.folder_ref, v.origin_path, v.panel_w
+                    v.url_ref, v.memo, v.z_order, v.folder_ref, v.origin_path, v.panel_w,
+                    v.kind, v.filter_ref
              FROM virtual_bodies v
              JOIN real_bodies r ON r.id = v.real_id
              WHERE v.desktop_id IS NULL AND v.deleted_at IS NULL
@@ -756,6 +762,8 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
                 cur_mtime,
                 view_source: None,
                 panel_w: row.get(16)?,
+                kind: row.get(17)?,
+                filter_ref: row.get(18)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -768,7 +776,11 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
     // v1.3-⑩: report how each file 仮身's view resolves, so the frontend can
     // show 薄赤 when the window lost its live target (CAS fallback / nothing).
     for it in &mut items {
-        if it.project_ref.is_some() || it.url_ref.is_some() || it.folder_ref.is_some() {
+        if it.project_ref.is_some()
+            || it.url_ref.is_some()
+            || it.folder_ref.is_some()
+            || it.filter_ref.is_some()
+        {
             continue;
         }
         it.view_source = Some(
@@ -1159,8 +1171,10 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
     p.conn
         .execute(
             "INSERT INTO virtual_bodies
-                (id, real_id, label, pos_x, pos_y, created_at, folder_ref, origin_path)
-             SELECT ?1, real_id, label, pos_x + 36.0, pos_y + 36.0, ?2, folder_ref, origin_path
+                (id, real_id, label, pos_x, pos_y, created_at, folder_ref, origin_path,
+                 kind, filter_ref)
+             SELECT ?1, real_id, label, pos_x + 36.0, pos_y + 36.0, ?2, folder_ref, origin_path,
+                 kind, filter_ref
              FROM virtual_bodies WHERE id = ?3",
             rusqlite::params![vid, db::now_ms(), id],
         )
@@ -1191,9 +1205,29 @@ fn create_relation(
     if from_id == to_id {
         return Err("cannot link an object to itself".into());
     }
-    let kind = kind.unwrap_or_else(|| "link".to_string());
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // v1.4 オートフロー⑤: フィルタカードに入る/出る矢印は自動的にフロー
+    // （新しい矢印種のUIは作らない — 確定方針1）。
+    let kind = kind.unwrap_or_else(|| {
+        let is_filter = |vid: &str| -> bool {
+            p.conn
+                .query_row(
+                    "SELECT 1 FROM virtual_bodies WHERE id = ?1 AND kind = 'filter'",
+                    rusqlite::params![vid],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        if is_filter(&from_id) || is_filter(&to_id) {
+            "flow".to_string()
+        } else {
+            "link".to_string()
+        }
+    });
     let inserted = p
         .conn
         .execute(
@@ -1409,13 +1443,14 @@ fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Result<CommitAll
         url_ref: Option<String>,
         ext: Option<String>,
         folder_ref: Option<String>,
+        kind: Option<String>,
     }
     let rows: Vec<Row> = {
         let mut stmt = p
             .conn
             .prepare(
                 "SELECT v.id, v.label, v.committed_path, v.project_ref, v.url_ref, r.ext,
-                        v.folder_ref
+                        v.folder_ref, v.kind
                  FROM virtual_bodies v JOIN real_bodies r ON r.id = v.real_id
                  WHERE v.deleted_at IS NULL
                  ORDER BY v.created_at",
@@ -1431,6 +1466,7 @@ fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Result<CommitAll
                     url_ref: row.get(4)?,
                     ext: row.get(5)?,
                     folder_ref: row.get(6)?,
+                    kind: row.get(7)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1446,6 +1482,15 @@ fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Result<CommitAll
         errors: vec![],
     };
     for r in rows {
+        // v1.4: フィルタカードはTexoS内の道具であり持ち出し対象のファイルを持たない
+        if r.kind.as_deref() == Some("filter") {
+            report.warnings.push(CommitAllWarning {
+                label: r.label,
+                kind: "filter".into(),
+                detail: String::new(),
+            });
+            continue;
+        }
         if let Some(url) = &r.url_ref {
             report.warnings.push(CommitAllWarning {
                 label: r.label,
@@ -1923,6 +1968,257 @@ fn create_text_object(text: String, x: f64, y: f64, state: State<AppState>) -> R
     db::insert_virtual_body(&p.conn, &vid, &hash, &label, x, y, None, None)
         .map_err(|e| e.to_string())?;
     Ok(vid)
+}
+
+// ---------------------------------------------------------------------------
+// オートフロー (v1.4-⑤: UNIXパイプラインの再来 — フィルタカードとフロー実行)
+// ---------------------------------------------------------------------------
+
+const FILTER_MIME: &str = "application/vnd.texos.filter";
+
+/// フィルタカードを作成（kind='filter'、定義は filter_ref の JSON）。
+#[tauri::command]
+fn create_filter(
+    label: String,
+    spec: String,
+    x: f64,
+    y: f64,
+    state: State<AppState>,
+) -> Result<String, String> {
+    flow::parse_spec(&spec)?; // 保存前に検証（壊れたJSONをDBに入れない）
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // sentinel real body (URLカードと同じ方式: 全フィルタカードで共有)
+    let real_id = "filter:sentinel".to_string();
+    p.conn
+        .execute(
+            "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+             VALUES (?1, ?2, 0, ?3)",
+            rusqlite::params![real_id, FILTER_MIME, db::now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+    let vid = uuid();
+    p.conn
+        .execute(
+            "INSERT INTO virtual_bodies
+                (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'filter', ?7)",
+            rusqlite::params![vid, real_id, label, x, y, db::now_ms(), spec],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(vid)
+}
+
+/// フィルタ定義（JSON）を更新。フォーム自動生成（JSON Schema）はフェーズ2。
+#[tauri::command]
+fn update_filter(id: String, spec: String, state: State<AppState>) -> Result<(), String> {
+    flow::parse_spec(&spec)?;
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let n = p
+        .conn
+        .execute(
+            "UPDATE virtual_bodies SET filter_ref = ?1 WHERE id = ?2 AND kind = 'filter'",
+            rusqlite::params![spec, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("フィルタカードが見つかりません".into());
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct FlowReport {
+    /// 新しく生まれた結果カードの vid（front は緑シグナル＋UNDO登録に使う）
+    pub created: Vec<String>,
+    /// 生成されたファイル名（ダイアログ表示用）
+    pub outputs: Vec<String>,
+    /// 型不一致などでスキップした入力（ラベル＋理由）
+    pub skipped: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// フローを実行（手動トリガー — 確定方針4）。
+/// 入力＝このフィルタへ入る flow 矢印の元カード。各入力の「窓の今」（v1.3-⑩の
+/// 解決順）を読んでフィルタを通し、結果をプロジェクト直下のコミット済み実身として
+/// カード化（緑シグナルで誕生）し、フィルタ→結果の flow 矢印を張る。
+/// 実行ログはフィルタカードの memo に記録する。
+#[tauri::command]
+fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+
+    let (spec_json, fx, fy, flabel): (Option<String>, f64, f64, String) = p
+        .conn
+        .query_row(
+            "SELECT filter_ref, pos_x, pos_y, label FROM virtual_bodies
+             WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|_| "フィルタカードが見つかりません".to_string())?;
+    let spec = flow::parse_spec(spec_json.as_deref().unwrap_or("{}"))?;
+    let accept = spec.accept_mime.clone().unwrap_or_else(|| "*/*".into());
+
+    // 入力: このフィルタへ入る flow 矢印（生きているカードのみ・接続順）
+    let inputs: Vec<(String, String, String, String, Option<String>)> = {
+        let mut stmt = p
+            .conn
+            .prepare(
+                "SELECT v.id, v.real_id, v.label, r.mime_type, r.ext
+                 FROM relations rel
+                 JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                 JOIN real_bodies r ON r.id = v.real_id
+                 WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                 ORDER BY rel.created_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+    };
+    if inputs.is_empty() {
+        return Err("入力がありません。データカードからフィルタへ矢印を引いてください".into());
+    }
+
+    // 出力ファイル名に使えるラベル（Windowsの禁止文字を逃がす）
+    let safe_flabel: String = flabel
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .take(24)
+        .collect();
+
+    let mut report = FlowReport {
+        created: vec![],
+        outputs: vec![],
+        skipped: vec![],
+        errors: vec![],
+    };
+    let mut out_i = 0usize;
+    for (vid, real_id, vlabel, mime, ext) in &inputs {
+        if !flow::mime_matches(&accept, mime) {
+            report
+                .skipped
+                .push(format!("{vlabel}（{mime} は受け入れ対象外）"));
+            continue;
+        }
+        // 仮身の窓の「今」を読む（閲覧時スナップショット更新 → 解決順で実体パス）
+        refresh_origin_snapshot(p, vid);
+        let path = resolve_view_path(p, vid, real_id);
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                report.errors.push(format!("{vlabel}: 読み込み失敗 ({e})"));
+                continue;
+            }
+        };
+        let in_ext = ext.clone().unwrap_or_else(|| "bin".into());
+        let result: Result<(Vec<u8>, String, String), String> = if let Some(b) = &spec.builtin {
+            flow::run_builtin(&spec, b, &data)
+        } else if let Some(cmd) = &spec.cmd {
+            let out_ext = spec.output_ext.clone().unwrap_or_else(|| in_ext.clone());
+            let out_mime = mime_for_ext(&out_ext)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            flow::run_external(cmd, &data, &in_ext, &out_ext).map(|b| (b, out_ext, out_mime))
+        } else {
+            Err("フィルタ定義に builtin も cmd もありません".into())
+        };
+        let (out_bytes, out_ext, out_mime) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                report.errors.push(format!("{vlabel}: {e}"));
+                continue;
+            }
+        };
+
+        // 結果＝プロジェクト直下のコミット済み実身（CASにも保存＝保険）
+        let stem = std::path::Path::new(vlabel)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        let dest = unique_file_path(&p.root, &format!("{stem}_{safe_flabel}.{out_ext}"));
+        if let Err(e) = std::fs::write(&dest, &out_bytes) {
+            report.errors.push(format!("{vlabel}: 書き出し失敗 ({e})"));
+            continue;
+        }
+        let hash = match cas::store_bytes(&p.cas_root, &out_bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                report.errors.push(format!("{vlabel}: CAS保存失敗 ({e})"));
+                continue;
+            }
+        };
+        if let Err(e) =
+            db::insert_real_body(&p.conn, &hash, &out_mime, out_bytes.len() as u64, Some(&out_ext))
+        {
+            report.errors.push(format!("{vlabel}: {e}"));
+            continue;
+        }
+        let new_vid = uuid();
+        let out_label = dest
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output")
+            .to_string();
+        let nx = fx + 190.0;
+        let ny = fy + (out_i as f64) * 170.0;
+        if let Err(e) = p.conn.execute(
+            "INSERT INTO virtual_bodies
+                (id, real_id, label, pos_x, pos_y, created_at,
+                 committed_path, committed_mtime, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'file')",
+            rusqlite::params![
+                new_vid,
+                hash,
+                out_label,
+                nx,
+                ny,
+                db::now_ms(),
+                dest.to_string_lossy(),
+                file_mtime_ms(&dest)
+            ],
+        ) {
+            report.errors.push(format!("{vlabel}: {e}"));
+            continue;
+        }
+        // フィルタ → 結果 の flow 矢印（パイプラインの連鎖が目に見える）
+        let _ = p.conn.execute(
+            "INSERT INTO relations (from_id, to_id, kind, created_at)
+             VALUES (?1, ?2, 'flow', ?3)",
+            rusqlite::params![id, new_vid, db::now_ms()],
+        );
+        report.created.push(new_vid);
+        report.outputs.push(out_label);
+        out_i += 1;
+    }
+
+    // 実行ログを memo に記録（最後の実行が常に見える — 確定方針4）
+    let mut log = format!(
+        "▶ 実行: 入力{} → 出力{}",
+        inputs.len(),
+        report.outputs.len()
+    );
+    if !report.skipped.is_empty() {
+        log.push_str(&format!("・スキップ{}", report.skipped.len()));
+    }
+    if !report.errors.is_empty() {
+        log.push_str(&format!("・エラー{}", report.errors.len()));
+    }
+    let _ = p.conn.execute(
+        "UPDATE virtual_bodies SET memo = ?1 WHERE id = ?2",
+        rusqlite::params![log, id],
+    );
+
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -2502,6 +2798,9 @@ pub fn run() {
             write_text_file,
             paste_clipboard,
             create_text_object,
+            create_filter,
+            update_filter,
+            run_flow,
             set_panel_width,
             create_shape,
             list_shapes,

@@ -16,6 +16,7 @@ import {
   PROJECT_MIME,
   isTextMime,
   lostOf,
+  mimeMatches,
   noteSize,
   shapeCenterOn,
   type NoteInfo,
@@ -399,6 +400,162 @@ function App() {
     }
   }, [pushUndo]);
 
+  // --- v1.4 オートフロー⑤ ----------------------------------------------------
+
+  // フィルタカードを作成。引数はプロンプトの連鎖で聞く（フォーム自動生成はフェーズ2）。
+  const handleAddFilter = useCallback(
+    (builtin: string, canvasX: number, canvasY: number) => {
+      const create = async (label: string, spec: Record<string, unknown>) => {
+        try {
+          const vid = await invoke<string>("create_filter", {
+            label,
+            spec: JSON.stringify(spec),
+            x: canvasX,
+            y: canvasY,
+          });
+          pushUndo([{ kind: "delete", ids: [vid] }]);
+          await refresh();
+        } catch (e) {
+          console.error("create_filter failed", e);
+          setConfirm({
+            title: "フィルタを作成できませんでした",
+            message: String(e),
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+      };
+      if (builtin === "text_grep") {
+        setPrompt({
+          title: "grep: 抽出する正規表現",
+          initial: "",
+          onConfirm: (pat) =>
+            create(`grep: ${pat}`, { builtin: "text_grep", pattern: pat, accept_mime: "text/*" }),
+        });
+      } else if (builtin === "text_replace") {
+        setPrompt({
+          title: "置換: 検索する正規表現",
+          initial: "",
+          onConfirm: (pat) =>
+            setPrompt({
+              title: "置換: 置き換え文字列",
+              initial: "",
+              onConfirm: (rep) =>
+                create(`置換: ${pat}→${rep}`, {
+                  builtin: "text_replace",
+                  pattern: pat,
+                  replacement: rep,
+                  accept_mime: "text/*",
+                }),
+            }),
+        });
+      } else if (builtin === "img_resize") {
+        setPrompt({
+          title: "リサイズ: 幅（px・高さは自動）",
+          initial: "800",
+          onConfirm: (w) =>
+            create(`リサイズ: 幅${w}px`, {
+              builtin: "img_resize",
+              width: parseInt(w, 10) || 800,
+              accept_mime: "image/*",
+            }),
+        });
+      } else if (builtin === "img_convert") {
+        setPrompt({
+          title: "形式変換: png / jpeg / webp / bmp / gif",
+          initial: "png",
+          onConfirm: (f) =>
+            create(`変換: ${f.trim().toLowerCase()}`, {
+              builtin: "img_convert",
+              format: f.trim().toLowerCase(),
+              accept_mime: "image/*",
+            }),
+        });
+      } else {
+        // 外部コマンドの逃げ道（{in}/{out} プレースホルダ）
+        setPrompt({
+          title: "外部コマンド（{in} と {out} を使用）",
+          initial: "",
+          onConfirm: (cmd) =>
+            setPrompt({
+              title: "出力ファイルの拡張子（空欄=入力と同じ）",
+              initial: "",
+              onConfirm: (ext) => {
+                const spec: Record<string, unknown> = { cmd, accept_mime: "*/*" };
+                if (ext.trim()) spec.output_ext = ext.trim().replace(/^\./, "");
+                create(`コマンド: ${cmd.slice(0, 20)}`, spec);
+              },
+            }),
+        });
+      }
+    },
+    [refresh, pushUndo]
+  );
+
+  // フローを実行（手動トリガー — 確定方針4）。結果カードは緑シグナル＋Ctrl+Zで戻せる。
+  const handleRunFlow = useCallback(
+    async (id: string) => {
+      try {
+        const res = await invoke<{
+          created: string[];
+          outputs: string[];
+          skipped: string[];
+          errors: string[];
+        }>("run_flow", { id });
+        if (res.created.length) {
+          setTouched((prev) => new Set([...prev, ...res.created]));
+          pushUndo([{ kind: "delete", ids: res.created }]);
+        }
+        await refresh();
+        const lines = [
+          ...res.outputs.map((o) => `生成: ${o}`),
+          ...res.skipped.map((s) => `スキップ: ${s}`),
+        ];
+        setConfirm({
+          title: "フローを実行しました",
+          message: lines.join("\n") || "出力はありません",
+          warning: res.errors.length ? "エラー:\n" + res.errors.join("\n") : undefined,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      } catch (e) {
+        console.error("run_flow failed", e);
+        setConfirm({
+          title: "フローを実行できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh, pushUndo]
+  );
+
+  // フィルタ定義（JSON）の直接編集。バックエンドが保存前に検証する。
+  const handleEditFilter = useCallback(
+    (id: string, current: string) => {
+      setPrompt({
+        title: "フィルタ定義（JSON）",
+        initial: current,
+        onConfirm: async (spec) => {
+          try {
+            await invoke("update_filter", { id, spec });
+            await refresh();
+          } catch (e) {
+            console.error("update_filter failed", e);
+            setConfirm({
+              title: "フィルタ定義を保存できませんでした",
+              message: String(e),
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          }
+        },
+      });
+    },
+    [refresh]
+  );
+
   // Rename = change the virtual body's display label only. 実身(CAS)は不変。
   const handleRenameObject = useCallback((id: string, current: string) => {
     setPrompt({
@@ -453,6 +610,11 @@ function App() {
   const handleOpenObject = useCallback(
     async (id: string) => {
       const obj = objectsRef.current.find((o) => o.id === id);
+      // v1.4: フィルタカードのダブルクリック＝そのカードの自然なアクション＝フロー実行。
+      if (obj && (obj.kind === "filter" || obj.filter_ref)) {
+        handleRunFlow(id);
+        return;
+      }
       if (obj?.project_ref) {
         try {
           const info = await invoke<ProjectInfo>("open_project_object", { id });
@@ -507,7 +669,7 @@ function App() {
         });
       }
     },
-    [refresh]
+    [refresh, handleRunFlow]
   );
 
   // Place a reference to an existing project as a project-object card.
@@ -664,6 +826,8 @@ function App() {
         ? "外部プロジェクト"
         : k === "folder"
         ? "リンクフォルダ"
+        : k === "filter"
+        ? "フィルタカード"
         : "プログラム";
     try {
       const plan = await invoke<CommitAllReport>("commit_all", { dryRun: true });
@@ -1742,6 +1906,9 @@ function App() {
         paste: handlePaste,
         shapeAdd: handleShapeAdd,
         addUrl: handleAddUrl,
+        addFilter: handleAddFilter,
+        runFlow: handleRunFlow,
+        editFilter: handleEditFilter,
         newSubproject: handleNewSubproject,
         linkProject: handleLinkProject,
         autoLayout: handleAutoLayout,
@@ -1880,6 +2047,9 @@ function App() {
       handleBulkUncommit,
       handleBulkDelete,
       handleCommitNoteToFile,
+      handleAddFilter,
+      handleRunFlow,
+      handleEditFilter,
       theme,
       expanded,
       notes,
@@ -1918,6 +2088,25 @@ function App() {
     .sort((a, b) => a.z_order - b.z_order)
     .forEach((o, i) => zRank.set(o.id, i + 1));
   const cardZ = (id: string) => (expanded.has(id) ? 1000 + (zRank.get(id) ?? 0) : zRank.get(id) ?? 0);
+
+  // v1.4 オートフロー: 接続時型チェック（確定方針3）。フィルタへ入る flow 矢印の
+  // 入力MIMEが accept_mime に合わない場合は赤矢印で警告（実行前に分かる）。
+  // 付箋からのフロー接続も入力にできないため赤。flow.rs と同じ判定規則。
+  const objById = new Map(objects.map((o) => [o.id, o]));
+  const invalidFlowIds = new Set<number>();
+  for (const r of relations) {
+    if (r.kind !== "flow") continue;
+    const filt = objById.get(r.to_id);
+    if (!filt || (filt.kind !== "filter" && !filt.filter_ref)) continue;
+    let accept = "*/*";
+    try {
+      accept = JSON.parse(filt.filter_ref ?? "{}").accept_mime ?? "*/*";
+    } catch {
+      /* 壊れた定義は全受け入れ扱い（実行時にエラーで分かる） */
+    }
+    const src = objById.get(r.from_id);
+    if (!src || !mimeMatches(accept, src.mime_type)) invalidFlowIds.add(r.id);
+  }
 
   return (
     <>
@@ -1959,6 +2148,7 @@ function App() {
           relations={relations}
           tempLine={linkDrag}
           onDeleteRelation={handleDeleteRelation}
+          invalidIds={invalidFlowIds}
         />
         {objects.map((obj) => (
           <ObjectCard
@@ -1975,6 +2165,7 @@ function App() {
             isProject={obj.mime_type === PROJECT_MIME || !!obj.project_ref}
             isUrl={!!obj.url_ref}
             isFolder={!!obj.folder_ref}
+            isFilter={obj.kind === "filter" || !!obj.filter_ref}
             memo={obj.memo}
             ext={obj.ext}
             expanded={expanded.has(obj.id)}
