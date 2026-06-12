@@ -3,7 +3,9 @@
 最終更新: 2026-06-12 / 現在の到達点: **v1.3.2 リリースビルド済み（UNDO/REDOと一括操作）**
 - インストーラー: `I:\texos_1.3.2_x64-setup.exe`（NSIS）。MSI は target\release\bundle\msi\。
 - 全バージョンの変更内容: `docs/更新履歴.md` ／ 今後の計画: `docs/バージョンアップ計画.md`
-- **次セッションの作業（2026-06-12 合意）: ①git管理の導入（git init＋初回コミット）→
+- **①git管理の導入は完了（2026-06-12）**: GitHub プライベートリポジトリ
+  https://github.com/yasu44key/texos（main ブランチ）。gh CLI 認証済み。以後 `git push` で同期。
+- **次セッションの作業（2026-06-12 合意）:
   ②App.tsx の小リファクタリング（useUndo / useSelection / メニュービルダー分離）→
   ③V1.3後半フェーズ1（オートフローMVP）の実装**。
   確定方針は `docs/V1.3後半_オートフロー設計.md` の「★確定方針」参照。要点:
