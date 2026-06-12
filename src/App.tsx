@@ -12,6 +12,26 @@ import { ContextMenu, type MenuItem } from "./ui/ContextMenu";
 import { PromptDialog } from "./ui/PromptDialog";
 import { ConfirmDialog } from "./ui/ConfirmDialog";
 import { ProjectChooser, type ProjectInfo } from "./ui/ProjectChooser";
+import {
+  PROJECT_MIME,
+  isTextMime,
+  lostOf,
+  noteSize,
+  shapeCenterOn,
+  type NoteInfo,
+  type VirtualBodyInfo,
+} from "./model";
+import { useUndo } from "./hooks/useUndo";
+import { useSelection } from "./hooks/useSelection";
+import {
+  buildAlignItems,
+  buildBulkItems,
+  buildCanvasMenu,
+  buildNoteMenu,
+  buildObjectMenu,
+  buildShapeMenu,
+  type MenuActions,
+} from "./ui/menuBuilder";
 import "./App.css";
 
 interface CommitAllWarning {
@@ -27,129 +47,12 @@ interface CommitAllReport {
   errors: string[];
 }
 
-interface VirtualBodyInfo {
-  id: string;
-  real_id: string;
-  label: string;
-  mime_type: string;
-  pos_x: number;
-  pos_y: number;
-  committed_path: string | null;
-  committed_modified: boolean;
-  project_ref: string | null;
-  ext: string | null;
-  expanded: boolean;
-  url_ref: string | null;
-  memo: string | null;
-  z_order: number;
-  folder_ref: string | null;
-  origin_path: string | null;
-  cur_mtime: number | null;
-  view_source: string | null;
-  panel_w: number | null;
-}
-
-const PROJECT_MIME = "application/vnd.texos.project";
-
-const TEXT_EXTS = new Set(["txt", "md", "csv", "json", "xml", "py", "js", "ts", "rs", "c", "cpp", "h", "css", "html", "yaml", "yml", "toml", "ini", "log"]);
-// v1.3-⑧: known binary containers must NEVER be treated as text, even when an
-// old DB row carries a wrong text-ish MIME (e.g. .docx imported pre-v1.3).
-const BINARY_EXTS = new Set(["doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "pdf", "zip", "7z", "rar", "gz", "tar", "exe", "msi", "dll", "lnk", "blend", "psd", "ai", "epub"]);
-function isTextMime(mime: string, ext?: string | null): boolean {
-  if (ext && BINARY_EXTS.has(ext.toLowerCase())) return false;
-  if (mime.startsWith("text/")) return true;
-  if (mime === "application/json") return true;
-  if (ext && TEXT_EXTS.has(ext.toLowerCase())) return true;
-  return false;
-}
-
-// v1.3-⑩ 薄赤判定: 仮身の窓が生きたファイルに届いていない状態。
-function lostOf(o: VirtualBodyInfo): "cas" | "none" | null {
-  if (o.committed_path || o.project_ref || o.url_ref || o.folder_ref) return null;
-  if (o.view_source === "none") return "none";
-  if (o.origin_path && (o.view_source === "cas" || o.view_source === "fork-cas")) return "cas";
-  return null;
-}
-
-// v1.3-①: UIカラープリセット（App.cssの[data-texos-theme]と対応）
-const THEMES: [string, string][] = [
-  ["midnight", "ミッドナイト（標準）"],
-  ["light", "視認性重視（ライト）"],
-  ["warm", "色調重視（セピア）"],
-  ["calm", "疲労防止（低刺激）"],
-];
-
-// v1.3 メモ⑤: 図形の階層化 — 中心が親図形の上に乗っているかで「従う」関係を判定。
-function shapeCenterOn(child: ShapeInfo, parent: ShapeInfo): boolean {
-  const cx = child.pos_x + child.width / 2;
-  const cy = child.pos_y + child.height / 2;
-  return (
-    cx >= parent.pos_x && cx <= parent.pos_x + parent.width &&
-    cy >= parent.pos_y && cy <= parent.pos_y + parent.height
-  );
-}
-
-// v1.3 メモ技術③: アンドゥはシリアライズ可能な操作レコードで持ち、
-// プロジェクトDB (.texos/texos.db の meta) に保存して再起動後も巻き戻せる。
-type UndoAction =
-  | { kind: "objects"; moves: { id: string; x: number; y: number }[] }
-  | { kind: "notes"; moves: { id: string; x: number; y: number }[] }
-  | { kind: "shapes"; geoms: { id: string; x: number; y: number; w: number; h: number; rot: number }[] }
-  | { kind: "shapeStyle"; id: string; fill: string; opacity: number }
-  | { kind: "noteStyle"; id: string; width: number; fontSize: number; bold: boolean }
-  // 復活の呪文（削除のUNDO）と再削除（そのREDO）— 全オブジェクト種別ぶん。
-  | { kind: "restore"; ids: string[] }
-  | { kind: "delete"; ids: string[] }
-  | { kind: "restoreNotes"; ids: string[] }
-  | { kind: "deleteNotes"; ids: string[] }
-  | { kind: "restoreShapes"; ids: string[] }
-  | { kind: "deleteShapes"; ids: string[] }
-  | { kind: "restoreRelations"; ids: number[] }
-  | { kind: "deleteRelations"; ids: number[] };
-
-interface UndoEntry {
-  t: number; // Date.now() — 同一マウス操作から出た複数エントリのバッチ判定に使う
-  actions: UndoAction[];
-}
-
-// v1.3-②: 図形のカラーパレット
-const SHAPE_COLORS: [string, string][] = [
-  ["青", "#4a90d9"],
-  ["緑", "#3fae6a"],
-  ["琥珀", "#e8b84a"],
-  ["赤", "#d96a6a"],
-  ["紫", "#9a7bd9"],
-  ["グレー", "#8a93a6"],
-];
-
-interface NoteInfo {
-  id: string;
-  text: string;
-  pos_x: number;
-  pos_y: number;
-  width: number;
-  font_size: number;
-  bold: boolean;
-  file_ref: string | null;
-}
-
 interface LinkDrag {
   fromId: string;
   x1: number;
   y1: number;
   x2: number;
   y2: number;
-}
-
-// Estimated footprint of a note (used for links, selection, layout).
-function noteSize(n: NoteInfo): { w: number; h: number } {
-  const w = n.width || 220;
-  const charW = n.font_size * 0.95; // CJK-leaning estimate
-  let lines = 0;
-  for (const para of (n.text || " ").split("\n")) {
-    lines += Math.max(1, Math.ceil((para.length * charW) / Math.max(80, w - 24)));
-  }
-  return { w, h: Math.max(40, lines * n.font_size * 1.5 + 20) };
 }
 
 function App() {
@@ -159,8 +62,6 @@ function App() {
   const [objects, setObjects] = useState<VirtualBodyInfo[]>([]);
   const [notes, setNotes] = useState<NoteInfo[]>([]);
   const [shapes, setShapes] = useState<ShapeInfo[]>([]);
-  // v1.3 メモ④: 図形はShift+クリックで複数選択できる（まとめて移動）。
-  const [selectedShapes, setSelectedShapes] = useState<Set<string>>(new Set());
   // v1.3 メモ①: カンバス左下に表示するアプリバージョン。
   const [appVersion, setAppVersion] = useState("");
   const [theme, setTheme] = useState<string>(() => localStorage.getItem("texos-theme") ?? "midnight");
@@ -185,8 +86,6 @@ function App() {
   const [touched, setTouched] = useState<Set<string>>(new Set());
   // Objects whose inline text editor is currently expanded.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  // Rubber-band selection (group move).
-  const [selected, setSelected] = useState<Set<string>>(new Set());
   // Saved canvas view (pan/zoom) for the current project, applied atomically.
   const [view, setView] = useState<{ key: string; transform: Transform } | null>(null);
   const saveTimer = useRef<number | null>(null);
@@ -194,24 +93,19 @@ function App() {
   const transformRef = useRef<Transform>({ x: 0, y: 0, scale: 1 });
   const objectsRef = useRef<VirtualBodyInfo[]>([]);
   objectsRef.current = objects;
-  const selectedRef = useRef<Set<string>>(selected);
-  selectedRef.current = selected;
   const shapesRef = useRef<ShapeInfo[]>([]);
   shapesRef.current = shapes;
-  const selectedShapesRef = useRef<Set<string>>(selectedShapes);
-  selectedShapesRef.current = selectedShapes;
   const notesRef = useRef<NoteInfo[]>([]);
   notesRef.current = notes;
-  // v1.3.1: notes participate in selection (rubber-band / shape group).
-  const [selectedNotes, setSelectedNotes] = useState<Set<string>>(new Set());
-  const selectedNotesRef = useRef<Set<string>>(selectedNotes);
-  selectedNotesRef.current = selectedNotes;
   // Actual rendered note sizes (ResizeObserver) — arrows/selection use these;
   // noteSize() stays as the pre-measurement fallback only.
   const [noteSizes, setNoteSizes] = useState<Map<string, { w: number; h: number }>>(new Map());
   const noteSizesRef = useRef(noteSizes);
   noteSizesRef.current = noteSizes;
-  const measuredNoteSize = (n: NoteInfo) => noteSizesRef.current.get(n.id) ?? noteSize(n);
+  const measuredNoteSize = useCallback(
+    (n: NoteInfo) => noteSizesRef.current.get(n.id) ?? noteSize(n),
+    []
+  );
   const handleNoteMeasure = useCallback((id: string, w: number, h: number) => {
     setNoteSizes((prev) => {
       const cur = prev.get(id);
@@ -227,73 +121,23 @@ function App() {
   // Canvas imperative API (fitTo) — 選択範囲にフォーカス等で使う。
   const canvasApi = useRef<CanvasApi | null>(null);
 
-  // --- v1.3 メモ② Ctrl+Z（ひとつ戻る） --------------------------------------
-  // 位置・サイズ・整列・削除（復活の呪文）など「動かす系」操作を巻き戻す。
-  // 履歴は操作レコードとしてプロジェクトDB (meta) に保存され、プロジェクトを
-  // 開き直しても・再起動しても続きから戻せる（メモ技術③の第一歩）。
-  // 1回のマウス操作から複数エントリが生まれる場合（図形＋上のカード等）は
-  // 同時刻バッチとして1回のCtrl+Zでまとめて戻す。
-  const undoStack = useRef<UndoEntry[]>([]);
-  // REDO (Ctrl+Shift+Z / Ctrl+Y): UNDO直前の状態から作った逆レコードを積む。
-  const redoStack = useRef<UndoEntry[]>([]);
-  const undoSaveTimer = useRef<number | null>(null);
-  const scheduleSaveUndo = useCallback(() => {
-    if (undoSaveTimer.current) window.clearTimeout(undoSaveTimer.current);
-    undoSaveTimer.current = window.setTimeout(() => {
-      undoSaveTimer.current = null;
-      invoke("set_undo_stack", {
-        json: JSON.stringify({ undo: undoStack.current, redo: redoStack.current }),
-      }).catch(() => {});
-    }, 400);
-  }, []);
-  const pushUndo = useCallback((actions: UndoAction[]) => {
-    if (!actions.length) return;
-    undoStack.current.push({ t: Date.now(), actions });
-    if (undoStack.current.length > 100) undoStack.current.shift();
-    redoStack.current = []; // 新しい操作をしたら「やり直す未来」は消える
-    scheduleSaveUndo();
-  }, [scheduleSaveUndo]);
-
-  // 位置・ジオメトリの一括適用（通常操作とアンドゥの両方から使う）。
-  const applyObjectMoves = useCallback(async (moves: { id: string; x: number; y: number }[]) => {
-    if (!moves.length) return;
-    await invoke("move_objects", { moves });
-    setObjects((prev) =>
-      prev.map((o) => {
-        const m = moves.find((mv) => mv.id === o.id);
-        return m ? { ...o, pos_x: m.x, pos_y: m.y } : o;
-      })
-    );
-  }, []);
-
-  const applyNoteMoves = useCallback(async (moves: { id: string; x: number; y: number }[]) => {
-    if (!moves.length) return;
-    for (const m of moves) await invoke("move_note", { id: m.id, x: m.x, y: m.y });
-    setNotes((prev) =>
-      prev.map((n) => {
-        const m = moves.find((mv) => mv.id === n.id);
-        return m ? { ...n, pos_x: m.x, pos_y: m.y } : n;
-      })
-    );
-  }, []);
-
-  const applyShapeGeoms = useCallback(
-    async (geoms: { id: string; x: number; y: number; w: number; h: number; rot: number }[]) => {
-      if (!geoms.length) return;
-      for (const g of geoms) {
-        await invoke("update_shape_geom", {
-          id: g.id, x: g.x, y: g.y, width: g.w, height: g.h, rotation: g.rot,
-        });
-      }
-      setShapes((prev) =>
-        prev.map((s) => {
-          const g = geoms.find((gg) => gg.id === s.id);
-          return g ? { ...s, pos_x: g.x, pos_y: g.y, width: g.w, height: g.h, rotation: g.rot } : s;
-        })
-      );
-    },
-    []
-  );
+  // 選択状態（カード・コメント・図形）— useSelection に分離（v1.3.2 リファクタ）。
+  const {
+    selected,
+    setSelected,
+    selectedRef,
+    selectedNotes,
+    setSelectedNotes,
+    selectedNotesRef,
+    selectedShapes,
+    setSelectedShapes,
+    selectedShapesRef,
+    handleSelectRect,
+    handleCardToggleSelect,
+    handleNoteToggleSelect,
+    handleShapeToggleSelect,
+    handleClearSelection,
+  } = useSelection({ objectsRef, notesRef, measuredNoteSize });
 
   const refresh = useCallback(async () => {
     try {
@@ -332,155 +176,16 @@ function App() {
     }
   }, []);
 
-  // アンドゥレコードを1件実行する。再起動後の履歴では対象が既に消えている
-  // こともあるため、各操作は欠けがあっても止まらずに進む（安全側）。
-  const runUndoAction = useCallback(
-    async (a: UndoAction) => {
-      switch (a.kind) {
-        case "objects":
-          await applyObjectMoves(a.moves);
-          break;
-        case "notes":
-          await applyNoteMoves(a.moves);
-          break;
-        case "shapes":
-          await applyShapeGeoms(a.geoms);
-          break;
-        case "shapeStyle":
-          await invoke("set_shape_style", { id: a.id, fill: a.fill, opacity: a.opacity });
-          setShapes((prev) =>
-            prev.map((s) => (s.id === a.id ? { ...s, fill: a.fill, opacity: a.opacity } : s))
-          );
-          break;
-        case "noteStyle":
-          await invoke("set_note_style", {
-            id: a.id, width: a.width, fontSize: a.fontSize, bold: a.bold,
-          });
-          setNotes((prev) =>
-            prev.map((n) =>
-              n.id === a.id ? { ...n, width: a.width, font_size: a.fontSize, bold: a.bold } : n
-            )
-          );
-          break;
-        case "restore":
-        case "delete":
-        case "restoreNotes":
-        case "deleteNotes":
-        case "restoreShapes":
-        case "deleteShapes":
-        case "restoreRelations":
-        case "deleteRelations": {
-          const cmd = {
-            restore: "restore_object",
-            delete: "delete_object",
-            restoreNotes: "restore_note",
-            deleteNotes: "delete_note",
-            restoreShapes: "restore_shape",
-            deleteShapes: "delete_shape",
-            restoreRelations: "restore_relation",
-            deleteRelations: "delete_relation",
-          }[a.kind];
-          for (const id of a.ids) {
-            try {
-              await invoke(cmd, { id });
-            } catch (e) {
-              console.error(`${cmd} failed`, id, e);
-            }
-          }
-          await refresh();
-          break;
-        }
-      }
-    },
-    [applyObjectMoves, applyNoteMoves, applyShapeGeoms, refresh]
-  );
-
-  // あるレコードの「逆」を今の状態から作る（REDO/UNDO相互変換の素）。
-  // 対象が既に存在しない場合はその分だけ欠ける（安全側）。
-  const inverseOf = useCallback((a: UndoAction): UndoAction | null => {
-    switch (a.kind) {
-      case "objects": {
-        const moves = a.moves.flatMap((m) => {
-          const o = objectsRef.current.find((x) => x.id === m.id);
-          return o ? [{ id: m.id, x: o.pos_x, y: o.pos_y }] : [];
-        });
-        return moves.length ? { kind: "objects", moves } : null;
-      }
-      case "notes": {
-        const moves = a.moves.flatMap((m) => {
-          const n = notesRef.current.find((x) => x.id === m.id);
-          return n ? [{ id: m.id, x: n.pos_x, y: n.pos_y }] : [];
-        });
-        return moves.length ? { kind: "notes", moves } : null;
-      }
-      case "shapes": {
-        const geoms = a.geoms.flatMap((g) => {
-          const s = shapesRef.current.find((x) => x.id === g.id);
-          return s
-            ? [{ id: g.id, x: s.pos_x, y: s.pos_y, w: s.width, h: s.height, rot: s.rotation }]
-            : [];
-        });
-        return geoms.length ? { kind: "shapes", geoms } : null;
-      }
-      case "shapeStyle": {
-        const s = shapesRef.current.find((x) => x.id === a.id);
-        return s ? { kind: "shapeStyle", id: a.id, fill: s.fill, opacity: s.opacity } : null;
-      }
-      case "noteStyle": {
-        const n = notesRef.current.find((x) => x.id === a.id);
-        return n
-          ? { kind: "noteStyle", id: a.id, width: n.width, fontSize: n.font_size, bold: n.bold }
-          : null;
-      }
-      case "restore":
-        return { kind: "delete", ids: a.ids };
-      case "delete":
-        return { kind: "restore", ids: a.ids };
-      case "restoreNotes":
-        return { kind: "deleteNotes", ids: a.ids };
-      case "deleteNotes":
-        return { kind: "restoreNotes", ids: a.ids };
-      case "restoreShapes":
-        return { kind: "deleteShapes", ids: a.ids };
-      case "deleteShapes":
-        return { kind: "restoreShapes", ids: a.ids };
-      case "restoreRelations":
-        return { kind: "deleteRelations", ids: a.ids };
-      case "deleteRelations":
-        return { kind: "restoreRelations", ids: a.ids };
-    }
-  }, []);
-
-  // UNDO/REDOの共通実行: 片方のスタックからバッチを取り、適用前の状態から
-  // 逆バッチを作ってもう片方へ積む。
-  const doUndoRedo = useCallback(
-    (redo: boolean) => {
-      const from = redo ? redoStack.current : undoStack.current;
-      const to = redo ? undoStack.current : redoStack.current;
-      const last = from.pop();
-      if (!last) return;
-      const batch = [last];
-      // 同一マウス操作（≒同時刻）のエントリだけをまとめる。REDOスタックは
-      // 逆時系列なので、符号付き比較だと全部負になり一括適用されてしまう。
-      while (from.length && Math.abs(last.t - from[from.length - 1].t) < 150) {
-        batch.push(from.pop()!);
-      }
-      for (const e of batch) {
-        const actions = e.actions
-          .map(inverseOf)
-          .filter((x): x is UndoAction => x !== null);
-        if (actions.length) to.push({ t: e.t, actions });
-      }
-      if (to.length > 100) to.splice(0, to.length - 100);
-      scheduleSaveUndo();
-      (async () => {
-        for (const e of batch) {
-          for (const a of e.actions) await runUndoAction(a);
-        }
-      })().catch((err) => console.error(redo ? "redo failed" : "undo failed", err));
-    },
-    [inverseOf, runUndoAction, scheduleSaveUndo]
-  );
+  // v1.3 メモ② UNDO/REDO — useUndo に分離（v1.3.2 リファクタ）。
+  // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y のキーバインドもフック内。
+  const {
+    pushUndo,
+    applyObjectMoves,
+    applyNoteMoves,
+    applyShapeGeoms,
+    resetStacks,
+    loadStacks,
+  } = useUndo({ objectsRef, notesRef, shapesRef, setObjects, setNotes, setShapes, refresh });
 
   // Windows: swap in the custom OLE drop target (files + URL drops).
   useEffect(() => {
@@ -491,23 +196,6 @@ function App() {
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => {});
   }, []);
-
-  // v1.3 メモ②: Ctrl+Z = UNDO、Ctrl+Shift+Z / Ctrl+Y = REDO。
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey)) return;
-      const k = e.key.toLowerCase();
-      const isRedo = (k === "z" && e.shiftKey) || (k === "y" && !e.shiftKey);
-      const isUndo = k === "z" && !e.shiftKey;
-      if (!isRedo && !isUndo) return;
-      const ae = document.activeElement as HTMLElement | null;
-      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
-      e.preventDefault();
-      doUndoRedo(isRedo);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [doUndoRedo]);
 
   // On launch, restore the last project (backend reopens it automatically).
   useEffect(() => {
@@ -521,33 +209,9 @@ function App() {
   useEffect(() => {
     // アンドゥはプロジェクト単位。前プロジェクトの履歴（と保存予約）を破棄し、
     // このプロジェクトのDBに保存されている履歴を読み込む（再起動後も続く）。
-    if (undoSaveTimer.current) {
-      window.clearTimeout(undoSaveTimer.current);
-      undoSaveTimer.current = null;
-    }
-    undoStack.current = [];
-    redoStack.current = [];
+    resetStacks();
     if (project) {
-      invoke<string | null>("get_undo_stack")
-        .then((j) => {
-          if (!j) return;
-          try {
-            const v = JSON.parse(j);
-            // ロード完了前にユーザーが操作していたら、その分を後ろに残す。
-            // （旧形式＝配列のみ、新形式＝{undo, redo} の両方を受ける）
-            if (Array.isArray(v)) {
-              undoStack.current = [...v, ...undoStack.current];
-            } else if (v && typeof v === "object") {
-              // ロード前に新しい操作が入っていたらREDOは無効（通常の規則どおり）。
-              const hadNewOps = undoStack.current.length > 0;
-              if (Array.isArray(v.undo)) undoStack.current = [...v.undo, ...undoStack.current];
-              if (Array.isArray(v.redo) && !hadNewOps) redoStack.current = v.redo;
-            }
-          } catch {
-            /* 壊れた履歴は無視（次の保存で上書きされる） */
-          }
-        })
-        .catch(() => {});
+      loadStacks();
       setTouched(new Set());
       setSelected(new Set());
       setSelectedNotes(new Set());
@@ -565,7 +229,7 @@ function App() {
       setShapes([]);
       setView(null);
     }
-  }, [project, refresh]);
+  }, [project, refresh, resetStacks, loadStacks]);
 
   // v1.3-①: apply / persist the UI color preset.
   useEffect(() => {
@@ -1352,61 +1016,7 @@ function App() {
     }
   }, []);
 
-  // --- Rubber-band selection & group move -----------------------------------
-
-  const handleSelectRect = useCallback(
-    (rect: { x: number; y: number; w: number; h: number }, additive: boolean) => {
-      const hit = objectsRef.current
-        .filter(
-          (o) =>
-            o.pos_x < rect.x + rect.w &&
-            o.pos_x + CARD_W > rect.x &&
-            o.pos_y < rect.y + rect.h &&
-            o.pos_y + CARD_H > rect.y
-        )
-        .map((o) => o.id);
-      setSelected((prev) => (additive ? new Set([...prev, ...hit]) : new Set(hit)));
-      // v1.3.1: notes join the rubber-band selection too.
-      const hitNotes = notesRef.current
-        .filter((n) => {
-          const s = measuredNoteSize(n);
-          return (
-            n.pos_x < rect.x + rect.w &&
-            n.pos_x + s.w > rect.x &&
-            n.pos_y < rect.y + rect.h &&
-            n.pos_y + s.h > rect.y
-          );
-        })
-        .map((n) => n.id);
-      setSelectedNotes((prev) => (additive ? new Set([...prev, ...hitNotes]) : new Set(hitNotes)));
-    },
-    []
-  );
-
-  // v1.3 メモ２追加: Ctrl+クリックで選択を個別にトグル（追加／解除）。
-  const handleCardToggleSelect = useCallback((id: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
-
-  const handleNoteToggleSelect = useCallback((id: string) => {
-    setSelectedNotes((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
-
-  const handleClearSelection = useCallback(() => {
-    setSelected((prev) => (prev.size ? new Set<string>() : prev));
-    setSelectedNotes((prev) => (prev.size ? new Set<string>() : prev));
-    setSelectedShapes((prev) => (prev.size ? new Set<string>() : prev));
-  }, []);
+  // --- Group move (selection state itself lives in useSelection) -------------
 
   // Drag one selected card/note → move the whole selection together
   // (cards AND notes — v1.3.1 unified).
@@ -1580,16 +1190,6 @@ function App() {
     },
     [cardsOnShape, notesOnShape]
   );
-
-  // v1.3 メモ④: Shift+クリック = 図形を複数選択にトグル追加／除外。
-  const handleShapeToggleSelect = useCallback((id: string) => {
-    setSelectedShapes((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
 
   // 図形をドラッグ → 上に乗っているカード・コメントも一緒に動かす（グループ移動）。
   // v1.3 メモ④: 複数選択中の図形をドラッグすると選択図形がまとめて動く。
@@ -2118,46 +1718,80 @@ function App() {
     }
   }, [pushUndo]);
 
+  // v1.3-④: コメントを実ファイル化（以後はファイルリンク付箋として編集が書き戻る）。
+  const handleCommitNoteToFile = useCallback(async (id: string) => {
+    try {
+      await invoke("commit_note_to_file", { id });
+      await refresh();
+    } catch (e) {
+      console.error("commit_note_to_file failed", e);
+    }
+  }, [refresh]);
+
   const handleContextMenu = useCallback(
     (info: { clientX: number; clientY: number; canvasX: number; canvasY: number }) => {
       const el = document.elementFromPoint(info.clientX, info.clientY);
+
+      // App のハンドラ群をメニュービルダー（ui/menuBuilder.ts）への窓口にまとめる。
+      const actions: MenuActions = {
+        // サブメニューを同位置に開き直す（既存メニューのクローズ後に）。
+        openSubmenu: (sub) =>
+          window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items: sub }), 0),
+        contextPlace: handleContextPlace,
+        addNote: handleAddNote,
+        paste: handlePaste,
+        shapeAdd: handleShapeAdd,
+        addUrl: handleAddUrl,
+        newSubproject: handleNewSubproject,
+        linkProject: handleLinkProject,
+        autoLayout: handleAutoLayout,
+        commitAll: handleCommitAll,
+        setTheme,
+        switchProject: () => setShowChooser(true),
+        focusSelection: handleFocusSelection,
+        alignSelected,
+        bulkCommit: handleBulkCommit,
+        bulkUncommit: handleBulkUncommit,
+        bulkDelete: handleBulkDelete,
+        openObject: handleOpenObject,
+        openDefault: handleOpenDefault,
+        openWith: handleOpenWith,
+        commitReveal: handleCommitReveal,
+        editInCanvas: handleEditInCanvas,
+        expandView: handleExpandView,
+        collapse: handleCollapse,
+        viewTemp: handleViewTemp,
+        recommit: handleRecommit,
+        uncommit: handleUncommit,
+        duplicate: handleDuplicate,
+        renameObject: handleRenameObject,
+        setMemo: handleSetMemo,
+        changeUrl: handleChangeUrl,
+        deleteObject: handleDeleteObject,
+        requestDelete: handleRequestDelete,
+        bringToFront: handleBringToFront,
+        sendToBack: handleSendToBack,
+        noteStyle: handleNoteStyle,
+        commitNoteToFile: handleCommitNoteToFile,
+        deleteNote: handleDeleteNote,
+        shapeClickSelect: handleShapeClickSelect,
+        shapeStyle: handleShapeStyle,
+        shapeRotate: handleShapeRotate,
+        shapeScale: handleShapeScale,
+        shapeFitToCards: handleShapeFitToCards,
+        shapeLabel: handleShapeLabel,
+        shapeZ: handleShapeZ,
+        shapeDelete: handleShapeDelete,
+      };
 
       // Note (comment) hit-test
       const noteEl = el?.closest<HTMLElement>("[data-note-id]");
       const noteId = noteEl?.dataset.noteId;
       if (noteId) {
-        const note = notes.find((n) => n.id === noteId);
-        const cur = note ?? { font_size: 13, bold: false };
         setMenu({
           x: info.clientX,
           y: info.clientY,
-          items: [
-            { label: note?.file_ref ? "リンクテキスト" : "コメント", onClick: () => {}, disabled: true },
-            { label: "見出し（大）", onClick: () => handleNoteStyle(noteId, 24, true) },
-            { label: "小見出し（中）", onClick: () => handleNoteStyle(noteId, 17, true) },
-            { label: "本文（小）", onClick: () => handleNoteStyle(noteId, 13, false) },
-            {
-              label: cur.bold ? "太字を解除" : "太字",
-              onClick: () => handleNoteStyle(noteId, cur.font_size, !cur.bold),
-            },
-            // v1.3-④: コメントを実ファイル化（以後はファイルリンク付箋として編集が書き戻る）
-            ...(!note?.file_ref
-              ? [
-                  {
-                    label: "コミットしてテキストファイルとして保存",
-                    onClick: async () => {
-                      try {
-                        await invoke("commit_note_to_file", { id: noteId });
-                        await refresh();
-                      } catch (e) {
-                        console.error("commit_note_to_file failed", e);
-                      }
-                    },
-                  },
-                ]
-              : []),
-            { label: "削除", danger: true, onClick: () => handleDeleteNote(noteId) },
-          ],
+          items: buildNoteMenu(noteId, notes.find((n) => n.id === noteId), actions),
         });
         return;
       }
@@ -2165,413 +1799,40 @@ function App() {
       const targetEl = el?.closest<HTMLElement>("[data-object-id]");
       const targetId = targetEl?.dataset.objectId;
 
-      // サブメニューを同位置に開き直す（既存メニューのクローズ後に）。
-      const submenu = (sub: MenuItem[]) =>
-        window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items: sub }), 0);
-
-      // v1.3 メモ⑦: 選択カードの整列（2枚以上選択時のみメニューに出す）。
-      const alignItems: MenuItem[] = [
-        { label: "横一列に整列（水平）", onClick: () => alignSelected("row") },
-        { label: "縦一列に整列（垂直）", onClick: () => alignSelected("col") },
-        { label: "格子状に整列", onClick: () => alignSelected("grid") },
-        { label: "横方向に均等配置", onClick: () => alignSelected("dist-h") },
-        { label: "縦方向に均等配置", onClick: () => alignSelected("dist-v") },
-      ];
-
-      // v1.3 メモ２追加④: 選択カードへの一括操作（対象件数つき）。
+      // v1.3 メモ⑦／メモ２追加④: 整列・一括操作のサブメニュー素材。
+      const alignItems = buildAlignItems(actions);
       const selObjs = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
-      const commitable = selObjs.filter(
-        (o) => !o.committed_path && !o.project_ref && !o.url_ref && !o.folder_ref
-      ).length;
-      const uncommitable = selObjs.filter(
-        (o) => !!o.committed_path && !(o.origin_path && o.origin_path === o.committed_path)
-      ).length;
-      const bulkItems: MenuItem[] = [
+      const bulkItems = buildBulkItems(
         {
-          label: `まとめて実身化（コミット・${commitable}件）`,
-          disabled: !commitable,
-          onClick: () => handleBulkCommit(),
+          commitable: selObjs.filter(
+            (o) => !o.committed_path && !o.project_ref && !o.url_ref && !o.folder_ref
+          ).length,
+          uncommitable: selObjs.filter(
+            (o) => !!o.committed_path && !(o.origin_path && o.origin_path === o.committed_path)
+          ).length,
+          total: selObjs.length,
         },
-        {
-          label: `まとめて仮身化（コミット取り消し・${uncommitable}件）`,
-          disabled: !uncommitable,
-          onClick: () => handleBulkUncommit(),
-        },
-        {
-          label: `まとめて削除（${selObjs.length}件）`,
-          danger: true,
-          onClick: () => handleBulkDelete(),
-        },
-      ];
+        actions
+      );
 
       let items: MenuItem[];
       if (targetId) {
-        const obj = objectsRef.current.find((o) => o.id === targetId);
-        const zItems: MenuItem[] = [
-          ...(selectedRef.current.has(targetId)
-            ? [{ label: "選択範囲にフォーカス", onClick: () => handleFocusSelection() }]
-            : []),
-          ...(selectedRef.current.has(targetId) && selectedRef.current.size >= 2
-            ? [
-                { label: "選択カードを整列 ...", onClick: () => submenu(alignItems) },
-                { label: "選択カードをまとめて ...", onClick: () => submenu(bulkItems) },
-              ]
-            : []),
-          { label: "最前面へ", onClick: () => handleBringToFront(targetId) },
-          { label: "最背面へ", onClick: () => handleSendToBack(targetId) },
-        ];
-        // Project object: navigate / rename / remove reference.
-        if (obj?.project_ref) {
-          setMenu({
-            x: info.clientX,
-            y: info.clientY,
-            items: [
-              { label: `「${obj.label}」`, onClick: () => {}, disabled: true },
-              { label: "開く（プロジェクトへ移動）", onClick: () => handleOpenObject(targetId) },
-              ...zItems,
-              {
-                label: "表示名を変更...",
-                onClick: () => handleRenameObject(targetId, obj.label),
-              },
-              {
-                label: "削除（参照のみ・フォルダは残る）",
-                danger: true,
-                onClick: () => handleDeleteObject(targetId),
-              },
-            ],
-          });
-          return;
-        }
-        // URL link object
-        if (obj?.url_ref) {
-          setMenu({
-            x: info.clientX,
-            y: info.clientY,
-            items: [
-              { label: `「${obj.label}」`, onClick: () => {}, disabled: true },
-              {
-                label: "リンクを開く",
-                onClick: () =>
-                  invoke("open_with_default", { path: obj.url_ref! }).catch(() => {}),
-              },
-              {
-                label: "アプリを選択して開く...",
-                onClick: () =>
-                  invoke("open_url_with_chooser", { url: obj.url_ref! }).catch(() => {}),
-              },
-              { label: "URLを変更...", onClick: () => handleChangeUrl(targetId, obj.url_ref!) },
-              ...zItems,
-              { label: "コメントを編集...", onClick: () => handleSetMemo(targetId, obj.memo ?? "") },
-              { label: "表示名を変更...", onClick: () => handleRenameObject(targetId, obj.label) },
-              { label: "削除", danger: true, onClick: () => handleDeleteObject(targetId) },
-            ],
-          });
-          return;
-        }
-        // Folder link object (リンクフォルダ)
-        if (obj?.folder_ref) {
-          setMenu({
-            x: info.clientX,
-            y: info.clientY,
-            items: [
-              { label: `「${obj.label}」`, onClick: () => {}, disabled: true },
-              {
-                label: "フォルダを開く",
-                onClick: () =>
-                  invoke("open_with_default", { path: obj.folder_ref! }).catch(() => {}),
-              },
-              {
-                label: "エクスプローラーで表示",
-                onClick: () =>
-                  invoke("reveal_in_dir", { path: obj.folder_ref! }).catch(() => {}),
-              },
-              ...zItems,
-              { label: "コメントを編集...", onClick: () => handleSetMemo(targetId, obj.memo ?? "") },
-              { label: "表示名を変更...", onClick: () => handleRenameObject(targetId, obj.label) },
-              {
-                label: "削除（参照のみ・フォルダは残る）",
-                danger: true,
-                onClick: () => handleDeleteObject(targetId),
-              },
-            ],
-          });
-          return;
-        }
-        const committed = !!obj?.committed_path;
-        // 取り込み元の実ファイルがそのままコミット先（プロジェクト内取り込み）。
-        // 仮身に戻す＝元ファイル削除になってしまうため、コマンドを出さない。
-        const isOriginalFile =
-          !!obj?.origin_path && !!obj?.committed_path && obj.origin_path === obj.committed_path;
-        items = [
-          { label: `「${obj?.label ?? ""}」`, onClick: () => {}, disabled: true },
-          // v1.3.1: 窓の先を喪失した仮身 → CASのスナップショットから復活。
-          ...(obj && lostOf(obj) === "cas"
-            ? [
-                {
-                  label: "取り込み時点の内容を復活（コミットして表示）",
-                  onClick: () => handleCommitReveal(targetId),
-                },
-              ]
-            : []),
-          {
-            label: "既定のアプリで開く／編集",
-            onClick: () => handleOpenDefault(targetId),
-          },
-          {
-            label: "アプリを選択して開く／編集...",
-            onClick: () => handleOpenWith(targetId),
-          },
-          // 第3の選択肢: 実身化してExplorerでフォーカス（そこから先はWindows任せ）
-          ...(!committed
-            ? [
-                {
-                  label: "コミットしてプロジェクトフォルダで表示",
-                  onClick: () => handleCommitReveal(targetId),
-                },
-              ]
-            : []),
-          ...(obj && isTextMime(obj.mime_type, obj.ext)
-            ? [
-                {
-                  label: "キャンバスで編集（テキスト）",
-                  onClick: () => handleEditInCanvas(targetId),
-                },
-              ]
-            : []),
-          ...(obj?.mime_type.startsWith("image/")
-            ? [
-                {
-                  label: expanded.has(targetId) ? "プレビューを閉じる" : "キャンバスでプレビュー",
-                  onClick: () =>
-                    expanded.has(targetId)
-                      ? handleCollapse(targetId)
-                      : handleExpandView(targetId),
-                },
-              ]
-            : []),
-          ...(obj?.mime_type.startsWith("audio/")
-            ? [
-                {
-                  label: expanded.has(targetId) ? "再生を閉じる" : "キャンバスで再生",
-                  onClick: () =>
-                    expanded.has(targetId)
-                      ? handleCollapse(targetId)
-                      : handleExpandView(targetId),
-                },
-              ]
-            : []),
-          ...(obj &&
-          (obj.mime_type.startsWith("video/") ||
-            obj.mime_type === "application/pdf" ||
-            (obj.ext ?? "").toLowerCase() === "pdf")
-            ? [
-                {
-                  label: expanded.has(targetId)
-                    ? "プレビューを閉じる"
-                    : obj.mime_type.startsWith("video/")
-                    ? "キャンバスで再生（動画）"
-                    : "キャンバスでプレビュー（PDF）",
-                  onClick: () =>
-                    expanded.has(targetId)
-                      ? handleCollapse(targetId)
-                      : handleExpandView(targetId),
-                },
-              ]
-            : []),
-          {
-            label: "一時的に閲覧（コピーを破棄）",
-            onClick: () => handleViewTemp(targetId),
-          },
-          ...zItems,
-          ...(!committed && obj?.origin_path
-            ? [
-                {
-                  label: "借用元のフォルダで表示",
-                  onClick: () => {
-                    invoke("reveal_in_dir", { path: obj.origin_path! }).catch(() => {});
-                  },
-                },
-              ]
-            : []),
-          ...(committed
-            ? [
-                {
-                  label: "フォルダで表示",
-                  onClick: () => {
-                    if (obj?.committed_path)
-                      invoke("reveal_in_dir", { path: obj.committed_path });
-                  },
-                },
-                {
-                  label: "編集を破棄して再コミット",
-                  onClick: () => handleRecommit(targetId),
-                },
-                ...(!isOriginalFile
-                  ? [
-                      {
-                        label: "コミットを取り消す（仮身に戻す）",
-                        onClick: () => handleUncommit(targetId),
-                      },
-                    ]
-                  : []),
-              ]
-            : []),
-          {
-            label: "元のファイルを呼ぶ（仮身を複製）",
-            onClick: () => handleDuplicate(targetId),
-          },
-          {
-            label: "表示名を変更...",
-            onClick: () => handleRenameObject(targetId, obj?.label ?? ""),
-          },
-          { label: "削除", danger: true, onClick: () => handleRequestDelete(targetId) },
-        ];
+        items = buildObjectMenu(
+          targetId,
+          objectsRef.current.find((o) => o.id === targetId),
+          { selected: selectedRef.current, expanded, alignItems, bulkItems },
+          actions
+        );
       } else if (el?.closest<HTMLElement>("[data-shape-id]")) {
         // v1.3-②③: shape menu (shapes sit behind cards)
         const shapeId = el.closest<HTMLElement>("[data-shape-id]")!.dataset.shapeId!;
-        const sh = shapesRef.current.find((s) => s.id === shapeId);
-        const kindName = sh?.kind === "ellipse" ? "楕円" : sh?.kind === "arrow" ? "矢印" : "角丸四角";
-        items = [
-          { label: `図形「${sh?.label || kindName}」`, onClick: () => {}, disabled: true },
-          { label: "上のカードをまとめて選択", onClick: () => handleShapeClickSelect(shapeId) },
-          {
-            label: "色を変更 ...",
-            onClick: () =>
-              submenu(
-                SHAPE_COLORS.map(([name, hex]) => ({
-                  label: name,
-                  onClick: () => handleShapeStyle(shapeId, hex, sh?.opacity ?? 0.2),
-                }))
-              ),
-          },
-          {
-            label: "濃さを変更 ...",
-            onClick: () =>
-              submenu(
-                [
-                  ["薄く", 0.12],
-                  ["標準", 0.2],
-                  ["濃く", 0.38],
-                ].map(([name, op]) => ({
-                  label: name as string,
-                  onClick: () => handleShapeStyle(shapeId, sh?.fill ?? "#4a90d9", op as number),
-                }))
-              ),
-          },
-          ...(sh?.kind === "arrow"
-            ? [
-                {
-                  label: "向きを変更 ...",
-                  onClick: () =>
-                    submenu(
-                      [0, 45, 90, 135, 180, 225, 270, 315].map((deg) => ({
-                        label: `${deg}°`,
-                        onClick: () => handleShapeRotate(shapeId, deg),
-                      }))
-                    ),
-                },
-              ]
-            : []),
-          // v1.3 メモ⑥: ハンドルが隠れていてもメニューから拡縮できる。
-          {
-            label: "図形の拡縮 ...",
-            onClick: () =>
-              submenu([
-                { label: "上のカードを含む大きさに", onClick: () => handleShapeFitToCards(shapeId) },
-                { label: "拡大（1.25倍）", onClick: () => handleShapeScale(shapeId, 1.25) },
-                { label: "縮小（0.8倍）", onClick: () => handleShapeScale(shapeId, 0.8) },
-              ]),
-          },
-          { label: "名前を変更...", onClick: () => handleShapeLabel(shapeId, sh?.label ?? "") },
-          { label: "最前面へ（図形内）", onClick: () => handleShapeZ(shapeId, true) },
-          { label: "最背面へ（図形内）", onClick: () => handleShapeZ(shapeId, false) },
-          { label: "図形を削除", danger: true, onClick: () => handleShapeDelete(shapeId) },
-        ];
+        items = buildShapeMenu(shapeId, shapesRef.current.find((s) => s.id === shapeId), actions);
       } else {
-        items = [
-          ...(selectedRef.current.size
-            ? [{ label: "選択範囲にフォーカス", onClick: () => handleFocusSelection() }]
-            : []),
-          ...(selectedRef.current.size >= 2
-            ? [
-                { label: "選択カードを整列 ...", onClick: () => submenu(alignItems) },
-                { label: "選択カードをまとめて ...", onClick: () => submenu(bulkItems) },
-              ]
-            : []),
-          {
-            label: "ファイルを配置...",
-            onClick: () => handleContextPlace(info.canvasX, info.canvasY),
-          },
-          {
-            label: "コメントを追加...",
-            onClick: () => handleAddNote(info.canvasX, info.canvasY),
-          },
-          {
-            label: "クリップボードから貼り付け",
-            onClick: () => handlePaste(info.canvasX, info.canvasY),
-          },
-          {
-            label: "図形を追加 ...",
-            onClick: () =>
-              window.setTimeout(
-                () =>
-                  setMenu({
-                    x: info.clientX,
-                    y: info.clientY,
-                    items: [
-                      { label: "角丸四角", onClick: () => handleShapeAdd("rect", info.canvasX, info.canvasY) },
-                      { label: "楕円", onClick: () => handleShapeAdd("ellipse", info.canvasX, info.canvasY) },
-                      { label: "太矢印", onClick: () => handleShapeAdd("arrow", info.canvasX, info.canvasY) },
-                    ],
-                  }),
-                0
-              ),
-          },
-          {
-            label: "URLリンクを追加...",
-            onClick: () => handleAddUrl(info.canvasX, info.canvasY),
-          },
-          {
-            label: "新規プロジェクトを内包（コミット）...",
-            onClick: () => handleNewSubproject(false, info.canvasX, info.canvasY),
-          },
-          {
-            label: "新規プロジェクトを分岐（フォーク）...",
-            onClick: () => handleNewSubproject(true, info.canvasX, info.canvasY),
-          },
-          {
-            label: "既存プロジェクトへのリンクを配置...",
-            onClick: () => handleLinkProject(info.canvasX, info.canvasY),
-          },
-          {
-            label: "自動レイアウト（重なり解消）",
-            onClick: () => handleAutoLayout(),
-          },
-          {
-            label: "全コミット（データ持ち出し）...",
-            onClick: () => handleCommitAll(),
-          },
-          {
-            label: "UIカラー ...",
-            onClick: () =>
-              window.setTimeout(
-                () =>
-                  setMenu({
-                    x: info.clientX,
-                    y: info.clientY,
-                    items: THEMES.map(([key, name]) => ({
-                      label: (theme === key ? "✓ " : "　") + name,
-                      onClick: () => setTheme(key),
-                    })),
-                  }),
-                0
-              ),
-          },
-          {
-            label: "プロジェクトを切り替え...",
-            onClick: () => setShowChooser(true),
-          },
-        ];
+        items = buildCanvasMenu(
+          info,
+          { selectionCount: selectedRef.current.size, theme, alignItems, bulkItems },
+          actions
+        );
       }
       setMenu({ x: info.clientX, y: info.clientY, items });
     },
@@ -2618,7 +1879,7 @@ function App() {
       handleBulkCommit,
       handleBulkUncommit,
       handleBulkDelete,
-      refresh,
+      handleCommitNoteToFile,
       theme,
       expanded,
       notes,
