@@ -3,22 +3,27 @@ import { useState, useEffect, useRef } from "react";
 interface PromptDialogProps {
   title: string;
   initial: string;
+  /// true なら空欄のまま OK できる（空文字を onConfirm に渡す）。既定は空欄=キャンセル。
+  allowEmpty?: boolean;
   onConfirm: (value: string) => void;
   onCancel: () => void;
 }
 
-export function PromptDialog({ title, initial, onConfirm, onCancel }: PromptDialogProps) {
+export function PromptDialog({ title, initial, allowEmpty, onConfirm, onCancel }: PromptDialogProps) {
   const [value, setValue] = useState(initial);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // プロンプトを連鎖させる（onConfirm 内で次の setPrompt）とダイアログは
+  // 再マウントされないため、props の変化で値を初期化し直す。
   useEffect(() => {
+    setValue(initial);
     inputRef.current?.focus();
     inputRef.current?.select();
-  }, []);
+  }, [title, initial]);
 
   const confirm = () => {
     const v = value.trim();
-    if (v) onConfirm(v);
+    if (v || allowEmpty) onConfirm(v);
     else onCancel();
   };
 

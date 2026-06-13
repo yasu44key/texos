@@ -28,6 +28,10 @@ pub struct Project {
 pub struct AppState {
     pub current: Mutex<Option<Project>>,
     pub app_data: PathBuf,
+    /// フロー実行の中断フラグ（UIの中断ボタン → break_flow）。
+    /// run_flow が DB の Mutex を握っている間も break_flow はこれだけを触るので
+    /// 外部コマンドがストールしてもブレイクできる。
+    pub flow_cancel: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -2010,6 +2014,185 @@ fn create_filter(
     Ok(vid)
 }
 
+/// プロジェクト同梱プログラムの置き場（v1.5: 可搬なフィルタはここに入れて持ち運ぶ）。
+fn filters_dir(root: &Path) -> PathBuf {
+    texos_dir(root).join("filters")
+}
+
+/// 外部フィルタの実行コマンドラインを組み立てる。
+/// 新形式（name あり）: プログラムを解決して `"exe" + CMD書式`。旧形式: cmd をそのまま。
+fn build_cmdline(p: &Project, spec: &flow::FilterSpec) -> Result<String, String> {
+    if let Some(name) = spec.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let exe = flow::resolve_program(name, spec.path.as_deref(), &filters_dir(&p.root))
+            .ok_or_else(|| {
+                format!(
+                    "プログラム「{name}」が見つかりません（指定パス → .texos\\filters → 環境変数PATH の順で探索）"
+                )
+            })?;
+        Ok(format!("\"{}\" {}", exe.display(), spec.cmd.as_deref().unwrap_or(""))
+            .trim()
+            .to_string())
+    } else if let Some(cmd) = &spec.cmd {
+        Ok(cmd.clone())
+    } else {
+        Err("フィルタ定義に builtin も cmd もありません".into())
+    }
+}
+
+/// 外部プログラムの所在チェック（設定ダイアログの事前チェック）。
+/// 見つかれば解決済みのフルパス、見つからなければ null を返す。
+#[tauri::command]
+fn check_filter_program(
+    name: String,
+    path: Option<String>,
+    state: State<AppState>,
+) -> Result<Option<String>, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    Ok(
+        flow::resolve_program(&name, path.as_deref(), &filters_dir(&p.root))
+            .map(|pb| pb.to_string_lossy().into_owned()),
+    )
+}
+
+/// .texos/filters に同梱されたプログラムの一覧（設定ダイアログの選択肢）。
+#[tauri::command]
+fn list_filter_programs(state: State<AppState>) -> Result<Vec<String>, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let mut names = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(filters_dir(&p.root)) {
+        for e in rd.flatten() {
+            if e.path().is_file() {
+                if let Some(n) = e.file_name().to_str() {
+                    // .removed は同梱解除の退避ファイル（一覧に出さない）
+                    if !n.ends_with(".removed") {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// 同梱を解除（.texos/filters から退避）。完全削除はせず「<name>.removed」へ
+/// 改名して、Ctrl+Z（元に戻す）の余地を残す。.removed は一覧・解決の対象外。
+#[tauri::command]
+fn remove_filter_program(name: String, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let dir = filters_dir(&p.root);
+    let src = dir.join(&name);
+    if !src.is_file() {
+        return Err(format!("同梱されていません: {name}"));
+    }
+    let bak = dir.join(format!("{name}.removed"));
+    let _ = std::fs::remove_file(&bak); // 古い退避は捨てて最新を残す
+    std::fs::rename(&src, &bak).map_err(|e| e.to_string())
+}
+
+/// 同梱解除を取り消す（.removed を元の名前へ戻す）。
+#[tauri::command]
+fn restore_filter_program(name: String, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let dir = filters_dir(&p.root);
+    let bak = dir.join(format!("{name}.removed"));
+    if !bak.is_file() {
+        return Err("元に戻せるファイルがありません".into());
+    }
+    let dst = dir.join(&name);
+    if dst.exists() {
+        return Err(format!("既に {name} が同梱されています"));
+    }
+    std::fs::rename(&bak, &dst).map_err(|e| e.to_string())
+}
+
+/// プログラムをプロジェクトに同梱（.texos/filters へコピー）。戻り値はファイル名。
+#[tauri::command]
+fn import_filter_program(src: String, state: State<AppState>) -> Result<String, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let srcp = Path::new(&src);
+    if !srcp.is_file() {
+        return Err(format!("ファイルが見つかりません: {src}"));
+    }
+    let name = srcp
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("ファイル名を取得できません")?
+        .to_string();
+    let dir = filters_dir(&p.root);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::copy(srcp, dir.join(&name)).map_err(|e| format!("コピーに失敗: {e}"))?;
+    Ok(name)
+}
+
+// --- v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断） ---------------------
+
+/// ライブラリの1エントリ。spec は filter_ref と同じ JSON。
+#[derive(Serialize, Deserialize)]
+struct LibFilter {
+    name: String,
+    spec: String,
+    created_at: i64,
+}
+
+fn library_path(app_data: &Path) -> PathBuf {
+    app_data.join("filter_library.json")
+}
+
+fn read_library(app_data: &Path) -> Vec<LibFilter> {
+    std::fs::read_to_string(library_path(app_data))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_library(app_data: &Path, list: &[LibFilter]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    std::fs::write(library_path(app_data), json).map_err(|e| e.to_string())
+}
+
+/// 登録済みフィルタの一覧（メニュー「ユーザーのフィルタ」の素材）。
+#[tauri::command]
+fn list_filter_library(state: State<AppState>) -> Result<Vec<LibFilter>, String> {
+    Ok(read_library(&state.app_data))
+}
+
+/// フィルタ設定に名前を付けてライブラリへ登録。同名は上書き。
+#[tauri::command]
+fn save_filter_library(name: String, spec: String, state: State<AppState>) -> Result<(), String> {
+    flow::parse_spec(&spec)?; // 壊れた定義を登録しない
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("フィルタ名を入力してください".into());
+    }
+    let mut list = read_library(&state.app_data);
+    list.retain(|e| e.name != name);
+    list.push(LibFilter {
+        name,
+        spec,
+        created_at: db::now_ms(),
+    });
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    write_library(&state.app_data, &list)
+}
+
+/// ライブラリからエントリを削除。
+#[tauri::command]
+fn delete_filter_library(name: String, state: State<AppState>) -> Result<(), String> {
+    let mut list = read_library(&state.app_data);
+    let before = list.len();
+    list.retain(|e| e.name != name);
+    if list.len() == before {
+        return Err(format!("「{name}」はライブラリにありません"));
+    }
+    write_library(&state.app_data, &list)
+}
+
 /// フィルタ定義（JSON）を更新。フォーム自動生成（JSON Schema）はフェーズ2。
 #[tauri::command]
 fn update_filter(id: String, spec: String, state: State<AppState>) -> Result<(), String> {
@@ -2033,6 +2216,8 @@ fn update_filter(id: String, spec: String, state: State<AppState>) -> Result<(),
 pub struct FlowReport {
     /// 新しく生まれた結果カードの vid（front は緑シグナル＋UNDO登録に使う）
     pub created: Vec<String>,
+    /// 固定名上書きで中身を差し替えた既存カードの vid（緑シグナルのみ・UNDO対象外）
+    pub updated: Vec<String>,
     /// 生成されたファイル名（ダイアログ表示用）
     pub outputs: Vec<String>,
     /// 型不一致などでスキップした入力（ラベル＋理由）
@@ -2058,6 +2243,7 @@ fn eval_filter(
     fid: &str,
     visited: &mut std::collections::HashSet<String>,
     report: &mut FlowReport,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<FlowPayload>, String> {
     if !visited.insert(fid.to_string()) {
         return Err("フローに循環があります".into());
@@ -2073,6 +2259,30 @@ fn eval_filter(
         .map_err(|_| "フィルタカードが見つかりません".to_string())?;
     let spec = flow::parse_spec(spec_json.as_deref().unwrap_or("{}"))?;
     let accept = spec.accept_mime.clone().unwrap_or_else(|| "*/*".into());
+
+    // ジェネレータ型: 入力を取らず1回実行してファイルを生む（入力矢印は無視）
+    if spec.filter_type.as_deref() == Some("generator") {
+        let out_ext = spec.output_ext.clone().unwrap_or_else(|| "bin".into());
+        let out_mime = mime_for_ext(&out_ext)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let cmdline = build_cmdline(p, &spec)?;
+        let result = flow::run_external(&cmdline, &[], &out_ext, spec.timeout_secs, cancel);
+        visited.remove(fid);
+        return match result {
+            Ok(bytes) => Ok(vec![FlowPayload {
+                bytes,
+                ext: out_ext,
+                mime: out_mime,
+                stem: spec
+                    .prefix
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "output".into()),
+            }]),
+            Err(e) => Err(e),
+        };
+    }
 
     // 入力: このフィルタへ入る flow 矢印（生きているカードのみ・接続順）
     let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
@@ -2096,10 +2306,17 @@ fn eval_filter(
     };
 
     let mut produced = Vec::new();
+    // フェーズ1: 全入力のペイロードを接続順に収集（{inN} の番号は矢印を張った順）
+    let mut collected: Vec<FlowPayload> = Vec::new();
     for (vid, real_id, vlabel, mime, ext, kind) in &inputs {
         // 入力ペイロードを集める: 上流フィルタ＝再帰評価／データカード＝窓の今を読む
+        // 中断後は新しいプロセスを起こさない（複数入力の連鎖を断つ）
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            report.errors.push("中断されました".into());
+            break;
+        }
         let payloads: Vec<FlowPayload> = if kind.as_deref() == Some("filter") {
-            match eval_filter(p, vid, visited, report) {
+            match eval_filter(p, vid, visited, report, cancel) {
                 Ok(v) => v,
                 Err(e) => {
                     report.errors.push(format!("{vlabel}: {e}"));
@@ -2134,24 +2351,96 @@ fn eval_filter(
                 }
             }
         };
-        // 集めたペイロードをこのフィルタに通す
-        for pl in payloads {
+        collected.extend(payloads);
+    }
+
+    // フェーズ2: 実行。CMD の書き方でモードを自動判別 —
+    // {in*} か {in2} 以降がある = 全入力を集めて1回実行（集約: gcc分割ソース・画像合成）、
+    // {in}/{in1} のみ = 入力ごとに実行（従来のファンアウト）。
+    let aggregate = spec.builtin.is_none()
+        && (spec.name.is_some() || spec.cmd.is_some())
+        && flow::cmd_is_aggregate(spec.cmd.as_deref().unwrap_or(""));
+    if aggregate {
+        // 集約実行は引数の位置・本数が意味を持つ → 合わない入力はスキップではなくエラー
+        let mut bad = Vec::new();
+        for pl in &collected {
+            if !flow::mime_matches(&accept, &pl.mime) {
+                bad.push(format!("{}（{} は受け入れ対象外）", pl.stem, pl.mime));
+            } else if let Some(exts) = &spec.in_exts {
+                let ok = exts.is_empty()
+                    || exts
+                        .iter()
+                        .any(|e| e.trim().trim_start_matches('.').eq_ignore_ascii_case(&pl.ext));
+                if !ok {
+                    bad.push(format!("{}（.{} は想定拡張子外）", pl.stem, pl.ext));
+                }
+            }
+        }
+        if !bad.is_empty() {
+            report.errors.extend(bad);
+        } else if !collected.is_empty() {
+            let out_ext = spec
+                .output_ext
+                .clone()
+                .unwrap_or_else(|| collected[0].ext.clone());
+            let out_mime = mime_for_ext(&out_ext)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let ins: Vec<(&[u8], &str)> = collected
+                .iter()
+                .map(|pl| (pl.bytes.as_slice(), pl.ext.as_str()))
+                .collect();
+            match build_cmdline(p, &spec).and_then(|cmd| {
+                flow::run_external(&cmd, &ins, &out_ext, spec.timeout_secs, cancel)
+            }) {
+                Ok(bytes) => produced.push(FlowPayload {
+                    bytes,
+                    ext: out_ext,
+                    mime: out_mime,
+                    stem: collected[0].stem.clone(),
+                }),
+                Err(e) => report.errors.push(format!("{}: {e}", collected[0].stem)),
+            }
+        }
+    } else {
+        for pl in collected {
             if !flow::mime_matches(&accept, &pl.mime) {
                 report
                     .skipped
                     .push(format!("{}（{} は受け入れ対象外）", pl.stem, pl.mime));
                 continue;
             }
+            // 想定拡張子のチェック（新形式 IN欄。空なら制限なし）
+            if let Some(exts) = &spec.in_exts {
+                let ok = exts.is_empty()
+                    || exts
+                        .iter()
+                        .any(|e| e.trim().trim_start_matches('.').eq_ignore_ascii_case(&pl.ext));
+                if !ok {
+                    report
+                        .skipped
+                        .push(format!("{}（.{} は想定拡張子外）", pl.stem, pl.ext));
+                    continue;
+                }
+            }
             let result: Result<(Vec<u8>, String, String), String> = if let Some(b) = &spec.builtin
             {
                 flow::run_builtin(&spec, b, &pl.bytes)
-            } else if let Some(cmd) = &spec.cmd {
+            } else if spec.name.is_some() || spec.cmd.is_some() {
                 let out_ext = spec.output_ext.clone().unwrap_or_else(|| pl.ext.clone());
                 let out_mime = mime_for_ext(&out_ext)
                     .unwrap_or("application/octet-stream")
                     .to_string();
-                flow::run_external(cmd, &pl.bytes, &pl.ext, &out_ext)
+                build_cmdline(p, &spec).and_then(|cmd| {
+                    flow::run_external(
+                        &cmd,
+                        &[(pl.bytes.as_slice(), pl.ext.as_str())],
+                        &out_ext,
+                        spec.timeout_secs,
+                        cancel,
+                    )
                     .map(|b| (b, out_ext, out_mime))
+                })
             } else {
                 Err("フィルタ定義に builtin も cmd もありません".into())
             };
@@ -2175,29 +2464,59 @@ fn eval_filter(
 /// メモリ上で通過）、最終結果だけをプロジェクト直下のコミット済み実身として
 /// カード化（緑シグナルで誕生）。フィルタ→結果の flow 矢印を張り、
 /// 実行ログはフィルタカードの memo に記録する。
-#[tauri::command]
+// (async) でスレッドプール実行にする — 同期コマンドはメインスレッドで走るため、
+// 外部コマンドがストールするとイベントループごと固まり中断ボタンが届かない。
+#[tauri::command(async)]
 fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
 
-    let (fx, fy, flabel): (f64, f64, String) = p
+    let (fx, fy, flabel, fref): (f64, f64, String, Option<String>) = p
         .conn
         .query_row(
-            "SELECT pos_x, pos_y, label FROM virtual_bodies
+            "SELECT pos_x, pos_y, label, filter_ref FROM virtual_bodies
              WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
             rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .map_err(|_| "フィルタカードが見つかりません".to_string())?;
+    // 終端フィルタの設定が出力先と命名を決める（prefix連番 / 出力フォルダ）
+    let term_spec = flow::parse_spec(fref.as_deref().unwrap_or("{}"))?;
+    let prefix = term_spec
+        .prefix
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut seq = term_spec.seq.unwrap_or(0);
+    let out_dir = term_spec
+        .out_dir
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (out_root, external_out) = match &out_dir {
+        Some(d) => {
+            let pb = PathBuf::from(d);
+            if !pb.is_dir() {
+                return Err(format!("出力フォルダがありません: {d}"));
+            }
+            (pb, true)
+        }
+        None => (p.root.clone(), false),
+    };
 
     let mut report = FlowReport {
         created: vec![],
+        updated: vec![],
         outputs: vec![],
         skipped: vec![],
         errors: vec![],
     };
+    // 前回の中断フラグを下ろしてから評価を始める
+    state
+        .flow_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let mut visited = std::collections::HashSet::new();
-    let payloads = eval_filter(p, &id, &mut visited, &mut report)?;
+    let payloads = eval_filter(p, &id, &mut visited, &mut report, &state.flow_cancel)?;
     if payloads.is_empty() && report.skipped.is_empty() && report.errors.is_empty() {
         return Err("入力がありません。データカードからフィルタへ矢印を引いてください".into());
     }
@@ -2215,8 +2534,22 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
 
     let mut out_i = 0usize;
     for pl in &payloads {
-        // 結果＝プロジェクト直下のコミット済み実身（CASにも保存＝保険）
-        let dest = unique_file_path(&p.root, &format!("{}_{safe_flabel}.{}", pl.stem, pl.ext));
+        // 結果の置き場と名前: prefix＋連番→「prefix連番.ext」（空き番号まで進める）、
+        // prefixのみ（連番空欄）→「prefix.ext」固定名で毎回上書き（コンパイラ等）、
+        // prefixなし→従来の「入力名_フィルタ名.ext」。out_dir指定なら外部フォルダへ。
+        let dest = match (&prefix, term_spec.seq) {
+            (Some(px), Some(_)) => loop {
+                let cand = out_root.join(format!("{px}{seq:03}.{}", pl.ext));
+                seq += 1;
+                if !cand.exists() {
+                    break cand;
+                }
+            },
+            (Some(px), None) => out_root.join(format!("{px}.{}", pl.ext)),
+            (None, _) => {
+                unique_file_path(&out_root, &format!("{}_{safe_flabel}.{}", pl.stem, pl.ext))
+            }
+        };
         if let Err(e) = std::fs::write(&dest, &pl.bytes) {
             report.errors.push(format!("{}: 書き出し失敗 ({e})", pl.stem));
             continue;
@@ -2234,19 +2567,73 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
             report.errors.push(format!("{}: {e}", pl.stem));
             continue;
         }
-        let new_vid = uuid();
         let out_label = dest
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("output")
             .to_string();
+        let dest_str = dest.to_string_lossy().into_owned();
+
+        // 同じパスを指す生きたカードが既にあれば（固定名上書きの再実行）、
+        // 新カードは作らず中身を差し替える — 位置と矢印は維持、緑シグナルで再誕生。
+        let existing: Option<String> = p
+            .conn
+            .query_row(
+                "SELECT id FROM virtual_bodies
+                 WHERE deleted_at IS NULL AND (committed_path = ?1 OR origin_path = ?1)",
+                rusqlite::params![dest_str],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        if let Some(vid) = existing {
+            let _ = p.conn.execute(
+                "UPDATE virtual_bodies SET real_id = ?1, committed_mtime = ?2 WHERE id = ?3",
+                rusqlite::params![
+                    hash,
+                    if external_out { None } else { file_mtime_ms(&dest) },
+                    vid
+                ],
+            );
+            // フィルタ→結果の flow 矢印が無ければ張る（重複矢印は作らない）
+            let has_rel: bool = p
+                .conn
+                .query_row(
+                    "SELECT 1 FROM relations
+                     WHERE from_id = ?1 AND to_id = ?2 AND kind = 'flow' AND deleted_at IS NULL",
+                    rusqlite::params![id, vid],
+                    |_| Ok(true),
+                )
+                .optional()
+                .unwrap_or(None)
+                .unwrap_or(false);
+            if !has_rel {
+                let _ = p.conn.execute(
+                    "INSERT INTO relations (from_id, to_id, kind, created_at)
+                     VALUES (?1, ?2, 'flow', ?3)",
+                    rusqlite::params![id, vid, db::now_ms()],
+                );
+            }
+            report.updated.push(vid);
+            report.outputs.push(format!("{out_label}（上書き）"));
+            continue;
+        }
+
+        let new_vid = uuid();
         let nx = fx + 190.0;
         let ny = fy + (out_i as f64) * 170.0;
+        // 出力フォルダ指定時は外部ファイルへの窓（origin_path の仮身）、
+        // 指定なしはプロジェクト直下のコミット済み実身（従来どおり）
+        let (committed_path, committed_mtime, origin_path) = if external_out {
+            (None, None, Some(dest_str))
+        } else {
+            (Some(dest_str), file_mtime_ms(&dest), None)
+        };
         if let Err(e) = p.conn.execute(
             "INSERT INTO virtual_bodies
                 (id, real_id, label, pos_x, pos_y, created_at,
-                 committed_path, committed_mtime, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'file')",
+                 committed_path, committed_mtime, origin_path, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'file')",
             rusqlite::params![
                 new_vid,
                 hash,
@@ -2254,8 +2641,9 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
                 nx,
                 ny,
                 db::now_ms(),
-                dest.to_string_lossy(),
-                file_mtime_ms(&dest)
+                committed_path,
+                committed_mtime,
+                origin_path
             ],
         ) {
             report.errors.push(format!("{}: {e}", pl.stem));
@@ -2272,6 +2660,20 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         out_i += 1;
     }
 
+    // 連番の永続化: 使った分だけ進めてカードに書き戻す
+    // （未知フィールドを保持するため serde_json::Value 経由で seq だけ更新）
+    if prefix.is_some() && term_spec.seq.unwrap_or(0) != seq {
+        if let Ok(mut v) =
+            serde_json::from_str::<serde_json::Value>(fref.as_deref().unwrap_or("{}"))
+        {
+            v["seq"] = seq.into();
+            let _ = p.conn.execute(
+                "UPDATE virtual_bodies SET filter_ref = ?1 WHERE id = ?2",
+                rusqlite::params![v.to_string(), id],
+            );
+        }
+    }
+
     // 実行ログを memo に記録（最後の実行が常に見える — 確定方針4）
     let mut log = format!("▶ 実行: 出力{}", report.outputs.len());
     if !report.skipped.is_empty() {
@@ -2286,6 +2688,15 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
     );
 
     Ok(report)
+}
+
+/// フロー実行の中断（UIの中断ボタン）。run_flow が外部コマンドでストールしていても
+/// このコマンドは DB の Mutex を取らないため即座に通り、監視ループがツリーごと kill する。
+#[tauri::command(async)]
+fn break_flow(state: State<AppState>) {
+    state
+        .flow_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 const DROP_MIME: &str = "application/vnd.texos.drop";
@@ -2866,6 +3277,7 @@ pub fn run() {
             app.manage(AppState {
                 current: Mutex::new(current),
                 app_data: app_dir,
+                flow_cancel: std::sync::atomic::AtomicBool::new(false),
             });
             Ok(())
         })
@@ -2927,6 +3339,15 @@ pub fn run() {
             create_filter,
             update_filter,
             run_flow,
+            break_flow,
+            check_filter_program,
+            list_filter_programs,
+            import_filter_program,
+            remove_filter_program,
+            restore_filter_program,
+            list_filter_library,
+            save_filter_library,
+            delete_filter_library,
             create_drop_point,
             drop_into_point,
             set_panel_width,

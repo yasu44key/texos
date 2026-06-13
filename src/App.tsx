@@ -10,6 +10,7 @@ import { NoteCard } from "./objects/NoteCard";
 import { ShapeCard, type ShapeInfo } from "./objects/ShapeCard";
 import { ContextMenu, type MenuItem } from "./ui/ContextMenu";
 import { PromptDialog } from "./ui/PromptDialog";
+import { FilterDialog } from "./ui/FilterDialog";
 import { ConfirmDialog } from "./ui/ConfirmDialog";
 import { ProjectChooser, type ProjectInfo } from "./ui/ProjectChooser";
 import {
@@ -74,8 +75,31 @@ function App() {
   const [prompt, setPrompt] = useState<{
     title: string;
     initial: string;
+    allowEmpty?: boolean;
     onConfirm: (v: string) => void;
   } | null>(null);
+  // フロー実行中の表示と中断ボタン（外部コマンドのストール対策）
+  const [flowRunning, setFlowRunning] = useState(false);
+  // v1.5 外部プログラムフィルタの設定ダイアログ（作成 or 既存カードの編集）
+  const [filterDlg, setFilterDlg] = useState<{
+    x: number;
+    y: number;
+    edit?: { id: string; label: string; spec: string };
+  } | null>(null);
+  // v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断）。メニュー構築が同期なので state に持つ。
+  const [filterLibrary, setFilterLibrary] = useState<{ name: string; spec: string }[]>([]);
+  const filterLibraryRef = useRef<{ name: string; spec: string }[]>([]);
+  filterLibraryRef.current = filterLibrary;
+  const reloadFilterLibrary = useCallback(async () => {
+    try {
+      setFilterLibrary(await invoke<{ name: string; spec: string }[]>("list_filter_library"));
+    } catch {
+      setFilterLibrary([]);
+    }
+  }, []);
+  useEffect(() => {
+    void reloadFilterLibrary();
+  }, [reloadFilterLibrary]);
   const [confirm, setConfirm] = useState<{
     title: string;
     message?: string;
@@ -512,38 +536,9 @@ function App() {
             }),
         });
       } else {
-        // 外部プログラム: exe をファイル選択してコマンドラインを自動構成する
-        // （プレースホルダの手書きは現実的でない — v1.4 実機指摘）。
-        (async () => {
-          const exe = await open({
-            multiple: false,
-            title:
-              builtin === "external_stdio"
-                ? "プログラムを選択（標準入出力フィルタ型: prog < 入力 > 出力）"
-                : "プログラムを選択（引数型: prog 入力 出力）",
-            filters: [{ name: "プログラム", extensions: ["exe", "bat", "cmd", "com"] }],
-          });
-          if (!exe || Array.isArray(exe)) return;
-          const name = exe.split(/[\\/]/).pop() ?? "program";
-          const initialCmd =
-            builtin === "external_stdio"
-              ? `"${exe}" < "{in}" > "{out}"`
-              : `"${exe}" "{in}" "{out}"`;
-          setPrompt({
-            title: "コマンドライン（必要なら引数を編集）",
-            initial: initialCmd,
-            onConfirm: (cmd) =>
-              setPrompt({
-                title: "出力ファイルの拡張子（空欄=入力と同じ）",
-                initial: "txt",
-                onConfirm: (ext) => {
-                  const spec: Record<string, unknown> = { cmd, accept_mime: "*/*" };
-                  if (ext.trim()) spec.output_ext = ext.trim().replace(/^\./, "");
-                  create(name, spec);
-                },
-              }),
-          });
-        })();
+        // 外部プログラム: 設定ダイアログ（v1.5）。NAME/PATH/Type/CMD/IN/OUT/Prefix を
+        // フォームで設定する — JSON直編集・プロンプト連鎖は現実的でない（実機指摘）。
+        setFilterDlg({ x: canvasX, y: canvasY });
       }
     },
     [refresh, pushUndo]
@@ -552,9 +547,11 @@ function App() {
   // フローを実行（手動トリガー — 確定方針4）。結果カードは緑シグナル＋Ctrl+Zで戻せる。
   const handleRunFlow = useCallback(
     async (id: string) => {
+      setFlowRunning(true);
       try {
         const res = await invoke<{
           created: string[];
+          updated: string[];
           outputs: string[];
           skipped: string[];
           errors: string[];
@@ -562,6 +559,10 @@ function App() {
         if (res.created.length) {
           setTouched((prev) => new Set([...prev, ...res.created]));
           pushUndo([{ kind: "delete", ids: res.created }]);
+        }
+        // 固定名上書きで中身が変わった既存カード: 緑シグナルのみ（削除Undoはしない）
+        if (res.updated.length) {
+          setTouched((prev) => new Set([...prev, ...res.updated]));
         }
         await refresh();
         const lines = [
@@ -583,14 +584,28 @@ function App() {
           okLabel: "OK",
           onConfirm: () => setConfirm(null),
         });
+      } finally {
+        setFlowRunning(false);
       }
     },
     [refresh, pushUndo]
   );
 
-  // フィルタ定義（JSON）の直接編集。バックエンドが保存前に検証する。
+  // フィルタ定義の編集。外部プログラムは設定ダイアログ（v1.5）、
+  // 内蔵フィルタは従来の JSON 直編集（バックエンドが保存前に検証する）。
   const handleEditFilter = useCallback(
     (id: string, current: string) => {
+      let isBuiltin = false;
+      try {
+        isBuiltin = Boolean(JSON.parse(current || "{}").builtin);
+      } catch {
+        isBuiltin = false;
+      }
+      if (!isBuiltin) {
+        const label = objectsRef.current.find((o) => o.id === id)?.label ?? "";
+        setFilterDlg({ x: 0, y: 0, edit: { id, label, spec: current } });
+        return;
+      }
       setPrompt({
         title: "フィルタ定義（JSON）",
         initial: current,
@@ -611,6 +626,101 @@ function App() {
       });
     },
     [refresh]
+  );
+
+  // v1.5: フィルタ設定に名前を付けてライブラリへ登録（同名は上書き）。
+  const handleSaveFilterToLibrary = useCallback(
+    (id: string) => {
+      const obj = objectsRef.current.find((o) => o.id === id);
+      const spec = obj?.filter_ref;
+      if (!spec) return;
+      setPrompt({
+        title: "ライブラリに登録: フィルタ名（同名は上書き）",
+        initial: obj?.label ?? "",
+        onConfirm: async (name) => {
+          try {
+            await invoke("save_filter_library", { name, spec });
+            await reloadFilterLibrary();
+          } catch (e) {
+            setConfirm({
+              title: "ライブラリに登録できませんでした",
+              message: String(e),
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          }
+        },
+      });
+    },
+    [reloadFilterLibrary]
+  );
+
+  // v1.5: ライブラリのフィルタをカード化（インスタンス化）。配置時にプログラムの所在をチェック。
+  const handleAddLibraryFilter = useCallback(
+    async (name: string, x: number, y: number) => {
+      const entry = filterLibraryRef.current.find((e) => e.name === name);
+      if (!entry) return;
+      try {
+        const vid = await invoke<string>("create_filter", {
+          label: name,
+          spec: entry.spec,
+          x,
+          y,
+        });
+        pushUndo([{ kind: "delete", ids: [vid] }]);
+        await refresh();
+        try {
+          const s = JSON.parse(entry.spec);
+          if (s.name) {
+            const found = await invoke<string | null>("check_filter_program", {
+              name: s.name,
+              path: s.path ?? null,
+            });
+            if (!found) {
+              setConfirm({
+                title: "プログラムが見つかりません",
+                message:
+                  `「${s.name}」が見つかりません（指定パス → .texos\\filters → 環境変数PATH の順で探索）。\n` +
+                  "カードは配置しました。右クリック→フィルタ設定で PATH を確認するか、プログラムをこのプロジェクトに同梱してください。",
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              });
+            }
+          }
+        } catch {
+          // spec が壊れていても配置自体は成立させる（編集ダイアログで直せる）
+        }
+      } catch (e) {
+        setConfirm({
+          title: "フィルタを配置できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh, pushUndo]
+  );
+
+  // v1.5: ライブラリからエントリを削除（配置済みカードには影響しない）。
+  const handleDeleteLibraryFilter = useCallback(
+    (name: string) => {
+      setConfirm({
+        title: "ライブラリから削除",
+        message: `「${name}」をライブラリから削除します。\n（配置済みのカードには影響しません）`,
+        okLabel: "削除",
+        onConfirm: async () => {
+          setConfirm(null);
+          try {
+            await invoke("delete_filter_library", { name });
+          } catch (e) {
+            console.error("delete_filter_library failed", e);
+          }
+          await reloadFilterLibrary();
+        },
+      });
+    },
+    [reloadFilterLibrary]
   );
 
   // ドロップポイントから flow 矢印を下流へ辿り、末端のフィルタ（その先に
@@ -2036,6 +2146,9 @@ function App() {
         addFilter: handleAddFilter,
         runFlow: handleRunFlow,
         editFilter: handleEditFilter,
+        saveFilterToLibrary: handleSaveFilterToLibrary,
+        addLibraryFilter: handleAddLibraryFilter,
+        deleteLibraryFilter: handleDeleteLibraryFilter,
         feedDrop: handleFeedDrop,
         runDrop: runDownstreamFlows,
         newSubproject: handleNewSubproject,
@@ -2126,7 +2239,13 @@ function App() {
       } else {
         items = buildCanvasMenu(
           info,
-          { selectionCount: selectedRef.current.size, theme, alignItems, bulkItems },
+          {
+            selectionCount: selectedRef.current.size,
+            theme,
+            alignItems,
+            bulkItems,
+            library: filterLibrary.map((e) => e.name),
+          },
           actions
         );
       }
@@ -2179,11 +2298,15 @@ function App() {
       handleAddFilter,
       handleRunFlow,
       handleEditFilter,
+      handleSaveFilterToLibrary,
+      handleAddLibraryFilter,
+      handleDeleteLibraryFilter,
       handleFeedDrop,
       runDownstreamFlows,
       theme,
       expanded,
       notes,
+      filterLibrary,
     ]
   );
 
@@ -2203,6 +2326,25 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Delete キー = 選択カードを削除（確認・一括Undoは既存の削除フローに乗せる）。
+  // テキスト入力中・ダイアログ/メニュー表示中は奪わない。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Delete") return;
+      if (prompt || confirm || filterDlg || menu) return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable))
+        return;
+      const ids = objectsRef.current.filter((o) => selectedRef.current.has(o.id)).map((o) => o.id);
+      if (!ids.length) return;
+      e.preventDefault();
+      if (ids.length >= 2) handleBulkDelete();
+      else handleRequestDelete(ids[0]);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [prompt, confirm, filterDlg, menu, handleBulkDelete, handleRequestDelete]);
 
   const handleChosen = useCallback((info: ProjectInfo) => {
     setShowChooser(false);
@@ -2308,6 +2450,7 @@ function App() {
             isUrl={!!obj.url_ref}
             isFolder={!!obj.folder_ref}
             isFilter={obj.kind === "filter" || !!obj.filter_ref}
+            filterRef={obj.filter_ref}
             isDrop={obj.kind === "drop"}
             memo={obj.memo}
             ext={obj.ext}
@@ -2436,10 +2579,86 @@ function App() {
       {menu && (
         <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />
       )}
+      {filterDlg && (
+        <FilterDialog
+          initialLabel={filterDlg.edit?.label}
+          initialSpec={filterDlg.edit?.spec}
+          onCancel={() => setFilterDlg(null)}
+          onSave={async (label, spec) => {
+            const dlg = filterDlg;
+            setFilterDlg(null);
+            try {
+              if (dlg.edit) {
+                await invoke("update_filter", { id: dlg.edit.id, spec });
+                if (label !== dlg.edit.label) {
+                  await invoke("rename_object", { id: dlg.edit.id, label });
+                }
+              } else {
+                const vid = await invoke<string>("create_filter", {
+                  label,
+                  spec,
+                  x: dlg.x,
+                  y: dlg.y,
+                });
+                pushUndo([{ kind: "delete", ids: [vid] }]);
+              }
+              await refresh();
+            } catch (e) {
+              console.error("filter save failed", e);
+              setConfirm({
+                title: "フィルタを保存できませんでした",
+                message: String(e),
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              });
+            }
+          }}
+        />
+      )}
+      {flowRunning && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 24,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 2500,
+            display: "flex",
+            alignItems: "center",
+            gap: 14,
+            background: "#1c2130",
+            border: "1px solid #38445e",
+            borderRadius: 10,
+            padding: "10px 18px",
+            color: "#d6dded",
+            fontFamily: "sans-serif",
+            fontSize: 13,
+            boxShadow: "0 8px 32px #000000aa",
+          }}
+        >
+          <span>フロー実行中…</span>
+          <button
+            onClick={() => void invoke("break_flow")}
+            style={{
+              padding: "6px 16px",
+              background: "#b03a3a",
+              color: "#ffffff",
+              border: "none",
+              borderRadius: 6,
+              cursor: "pointer",
+              fontSize: 13,
+              fontFamily: "sans-serif",
+            }}
+          >
+            ■ 中断
+          </button>
+        </div>
+      )}
       {prompt && (
         <PromptDialog
           title={prompt.title}
           initial={prompt.initial}
+          allowEmpty={prompt.allowEmpty}
           onConfirm={(v) => {
             // Close first, THEN run the callback — so a callback that opens
             // another prompt (e.g. URL → title) isn't immediately cleared.

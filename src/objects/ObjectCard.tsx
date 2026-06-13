@@ -31,6 +31,8 @@ interface Props {
   isFolder?: boolean;
   /** v1.4 オートフロー: this card is a filter (pipeline processor) */
   isFilter?: boolean;
+  /** filter_ref JSON — Type（フィルタ/コマンド/ジェネレータ）でバッジと配色を変える */
+  filterRef?: string | null;
   /** v1.4 オートフロー: this card is a drop point (pipeline data inlet) */
   isDrop?: boolean;
   /** stacking order (computed by the parent; expanded cards come to front) */
@@ -124,15 +126,51 @@ function iconFor(mime: string, ext?: string | null): string {
   return "📦";
 }
 
+// v1.5: フィルタカードの Type 別ビジュアル（一目で見分けるビジュアル系TexoS）。
+// 内蔵フィルタ・旧形式はフィルタ扱い（緑）。
+const FILTER_TYPE_STYLES = {
+  filter: {
+    bg: "var(--card-bg-filter, #14281e)",
+    border: "#3a7a5a",
+    text: "#7fd8b0",
+    badge: "⚙ フィルタ（Wクリックで実行）",
+  },
+  command: {
+    bg: "var(--card-bg-filter-cmd, #142828)",
+    border: "#3a7a7a",
+    text: "#7fd8d8",
+    badge: "⌨ コマンド（Wクリックで実行）",
+  },
+  generator: {
+    bg: "var(--card-bg-filter-gen, #2a2114)",
+    border: "#7a5d3a",
+    text: "#e8c07f",
+    badge: "✨ ジェネレータ（Wクリックで生成）",
+  },
+} as const;
+
+function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_STYLES {
+  if (!ref) return "filter";
+  try {
+    const s = JSON.parse(ref);
+    if (!s.builtin && (s.type === "command" || s.type === "generator")) return s.type;
+  } catch {
+    // 壊れたJSONはフィルタ扱いで表示だけ続行（編集ダイアログ側で直せる）
+  }
+  return "filter";
+}
+
 export function ObjectCard({
   id, realId, label, mimeType, x, y,
   committed = false, active = false, lost = null,
   isProject = false, isUrl = false, isFolder = false, isFilter = false, isDrop = false,
+  filterRef = null,
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onGroupDragStart,
   onMoveEnd, onStartLink, onOpen, onCollapse, onAfterSave,
 }: Props) {
+  const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
   const posRef = useRef({ x, y });
   posRef.current = { x, y };
   const [thumbnail, setThumbnail] = useState<string | null>(null);
@@ -252,11 +290,11 @@ export function ObjectCard({
           : isFolder
           ? "var(--card-bg-folder, #2a2418)"
           : isFilter
-          ? "var(--card-bg-filter, #14281e)"
+          ? fstyle.bg
           : isDrop
           ? "var(--card-bg-drop, #102030)"
           : "var(--card-bg, #111120)",
-        border: `1px ${isDrop ? "dashed" : "solid"} ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? "#3a7a5a" : isDrop ? "#4a90d9" : status.border}`,
+        border: `1px ${isDrop ? "dashed" : "solid"} ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? fstyle.border : isDrop ? "#4a90d9" : status.border}`,
         outline: selected ? "2px solid var(--accent, #4a90d9)" : "none",
         outlineOffset: 1,
         borderRadius: 10,
@@ -352,7 +390,7 @@ export function ObjectCard({
               <span style={{ fontSize: 9, color: "#d8c47f" }}>🔗 リンクフォルダ ▸</span>
             )}
             {isFilter && (
-              <span style={{ fontSize: 9, color: "#7fd8b0" }}>⚙ フィルタ（Wクリックで実行）</span>
+              <span style={{ fontSize: 9, color: fstyle.text }}>{fstyle.badge}</span>
             )}
             {isDrop && (
               <span style={{ fontSize: 9, color: "#7fb0d8" }}>📥 ここにドロップ→自動実行</span>

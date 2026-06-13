@@ -21,6 +21,10 @@ export interface MenuActions {
   addFilter: (builtin: string, x: number, y: number) => void;
   runFlow: (id: string) => void;
   editFilter: (id: string, current: string) => void;
+  // v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断）
+  saveFilterToLibrary: (id: string) => void;
+  addLibraryFilter: (name: string, x: number, y: number) => void;
+  deleteLibraryFilter: (name: string) => void;
   feedDrop: (id: string) => void;
   runDrop: (id: string) => void;
   newSubproject: (sibling: boolean, x: number, y: number) => void;
@@ -158,6 +162,17 @@ export function buildObjectMenu(
     { label: "最前面へ", onClick: () => a.bringToFront(targetId) },
     { label: "最背面へ", onClick: () => a.sendToBack(targetId) },
   ];
+  // 複数選択の一員を右クリックしたときの「削除」は選択全体を対象にする
+  // （確認・一括Undoは bulkDelete 側が持つ）。単独選択なら従来の単体削除。
+  const multi = ctx.selected.has(targetId) && ctx.selected.size >= 2;
+  const deleteItem = (single: MenuItem): MenuItem =>
+    multi
+      ? {
+          label: `削除（選択 ${ctx.selected.size} 件）`,
+          danger: true,
+          onClick: () => a.bulkDelete(),
+        }
+      : single;
   // Project object: navigate / rename / remove reference.
   if (obj?.project_ref) {
     return [
@@ -168,11 +183,11 @@ export function buildObjectMenu(
         label: "表示名を変更...",
         onClick: () => a.renameObject(targetId, obj.label),
       },
-      {
+      deleteItem({
         label: "削除（参照のみ・フォルダは残る）",
         danger: true,
         onClick: () => a.deleteObject(targetId),
-      },
+      }),
     ];
   }
   // URL link object
@@ -193,7 +208,7 @@ export function buildObjectMenu(
       ...zItems,
       { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
-      { label: "削除", danger: true, onClick: () => a.deleteObject(targetId) },
+      deleteItem({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
   }
   // v1.4 オートフロー: ドロップポイント（パイプラインのデータ入口）
@@ -204,7 +219,7 @@ export function buildObjectMenu(
       { label: "▶ 下流のフローを実行", onClick: () => a.runDrop(targetId) },
       ...zItems,
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
-      { label: "削除", danger: true, onClick: () => a.deleteObject(targetId) },
+      deleteItem({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
   }
   // v1.4 オートフロー: フィルタカード（パイプラインの処理ノード）
@@ -213,12 +228,15 @@ export function buildObjectMenu(
       { label: `⚗「${obj.label}」`, onClick: () => {}, disabled: true },
       { label: "▶ フローを実行", onClick: () => a.runFlow(targetId) },
       {
-        label: "フィルタ設定を編集（JSON）...",
+        // 外部プログラムは設定ダイアログ、内蔵フィルタはJSON編集（App側で分岐）
+        label: "フィルタ設定を編集...",
         onClick: () => a.editFilter(targetId, obj.filter_ref ?? "{}"),
       },
+      // v1.5: 設定済みフィルタに名前を付けてプロジェクト横断で再利用
+      { label: "ライブラリに登録...", onClick: () => a.saveFilterToLibrary(targetId) },
       ...zItems,
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
-      { label: "削除", danger: true, onClick: () => a.deleteObject(targetId) },
+      deleteItem({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
   }
   // Folder link object (リンクフォルダ)
@@ -238,11 +256,11 @@ export function buildObjectMenu(
       ...zItems,
       { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
-      {
+      deleteItem({
         label: "削除（参照のみ・フォルダは残る）",
         danger: true,
         onClick: () => a.deleteObject(targetId),
-      },
+      }),
     ];
   }
   const committed = !!obj?.committed_path;
@@ -372,7 +390,7 @@ export function buildObjectMenu(
       label: "表示名を変更...",
       onClick: () => a.renameObject(targetId, obj?.label ?? ""),
     },
-    { label: "削除", danger: true, onClick: () => a.requestDelete(targetId) },
+    deleteItem({ label: "削除", danger: true, onClick: () => a.requestDelete(targetId) }),
   ];
 }
 
@@ -446,6 +464,8 @@ interface CanvasMenuCtx {
   theme: string;
   alignItems: MenuItem[];
   bulkItems: MenuItem[];
+  /// v1.5: ライブラリ登録済みフィルタ名（「ユーザーのフィルタ」として列挙）
+  library: string[];
 }
 
 export function buildCanvasMenu(
@@ -498,8 +518,30 @@ export function buildCanvasMenu(
           { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
           { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
           { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
-          { label: "外部プログラム（標準入出力型）...", onClick: () => a.addFilter("external_stdio", pos.canvasX, pos.canvasY) },
-          { label: "外部プログラム（引数型）...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
+          // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
+          { label: "外部プログラム...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
+          // v1.5: ライブラリ登録済みフィルタのインスタンス化（配置時に所在チェック）
+          ...(ctx.library.length
+            ? [
+                { label: "── ユーザーのフィルタ ──", onClick: () => {}, disabled: true },
+                ...ctx.library.map((name) => ({
+                  label: `⚗ ${name}`,
+                  onClick: () => a.addLibraryFilter(name, pos.canvasX, pos.canvasY),
+                })),
+                {
+                  label: "ライブラリから削除 ...",
+                  danger: true,
+                  onClick: () =>
+                    a.openSubmenu(
+                      ctx.library.map((name) => ({
+                        label: `${name} を削除`,
+                        danger: true,
+                        onClick: () => a.deleteLibraryFilter(name),
+                      }))
+                    ),
+                },
+              ]
+            : []),
         ]),
     },
     {
