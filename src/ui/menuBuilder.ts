@@ -32,6 +32,8 @@ export interface MenuActions {
   autoLayout: () => void;
   commitAll: () => void;
   setTheme: (key: string) => void;
+  // v1.3.4: メニューの説明ツールチップ表示のオン/オフ。
+  toggleMenuHints: () => void;
   switchProject: () => void;
   // 選択
   focusSelection: () => void;
@@ -39,6 +41,8 @@ export interface MenuActions {
   bulkCommit: () => void;
   bulkUncommit: () => void;
   bulkDelete: () => void;
+  // v1.3.4 クリップボード持ち出し（選択カードをファイルとして）
+  copyFiles: (ids: string[]) => void;
   // カード
   openObject: (id: string) => void;
   openDefault: (id: string) => void;
@@ -73,6 +77,22 @@ export interface MenuActions {
   shapeDelete: (id: string) => void;
 }
 
+// v1.3.4: 区切り線アイテム。グループ間に挟む。
+const DIV: MenuItem = { divider: true, label: "", onClick: () => {} };
+
+// v1.3.4: 先頭・末尾・連続する区切り線を畳む（条件分岐で空グループになっても綺麗に）。
+function compact(items: MenuItem[]): MenuItem[] {
+  const out: MenuItem[] = [];
+  for (const it of items) {
+    if (it.divider) {
+      if (out.length === 0 || out[out.length - 1].divider) continue;
+    }
+    out.push(it);
+  }
+  while (out.length && out[out.length - 1].divider) out.pop();
+  return out;
+}
+
 // v1.3 メモ⑦: 選択カードの整列（2枚以上選択時のみメニューに出す）。
 export function buildAlignItems(a: MenuActions): MenuItem[] {
   return [
@@ -86,19 +106,27 @@ export function buildAlignItems(a: MenuActions): MenuItem[] {
 
 // v1.3 メモ２追加④: 選択カードへの一括操作（対象件数つき）。
 export function buildBulkItems(
-  counts: { commitable: number; uncommitable: number; total: number },
+  counts: { commitable: number; uncommitable: number; total: number; ids: string[] },
   a: MenuActions
 ): MenuItem[] {
   return [
     {
-      label: `まとめて実身化（コミット・${counts.commitable}件）`,
+      label: `まとめて実身化（${counts.commitable}件）`,
+      hint: "選択した仮身をまとめてプロジェクトに保存し、実身（実体）にします。",
       disabled: !counts.commitable,
       onClick: () => a.bulkCommit(),
     },
     {
-      label: `まとめて仮身化（コミット取り消し・${counts.uncommitable}件）`,
+      label: `まとめて仮身化（${counts.uncommitable}件）`,
+      hint: "選択した実身をまとめて参照（仮身）に戻し、プロジェクト内の実体を消します。",
       disabled: !counts.uncommitable,
       onClick: () => a.bulkUncommit(),
+    },
+    {
+      label: `まとめてクリップボードにコピー（${counts.total}件）`,
+      hint: "選択カードをファイルとしてOSのクリップボードへ。未保存の仮身は自動で実身化されます。",
+      disabled: !counts.total,
+      onClick: () => a.copyFiles(counts.ids),
     },
     {
       label: `まとめて削除（${counts.total}件）`,
@@ -127,7 +155,8 @@ export function buildNoteMenu(
     ...(!note?.file_ref
       ? [
           {
-            label: "コミットしてテキストファイルとして保存",
+            label: "実身化（テキストファイルにする）",
+            hint: "このコメントをテキストファイルとして保存し、以後は編集が実ファイルへ書き戻る付箋にします。",
             onClick: () => a.commitNoteToFile(noteId),
           },
         ]
@@ -268,17 +297,22 @@ export function buildObjectMenu(
   // 仮身に戻す＝元ファイル削除になってしまうため、コマンドを出さない。
   const isOriginalFile =
     !!obj?.origin_path && !!obj?.committed_path && obj.origin_path === obj.committed_path;
-  return [
+  // v1.3.4: 用語を実身/仮身に統一し、グループを区切り線で分ける。
+  // 説明は label から外してツールチップ(hint)へ。compact() で空グループの線を畳む。
+  return compact([
     { label: `「${obj?.label ?? ""}」`, onClick: () => {}, disabled: true },
     // v1.3.1: 窓の先を喪失した仮身 → CASのスナップショットから復活。
     ...(obj && lostOf(obj) === "cas"
       ? [
           {
-            label: "取り込み時点の内容を復活（コミットして表示）",
+            label: "取り込み時点の内容を復活",
+            hint: "失われた窓の先を、CASに残るスナップショットから実身化して表示します。",
             onClick: () => a.commitReveal(targetId),
           },
         ]
       : []),
+    DIV,
+    // ── 開く・編集系 ──
     {
       label: "既定のアプリで開く／編集",
       onClick: () => a.openDefault(targetId),
@@ -287,15 +321,6 @@ export function buildObjectMenu(
       label: "アプリを選択して開く／編集...",
       onClick: () => a.openWith(targetId),
     },
-    // 第3の選択肢: 実身化してExplorerでフォーカス（そこから先はWindows任せ）
-    ...(!committed
-      ? [
-          {
-            label: "コミットしてプロジェクトフォルダで表示",
-            onClick: () => a.commitReveal(targetId),
-          },
-        ]
-      : []),
     ...(obj && isTextMime(obj.mime_type, obj.ext)
       ? [
           {
@@ -345,9 +370,12 @@ export function buildObjectMenu(
         ]
       : []),
     {
-      label: "一時的に閲覧（コピーを破棄）",
+      label: "一時的に閲覧",
+      hint: "プロジェクトに保存せず、一時コピーで中身を確認します。閉じるとコピーは破棄されます。",
       onClick: () => a.viewTemp(targetId),
     },
+    DIV,
+    // ── 配置・表示系 ──
     ...zItems,
     ...(!committed && obj?.origin_path
       ? [
@@ -368,30 +396,65 @@ export function buildObjectMenu(
                 invoke("reveal_in_dir", { path: obj.committed_path });
             },
           },
+        ]
+      : []),
+    DIV,
+    // ── 実身⇔仮身・持ち出し系 ──
+    // 第3の選択肢: 実身化してExplorerでフォーカス（そこから先はWindows任せ）
+    ...(!committed
+      ? [
           {
-            label: "編集を破棄して再コミット",
+            label: "実身化（フォルダで表示）",
+            hint: "このカードの内容をプロジェクトに保存して実身（実体）にし、保存先フォルダを開きます。",
+            onClick: () => a.commitReveal(targetId),
+          },
+        ]
+      : []),
+    ...(committed
+      ? [
+          {
+            label: "実身化し直す",
+            hint: "現在の編集を破棄し、取り込み時点の内容で実身化し直します。",
             onClick: () => a.recommit(targetId),
           },
           ...(!isOriginalFile
             ? [
                 {
-                  label: "コミットを取り消す（仮身に戻す）",
+                  label: "仮身化",
+                  hint: "プロジェクト内の実体を消し、元ファイルへの参照（仮身）に戻します。",
                   onClick: () => a.uncommit(targetId),
                 },
               ]
             : []),
         ]
       : []),
+    // v1.3.4: ファイルとしてクリップボードへ（未保存の仮身は自動で実身化）。
+    // 複数選択時は「選択カードをまとめて ...」サブメニューに一本化（重複排除）。
+    ...(!multi
+      ? [
+          {
+            label: "クリップボードにコピー",
+            hint: "このカードをファイルとしてOSのクリップボードへ。Explorerや他アプリに貼り付けられます。未保存の仮身は自動で実身化されます。",
+            onClick: () => a.copyFiles([targetId]),
+          },
+        ]
+      : []),
     {
-      label: "元のファイルを呼ぶ（仮身を複製）",
+      label: "仮身を複製",
+      hint: "同じ実身を指す仮身をもう一枚作ります。内容は複製されず、両方が同じ実体を指します。",
       onClick: () => a.duplicate(targetId),
     },
+    DIV,
+    // ── メタ操作 ──
     {
       label: "表示名を変更...",
       onClick: () => a.renameObject(targetId, obj?.label ?? ""),
     },
-    deleteItem({ label: "削除", danger: true, onClick: () => a.requestDelete(targetId) }),
-  ];
+    // 複数選択時の削除も「まとめて ...」サブメニュー側に集約（重複排除）。
+    ...(!multi
+      ? [{ label: "削除", danger: true, onClick: () => a.requestDelete(targetId) }]
+      : []),
+  ]);
 }
 
 // v1.3-②③: shape menu (shapes sit behind cards)
@@ -466,6 +529,8 @@ interface CanvasMenuCtx {
   bulkItems: MenuItem[];
   /// v1.5: ライブラリ登録済みフィルタ名（「ユーザーのフィルタ」として列挙）
   library: string[];
+  /// v1.3.4: メニュー説明ツールチップの現在のオン/オフ（トグル表示用）。
+  menuHints: boolean;
 }
 
 export function buildCanvasMenu(
@@ -473,7 +538,9 @@ export function buildCanvasMenu(
   ctx: CanvasMenuCtx,
   a: MenuActions
 ): MenuItem[] {
-  return [
+  // v1.3.4: カテゴリ別に区切り線で分ける。選択系は選択があるときだけ先頭に出る。
+  return compact([
+    // ── 選択系（選択があるときだけ）──
     ...(ctx.selectionCount
       ? [{ label: "選択範囲にフォーカス", onClick: () => a.focusSelection() }]
       : []),
@@ -483,6 +550,8 @@ export function buildCanvasMenu(
           { label: "選択カードをまとめて ...", onClick: () => a.openSubmenu(ctx.bulkItems) },
         ]
       : []),
+    DIV,
+    // ── 配置・追加系 ──
     {
       label: "ファイルを配置...",
       onClick: () => a.contextPlace(pos.canvasX, pos.canvasY),
@@ -493,6 +562,7 @@ export function buildCanvasMenu(
     },
     {
       label: "クリップボードから貼り付け",
+      hint: "OSのクリップボードの内容（画像・テキスト・URL）をカードとして取り込みます。",
       onClick: () => a.paste(pos.canvasX, pos.canvasY),
     },
     {
@@ -544,26 +614,35 @@ export function buildCanvasMenu(
             : []),
         ]),
     },
+    DIV,
+    // ── プロジェクト系 ──
     {
-      label: "新規プロジェクトを内包（コミット）...",
+      label: "新規プロジェクトを内包...",
+      hint: "新しいサブプロジェクトを作成し、このプロジェクトの中に実身として内包します。",
       onClick: () => a.newSubproject(false, pos.canvasX, pos.canvasY),
     },
     {
       label: "新規プロジェクトを分岐（フォーク）...",
+      hint: "新しいプロジェクトを兄弟（フォーク）として分岐作成します。",
       onClick: () => a.newSubproject(true, pos.canvasX, pos.canvasY),
     },
     {
       label: "既存プロジェクトへのリンクを配置...",
       onClick: () => a.linkProject(pos.canvasX, pos.canvasY),
     },
+    DIV,
+    // ── 整理・出力系 ──
     {
       label: "自動レイアウト（重なり解消）",
       onClick: () => a.autoLayout(),
     },
     {
-      label: "全コミット（データ持ち出し）...",
+      label: "すべて実身化（持ち出し）...",
+      hint: "プロジェクト内のすべての仮身を実身化し、データをプロジェクトフォルダに書き出します。",
       onClick: () => a.commitAll(),
     },
+    DIV,
+    // ── 設定系 ──
     {
       label: "UIカラー ...",
       onClick: () =>
@@ -575,8 +654,14 @@ export function buildCanvasMenu(
         ),
     },
     {
+      // v1.3.4: メニュー項目の説明ツールチップを出すか。慣れたらオフにできる。
+      label: (ctx.menuHints ? "✓ " : "　") + "メニューの説明を表示",
+      hint: "各メニュー項目にカーソルを合わせたとき、このような説明を表示します。オフにすると非表示になります。",
+      onClick: () => a.toggleMenuHints(),
+    },
+    {
       label: "プロジェクトを切り替え...",
       onClick: () => a.switchProject(),
     },
-  ];
+  ]);
 }

@@ -1,4 +1,6 @@
 mod cas;
+#[cfg(windows)]
+mod clipboard_out;
 mod db;
 #[cfg(windows)]
 mod drag_drop;
@@ -1555,6 +1557,118 @@ fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Result<CommitAll
     Ok(report)
 }
 
+#[derive(Serialize)]
+pub struct ClipboardExportReport {
+    /// labels whose file ended up on the clipboard
+    pub copied: Vec<String>,
+    /// number of paths put on the clipboard (== copied.len())
+    pub count: usize,
+    /// objects skipped because they have no file (URL / filter / drop point)
+    pub warnings: Vec<CommitAllWarning>,
+    pub errors: Vec<String>,
+}
+
+/// v1.3.4 クリップボード持ち出し: put the selected cards on the OS clipboard as
+/// CF_HDROP (a file list). Mirrors `commit_all`'s "what is a file" rules:
+/// URL / filter / drop-point cards have no file and are reported as warnings;
+/// uncommitted 仮身 are committed first (エクスポート＝コミット原則) so the path
+/// is a stable real file and no TEMP orphan is created. Folder / project links
+/// contribute their real folder path directly.
+#[tauri::command]
+fn copy_objects_to_clipboard(
+    ids: Vec<String>,
+    state: State<AppState>,
+) -> Result<ClipboardExportReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+
+    let mut report = ClipboardExportReport {
+        copied: vec![],
+        count: 0,
+        warnings: vec![],
+        errors: vec![],
+    };
+    let mut paths: Vec<String> = vec![];
+
+    for id in &ids {
+        let row: Result<(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>), _> =
+            p.conn.query_row(
+                "SELECT label, committed_path, project_ref, url_ref, folder_ref, kind
+                 FROM virtual_bodies WHERE id = ?1 AND deleted_at IS NULL",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            );
+        let (label, committed, project_ref, url_ref, folder_ref, kind) = match row {
+            Ok(x) => x,
+            Err(_) => continue, // 消えた・存在しないIDは黙ってスキップ
+        };
+
+        // フィルタ・ドロップポイントはTexoS内の道具で持ち出し対象外（commit_all と同じ）
+        if kind.as_deref() == Some("filter") || kind.as_deref() == Some("drop") {
+            report.warnings.push(CommitAllWarning {
+                label,
+                kind: kind.unwrap_or_default(),
+                detail: String::new(),
+            });
+            continue;
+        }
+        if let Some(url) = &url_ref {
+            report.warnings.push(CommitAllWarning {
+                label,
+                kind: "url".into(),
+                detail: url.clone(),
+            });
+            continue;
+        }
+        // フォルダ／プロジェクトリンクは実フォルダそのものを渡す
+        if let Some(folder) = &folder_ref {
+            if Path::new(folder).exists() {
+                paths.push(folder.clone());
+                report.copied.push(label);
+            } else {
+                report.errors.push(format!("{}: フォルダが見つかりません", label));
+            }
+            continue;
+        }
+        if let Some(proj) = &project_ref {
+            if Path::new(proj).exists() {
+                paths.push(proj.clone());
+                report.copied.push(label);
+            } else {
+                report.errors.push(format!("{}: プロジェクトが見つかりません", label));
+            }
+            continue;
+        }
+
+        // 通常のファイル系カード: 既にコミット済みならそのパス、なければコミット
+        let existing_ok = committed
+            .as_deref()
+            .map(|c| Path::new(c).exists())
+            .unwrap_or(false);
+        if existing_ok {
+            paths.push(committed.unwrap());
+            report.copied.push(label);
+            continue;
+        }
+        match commit_object_inner(p, id, false) {
+            Ok(path) => {
+                paths.push(path);
+                report.copied.push(label);
+            }
+            Err(e) => report.errors.push(format!("{}: {}", label, e)),
+        }
+    }
+
+    report.count = paths.len();
+    if !paths.is_empty() {
+        #[cfg(windows)]
+        clipboard_out::set_clipboard_files(&paths)?;
+        #[cfg(not(windows))]
+        return Err("クリップボード持ち出しは Windows のみ対応です".into());
+    }
+    Ok(report)
+}
+
 /// Undo a commit: delete the editable real file and return the object to a 仮身
 /// (reference). The CAS object is kept, so it can still be viewed/re-committed.
 /// Refused when the committed file IS the original imported file (in-project
@@ -1940,6 +2054,18 @@ fn paste_clipboard(x: f64, y: f64, state: State<AppState>) -> Result<ClipboardPa
                 id: None,
             });
         }
+    }
+    // v1.3.4: クリップボードがファイル一覧（CF_HDROP）の場合 — TexoS自身がコピー
+    // したファイルも他アプリでコピーしたファイルもここに来る。「実身のコピーは実身」
+    // という一般原則と仮身モデルの整合のため、内部ペーストでファイルを取り込むことは
+    // せず、正しい持ち込み方（D&D で仮身化）を案内する（フロントでダイアログ）。
+    #[cfg(windows)]
+    if clipboard_out::clipboard_has_files() {
+        return Ok(ClipboardPaste {
+            kind: "files".into(),
+            text: None,
+            id: None,
+        });
     }
     Ok(ClipboardPaste {
         kind: "empty".into(),
@@ -3335,6 +3461,7 @@ pub fn run() {
             read_text_file,
             write_text_file,
             paste_clipboard,
+            copy_objects_to_clipboard,
             create_text_object,
             create_filter,
             update_filter,

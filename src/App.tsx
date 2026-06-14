@@ -68,6 +68,10 @@ function App() {
   // v1.3 メモ①: カンバス左下に表示するアプリバージョン。
   const [appVersion, setAppVersion] = useState("");
   const [theme, setTheme] = useState<string>(() => localStorage.getItem("texos-theme") ?? "midnight");
+  // v1.3.4: メニュー項目の説明ツールチップを出すか（既定オン、設定で切替・永続化）。
+  const [showMenuHints, setShowMenuHints] = useState<boolean>(
+    () => localStorage.getItem("texos-menu-hints") !== "0"
+  );
   const [newNoteId, setNewNoteId] = useState<string | null>(null);
   const [relations, setRelations] = useState<RelationInfo[]>([]);
   const [linkDrag, setLinkDrag] = useState<LinkDrag | null>(null);
@@ -1507,6 +1511,18 @@ function App() {
           }
           pushUndo([{ kind: "delete", ids: [vid] }]);
           await refresh();
+        } else if (res.kind === "files") {
+          // v1.3.4: クリップボードのファイルは貼り付けで取り込まない。
+          // 「実身のコピーは実身になる」のが一般原則で、キャンバスは仮身（元ファイル
+          // への窓）を置く場 — 概念が衝突する。正しい持ち込み方を案内するだけにする。
+          setConfirm({
+            title: "貼り付けについて",
+            message:
+              "ファイルはキャンバスにドラッグ&ドロップで取り込めます（仮身になります）。\n" +
+              "外部へ出すときはカードを Ctrl+C。",
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
         }
       } catch (e) {
         console.error("paste_clipboard failed", e);
@@ -1527,6 +1543,85 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [handlePaste]);
+
+  // --- v1.3.4 クリップボード持ち出し（出す側） -------------------------------
+  // 選択カードを CF_HDROP（ファイル）として OS クリップボードへ。未コミットの
+  // 仮身はバックエンドでコミットしてから載せる（エクスポート＝コミット原則）。
+  const handleCopyFiles = useCallback(
+    async (ids: string[]) => {
+      if (!ids.length) return;
+      // コピーで新規に実身化されるのは「未コミットのファイル系カード」だけ。
+      // 他のコミット経路と同じく今セッション中は緑（touched）にする（次回起動でグレー）。
+      const idSet = new Set(ids);
+      const freshlyCommitted = objectsRef.current
+        .filter(
+          (o) =>
+            idSet.has(o.id) &&
+            !o.committed_path &&
+            !o.url_ref &&
+            !o.project_ref &&
+            !o.folder_ref &&
+            o.kind !== "filter" &&
+            o.kind !== "drop"
+        )
+        .map((o) => o.id);
+      try {
+        const rep = await invoke<{
+          copied: string[];
+          count: number;
+          warnings: { label: string; kind: string; detail: string }[];
+          errors: string[];
+        }>("copy_objects_to_clipboard", { ids });
+        // 未コミット仮身をコミットした場合があるのでシグナルを更新
+        if (freshlyCommitted.length)
+          setTouched((prev) => new Set([...prev, ...freshlyCommitted]));
+        await refresh();
+        if (rep.count === 0 && !rep.warnings.length && !rep.errors.length) return;
+        const lines: string[] = [];
+        if (rep.warnings.length) {
+          const label = (w: { kind: string }) =>
+            w.kind === "url"
+              ? "URL"
+              : w.kind === "filter"
+              ? "フィルタカード"
+              : w.kind === "drop"
+              ? "ドロップポイント"
+              : w.kind;
+          lines.push(
+            "コピーできない項目（ファイルを持たない）:\n" +
+              rep.warnings.map((w) => `・${w.label}（${label(w)}）`).join("\n")
+          );
+        }
+        if (rep.errors.length) lines.push("エラー:\n" + rep.errors.map((e) => `・${e}`).join("\n"));
+        // 全部成功（スキップ・エラーなし）なら通常の Ctrl+C と同じく無音
+        if (!lines.length) return;
+        setConfirm({
+          title: rep.count ? `${rep.count} 件をクリップボードにコピーしました` : "クリップボードにコピーできませんでした",
+          message: lines.join("\n\n"),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      } catch (e) {
+        console.error("copy_objects_to_clipboard failed", e);
+      }
+    },
+    [refresh]
+  );
+
+  // Ctrl+C → 選択カードをファイルとしてコピー（テキスト編集中は奪わない）。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "c") return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      const ids = [...selectedRef.current];
+      if (!ids.length) return; // 選択がなければブラウザ標準コピーに任せる
+      e.preventDefault();
+      handleCopyFiles(ids);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [handleCopyFiles]);
 
   // --- Shapes (v1.3-②③) ------------------------------------------------------
 
@@ -2156,12 +2251,19 @@ function App() {
         autoLayout: handleAutoLayout,
         commitAll: handleCommitAll,
         setTheme,
+        toggleMenuHints: () =>
+          setShowMenuHints((v) => {
+            const nv = !v;
+            localStorage.setItem("texos-menu-hints", nv ? "1" : "0");
+            return nv;
+          }),
         switchProject: () => setShowChooser(true),
         focusSelection: handleFocusSelection,
         alignSelected,
         bulkCommit: handleBulkCommit,
         bulkUncommit: handleBulkUncommit,
         bulkDelete: handleBulkDelete,
+        copyFiles: handleCopyFiles,
         openObject: handleOpenObject,
         openDefault: handleOpenDefault,
         openWith: handleOpenWith,
@@ -2220,6 +2322,7 @@ function App() {
             (o) => !!o.committed_path && !(o.origin_path && o.origin_path === o.committed_path)
           ).length,
           total: selObjs.length,
+          ids: selObjs.map((o) => o.id),
         },
         actions
       );
@@ -2245,6 +2348,7 @@ function App() {
             alignItems,
             bulkItems,
             library: filterLibrary.map((e) => e.name),
+            menuHints: showMenuHints,
           },
           actions
         );
@@ -2304,6 +2408,7 @@ function App() {
       handleFeedDrop,
       runDownstreamFlows,
       theme,
+      showMenuHints,
       expanded,
       notes,
       filterLibrary,
@@ -2577,7 +2682,13 @@ function App() {
       </div>
 
       {menu && (
-        <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={menu.items}
+          showHints={showMenuHints}
+          onClose={() => setMenu(null)}
+        />
       )}
       {filterDlg && (
         <FilterDialog
