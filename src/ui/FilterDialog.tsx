@@ -432,7 +432,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
               style={{ ...inputStyle(), flex: 1 }}
               value={outDir}
               onChange={(e) => setOutDir(e.target.value)}
-              placeholder="空欄=プロジェクト直下（コミット済み実身）／指定=窓（仮身）で配置"
+              placeholder="空欄=プロジェクト直下（実身）／指定=窓（仮身）で配置"
             />
             <button style={smallBtn()} onClick={() => void pickOutDir()}>
               フォルダ…

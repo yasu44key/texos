@@ -24,7 +24,7 @@ import {
   type NoteInfo,
   type VirtualBodyInfo,
 } from "./model";
-import { useUndo } from "./hooks/useUndo";
+import { useUndo, type UndoAction } from "./hooks/useUndo";
 import { useSelection } from "./hooks/useSelection";
 import {
   buildAlignItems,
@@ -826,7 +826,7 @@ function App() {
         setConfirm({
           title: "削除しますか？",
           message:
-            "このオブジェクトと、プロジェクトフォルダ内のコミット済み実ファイルを削除します。\n（CAS内の元データは保持されます）",
+            "このオブジェクトと、プロジェクトフォルダ内の実身ファイルを削除します。\n（CAS内の元データは保持されます）",
           okLabel: "削除",
           onConfirm: () => {
             setConfirm(null);
@@ -1029,10 +1029,10 @@ function App() {
   const handleRecommit = useCallback(
     (id: string) => {
       setConfirm({
-        title: "編集を破棄して再コミット",
+        title: "実身化し直す（編集を破棄）",
         message:
           "プロジェクトフォルダの編集済みファイルを、元の実身（不変）で上書きします。編集内容は失われます。よろしいですか？",
-        okLabel: "再コミット",
+        okLabel: "実身化し直す",
         onConfirm: async () => {
           setConfirm(null);
           try {
@@ -1077,13 +1077,13 @@ function App() {
           plan.warnings.map((w) => `・${w.label}（${kindLabel(w.kind)}）`).join("\n")
         : undefined;
       setConfirm({
-        title: "全コミット（データ持ち出し）",
+        title: "すべて実身化（持ち出し）",
         message:
-          `${plan.committed.length} 件を実ファイルとしてコミットし、` +
+          `${plan.committed.length} 件を実身化し、` +
           `プロジェクトフォルダを単体で持ち出せる状態にします。\n` +
-          `（コミット済み: ${plan.already} 件）`,
+          `（実身化済み: ${plan.already} 件）`,
         warning,
-        okLabel: "全コミット実行",
+        okLabel: "すべて実身化",
         onConfirm: async () => {
           setConfirm(null);
           try {
@@ -1093,8 +1093,8 @@ function App() {
               ? `\n\n失敗 ${res.errors.length} 件:\n` + res.errors.join("\n")
               : "";
             setConfirm({
-              title: "全コミット完了",
-              message: `${res.committed.length} 件をコミットしました（既存 ${res.already} 件）。${errText}`,
+              title: "すべて実身化 完了",
+              message: `${res.committed.length} 件を実身化しました（既存 ${res.already} 件）。${errText}`,
               warning: res.warnings.length
                 ? "含められなかった・注意項目:\n" +
                   res.warnings.map((w) => `・${w.label}（${kindLabel(w.kind)}）`).join("\n")
@@ -1105,7 +1105,7 @@ function App() {
           } catch (e) {
             console.error("commit_all failed", e);
             setConfirm({
-              title: "全コミットに失敗しました",
+              title: "すべて実身化に失敗しました",
               message: String(e),
               okLabel: "OK",
               onConfirm: () => setConfirm(null),
@@ -1152,7 +1152,7 @@ function App() {
       } catch (e) {
         console.error("commit/reveal failed", e);
         setConfirm({
-          title: "コミットできませんでした",
+          title: "実身化できませんでした",
           message: String(e),
           okLabel: "OK",
           onConfirm: () => setConfirm(null),
@@ -1233,13 +1233,13 @@ function App() {
     setExpanded((prev) => new Set(prev).add(id));
   }, []);
 
-  // コミットを取り消す（仮身に戻す）= Ctrl+Z for the 仮身→実身 conversion.
+  // 仮身に戻す（仮身化）= 実身→仮身。編集内容は失われるため確認ダイアログを出す。
   const handleUncommit = useCallback(
     (id: string) => {
       setConfirm({
-        title: "コミットを取り消す（仮身に戻す）",
+        title: "仮身に戻す",
         message:
-          "実ファイルを削除し、参照（仮身）に戻します。この実ファイルへの編集内容は失われます。よろしいですか？",
+          "実身ファイルを削除し、仮身に戻します。この編集内容は失われます。よろしいですか？",
         okLabel: "仮身に戻す",
         onConfirm: async () => {
           setConfirm(null);
@@ -1291,8 +1291,8 @@ function App() {
     await refresh();
     if (errors.length) {
       setConfirm({
-        title: "一部のカードをコミットできませんでした",
-        message: `${done.length} 件をコミットしました。\n\n失敗 ${errors.length} 件:\n` + errors.join("\n"),
+        title: "一部のカードを実身化できませんでした",
+        message: `${done.length} 件を実身化しました。\n\n失敗 ${errors.length} 件:\n` + errors.join("\n"),
         okLabel: "OK",
         onConfirm: () => setConfirm(null),
       });
@@ -1312,8 +1312,8 @@ function App() {
     setConfirm({
       title: "選択カードをまとめて仮身に戻す",
       message:
-        `${targets.length} 件の実ファイルを削除し、参照（仮身）に戻します。\n` +
-        "実ファイルへの編集内容は失われます。よろしいですか？",
+        `${targets.length} 件の実身ファイルを削除し、仮身に戻します。\n` +
+        "この編集内容は失われます。よろしいですか？",
       okLabel: "仮身に戻す",
       onConfirm: async () => {
         setConfirm(null);
@@ -1351,7 +1351,7 @@ function App() {
       message:
         `${targets.length} 件のカードを削除します。` +
         (committedCount
-          ? `\nうち ${committedCount} 件はコミット済みで、プロジェクトフォルダ内の実ファイルも削除されます。\n（CAS内の元データは保持されます）`
+          ? `\nうち ${committedCount} 件は実身化済みで、プロジェクトフォルダ内の実身ファイルも削除されます。\n（CAS内の元データは保持されます）`
           : ""),
       okLabel: "削除",
       onConfirm: async () => {
@@ -1932,52 +1932,68 @@ function App() {
 
   const alignSelected = useCallback(
     async (mode: "row" | "col" | "grid" | "dist-h" | "dist-v") => {
-      const sel = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
-      if (sel.length < 2) return;
+      // v1.3.5: コメント(付箋)も整列対象に含める。カードとコメントを位置だけで
+      // 統一的に扱い、結果をカード／ノートの move に振り分ける（自動レイアウト＝
+      // 重なり解消だけは、コメントを常時最前面の注釈として対象外のまま据え置く）。
+      type It = { id: string; x: number; y: number; note: boolean };
+      const selCards = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
+      const selNotes = notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
+      const items: It[] = [
+        ...selCards.map((o) => ({ id: o.id, x: o.pos_x, y: o.pos_y, note: false })),
+        ...selNotes.map((n) => ({ id: n.id, x: n.pos_x, y: n.pos_y, note: true })),
+      ];
+      if (items.length < 2) return;
       const GAP = 28;
-      let moves: { id: string; x: number; y: number }[];
+      let moved: It[];
       if (mode === "row") {
-        // 横一列: 一番上のカードのYにそろえる（Xは保持）。
-        const y = Math.round(Math.min(...sel.map((o) => o.pos_y)));
-        moves = sel.map((o) => ({ id: o.id, x: o.pos_x, y }));
+        // 横一列: 一番上のY にそろえる（X は保持）。
+        const y = Math.round(Math.min(...items.map((o) => o.y)));
+        moved = items.map((o) => ({ ...o, y }));
       } else if (mode === "col") {
-        // 縦一列: 一番左のカードのXにそろえる（Yは保持）。
-        const x = Math.round(Math.min(...sel.map((o) => o.pos_x)));
-        moves = sel.map((o) => ({ id: o.id, x, y: o.pos_y }));
+        // 縦一列: 一番左のX にそろえる（Y は保持）。
+        const x = Math.round(Math.min(...items.map((o) => o.x)));
+        moved = items.map((o) => ({ ...o, x }));
       } else if (mode === "grid") {
         // 読み順（上→下、左→右）を保ったまま正方形に近い格子へ。
-        const sorted = [...sel].sort((a, b) => a.pos_y - b.pos_y || a.pos_x - b.pos_x);
+        const sorted = [...items].sort((a, b) => a.y - b.y || a.x - b.x);
         const cols = Math.ceil(Math.sqrt(sorted.length));
-        const x0 = Math.round(Math.min(...sel.map((o) => o.pos_x)));
-        const y0 = Math.round(Math.min(...sel.map((o) => o.pos_y)));
-        moves = sorted.map((o, i) => ({
-          id: o.id,
+        const x0 = Math.round(Math.min(...items.map((o) => o.x)));
+        const y0 = Math.round(Math.min(...items.map((o) => o.y)));
+        moved = sorted.map((o, i) => ({
+          ...o,
           x: x0 + (i % cols) * (CARD_W + GAP),
           y: y0 + Math.floor(i / cols) * (CARD_H + GAP),
         }));
       } else {
-        // 均等配置: 両端のカードを固定し、間を等間隔に。
+        // 均等配置: 両端を固定し、間を等間隔に。
         const horiz = mode === "dist-h";
-        const sorted = [...sel].sort((a, b) => (horiz ? a.pos_x - b.pos_x : a.pos_y - b.pos_y));
+        const sorted = [...items].sort((a, b) => (horiz ? a.x - b.x : a.y - b.y));
         const first = sorted[0];
         const last = sorted[sorted.length - 1];
-        const span = horiz ? last.pos_x - first.pos_x : last.pos_y - first.pos_y;
+        const span = horiz ? last.x - first.x : last.y - first.y;
         const step = span / (sorted.length - 1);
-        moves = sorted.map((o, i) => ({
-          id: o.id,
-          x: horiz ? Math.round(first.pos_x + step * i) : o.pos_x,
-          y: horiz ? o.pos_y : Math.round(first.pos_y + step * i),
+        moved = sorted.map((o, i) => ({
+          ...o,
+          x: horiz ? Math.round(first.x + step * i) : o.x,
+          y: horiz ? o.y : Math.round(first.y + step * i),
         }));
       }
-      const olds = sel.map((o) => ({ id: o.id, x: o.pos_x, y: o.pos_y }));
-      pushUndo([{ kind: "objects", moves: olds }]);
+      const cardMoves = moved.filter((m) => !m.note).map((m) => ({ id: m.id, x: m.x, y: m.y }));
+      const noteMoves = moved.filter((m) => m.note).map((m) => ({ id: m.id, x: m.x, y: m.y }));
+      const undo: UndoAction[] = [];
+      if (cardMoves.length)
+        undo.push({ kind: "objects", moves: selCards.map((o) => ({ id: o.id, x: o.pos_x, y: o.pos_y })) });
+      if (noteMoves.length)
+        undo.push({ kind: "notes", moves: selNotes.map((n) => ({ id: n.id, x: n.pos_x, y: n.pos_y })) });
+      pushUndo(undo);
       try {
-        await applyObjectMoves(moves);
+        if (cardMoves.length) await applyObjectMoves(cardMoves);
+        if (noteMoves.length) await applyNoteMoves(noteMoves);
       } catch (e) {
         console.error("align failed", e);
       }
     },
-    [pushUndo, applyObjectMoves]
+    [pushUndo, applyObjectMoves, applyNoteMoves]
   );
 
   // --- Auto layout (重なり解消) ----------------------------------------------
@@ -2215,14 +2231,23 @@ function App() {
   }, [pushUndo]);
 
   // v1.3-④: コメントを実ファイル化（以後はファイルリンク付箋として編集が書き戻る）。
-  const handleCommitNoteToFile = useCallback(async (id: string) => {
+  // v1.3.5: コメントの内容から独立したテキスト仮身カードを作る（実身化の後継）。
+  // コメントは一切変更しない。コピペのテキスト仮身（create_text_object）と同一経路。
+  const handleNoteToTextCard = useCallback(async (id: string) => {
+    const note = notes.find((n) => n.id === id);
+    if (!note) return;
     try {
-      await invoke("commit_note_to_file", { id });
+      const vid = await invoke<string>("create_text_object", {
+        text: note.text,
+        x: note.pos_x + note.width + 28, // コメントの右隣に置く（重ならない）
+        y: note.pos_y,
+      });
+      pushUndo([{ kind: "delete", ids: [vid] }]);
       await refresh();
     } catch (e) {
-      console.error("commit_note_to_file failed", e);
+      console.error("note→text card failed", e);
     }
-  }, [refresh]);
+  }, [notes, pushUndo, refresh]);
 
   const handleContextMenu = useCallback(
     (info: { clientX: number; clientY: number; canvasX: number; canvasY: number }) => {
@@ -2283,7 +2308,7 @@ function App() {
         bringToFront: handleBringToFront,
         sendToBack: handleSendToBack,
         noteStyle: handleNoteStyle,
-        commitNoteToFile: handleCommitNoteToFile,
+        noteToTextCard: handleNoteToTextCard,
         deleteNote: handleDeleteNote,
         shapeClickSelect: handleShapeClickSelect,
         shapeStyle: handleShapeStyle,
@@ -2344,6 +2369,7 @@ function App() {
           info,
           {
             selectionCount: selectedRef.current.size,
+            noteCount: selectedNotesRef.current.size,
             theme,
             alignItems,
             bulkItems,
@@ -2398,7 +2424,7 @@ function App() {
       handleBulkCommit,
       handleBulkUncommit,
       handleBulkDelete,
-      handleCommitNoteToFile,
+      handleNoteToTextCard,
       handleAddFilter,
       handleRunFlow,
       handleEditFilter,

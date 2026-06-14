@@ -64,7 +64,8 @@ export interface MenuActions {
   sendToBack: (id: string) => void;
   // コメント（付箋）
   noteStyle: (id: string, fontSize: number, bold: boolean) => void;
-  commitNoteToFile: (id: string) => void;
+  // v1.3.5: コメント内容から独立したテキスト仮身カードを作成（実身化の後継）。
+  noteToTextCard: (id: string) => void;
   deleteNote: (id: string) => void;
   // 図形
   shapeClickSelect: (id: string) => void;
@@ -117,7 +118,7 @@ export function buildBulkItems(
       onClick: () => a.bulkCommit(),
     },
     {
-      label: `まとめて仮身化（${counts.uncommitable}件）`,
+      label: `まとめて仮身に戻す（${counts.uncommitable}件）`,
       hint: "選択した実身をまとめて参照（仮身）に戻し、プロジェクト内の実体を消します。",
       disabled: !counts.uncommitable,
       onClick: () => a.bulkUncommit(),
@@ -151,16 +152,13 @@ export function buildNoteMenu(
       label: cur.bold ? "太字を解除" : "太字",
       onClick: () => a.noteStyle(noteId, cur.font_size, !cur.bold),
     },
-    // v1.3-④: コメントを実ファイル化（以後はファイルリンク付箋として編集が書き戻る）
-    ...(!note?.file_ref
-      ? [
-          {
-            label: "実身化（テキストファイルにする）",
-            hint: "このコメントをテキストファイルとして保存し、以後は編集が実ファイルへ書き戻る付箋にします。",
-            onClick: () => a.commitNoteToFile(noteId),
-          },
-        ]
-      : []),
+    // v1.3.5: コメントの内容から独立したテキスト仮身カードを作る（コメントは不変）。
+    // コピペで作るテキスト仮身（create_text_object）と全く同じ。実身化（旧）は廃止。
+    {
+      label: "内容でテキストカードを作成",
+      hint: "内容からテキスト仮身カードを作ります。コピペで作るテキストカードと同じで、独立した新カード（リンク矢印は引き継ぎません）。コメントはそのまま残ります。",
+      onClick: () => a.noteToTextCard(noteId),
+    },
     { label: "削除", danger: true, onClick: () => a.deleteNote(noteId) },
   ];
 }
@@ -420,7 +418,7 @@ export function buildObjectMenu(
           ...(!isOriginalFile
             ? [
                 {
-                  label: "仮身化",
+                  label: "仮身に戻す",
                   hint: "プロジェクト内の実体を消し、元ファイルへの参照（仮身）に戻します。",
                   onClick: () => a.uncommit(targetId),
                 },
@@ -524,6 +522,8 @@ export function buildShapeMenu(
 
 interface CanvasMenuCtx {
   selectionCount: number;
+  /// v1.3.5: 選択中のコメント(付箋)数。整列・フォーカスはカード＋コメントで判定。
+  noteCount: number;
   theme: string;
   alignItems: MenuItem[];
   bulkItems: MenuItem[];
@@ -539,16 +539,19 @@ export function buildCanvasMenu(
   a: MenuActions
 ): MenuItem[] {
   // v1.3.4: カテゴリ別に区切り線で分ける。選択系は選択があるときだけ先頭に出る。
+  // v1.3.5: フォーカス・整列はカード＋コメントの合計で判定（コメントも整列対象）。
+  //         一括操作（まとめて…）はカード専用なのでカード数だけで判定。
+  const selTotal = ctx.selectionCount + ctx.noteCount;
   return compact([
     // ── 選択系（選択があるときだけ）──
-    ...(ctx.selectionCount
+    ...(selTotal
       ? [{ label: "選択範囲にフォーカス", onClick: () => a.focusSelection() }]
       : []),
+    ...(selTotal >= 2
+      ? [{ label: "選択を整列 ...", onClick: () => a.openSubmenu(ctx.alignItems) }]
+      : []),
     ...(ctx.selectionCount >= 2
-      ? [
-          { label: "選択カードを整列 ...", onClick: () => a.openSubmenu(ctx.alignItems) },
-          { label: "選択カードをまとめて ...", onClick: () => a.openSubmenu(ctx.bulkItems) },
-        ]
+      ? [{ label: "選択カードをまとめて ...", onClick: () => a.openSubmenu(ctx.bulkItems) }]
       : []),
     DIV,
     // ── 配置・追加系 ──

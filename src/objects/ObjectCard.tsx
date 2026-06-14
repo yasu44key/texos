@@ -251,7 +251,7 @@ export function ObjectCard({
   const status = committed
     ? active
       ? { color: "#3fae6a", border: "#2c4f3c", filled: true, title: "実身（このセッションで導入／変更）" }
-      : { color: "#8a93a6", border: "#3a4254", filled: true, title: "実身（コミット済み・プロジェクトのもの）" }
+      : { color: "#8a93a6", border: "#3a4254", filled: true, title: "実身（プロジェクトのもの）" }
     : lost
     ? {
         color: "#e08a8a",
