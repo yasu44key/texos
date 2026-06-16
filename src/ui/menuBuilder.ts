@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { MenuItem } from "./ContextMenu";
 import type { ShapeInfo } from "../objects/ShapeCard";
 import type { NoteInfo, VirtualBodyInfo } from "../model";
-import { SHAPE_COLORS, THEMES, isTextMime, lostOf } from "../model";
+import { SHAPE_COLORS, THEMES, isTextMime, lostOf, isInternalReal } from "../model";
 
 // App のハンドラ群。メニュー項目はすべてこの窓口経由で実行する。
 export interface MenuActions {
@@ -55,6 +55,8 @@ export interface MenuActions {
   recommit: (id: string) => void;
   uncommit: (id: string) => void;
   duplicate: (id: string) => void;
+  // v1.3.6 変更②: この仮身が指す内容を独立した内部実身にする（元ファイルから独立）。
+  makeReal: (id: string) => void;
   renameObject: (id: string, current: string) => void;
   setMemo: (id: string, current: string) => void;
   changeUrl: (id: string, current: string) => void;
@@ -291,10 +293,42 @@ export function buildObjectMenu(
     ];
   }
   const committed = !!obj?.committed_path;
-  // 取り込み元の実ファイルがそのままコミット先（プロジェクト内取り込み）。
-  // 仮身に戻す＝元ファイル削除になってしまうため、コマンドを出さない。
-  const isOriginalFile =
-    !!obj?.origin_path && !!obj?.committed_path && obj.origin_path === obj.committed_path;
+  // v1.3.6: 内部実身（外部の戻り先が無い実身）。仮身に戻す／実身化し直すは出さない
+  // （戻り先が無く、実行すると編集を捨てるだけ＝危険）。その場取り込みもこれに含む。
+  const internalReal = !!obj && isInternalReal(obj);
+  // v1.3.6 変更③: 危険度の高い操作（仮身に戻す・実身化し直す・仮身を複製・
+  // クリップボードにコピー）は「特別 ...」サブメニューへ退避して優先度を下げる。
+  const specialItems: MenuItem[] = compact([
+    ...(committed && !internalReal
+      ? [
+          {
+            label: "実身化し直す",
+            hint: "現在の編集を破棄し、取り込み時点の内容で実身化し直します。",
+            onClick: () => a.recommit(targetId),
+          },
+          {
+            label: "仮身に戻す",
+            hint: "プロジェクト内の実体を消し、元ファイルへの参照（仮身）に戻します。",
+            danger: true,
+            onClick: () => a.uncommit(targetId),
+          },
+        ]
+      : []),
+    {
+      label: "仮身を複製",
+      hint: "同じ実身を指す仮身をもう一枚作ります。内容は複製されず、両方が同じ実体を指します。",
+      onClick: () => a.duplicate(targetId),
+    },
+    ...(!multi
+      ? [
+          {
+            label: "クリップボードにコピー",
+            hint: "このカードをファイルとしてOSのクリップボードへ。Explorerや他アプリに貼り付けられます。未保存の仮身は自動で実身化されます。",
+            onClick: () => a.copyFiles([targetId]),
+          },
+        ]
+      : []),
+  ]);
   // v1.3.4: 用語を実身/仮身に統一し、グループを区切り線で分ける。
   // 説明は label から外してツールチップ(hint)へ。compact() で空グループの線を畳む。
   return compact([
@@ -397,10 +431,16 @@ export function buildObjectMenu(
         ]
       : []),
     DIV,
-    // ── 実身⇔仮身・持ち出し系 ──
-    // 第3の選択肢: 実身化してExplorerでフォーカス（そこから先はWindows任せ）
+    // ── 実身⇔仮身系 ──
+    // v1.3.6 変更②: 仮身 →「実身にする」。指す内容を独立した内部実身にする
+    // （元ファイルから独立。以後は仮身に戻す対象外）。
     ...(!committed
       ? [
+          {
+            label: "実身にする",
+            hint: "この仮身が指す内容のコピーをプロジェクト内に確定し、独立した実身にします。元ファイルとの縁は切れ、以後この実身を編集できます。",
+            onClick: () => a.makeReal(targetId),
+          },
           {
             label: "実身化（フォルダで表示）",
             hint: "このカードの内容をプロジェクトに保存して実身（実体）にし、保存先フォルダを開きます。",
@@ -408,40 +448,21 @@ export function buildObjectMenu(
           },
         ]
       : []),
+    // v1.3.6 変更①: 実身 →「仮身を作成」。この実身を指す仮身を作る。
+    // 実身を編集すると、この仮身にも反映される（生きた窓）。
     ...(committed
       ? [
           {
-            label: "実身化し直す",
-            hint: "現在の編集を破棄し、取り込み時点の内容で実身化し直します。",
-            onClick: () => a.recommit(targetId),
-          },
-          ...(!isOriginalFile
-            ? [
-                {
-                  label: "仮身に戻す",
-                  hint: "プロジェクト内の実体を消し、元ファイルへの参照（仮身）に戻します。",
-                  onClick: () => a.uncommit(targetId),
-                },
-              ]
-            : []),
-        ]
-      : []),
-    // v1.3.4: ファイルとしてクリップボードへ（未保存の仮身は自動で実身化）。
-    // 複数選択時は「選択カードをまとめて ...」サブメニューに一本化（重複排除）。
-    ...(!multi
-      ? [
-          {
-            label: "クリップボードにコピー",
-            hint: "このカードをファイルとしてOSのクリップボードへ。Explorerや他アプリに貼り付けられます。未保存の仮身は自動で実身化されます。",
-            onClick: () => a.copyFiles([targetId]),
+            label: "仮身を作成",
+            hint: "この実身を指す仮身を作ります。実身を編集すると、この仮身にも反映されます（同じ実体を指す生きた窓）。",
+            onClick: () => a.duplicate(targetId),
           },
         ]
       : []),
-    {
-      label: "仮身を複製",
-      hint: "同じ実身を指す仮身をもう一枚作ります。内容は複製されず、両方が同じ実体を指します。",
-      onClick: () => a.duplicate(targetId),
-    },
+    // v1.3.6 変更③: 危険・低頻度の操作はまとめて「特別 ...」へ退避。
+    ...(specialItems.length
+      ? [{ label: "特別 ...", onClick: () => a.openSubmenu(specialItems) }]
+      : []),
     DIV,
     // ── メタ操作 ──
     {

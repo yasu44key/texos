@@ -1306,7 +1306,8 @@ function App() {
       (o) =>
         selectedRef.current.has(o.id) &&
         !!o.committed_path &&
-        !(o.origin_path && o.origin_path === o.committed_path)
+        !!o.origin_path &&
+        o.origin_path !== o.committed_path
     );
     if (!targets.length) return;
     setConfirm({
@@ -1397,6 +1398,27 @@ function App() {
       }
     },
     [refresh, pushUndo]
+  );
+
+  // v1.3.6 変更②「実身にする」: 仮身が指す内容を独立した内部実身に確定する。
+  // 元ファイルから独立 → 緑（このセッションで導入）→ 次回オープンでグレー。
+  const handleMakeReal = useCallback(
+    async (id: string) => {
+      try {
+        await invoke<string>("make_real", { id });
+        setTouched((prev) => new Set(prev).add(id));
+        await refresh();
+      } catch (e) {
+        console.error("make_real failed", e);
+        setConfirm({
+          title: "実身にできませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh]
   );
 
   // --- Z-order -------------------------------------------------------------
@@ -2300,6 +2322,7 @@ function App() {
         recommit: handleRecommit,
         uncommit: handleUncommit,
         duplicate: handleDuplicate,
+        makeReal: handleMakeReal,
         renameObject: handleRenameObject,
         setMemo: handleSetMemo,
         changeUrl: handleChangeUrl,
@@ -2344,7 +2367,7 @@ function App() {
             (o) => !o.committed_path && !o.project_ref && !o.url_ref && !o.folder_ref
           ).length,
           uncommitable: selObjs.filter(
-            (o) => !!o.committed_path && !(o.origin_path && o.origin_path === o.committed_path)
+            (o) => !!o.committed_path && !!o.origin_path && o.origin_path !== o.committed_path
           ).length,
           total: selObjs.length,
           ids: selObjs.map((o) => o.id),

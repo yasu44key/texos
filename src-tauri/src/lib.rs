@@ -129,6 +129,7 @@ fn open_project_at(root: &Path) -> Result<Project, String> {
     let db_path = texos.join("texos.db");
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     repair_mime_types(&conn);
+    backfill_vbody_ext(&conn);
     Ok(Project {
         conn,
         root: root.to_path_buf(),
@@ -693,12 +694,14 @@ fn import_file(
     let committed_path = in_project.then(|| path.clone());
     let committed_mtime = if in_project { file_mtime_ms(src) } else { None };
 
+    // v1.3.6: 拡張子/MIME は仮身側にも保存する。空ファイル等は実身を共有するため、
+    // 実身の ext/mime だけだと別名・別形式が同じ型に潰れる（ビットマップ.bmp が ods 等）。
     p.conn
         .execute(
             "INSERT INTO virtual_bodies
                 (id, real_id, label, pos_x, pos_y, created_at,
-                 origin_path, committed_path, committed_mtime)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 origin_path, committed_path, committed_mtime, ext, mime_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 vid,
                 hash,
@@ -708,7 +711,9 @@ fn import_file(
                 db::now_ms(),
                 path,
                 committed_path,
-                committed_mtime
+                committed_mtime,
+                orig_ext,
+                mime
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -726,8 +731,10 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
     let mut stmt = p
         .conn
         .prepare(
-            "SELECT v.id, v.real_id, v.label, r.mime_type, v.pos_x, v.pos_y,
-                    v.committed_path, v.committed_mtime, v.project_ref, r.ext, v.expanded,
+            // v1.3.6: ext/mime は仮身優先（COALESCE）。空ファイル共有で実身に潰れた型を、
+            // そのファイル本来の拡張子で表示・分類するため。NULL は実身へフォールバック。
+            "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), v.pos_x, v.pos_y,
+                    v.committed_path, v.committed_mtime, v.project_ref, COALESCE(v.ext, r.ext), v.expanded,
                     v.url_ref, v.memo, v.z_order, v.folder_ref, v.origin_path, v.panel_w,
                     v.kind, v.filter_ref
              FROM virtual_bodies v
@@ -861,7 +868,7 @@ fn get_media_data_url(id: String, state: State<AppState>) -> Result<String, Stri
         let (real_id, mime): (String, String) = p
             .conn
             .query_row(
-                "SELECT v.real_id, r.mime_type FROM virtual_bodies v
+                "SELECT v.real_id, COALESCE(v.mime_type, r.mime_type) FROM virtual_bodies v
                  JOIN real_bodies r ON r.id = v.real_id WHERE v.id = ?1",
                 rusqlite::params![id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1347,10 +1354,12 @@ fn commit_object_inner(p: &Project, id: &str, force: bool) -> Result<String, Str
         )
         .map_err(|e| e.to_string())?;
 
+    // v1.3.6: ファイル名の拡張子・MIME は仮身優先（COALESCE）。空ファイル共有で実身が
+    // ods 等に潰れていても、本来の拡張子（.docx 等）で書き出す／開く（.docx.ods を防ぐ）。
     let (real_id, label, mime, stored_ext): (String, String, String, Option<String>) = p
         .conn
         .query_row(
-            "SELECT v.real_id, v.label, r.mime_type, r.ext
+            "SELECT v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext)
              FROM virtual_bodies v JOIN real_bodies r ON r.id = v.real_id
              WHERE v.id = ?1",
             rusqlite::params![id],
@@ -1456,7 +1465,7 @@ fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Result<CommitAll
         let mut stmt = p
             .conn
             .prepare(
-                "SELECT v.id, v.label, v.committed_path, v.project_ref, v.url_ref, r.ext,
+                "SELECT v.id, v.label, v.committed_path, v.project_ref, v.url_ref, COALESCE(v.ext, r.ext),
                         v.folder_ref, v.kind
                  FROM virtual_bodies v JOIN real_bodies r ON r.id = v.real_id
                  WHERE v.deleted_at IS NULL
@@ -1697,6 +1706,15 @@ fn uncommit_object(id: String, state: State<AppState>) -> Result<(), String> {
             );
         }
     }
+    // v1.3.6: 内部実身（外部の戻り先が無い実身）は仮身に戻せない。戻り先が無いため
+    // 実体を消して編集内容を失うだけになる。UIでも当該メニューは出さないが、二重の安全弁。
+    if committed.is_some() && origin.is_none() {
+        return Err(
+            "これはプロジェクト内部の実身です。戻り先の外部ファイルが無いため仮身に戻せません。\
+             （不要なら「削除」を使用してください）"
+                .into(),
+        );
+    }
     if let Some(cp) = committed {
         let path = std::path::Path::new(&cp);
         if path.starts_with(&p.root) && path.is_file() {
@@ -1712,14 +1730,35 @@ fn uncommit_object(id: String, state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// v1.3.6 変更②「実身にする」: この仮身が見ている内容をプロジェクト内に確定し、
+/// 外部の元ファイルとの縁を切って独立した内部実身にする。以後は「仮身に戻す／
+/// 実身化し直す」の対象外（戻り先が無く、編集を捨てるだけになるため）。
+#[tauri::command]
+fn make_real(id: String, state: State<AppState>) -> Result<String, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // live 内容を CAS へ追従させてからコミット（commit_object_inner と同じ流れ）。
+    let path = commit_object_inner(p, &id, false)?;
+    // 元ファイルとの縁を切る → origin が無い＝完全独立の内部実身。
+    p.conn
+        .execute(
+            "UPDATE virtual_bodies SET origin_path = NULL WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// Copy a virtual body's real bytes to a throwaway TEMP file with its proper
 /// name/extension and return the path.
 fn materialize_temp(p: &Project, id: &str) -> Result<String, String> {
     refresh_origin_snapshot(p, id); // 閲覧時にCASスナップショットを更新
+    // v1.3.6: ファイル名の拡張子・MIME は仮身優先（COALESCE）。空ファイル共有で実身が
+    // ods 等に潰れていても、本来の拡張子（.docx 等）で書き出す／開く（.docx.ods を防ぐ）。
     let (real_id, label, mime, stored_ext): (String, String, String, Option<String>) = p
         .conn
         .query_row(
-            "SELECT v.real_id, v.label, r.mime_type, r.ext
+            "SELECT v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext)
              FROM virtual_bodies v JOIN real_bodies r ON r.id = v.real_id
              WHERE v.id = ?1",
             rusqlite::params![id],
@@ -1760,7 +1799,7 @@ fn materialize_view(id: String, state: State<AppState>) -> Result<String, String
     let (real_id, mime, stored_ext, committed): (String, String, Option<String>, Option<String>) =
         p.conn
             .query_row(
-                "SELECT v.real_id, r.mime_type, r.ext, v.committed_path
+                "SELECT v.real_id, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.committed_path
                  FROM virtual_bodies v JOIN real_bodies r ON r.id = v.real_id
                  WHERE v.id = ?1",
                 rusqlite::params![id],
@@ -2415,7 +2454,7 @@ fn eval_filter(
         let mut stmt = p
             .conn
             .prepare(
-                "SELECT v.id, v.real_id, v.label, r.mime_type, r.ext, v.kind
+                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
                  FROM relations rel
                  JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
                  JOIN real_bodies r ON r.id = v.real_id
@@ -3367,6 +3406,38 @@ fn repair_mime_types(conn: &Connection) {
     }
 }
 
+/// v1.3.6: 仮身の ext/mime をバックフィルする（開くたび修復）。空ファイル等で実身を
+/// 共有して別形式に潰れた既存データ（ビットマップ.bmp が ods など）を、ラベルの拡張子
+/// から本来の型に直す。ext が既にある行・拡張子の無い行・URL/フォルダ/プロジェクト/
+/// フィルタ等は対象外（ファイルカードのみ）。
+fn backfill_vbody_ext(conn: &Connection) {
+    let rows: Vec<(String, String)> = match conn.prepare(
+        "SELECT id, label FROM virtual_bodies
+         WHERE ext IS NULL AND label IS NOT NULL
+           AND url_ref IS NULL AND folder_ref IS NULL AND project_ref IS NULL
+           AND (kind IS NULL OR kind IN ('file', 'text'))",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default(),
+        Err(_) => return,
+    };
+    for (id, label) in rows {
+        // ラベル末尾の拡張子を取り出す（"Word 文書.docx" → "docx"）。
+        let ext = match label.rsplit_once('.') {
+            Some((stem, e)) if !stem.is_empty() && !e.is_empty() => e.to_lowercase(),
+            _ => continue,
+        };
+        if let Some(mime) = mime_for_ext(&ext) {
+            let _ = conn.execute(
+                "UPDATE virtual_bodies SET ext = ?1, mime_type = ?2 WHERE id = ?3",
+                rusqlite::params![ext, mime, id],
+            );
+        }
+    }
+}
+
 fn uuid() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
@@ -3444,6 +3515,7 @@ pub fn run() {
             commit_object,
             commit_all,
             uncommit_object,
+            make_real,
             open_with_default,
             open_with_chooser,
             open_url_with_chooser,

@@ -61,6 +61,16 @@ export function lostOf(o: VirtualBodyInfo): "cas" | "none" | null {
   return null;
 }
 
+// v1.3.6: 内部実身 — プロジェクト内に実体があり、外部の戻り先を持たない実身。
+// 「実身にする」で外部から独立させた実身や、その場取り込み（origin===committed）が該当。
+// これらには「仮身に戻す」「実身化し直す」を出してはいけない（戻り先が無く、
+// 実行すると編集内容を捨てるだけになる＝危険）。
+export function isInternalReal(o: VirtualBodyInfo): boolean {
+  if (!o.committed_path) return false;
+  if (!o.origin_path) return true;
+  return o.origin_path === o.committed_path;
+}
+
 // v1.3-①: UIカラープリセット（App.cssの[data-texos-theme]と対応）
 export const THEMES: [string, string][] = [
   ["midnight", "ミッドナイト（標準）"],
