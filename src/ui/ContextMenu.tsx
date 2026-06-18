@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 export interface MenuItem {
   label: string;
@@ -9,6 +9,8 @@ export interface MenuItem {
   hint?: string;
   // v1.3.4: 区切り線（label/onClick は無視される）。
   divider?: boolean;
+  // v1.3.7: 対応するショートカット（"Ctrl+C" 等）。ラベル右に淡色で併記。
+  shortcut?: string;
 }
 
 interface ContextMenuProps {
@@ -24,6 +26,20 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
   const ref = useRef<HTMLDivElement>(null);
   // ホバー中の項目の説明と表示位置（自前ツールチップ）。
   const [tip, setTip] = useState<{ text: string; x: number; y: number } | null>(null);
+  // v1.3.7 memo①: 画面内に収まるよう、表示後に実寸を測って位置を補正する。
+  // 右端/下端で見切れて操作できない問題を解消（サブメニューで高さが変わっても再補正）。
+  const [pos, setPos] = useState({ x, y });
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const PAD = 8;
+    let nx = x;
+    let ny = y;
+    if (x + r.width > window.innerWidth - PAD) nx = Math.max(PAD, window.innerWidth - r.width - PAD);
+    if (y + r.height > window.innerHeight - PAD) ny = Math.max(PAD, window.innerHeight - r.height - PAD);
+    setPos({ x: nx, y: ny });
+  }, [x, y, items]);
 
   useEffect(() => {
     const onDown = (e: globalThis.MouseEvent) => {
@@ -47,11 +63,11 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
         ref={ref}
         style={{
           position: "fixed",
-          left: x,
-          top: y,
+          left: pos.x,
+          top: pos.y,
           minWidth: 180,
-          background: "#1c2130",
-          border: "1px solid #38445e",
+          background: "var(--menu-bg, #1c2130)",
+          border: "1px solid var(--menu-border, #38445e)",
           borderRadius: 8,
           boxShadow: "0 6px 24px #000000aa",
           padding: 4,
@@ -68,7 +84,7 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
               key={i}
               style={{
                 height: 1,
-                background: "#38445e",
+                background: "var(--menu-border, #38445e)",
                 margin: "4px 8px",
               }}
             />
@@ -81,16 +97,24 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
                 onClose();
               }}
               style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 16,
                 padding: "7px 12px",
                 borderRadius: 5,
-                color: item.disabled ? "#5a6378" : item.danger ? "#ff7b7b" : "#d6dded",
+                color: item.disabled
+                  ? "var(--menu-dim, #5a6378)"
+                  : item.danger
+                  ? "var(--menu-danger, #ff7b7b)"
+                  : "var(--menu-text, #d6dded)",
                 cursor: item.disabled ? "default" : "pointer",
               }}
               onMouseEnter={(e) => {
                 if (!item.disabled)
                   (e.currentTarget as HTMLElement).style.background = item.danger
-                    ? "#3a2030"
-                    : "#2a3346";
+                    ? "var(--menu-danger-bg, #3a2030)"
+                    : "var(--menu-hover, #2a3346)";
                 if (showHints && item.hint) {
                   const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
                   // 既定はメニューの右側。右端に収まらなければ左側へ。
@@ -107,7 +131,12 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
                 setTip(null);
               }}
             >
-              {item.label}
+              <span>{item.label}</span>
+              {item.shortcut && (
+                <span style={{ color: "var(--menu-dim, #5a6378)", fontSize: 11, whiteSpace: "nowrap" }}>
+                  {item.shortcut}
+                </span>
+              )}
             </div>
           )
         )}
@@ -119,8 +148,8 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
             left: tip.x,
             top: tip.y,
             maxWidth: 260,
-            background: "#11151f",
-            border: "1px solid #38445e",
+            background: "var(--tip-bg, #11151f)",
+            border: "1px solid var(--menu-border, #38445e)",
             borderRadius: 6,
             boxShadow: "0 4px 16px #000000aa",
             padding: "7px 10px",
@@ -128,7 +157,7 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
             fontFamily: "sans-serif",
             fontSize: 12,
             lineHeight: 1.5,
-            color: "#aeb8cc",
+            color: "var(--tip-text, #aeb8cc)",
             pointerEvents: "none",
           }}
         >

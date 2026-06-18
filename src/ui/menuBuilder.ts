@@ -128,12 +128,14 @@ export function buildBulkItems(
     {
       label: `まとめてクリップボードにコピー（${counts.total}件）`,
       hint: "選択カードをファイルとしてOSのクリップボードへ。未保存の仮身は自動で実身化されます。",
+      shortcut: "Ctrl+C",
       disabled: !counts.total,
       onClick: () => a.copyFiles(counts.ids),
     },
     {
       label: `まとめて削除（${counts.total}件）`,
       danger: true,
+      shortcut: "Delete",
       onClick: () => a.bulkDelete(),
     },
   ];
@@ -161,7 +163,7 @@ export function buildNoteMenu(
       hint: "内容からテキスト仮身カードを作ります。コピペで作るテキストカードと同じで、独立した新カード（リンク矢印は引き継ぎません）。コメントはそのまま残ります。",
       onClick: () => a.noteToTextCard(noteId),
     },
-    { label: "削除", danger: true, onClick: () => a.deleteNote(noteId) },
+    { label: "削除", danger: true, shortcut: "Delete", onClick: () => a.deleteNote(noteId) },
   ];
 }
 
@@ -191,17 +193,12 @@ export function buildObjectMenu(
     { label: "最前面へ", onClick: () => a.bringToFront(targetId) },
     { label: "最背面へ", onClick: () => a.sendToBack(targetId) },
   ];
-  // 複数選択の一員を右クリックしたときの「削除」は選択全体を対象にする
-  // （確認・一括Undoは bulkDelete 側が持つ）。単独選択なら従来の単体削除。
   const multi = ctx.selected.has(targetId) && ctx.selected.size >= 2;
-  const deleteItem = (single: MenuItem): MenuItem =>
-    multi
-      ? {
-          label: `削除（選択 ${ctx.selected.size} 件）`,
-          danger: true,
-          onClick: () => a.bulkDelete(),
-        }
-      : single;
+  // v1.3.7 C: 複数選択時はインラインの削除を出さず「選択カードをまとめて ...」サブ
+  // メニューに一本化（重複排除。通常カードと同じ扱いをリンクカードにも横展開）。
+  // 単独時は単体削除に Delete を併記。スプレッドで使う（multi のとき空配列）。
+  const deleteItems = (single: MenuItem): MenuItem[] =>
+    multi ? [] : [{ ...single, shortcut: "Delete" }];
   // Project object: navigate / rename / remove reference.
   if (obj?.project_ref) {
     return [
@@ -212,7 +209,7 @@ export function buildObjectMenu(
         label: "表示名を変更...",
         onClick: () => a.renameObject(targetId, obj.label),
       },
-      deleteItem({
+      ...deleteItems({
         label: "削除（参照のみ・フォルダは残る）",
         danger: true,
         onClick: () => a.deleteObject(targetId),
@@ -237,7 +234,7 @@ export function buildObjectMenu(
       ...zItems,
       { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
-      deleteItem({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
+      ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
   }
   // v1.4 オートフロー: ドロップポイント（パイプラインのデータ入口）
@@ -248,7 +245,7 @@ export function buildObjectMenu(
       { label: "▶ 下流のフローを実行", onClick: () => a.runDrop(targetId) },
       ...zItems,
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
-      deleteItem({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
+      ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
   }
   // v1.4 オートフロー: フィルタカード（パイプラインの処理ノード）
@@ -265,7 +262,7 @@ export function buildObjectMenu(
       { label: "ライブラリに登録...", onClick: () => a.saveFilterToLibrary(targetId) },
       ...zItems,
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
-      deleteItem({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
+      ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
   }
   // Folder link object (リンクフォルダ)
@@ -285,7 +282,7 @@ export function buildObjectMenu(
       ...zItems,
       { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
-      deleteItem({
+      ...deleteItems({
         label: "削除（参照のみ・フォルダは残る）",
         danger: true,
         onClick: () => a.deleteObject(targetId),
@@ -324,6 +321,7 @@ export function buildObjectMenu(
           {
             label: "クリップボードにコピー",
             hint: "このカードをファイルとしてOSのクリップボードへ。Explorerや他アプリに貼り付けられます。未保存の仮身は自動で実身化されます。",
+            shortcut: "Ctrl+C",
             onClick: () => a.copyFiles([targetId]),
           },
         ]
@@ -471,7 +469,7 @@ export function buildObjectMenu(
     },
     // 複数選択時の削除も「まとめて ...」サブメニュー側に集約（重複排除）。
     ...(!multi
-      ? [{ label: "削除", danger: true, onClick: () => a.requestDelete(targetId) }]
+      ? [{ label: "削除", danger: true, shortcut: "Delete", onClick: () => a.requestDelete(targetId) }]
       : []),
   ]);
 }
@@ -480,12 +478,19 @@ export function buildObjectMenu(
 export function buildShapeMenu(
   shapeId: string,
   sh: ShapeInfo | undefined,
+  // v1.3.7: 図形の上に「まだ選択されていない」カード/コメントがあるか。
+  // 普通クリックは図形＋上のカードをまとめて選択するので、その流れで開いた
+  // メニューでは全選択済み → 本項目は冗長になる。Shift+クリックで図形だけ選んだ
+  // 等、未選択カードが残る時だけ「上のカードをまとめて選択」を出す。
+  hasUnselectedAbove: boolean,
   a: MenuActions
 ): MenuItem[] {
   const kindName = sh?.kind === "ellipse" ? "楕円" : sh?.kind === "arrow" ? "矢印" : "角丸四角";
   return [
     { label: `図形「${sh?.label || kindName}」`, onClick: () => {}, disabled: true },
-    { label: "上のカードをまとめて選択", onClick: () => a.shapeClickSelect(shapeId) },
+    ...(hasUnselectedAbove
+      ? [{ label: "上のカードをまとめて選択", onClick: () => a.shapeClickSelect(shapeId) }]
+      : []),
     {
       label: "色を変更 ...",
       onClick: () =>
@@ -587,6 +592,7 @@ export function buildCanvasMenu(
     {
       label: "クリップボードから貼り付け",
       hint: "OSのクリップボードの内容（画像・テキスト・URL）をカードとして取り込みます。",
+      shortcut: "Ctrl+V",
       onClick: () => a.paste(pos.canvasX, pos.canvasY),
     },
     {

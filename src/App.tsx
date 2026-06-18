@@ -2383,10 +2383,23 @@ function App() {
           { selected: selectedRef.current, expanded, alignItems, bulkItems },
           actions
         );
-      } else if (el?.closest<HTMLElement>("[data-shape-id]")) {
-        // v1.3-②③: shape menu (shapes sit behind cards)
+      } else if (
+        el?.closest<HTMLElement>("[data-shape-id]") &&
+        selectedShapesRef.current.has(el.closest<HTMLElement>("[data-shape-id]")!.dataset.shapeId!)
+      ) {
+        // v1.3-②③: shape menu (shapes sit behind cards)。
+        // v1.3.7 memo②: 図形メニューは「その図形が選択中のとき」だけ。未選択の図形上の
+        // 右クリックはキャンバスメニューにフォールバック（カテゴリ図形の上にファイル配置等
+        // ができるように）。図形は左クリックで選択 → 右クリックで図形メニュー、の流れ。
         const shapeId = el.closest<HTMLElement>("[data-shape-id]")!.dataset.shapeId!;
-        items = buildShapeMenu(shapeId, shapesRef.current.find((s) => s.id === shapeId), actions);
+        const sh = shapesRef.current.find((s) => s.id === shapeId);
+        // v1.3.7: 上に「未選択の」カード/コメントが残っている時だけ「上のカードを
+        // まとめて選択」を出す（普通クリックで全選択済みの流れでは冗長なので隠す）。
+        const hasUnselectedAbove =
+          !!sh &&
+          (cardsOnShape(sh).some((c) => !selectedRef.current.has(c.id)) ||
+            notesOnShape(sh).some((n) => !selectedNotesRef.current.has(n.id)));
+        items = buildShapeMenu(shapeId, sh, hasUnselectedAbove, actions);
       } else {
         items = buildCanvasMenu(
           info,
@@ -2461,6 +2474,8 @@ function App() {
       expanded,
       notes,
       filterLibrary,
+      cardsOnShape,
+      notesOnShape,
     ]
   );
 

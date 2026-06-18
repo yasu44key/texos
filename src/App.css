@@ -37,6 +37,16 @@
   --chrome-border: #2a3346;
   --chrome-text: #cdd6e6cc;
   --card-shadow: 0 2px 16px #00000080;
+  /* v1.3.7: コンテキストメニュー／ツールチップ（テーマ追従） */
+  --menu-bg: #1c2130;
+  --menu-border: #38445e;
+  --menu-text: #d6dded;
+  --menu-dim: #5a6378;
+  --menu-hover: #2a3346;
+  --menu-danger: #ff7b7b;
+  --menu-danger-bg: #3a2030;
+  --tip-bg: #11151f;
+  --tip-text: #aeb8cc;
 }
 
 /* 視認性重視（ライト・高コントラスト） */
@@ -64,6 +74,15 @@
   --chrome-border: #c5cedd;
   --chrome-text: #2a3550;
   --card-shadow: 0 2px 10px #00000030;
+  --menu-bg: #ffffff;
+  --menu-border: #cdd6e4;
+  --menu-text: #1c2433;
+  --menu-dim: #9aa3b4;
+  --menu-hover: #eaf0f8;
+  --menu-danger: #c0392b;
+  --menu-danger-bg: #fbe9e7;
+  --tip-bg: #2a3344;
+  --tip-text: #e8edf5;
 }
 
 /* 色調重視（セピア・暖色でまとまり） */
@@ -91,6 +110,15 @@
   --chrome-border: #4a4030;
   --chrome-text: #e0d4bccc;
   --card-shadow: 0 2px 14px #00000070;
+  --menu-bg: #3a3327;
+  --menu-border: #574c39;
+  --menu-text: #ece0cb;
+  --menu-dim: #8a7d63;
+  --menu-hover: #463f2c;
+  --menu-danger: #ff9b8b;
+  --menu-danger-bg: #4a3020;
+  --tip-bg: #2a2419;
+  --tip-text: #cabfa6;
 }
 
 /* 疲労防止（低コントラスト・低ブルーライト） */
@@ -118,6 +146,15 @@
   --chrome-border: #3a423a;
   --chrome-text: #b8c0b4cc;
   --card-shadow: 0 2px 10px #00000050;
+  --menu-bg: #2a2f29;
+  --menu-border: #3e463c;
+  --menu-text: #c2c8bd;
+  --menu-dim: #7a836f;
+  --menu-hover: #36362a;
+  --menu-danger: #f0a090;
+  --menu-danger-bg: #3a2a24;
+  --tip-bg: #1f231e;
+  --tip-text: #aab0a2;
 }
 
 body {
