@@ -43,6 +43,8 @@ export interface MenuActions {
   bulkDelete: () => void;
   // v1.3.4 クリップボード持ち出し（選択カードをファイルとして）
   copyFiles: (ids: string[]) => void;
+  /** v1.3.8 (G6): 画像カードをビットマップ(CF_DIB)としてクリップボードへ。 */
+  copyImage: (id: string) => void;
   // カード
   openObject: (id: string) => void;
   openDefault: (id: string) => void;
@@ -75,6 +77,7 @@ export interface MenuActions {
   shapeRotate: (id: string, deg: number) => void;
   shapeScale: (id: string, factor: number) => void;
   shapeFitToCards: (id: string) => void;
+  shapeAlignGrid: (id: string) => void;
   shapeLabel: (id: string, current: string) => void;
   shapeZ: (id: string, front: boolean) => void;
   shapeDelete: (id: string) => void;
@@ -370,6 +373,15 @@ export function buildObjectMenu(
           },
         ]
       : []),
+    ...(obj?.mime_type.startsWith("image/") && !multi
+      ? [
+          {
+            label: "クリップボードに画像をコピー",
+            hint: "この画像をビットマップとしてOSのクリップボードへ。ペイント等の画像アプリに直接貼り付けられます（Ctrl+C はファイルとしてのコピー）。",
+            onClick: () => a.copyImage(targetId),
+          },
+        ]
+      : []),
     ...(obj?.mime_type.startsWith("audio/")
       ? [
           {
@@ -483,6 +495,8 @@ export function buildShapeMenu(
   // メニューでは全選択済み → 本項目は冗長になる。Shift+クリックで図形だけ選んだ
   // 等、未選択カードが残る時だけ「上のカードをまとめて選択」を出す。
   hasUnselectedAbove: boolean,
+  // v1.4.x: 図形に乗っているカード/コメントが2枚以上あるか（格子整列が意味を持つ条件）。
+  canArrangeAbove: boolean,
   a: MenuActions
 ): MenuItem[] {
   const kindName = sh?.kind === "ellipse" ? "楕円" : sh?.kind === "arrow" ? "矢印" : "角丸四角";
@@ -490,6 +504,9 @@ export function buildShapeMenu(
     { label: `図形「${sh?.label || kindName}」`, onClick: () => {}, disabled: true },
     ...(hasUnselectedAbove
       ? [{ label: "上のカードをまとめて選択", onClick: () => a.shapeClickSelect(shapeId) }]
+      : []),
+    ...(canArrangeAbove
+      ? [{ label: "上のカードを格子状に整列", onClick: () => a.shapeAlignGrid(shapeId) }]
       : []),
     {
       label: "色を変更 ...",

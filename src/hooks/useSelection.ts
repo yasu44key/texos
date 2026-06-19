@@ -27,8 +27,9 @@ export function useSelection({ objectsRef, notesRef, measuredNoteSize }: UseSele
   const selectedShapesRef = useRef<Set<string>>(selectedShapes);
   selectedShapesRef.current = selectedShapes;
 
+  // 範囲選択。mode: replace=置換（素LMBドラッグ）/ add=追加 / toggle=範囲トグル（Ctrl+ドラッグ）。
   const handleSelectRect = useCallback(
-    (rect: { x: number; y: number; w: number; h: number }, additive: boolean) => {
+    (rect: { x: number; y: number; w: number; h: number }, mode: "replace" | "add" | "toggle") => {
       const hit = objectsRef.current
         .filter(
           (o) =>
@@ -38,7 +39,6 @@ export function useSelection({ objectsRef, notesRef, measuredNoteSize }: UseSele
             o.pos_y + CARD_H > rect.y
         )
         .map((o) => o.id);
-      setSelected((prev) => (additive ? new Set([...prev, ...hit]) : new Set(hit)));
       // v1.3.1: notes join the rubber-band selection too.
       const hitNotes = notesRef.current
         .filter((n) => {
@@ -51,7 +51,18 @@ export function useSelection({ objectsRef, notesRef, measuredNoteSize }: UseSele
           );
         })
         .map((n) => n.id);
-      setSelectedNotes((prev) => (additive ? new Set([...prev, ...hitNotes]) : new Set(hitNotes)));
+      const apply = (prev: Set<string>, hits: string[]) => {
+        if (mode === "replace") return new Set(hits);
+        if (mode === "add") return new Set([...prev, ...hits]);
+        const next = new Set(prev); // toggle: 範囲内の各IDの選択状態を反転
+        for (const id of hits) {
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+        }
+        return next;
+      };
+      setSelected((prev) => apply(prev, hit));
+      setSelectedNotes((prev) => apply(prev, hitNotes));
     },
     [objectsRef, notesRef, measuredNoteSize]
   );
@@ -90,6 +101,19 @@ export function useSelection({ objectsRef, notesRef, measuredNoteSize }: UseSele
     setSelectedShapes((prev) => (prev.size ? new Set<string>() : prev));
   }, []);
 
+  // 素クリック = そのオブジェクトだけを選択（他は全解除）。標準のウィンドウシステム流。
+  const handleCardSelectOnly = useCallback((id: string) => {
+    setSelected(new Set([id]));
+    setSelectedNotes(new Set());
+    setSelectedShapes(new Set());
+  }, []);
+
+  const handleNoteSelectOnly = useCallback((id: string) => {
+    setSelectedNotes(new Set([id]));
+    setSelected(new Set());
+    setSelectedShapes(new Set());
+  }, []);
+
   return {
     selected,
     setSelected,
@@ -105,5 +129,7 @@ export function useSelection({ objectsRef, notesRef, measuredNoteSize }: UseSele
     handleNoteToggleSelect,
     handleShapeToggleSelect,
     handleClearSelection,
+    handleCardSelectOnly,
+    handleNoteSelectOnly,
   };
 }

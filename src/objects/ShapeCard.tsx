@@ -24,7 +24,7 @@ interface Props {
   onGeomEnd?: (id: string, x: number, y: number, w: number, h: number) => void;
   /** Plain click (no drag): select the cards on this shape. */
   onClickSelect?: (id: string) => void;
-  /** Shift+click (no drag): toggle this shape in the multi-selection (v1.3 メモ④). */
+  /** Ctrl+click: toggle this shape in the multi-selection (v1.3.8 マウスモデル: 選択系=Ctrl)。 */
   onToggleSelect?: (id: string) => void;
   /** Live-move the cards riding on the shape. (id, dx, dy, done) */
   onDragCards?: (id: string, dx: number, dy: number, done: boolean) => void;
@@ -45,8 +45,12 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
     if (e.button !== 0 || e.altKey) return;
     e.stopPropagation();
     e.preventDefault();
-    // v1.3 メモ③④: Shift+ドラッグ = 図形だけ動かす（カードは置いていく）。
-    // Shift+クリック（動かさず離す）= 複数選択にトグル。
+    // v1.3.8 マウスモデル: Ctrl/Meta = 図形を多重選択にトグル（選択系）。ドラッグは始めない。
+    if (mode === "move" && (e.ctrlKey || e.metaKey)) {
+      onToggleSelect?.(s.id);
+      return;
+    }
+    // Shift+ドラッグ = 図形だけ動かす（カードは置いていく）= 移動系（v1.3.8 で Shift に統一）。
     const solo = e.shiftKey;
     const layer = (e.currentTarget as HTMLElement).closest<HTMLElement>("[data-canvas-layer]");
     const scale = parseFloat(layer?.style.getPropertyValue("--canvas-scale") || "1") || 1;
@@ -75,7 +79,8 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       if (!moved) {
-        if (mode === "move") (solo ? onToggleSelect : onClickSelect)?.(s.id);
+        // 素クリックのみ図形グループを選択。Shift+クリック（動かさず）は何もしない（Shift=移動系）。
+        if (mode === "move" && !solo) onClickSelect?.(s.id);
         return;
       }
       if (mode === "move") {
@@ -106,7 +111,7 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
         width: s.width,
         height: s.height,
         zIndex: 0,
-        cursor: "grab",
+        cursor: "default", // ホバーは矢印のまま（G5）
         willChange: "transform",
       }}
       title={s.label || undefined}

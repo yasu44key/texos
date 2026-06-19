@@ -1678,6 +1678,53 @@ fn copy_objects_to_clipboard(
     Ok(report)
 }
 
+/// v1.3.8 (G6): copy ONE image card to the clipboard as a bitmap (CF_DIB) so it
+/// can be pasted into image apps (ペイント等). Separate from Ctrl+C, which stays
+/// files-only (CF_HDROP). 独立コマンドなので 動画/音声/選択範囲コピーへ拡張できる。
+#[tauri::command]
+fn copy_image_to_clipboard(id: String, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // 画像判定（仮身優先の MIME）。
+    let mime: String = p
+        .conn
+        .query_row(
+            "SELECT COALESCE(v.mime_type, r.mime_type) FROM virtual_bodies v
+             JOIN real_bodies r ON r.id = v.real_id
+             WHERE v.id = ?1 AND v.deleted_at IS NULL",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .map_err(|_| "カードが見つかりません".to_string())?;
+    if !mime.starts_with("image/") {
+        return Err("このカードは画像ではありません".into());
+    }
+    // パス解決: コミット済みならそのまま、なければコミット（エクスポート＝コミット原則）。
+    let committed: Option<String> = p
+        .conn
+        .query_row(
+            "SELECT committed_path FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let path = match committed {
+        Some(c) if Path::new(&c).exists() => c,
+        _ => commit_object_inner(p, &id, false)?,
+    };
+    #[cfg(windows)]
+    {
+        clipboard_out::set_clipboard_image(&path)?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        return Err("クリップボードへの画像コピーは Windows のみ対応です".into());
+    }
+    Ok(())
+}
+
 /// Undo a commit: delete the editable real file and return the object to a 仮身
 /// (reference). The CAS object is kept, so it can still be viewed/re-committed.
 /// Refused when the committed file IS the original imported file (in-project
@@ -3534,6 +3581,7 @@ pub fn run() {
             write_text_file,
             paste_clipboard,
             copy_objects_to_clipboard,
+            copy_image_to_clipboard,
             create_text_object,
             create_filter,
             update_filter,

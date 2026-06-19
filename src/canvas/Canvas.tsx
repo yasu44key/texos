@@ -27,8 +27,11 @@ interface CanvasProps {
   initialTransform?: Transform;
   /** Changing this (e.g. project path) resets the view to initialTransform. */
   viewKey?: string;
-  /** Rubber-band selection finished (canvas coords). additive = Shift held. */
-  onSelectRect?: (rect: { x: number; y: number; w: number; h: number }, additive: boolean) => void;
+  /** Rubber-band selection finished (canvas coords). mode: replace=置換 / add=追加 / toggle=範囲トグル(Ctrl)。 */
+  onSelectRect?: (
+    rect: { x: number; y: number; w: number; h: number },
+    mode: "replace" | "add" | "toggle"
+  ) => void;
   /** Plain left-click on empty canvas (clear selection etc.). */
   onEmptyClick?: () => void;
   /** Bounding box of all content (canvas coords) — for 「全体を表示」. */
@@ -162,15 +165,18 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
   }, []);
 
   const onMouseDown = useCallback((e: MouseEvent) => {
-    if (e.button === 1 || (e.button === 0 && e.altKey)) {
+    // v1.3.8 マウスモデル: パン = 中ボタン、または Shift+空キャンバスドラッグ。
+    // （Alt+LMB パンは廃止。手のひらカーソルは onMouseMove でドラッグ開始後に出す。）
+    if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
       e.preventDefault();
       panDragging.current = true;
       lastPanPos.current = { x: e.clientX, y: e.clientY };
       return;
     }
-    // Plain left-drag on empty canvas → rubber-band selection (cards stop
-    // propagation, so reaching here means the press started on empty space).
+    // 空キャンバスの左ドラッグ → 範囲選択（カードは伝播を止めるので、ここに来る＝空き）。
+    //   素ドラッグ = 置換、Ctrl/Meta = 範囲トグル。Shift は上でパンに割り当て済み。
     if (e.button === 0) {
+      const selectMode: "replace" | "toggle" = e.ctrlKey || e.metaKey ? "toggle" : "replace";
       const sx = e.clientX;
       const sy = e.clientY;
       let moved = false;
@@ -199,7 +205,7 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
         );
         onSelectRectRef.current?.(
           { x: p1.x, y: p1.y, w: p2.x - p1.x, h: p2.y - p1.y },
-          me.shiftKey
+          selectMode
         );
       };
       window.addEventListener("mousemove", onMove);
@@ -209,13 +215,17 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
 
   const onMouseMove = useCallback((e: MouseEvent) => {
     if (!panDragging.current) return;
+    document.body.style.cursor = "grabbing"; // 手のひらはパン開始後（G5）
     const dx = e.clientX - lastPanPos.current.x;
     const dy = e.clientY - lastPanPos.current.y;
     lastPanPos.current = { x: e.clientX, y: e.clientY };
     setTransform((t) => ({ ...t, x: t.x + dx, y: t.y + dy }));
   }, []);
 
-  const onMouseUp = useCallback(() => { panDragging.current = false; }, []);
+  const onMouseUp = useCallback(() => {
+    if (panDragging.current) document.body.style.cursor = "";
+    panDragging.current = false;
+  }, []);
 
   // Right-click → convert to canvas coords (clean: clientX/Y only, no DPR/window math)
   const handleContextMenu = useCallback((e: MouseEvent) => {
@@ -314,7 +324,7 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
         height: "100vh",
         overflow: "hidden",
         background: dragOver ? "var(--canvas-bg-drag, #1e2a40)" : "var(--canvas-bg, #1a1a2e)",
-        cursor: panDragging.current ? "grabbing" : "default",
+        cursor: "default", // パン中の手のひらは document.body.style.cursor で制御（G5）
         userSelect: "none",
         outline: dragOver ? "2px dashed var(--accent, #4a90d9)" : "none",
         transition: "background 0.15s",

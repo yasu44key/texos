@@ -170,6 +170,8 @@ function App() {
     handleNoteToggleSelect,
     handleShapeToggleSelect,
     handleClearSelection,
+    handleCardSelectOnly,
+    handleNoteSelectOnly,
   } = useSelection({ objectsRef, notesRef, measuredNoteSize });
 
   const refresh = useCallback(async () => {
@@ -1447,7 +1449,7 @@ function App() {
 
   // Drag one selected card/note → move the whole selection together
   // (cards AND notes — v1.3.1 unified).
-  const handleGroupDragStart = useCallback((_id: string, clientX: number, clientY: number) => {
+  const handleGroupDragStart = useCallback((id: string, clientX: number, clientY: number) => {
     if (!selectedRef.current.size && !selectedNotesRef.current.size) return;
     const scale = transformRef.current.scale || 1;
     const cardStarts = new Map(
@@ -1465,6 +1467,7 @@ function App() {
     let dx = 0;
     let dy = 0;
     const onMove = (me: globalThis.MouseEvent) => {
+      document.body.style.cursor = "grabbing"; // 手のひらはドラッグ開始後（G5）
       dx = (me.clientX - clientX) / scale;
       dy = (me.clientY - clientY) / scale;
       cardStarts.forEach((s, oid) => {
@@ -1479,7 +1482,18 @@ function App() {
     const onUp = async () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
-      if (dx === 0 && dy === 0) return;
+      document.body.style.cursor = "";
+      // クリック（移動なし）= 複数選択の1枚に絞る（標準のウィンドウシステム流）。
+      if (dx === 0 && dy === 0) {
+        if (objectsRef.current.some((o) => o.id === id)) {
+          setSelected(new Set([id]));
+          setSelectedNotes(new Set());
+        } else {
+          setSelectedNotes(new Set([id]));
+          setSelected(new Set());
+        }
+        return;
+      }
       const moves = [...cardStarts.entries()].map(([oid, s]) => ({
         id: oid,
         x: s.x + dx,
@@ -1625,6 +1639,20 @@ function App() {
         });
       } catch (e) {
         console.error("copy_objects_to_clipboard failed", e);
+      }
+    },
+    [refresh]
+  );
+
+  // v1.3.8 (G6): 画像カードをビットマップ(CF_DIB)としてコピー（RMBメニュー専用）。
+  // 未保存の仮身は自動でコミットされ得るので、状態シグナル更新のため refresh。
+  const handleCopyImage = useCallback(
+    async (id: string) => {
+      try {
+        await invoke("copy_image_to_clipboard", { id });
+        await refresh();
+      } catch (e) {
+        console.error("copy_image_to_clipboard failed", e);
       }
     },
     [refresh]
@@ -1953,13 +1981,17 @@ function App() {
   // --- v1.3 メモ⑦: 選択カードの整列 ------------------------------------------
 
   const alignSelected = useCallback(
-    async (mode: "row" | "col" | "grid" | "dist-h" | "dist-v") => {
+    async (
+      mode: "row" | "col" | "grid" | "dist-h" | "dist-v",
+      // v1.4.x: 選択ではなく明示の集合（図形スコープ等）を整列対象にできる。
+      source?: { cards: VirtualBodyInfo[]; notes: NoteInfo[] }
+    ) => {
       // v1.3.5: コメント(付箋)も整列対象に含める。カードとコメントを位置だけで
       // 統一的に扱い、結果をカード／ノートの move に振り分ける（自動レイアウト＝
       // 重なり解消だけは、コメントを常時最前面の注釈として対象外のまま据え置く）。
       type It = { id: string; x: number; y: number; note: boolean };
-      const selCards = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
-      const selNotes = notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
+      const selCards = source?.cards ?? objectsRef.current.filter((o) => selectedRef.current.has(o.id));
+      const selNotes = source?.notes ?? notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
       const items: It[] = [
         ...selCards.map((o) => ({ id: o.id, x: o.pos_x, y: o.pos_y, note: false })),
         ...selNotes.map((n) => ({ id: n.id, x: n.pos_x, y: n.pos_y, note: true })),
@@ -2016,6 +2048,17 @@ function App() {
       }
     },
     [pushUndo, applyObjectMoves, applyNoteMoves]
+  );
+
+  // v1.4.x: 図形スコープの格子整列 = ビジュアルコマンド（空間的 foreach）の第一歩。
+  // 図形に乗っているカード/コメントだけを、読み順を保って格子に並べ直す（選択に依存しない）。
+  const handleShapeAlignGrid = useCallback(
+    (id: string) => {
+      const s = shapesRef.current.find((sh) => sh.id === id);
+      if (!s) return;
+      void alignSelected("grid", { cards: cardsOnShape(s), notes: notesOnShape(s) });
+    },
+    [alignSelected, cardsOnShape, notesOnShape]
   );
 
   // --- Auto layout (重なり解消) ----------------------------------------------
@@ -2311,6 +2354,7 @@ function App() {
         bulkUncommit: handleBulkUncommit,
         bulkDelete: handleBulkDelete,
         copyFiles: handleCopyFiles,
+        copyImage: handleCopyImage,
         openObject: handleOpenObject,
         openDefault: handleOpenDefault,
         openWith: handleOpenWith,
@@ -2338,6 +2382,7 @@ function App() {
         shapeRotate: handleShapeRotate,
         shapeScale: handleShapeScale,
         shapeFitToCards: handleShapeFitToCards,
+        shapeAlignGrid: handleShapeAlignGrid,
         shapeLabel: handleShapeLabel,
         shapeZ: handleShapeZ,
         shapeDelete: handleShapeDelete,
@@ -2399,7 +2444,10 @@ function App() {
           !!sh &&
           (cardsOnShape(sh).some((c) => !selectedRef.current.has(c.id)) ||
             notesOnShape(sh).some((n) => !selectedNotesRef.current.has(n.id)));
-        items = buildShapeMenu(shapeId, sh, hasUnselectedAbove, actions);
+        // v1.4.x: 図形に乗るカード/コメントが2枚以上なら「格子状に整列」を出す。
+        const canArrangeAbove =
+          !!sh && cardsOnShape(sh).length + notesOnShape(sh).length >= 2;
+        items = buildShapeMenu(shapeId, sh, hasUnselectedAbove, canArrangeAbove, actions);
       } else {
         items = buildCanvasMenu(
           info,
@@ -2479,14 +2527,12 @@ function App() {
     ]
   );
 
-  // Esc closes all expanded panels (and persists) and clears the selection.
+  // Esc = 選択の全解除のみ（v1.3.8）。展開パネル/プレビューは閉じない
+  // （プレビューはダブルクリックで開く／右上×／RMBメニューで閉じる、と手段が揃っているため、
+  //  Esc で閉じると意図しない動作になる — ユーザー指摘 2026-06-19）。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        setExpanded((prev) => {
-          prev.forEach((id) => invoke("set_expanded", { id, expanded: false }).catch(() => {}));
-          return new Set();
-        });
         setSelected(new Set());
         setSelectedNotes(new Set());
         setSelectedShapes(new Set());
@@ -2630,6 +2676,7 @@ function App() {
             zIndex={cardZ(obj.id)}
             selected={selected.has(obj.id)}
             onToggleSelect={handleCardToggleSelect}
+            onSelect={handleCardSelectOnly}
             onGroupDragStart={handleGroupDragStart}
             onMoveEnd={handleMoveEnd}
             onStartLink={handleStartLink}
@@ -2653,6 +2700,7 @@ function App() {
             zIndex={objects.length + 10}
             selected={selectedNotes.has(n.id)}
             onToggleSelect={handleNoteToggleSelect}
+            onSelect={handleNoteSelectOnly}
             onGroupDragStart={handleGroupDragStart}
             onStartLink={handleStartLink}
             onMeasure={handleNoteMeasure}

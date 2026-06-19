@@ -17,6 +17,8 @@ interface Props {
   selected?: boolean;
   /** Ctrl+click: toggle this note in/out of the selection (v1.3 メモ２追加). */
   onToggleSelect?: (id: string) => void;
+  /** 素クリック（未選択時）: このコメントだけを選択（v1.3.8 マウスモデル刷新）。 */
+  onSelect?: (id: string) => void;
   /** When set and selected, delegate the drag to the parent (group move). */
   onGroupDragStart?: (id: string, clientX: number, clientY: number) => void;
   /** Begin dragging an arrow link from this note (v1.3.1). */
@@ -32,7 +34,7 @@ export function NoteCard({
   id, text, x, y,
   width = 220, fontSize = 13, bold = false, fileRef = null,
   startEditing, zIndex = 0, selected = false,
-  onToggleSelect, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onSave, onResize,
+  onToggleSelect, onSelect, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onSave, onResize,
 }: Props) {
   const posRef = useRef({ x, y });
   posRef.current = { x, y };
@@ -94,8 +96,16 @@ export function NoteCard({
       return;
     }
 
-    // Part of a multi-selection → the parent moves the whole group (v1.3.1).
-    if (mode === "move" && selected && onGroupDragStart) {
+    // v1.3.8 マウスモデル: Shift = この1枚だけ移動（複数選択中でも単体）。
+    const moveSingleOnly = mode === "move" && e.shiftKey;
+
+    // 素クリック（未選択）= このコメントだけを選択（他は解除）。
+    if (mode === "move" && !moveSingleOnly && !selected) {
+      onSelect?.(id);
+    }
+
+    // 複数選択の1枚を素クリック/ドラッグ → 群移動（親がドラッグ or クリックで1枚に絞る）。
+    if (mode === "move" && !moveSingleOnly && selected && onGroupDragStart) {
       onGroupDragStart(id, e.clientX, e.clientY);
       return;
     }
@@ -111,6 +121,7 @@ export function NoteCard({
 
     const onMove = (me: globalThis.MouseEvent) => {
       if (mode === "move") {
+        document.body.style.cursor = "grabbing"; // 手のひらはドラッグ開始後（G5）
         curX = startX + (me.clientX - startMouseX) / scale;
         curY = startY + (me.clientY - startMouseY) / scale;
         card.style.transform = `translate(${curX}px, ${curY}px)`;
@@ -122,6 +133,7 @@ export function NoteCard({
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
       if (mode === "move") onMoveEnd?.(id, curX, curY);
       else onResize?.(id, Math.round(curW));
     };
@@ -152,7 +164,7 @@ export function NoteCard({
         fontWeight: bold ? 700 : 400,
         fontFamily: "sans-serif",
         lineHeight: 1.5,
-        cursor: editing ? "text" : "grab",
+        cursor: editing ? "text" : "default", // ホバーは矢印のまま（G5）
         willChange: "transform",
         padding: editing ? 0 : "10px 12px",
         whiteSpace: "pre-wrap",

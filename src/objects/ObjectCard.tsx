@@ -41,6 +41,8 @@ interface Props {
   selected?: boolean;
   /** Ctrl+click: toggle this card in/out of the selection (v1.3 メモ２追加). */
   onToggleSelect?: (id: string) => void;
+  /** 素クリック（未選択時）: このカードだけを選択（v1.3.8 マウスモデル刷新）。 */
+  onSelect?: (id: string) => void;
   /** When set and this card is selected, delegate the drag to the parent
    *  (group move). (id, clientX, clientY) */
   onGroupDragStart?: (id: string, clientX: number, clientY: number) => void;
@@ -167,7 +169,7 @@ export function ObjectCard({
   filterRef = null,
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
-  zIndex = 0, selected = false, onToggleSelect, onGroupDragStart,
+  zIndex = 0, selected = false, onToggleSelect, onSelect, onGroupDragStart,
   onMoveEnd, onStartLink, onOpen, onCollapse, onAfterSave,
 }: Props) {
   const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
@@ -208,8 +210,16 @@ export function ObjectCard({
       return;
     }
 
-    // Part of a multi-selection → the parent moves the whole group.
-    if (selected && onGroupDragStart) {
+    // v1.3.8 マウスモデル: Shift = この1枚だけ移動（複数選択中でも単体）。
+    const moveSingleOnly = e.shiftKey;
+
+    // 素クリック（未選択）= このカードだけを選択（他は解除）。続けてドラッグすれば単体移動。
+    if (!moveSingleOnly && !selected) {
+      onSelect?.(id);
+    }
+
+    // 複数選択の1枚を素クリック/ドラッグ → 群移動（親がドラッグ or クリックで1枚に絞る）。
+    if (!moveSingleOnly && selected && onGroupDragStart) {
       onGroupDragStart(id, e.clientX, e.clientY);
       return;
     }
@@ -229,6 +239,7 @@ export function ObjectCard({
     // While dragging, float above everything; the prop value is restored on drop.
     el.style.zIndex = "20000";
     const onMove = (me: globalThis.MouseEvent) => {
+      document.body.style.cursor = "grabbing"; // 手のひらはドラッグ開始後（G5）
       curX = startX + (me.clientX - startMouseX) / scale;
       curY = startY + (me.clientY - startMouseY) / scale;
       el.style.transform = `translate(${curX}px, ${curY}px)`;
@@ -236,6 +247,7 @@ export function ObjectCard({
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
       el.style.zIndex = String(zIndex);
       onMoveEnd?.(id, curX, curY);
     };
@@ -305,7 +317,7 @@ export function ObjectCard({
         fontSize: 11,
         fontFamily: "sans-serif",
         boxShadow: "var(--card-shadow, 0 2px 16px #00000080)",
-        cursor: "grab",
+        cursor: "default", // ホバーは矢印のまま。手のひらはドラッグ中だけ（G5）
         willChange: "transform",
       }}
       onMouseDown={handleMouseDown}
