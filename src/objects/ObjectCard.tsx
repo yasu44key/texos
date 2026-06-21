@@ -70,6 +70,8 @@ interface Props {
   onStartLink?: (fromId: string, clientX: number, clientY: number) => void;
   /** Double-click to open/edit this object. */
   onOpen?: (id: string) => void;
+  /** v1.3.10: ラベルのダブルクリックでリネーム（実身=実ファイル改名／仮身=表示名）。 */
+  onRenameTitle?: (id: string) => void;
 }
 
 // Icon by file extension (covers types with no specific MIME).
@@ -181,7 +183,7 @@ export function ObjectCard({
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onSelect, onGroupDragStart,
-  onMoveEnd, onStartLink, onOpen, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
+  onMoveEnd, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
 }: Props) {
   const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
   const posRef = useRef({ x, y });
@@ -299,6 +301,18 @@ export function ObjectCard({
       }
     : { color: "#e8b84a", border: "#5e4a1e", filled: true, title: "仮身（参照）" };
 
+  // v1.3.10: タイトル(ラベル)のダブルクリックでリネーム。普通のファイルカードのみ
+  // （フィルタ/ドロップ/プロジェクト/URL/フォルダは別アクション）。カードのダブルクリック
+  // ＝プレビューと衝突しないよう stopPropagation。
+  const titleRenamable =
+    !!onRenameTitle && !isFilter && !isDrop && !isProject && !isUrl && !isFolder;
+  const onTitleDblClick = titleRenamable
+    ? (e: React.MouseEvent) => {
+        e.stopPropagation();
+        onRenameTitle!(id);
+      }
+    : undefined;
+
   // Connection handle: begin a link drag without moving the card
   const handleLinkDown = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -381,13 +395,18 @@ export function ObjectCard({
               }}
               draggable={false}
             />
-            <div style={{
-              padding: "4px 8px",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              background: "var(--card-label-bg, #00000055)",
-            }}>
+            <div
+              onDoubleClick={onTitleDblClick}
+              title={titleRenamable ? "ダブルクリックでリネーム" : undefined}
+              style={{
+                padding: "4px 8px",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                background: "var(--card-label-bg, #00000055)",
+                cursor: titleRenamable ? "text" : undefined,
+              }}
+            >
               {label}
             </div>
           </>
@@ -412,13 +431,18 @@ export function ObjectCard({
             ) : (
               <span style={{ fontSize: 26, lineHeight: 1 }}>{iconFor(mimeType, ext)}</span>
             )}
-            <span style={{
-              maxWidth: "100%",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              textAlign: "center",
-            }}>
+            <span
+              onDoubleClick={onTitleDblClick}
+              title={titleRenamable ? "ダブルクリックでリネーム" : undefined}
+              style={{
+                maxWidth: "100%",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                textAlign: "center",
+                cursor: titleRenamable ? "text" : undefined,
+              }}
+            >
               {label}
             </span>
             {isProject && (

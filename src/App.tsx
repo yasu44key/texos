@@ -1139,6 +1139,17 @@ function App() {
     [refresh]
   );
 
+  // v1.3.10: タイトル(ラベル)ダブルクリック → 実身なら実ファイル改名、仮身なら表示名変更。
+  const handleRenameTitle = useCallback(
+    (id: string) => {
+      const obj = objectsRef.current.find((o) => o.id === id);
+      if (!obj) return;
+      if (obj.committed_path) handleRenameReal(id, obj.label);
+      else handleRenameObject(id, obj.label);
+    },
+    [handleRenameReal, handleRenameObject]
+  );
+
   // 全コミット: materialize every object so the project folder can leave
   // TexoS as a plain Windows folder. External references get a red warning.
   const handleCommitAll = useCallback(async () => {
@@ -2770,6 +2781,7 @@ function App() {
             onMoveEnd={handleMoveEnd}
             onStartLink={handleStartLink}
             onOpen={handleOpenObject}
+            onRenameTitle={handleRenameTitle}
             onCollapse={handleCollapse}
             onAfterSave={refresh}
             onRequestEdit={handleEditInCanvas}
