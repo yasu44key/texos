@@ -117,6 +117,8 @@ function App() {
   const [touched, setTouched] = useState<Set<string>>(new Set());
   // Objects whose inline text editor is currently expanded.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
   // Saved canvas view (pan/zoom) for the current project, applied atomically.
   const [view, setView] = useState<{ key: string; transform: Transform } | null>(null);
   const saveTimer = useRef<number | null>(null);
@@ -899,10 +901,17 @@ function App() {
           (obj.ext ?? "").toLowerCase() === "pdf" ||
           isTextMime(obj.mime_type, obj.ext))
       ) {
+        // v1.3.10: ダブルクリックはプレビューのトグル（再度ダブルクリックで閉じる）。
+        // 旧「ダブルクリック＝実身にする」の名残で×ボタンだけが閉じる手段だった。
         // テキストは未コミットなら読取専用、実身なら編集パネル（ObjectCard が分岐）。
-        // handleExpandView 相当をインライン（定義順より前のため）。
-        invoke("set_expanded", { id, expanded: true }).catch(() => {});
-        setExpanded((prev) => new Set(prev).add(id));
+        const isOpen = expandedRef.current.has(id);
+        invoke("set_expanded", { id, expanded: !isOpen }).catch(() => {});
+        setExpanded((prev) => {
+          const next = new Set(prev);
+          if (isOpen) next.delete(id);
+          else next.add(id);
+          return next;
+        });
         return;
       }
       // インラインプレビューが無い種別 → 一時的閲覧（最新内容を読取専用で開く・破棄）。
@@ -2580,8 +2589,8 @@ function App() {
   );
 
   // Esc = 選択の全解除のみ（v1.3.8）。展開パネル/プレビューは閉じない
-  // （プレビューはダブルクリックで開く／右上×／RMBメニューで閉じる、と手段が揃っているため、
-  //  Esc で閉じると意図しない動作になる — ユーザー指摘 2026-06-19）。
+  // （プレビューはダブルクリックで開閉トグル／右上×／RMBメニューで閉じる、と手段が揃って
+  //  いるため、Esc で閉じると意図しない動作になる — ユーザー指摘 2026-06-19, トグルは v1.3.10）。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
