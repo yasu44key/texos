@@ -62,14 +62,14 @@ export function lostOf(o: VirtualBodyInfo): "cas" | "none" | null {
 }
 
 // v1.3.9 問題点2: 実身カードなのに実体ファイルが失われている状態（リネーム/移動/削除）。
-// own committed が消え、兄弟の生きた実身にも origin にも届かず CAS/none フォールバックに
-// なった実身。これも薄赤で警告し、「実ファイルを再リンク／CASから復元」を促す。
+// 判定は view_source ではなく「自分の committed_path が実在するか」(cur_mtime)で行う。
+// view_source 依存だと、空ファイル(0バイト)等で real_id を共有する無関係なカードに
+// 兄弟解決が引っ張られ view_source="sibling" となって喪失を見逃すため（実バグで判明）。
+// 自分が所有する実ファイルが消えていれば、兄弟の有無に関わらず喪失＝薄赤で警告する。
 export function lostRealOf(o: VirtualBodyInfo): boolean {
   if (!o.committed_path) return false; // 仮身は lostOf 側
   if (o.project_ref || o.url_ref || o.folder_ref) return false;
-  return (
-    o.view_source === "cas" || o.view_source === "fork-cas" || o.view_source === "none"
-  );
+  return o.cur_mtime == null; // committed_path があるのに実ファイルが無い
 }
 
 // v1.3.6: 内部実身 — プロジェクト内に実体があり、外部の戻り先を持たない実身。
