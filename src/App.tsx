@@ -412,6 +412,63 @@ function App() {
     return null;
   }, []);
 
+  // v1.3.10: リンク矢印を空きキャンバスに引き出したとき、その場にノードを作って繋ぐ。
+  // 関係づけながら新しいカード/コメントを生やせる（思考リンク側の生産性）。
+  const placeFileAndLink = useCallback(
+    async (fromId: string, x: number, y: number) => {
+      const sel = await open({ multiple: false, title: "配置して繋ぐファイルを選択" });
+      if (typeof sel !== "string") return;
+      try {
+        const newId = await invoke<string>("import_file", { path: sel, label: "", x, y });
+        const rid = await invoke<number | null>("create_relation", { fromId, toId: newId });
+        setTouched((prev) => new Set(prev).add(newId));
+        const batch: UndoAction[] = [{ kind: "delete", ids: [newId] }];
+        if (rid != null) batch.push({ kind: "deleteRelations", ids: [rid] });
+        pushUndo(batch);
+        await refresh();
+        setRelations(await invoke<RelationInfo[]>("list_relations"));
+      } catch (e) {
+        console.error("placeFileAndLink failed", e);
+      }
+    },
+    [refresh, pushUndo]
+  );
+
+  const addTextAndLink = useCallback(
+    async (fromId: string, x: number, y: number) => {
+      try {
+        const newId = await invoke<string>("create_text_object", { text: "", x, y });
+        const rid = await invoke<number | null>("create_relation", { fromId, toId: newId });
+        setTouched((prev) => new Set(prev).add(newId));
+        const batch: UndoAction[] = [{ kind: "delete", ids: [newId] }];
+        if (rid != null) batch.push({ kind: "deleteRelations", ids: [rid] });
+        pushUndo(batch);
+        await refresh();
+        setRelations(await invoke<RelationInfo[]>("list_relations"));
+      } catch (e) {
+        console.error("addTextAndLink failed", e);
+      }
+    },
+    [refresh, pushUndo]
+  );
+
+  const addNoteAndLink = useCallback(
+    async (fromId: string, x: number, y: number) => {
+      try {
+        const newId = await invoke<string>("create_note", { text: "", x, y });
+        const rid = await invoke<number | null>("create_relation", { fromId, toId: newId });
+        const batch: UndoAction[] = [{ kind: "deleteNotes", ids: [newId] }];
+        if (rid != null) batch.push({ kind: "deleteRelations", ids: [rid] });
+        pushUndo(batch);
+        await refresh();
+        setRelations(await invoke<RelationInfo[]>("list_relations"));
+      } catch (e) {
+        console.error("addNoteAndLink failed", e);
+      }
+    },
+    [refresh, pushUndo]
+  );
+
   const handleStartLink = useCallback(
     (fromId: string, clientX: number, clientY: number) => {
       const from = nodeBoxOf(fromId);
@@ -442,12 +499,39 @@ function App() {
           } catch (e) {
             console.error("create_relation failed", e);
           }
+          return;
+        }
+        // v1.3.10: 既存ノードでなく空きキャンバスに落としたら、その場にノードを
+        // 作って繋ぐメニューを出す（自分自身への落下は除く）。
+        if (!toId) {
+          const cp = screenToCanvas(transformRef.current, me.clientX, me.clientY);
+          setMenu({
+            x: me.clientX,
+            y: me.clientY,
+            items: [
+              {
+                label: "ここにファイルを配置して繋ぐ",
+                hint: "ファイルを選んでこの位置に配置し、矢印で繋ぎます。",
+                onClick: () => placeFileAndLink(fromId, cp.x, cp.y),
+              },
+              {
+                label: "テキストカードを作成して繋ぐ",
+                hint: "空のテキストカードをこの位置に作り、矢印で繋ぎます。",
+                onClick: () => addTextAndLink(fromId, cp.x, cp.y),
+              },
+              {
+                label: "コメントを作成して繋ぐ",
+                hint: "空のコメント付箋をこの位置に作り、矢印で繋ぎます。",
+                onClick: () => addNoteAndLink(fromId, cp.x, cp.y),
+              },
+            ],
+          });
         }
       };
       window.addEventListener("mousemove", onMove);
       window.addEventListener("mouseup", onUp);
     },
-    [nodeBoxOf, pushUndo]
+    [nodeBoxOf, pushUndo, placeFileAndLink, addTextAndLink, addNoteAndLink]
   );
 
   const handleDeleteRelation = useCallback(async (id: number) => {
