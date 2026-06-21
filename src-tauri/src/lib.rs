@@ -1396,21 +1396,19 @@ fn rename_real(id: String, new_name: String, state: State<AppState>) -> Result<S
 
     let dest_str = dest.to_string_lossy().to_string();
     let mtime = file_mtime_ms(&dest).unwrap_or_else(db::now_ms);
-    let new_label = dest
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&filename)
-        .to_string();
     let new_ext = dest
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_lowercase());
+    // v1.3.10 補完: label（表示名）は変更しない。表示名は「拡張子あり＝実ファイル名と一致／
+    // 拡張子なし＝独自の表示名」という情報を持つので、リネームで .docx を勝手に付けない
+    // （ユーザー指摘）。実ファイル名・committed_path・mtime・ext（属性）だけ更新する。
     p.conn
         .execute(
             "UPDATE virtual_bodies
-             SET committed_path = ?1, committed_mtime = ?2, label = ?3, ext = ?4
-             WHERE id = ?5",
-            rusqlite::params![dest_str, mtime, new_label, new_ext, id],
+             SET committed_path = ?1, committed_mtime = ?2, ext = ?3
+             WHERE id = ?4",
+            rusqlite::params![dest_str, mtime, new_ext, id],
         )
         .map_err(|e| e.to_string())?;
     Ok(dest_str)

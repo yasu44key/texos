@@ -935,7 +935,7 @@ function App() {
   const handleRenameReal = useCallback(
     (id: string, current: string) => {
       setPrompt({
-        title: "実ファイルのリネーム（このカードの実体ファイルを改名します）",
+        title: "実ファイル名の変更（実体ファイルを改名・表示名は変わりません）",
         initial: current,
         onConfirm: async (name) => {
           try {
