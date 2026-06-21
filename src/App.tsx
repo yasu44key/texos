@@ -61,6 +61,8 @@ interface LinkDrag {
 
 function App() {
   const [project, setProject] = useState<ProjectInfo | null>(null);
+  const currentProjectRef = useRef<ProjectInfo | null>(null);
+  currentProjectRef.current = project;
   const [projectLoaded, setProjectLoaded] = useState(false);
   const [showChooser, setShowChooser] = useState(false);
   const [objects, setObjects] = useState<VirtualBodyInfo[]>([]);
@@ -436,6 +438,8 @@ function App() {
     filter: (builtin: string, x: number, y: number, linkFrom: string) => void;
     note: (x: number, y: number, linkFrom: string) => void;
     text: (x: number, y: number, linkFrom: string) => void;
+    projectPath: (path: string, x: number, y: number, linkFrom: string) => void;
+    projectDialog: (x: number, y: number, linkFrom: string) => void;
   }>({
     file: () => {},
     paste: () => {},
@@ -443,6 +447,8 @@ function App() {
     filter: () => {},
     note: () => {},
     text: () => {},
+    projectPath: () => {},
+    projectDialog: () => {},
   });
 
   // v1.3.10: 引き出し元カードの仮身をドロップ位置に作って繋ぐ（元々の第一案）。
@@ -503,6 +509,28 @@ function App() {
           const la = linkActionsRef.current;
           const cx = me.clientX;
           const cy = me.clientY;
+          // 既存プロジェクトへのリンク: 最近のプロジェクト一覧＋その他（ファイル選択）。
+          // 相互リンクの礎。サブメニューは recents を取得してから開き直す。
+          const openProjectSub = async () => {
+            let recents: ProjectInfo[] = [];
+            try {
+              recents = await invoke<ProjectInfo[]>("list_recent_projects");
+            } catch (e) {
+              console.error("list_recent_projects failed", e);
+            }
+            const curPath = currentProjectRef.current?.path;
+            const items = [
+              ...recents
+                .filter((r) => r.path !== curPath)
+                .map((r) => ({
+                  label: `📁 ${r.name}`,
+                  hint: r.path,
+                  onClick: () => la.projectPath(r.path, cp.x, cp.y, fromId),
+                })),
+              { label: "その他のプロジェクト...", onClick: () => la.projectDialog(cp.x, cp.y, fromId) },
+            ];
+            window.setTimeout(() => setMenu({ x: cx, y: cy, items }), 0);
+          };
           const filterSub = [
             { label: "ドロップポイント（データ入口・自動実行）", onClick: () => la.filter("drop_point", cp.x, cp.y, fromId) },
             { label: "テキスト: grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
@@ -528,6 +556,7 @@ function App() {
               { label: "URLリンク...", onClick: () => la.url(cp.x, cp.y, fromId) },
               // サブメニューはメニューのクリック閉じの後に開き直す（openSubmenu と同じ定石）。
               { label: "フィルタカード ...", onClick: () => window.setTimeout(() => setMenu({ x: cx, y: cy, items: filterSub }), 0) },
+              { label: "既存プロジェクトへのリンク ...", onClick: () => openProjectSub() },
             ],
           });
         }
@@ -1037,14 +1066,14 @@ function App() {
   );
 
   // Place a reference to an existing project as a project-object card.
-  const handleLinkProject = useCallback(
-    async (canvasX: number, canvasY: number) => {
-      const dir = await open({ directory: true, title: "リンクするTexoSプロジェクトを選択" });
-      if (!dir || Array.isArray(dir)) return;
+  // 既存 TexoS プロジェクトを project_ref カードとして配置（パス指定）。linkFrom があれば繋ぐ。
+  const linkProjectByPath = useCallback(
+    async (path: string, canvasX: number, canvasY: number, linkFrom?: string) => {
       try {
-        const vid = await invoke<string>("link_project", { path: dir, x: canvasX, y: canvasY });
+        const vid = await invoke<string>("link_project", { path, x: canvasX, y: canvasY });
         pushUndo([{ kind: "delete", ids: [vid] }]);
         await refresh();
+        if (linkFrom) await linkNewNode(linkFrom, vid);
       } catch (e) {
         console.error("link_project failed", e);
         setConfirm({
@@ -1055,7 +1084,16 @@ function App() {
         });
       }
     },
-    [refresh, pushUndo]
+    [refresh, pushUndo, linkNewNode]
+  );
+
+  const handleLinkProject = useCallback(
+    async (canvasX: number, canvasY: number, linkFrom?: string) => {
+      const dir = await open({ directory: true, title: "リンクするTexoSプロジェクトを選択" });
+      if (!dir || Array.isArray(dir)) return;
+      await linkProjectByPath(dir, canvasX, canvasY, linkFrom);
+    },
+    [linkProjectByPath]
   );
 
   // Add a URL link card (prompt URL, then title).
@@ -2420,6 +2458,8 @@ function App() {
     filter: handleAddFilter,
     note: handleAddNote,
     text: handleAddTextCard,
+    projectPath: linkProjectByPath,
+    projectDialog: handleLinkProject,
   };
 
   const handleNoteMove = useCallback(async (id: string, x: number, y: number) => {
