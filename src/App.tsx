@@ -351,8 +351,22 @@ function App() {
     [refresh, pushUndo]
   );
 
+  // v1.3.10: 新しく作ったカード/コメントを fromId から矢印で繋ぐ（「その場に作って繋ぐ」共通処理）。
+  const linkNewNode = useCallback(
+    async (fromId: string, newId: string) => {
+      try {
+        const rid = await invoke<number | null>("create_relation", { fromId, toId: newId });
+        if (rid != null) pushUndo([{ kind: "deleteRelations", ids: [rid] }]);
+        setRelations(await invoke<RelationInfo[]>("list_relations"));
+      } catch (e) {
+        console.error("link new node failed", e);
+      }
+    },
+    [pushUndo]
+  );
+
   const handleContextPlace = useCallback(
-    async (canvasX: number, canvasY: number) => {
+    async (canvasX: number, canvasY: number, linkFrom?: string) => {
       const selected = await open({ multiple: true, title: "配置するファイルを選択" });
       if (!selected) return;
       const paths = Array.isArray(selected) ? selected : [selected];
@@ -372,8 +386,9 @@ function App() {
         pushUndo([{ kind: "delete", ids: imported }]);
       }
       await refresh();
+      if (linkFrom) for (const nid of imported) await linkNewNode(linkFrom, nid);
     },
-    [refresh, pushUndo]
+    [refresh, pushUndo, linkNewNode]
   );
 
   const handleMoveEnd = useCallback(async (id: string, x: number, y: number) => {
@@ -412,62 +427,23 @@ function App() {
     return null;
   }, []);
 
-  // v1.3.10: リンク矢印を空きキャンバスに引き出したとき、その場にノードを作って繋ぐ。
-  // 関係づけながら新しいカード/コメントを生やせる（思考リンク側の生産性）。
-  const placeFileAndLink = useCallback(
-    async (fromId: string, x: number, y: number) => {
-      const sel = await open({ multiple: false, title: "配置して繋ぐファイルを選択" });
-      if (typeof sel !== "string") return;
-      try {
-        const newId = await invoke<string>("import_file", { path: sel, label: "", x, y });
-        const rid = await invoke<number | null>("create_relation", { fromId, toId: newId });
-        setTouched((prev) => new Set(prev).add(newId));
-        const batch: UndoAction[] = [{ kind: "delete", ids: [newId] }];
-        if (rid != null) batch.push({ kind: "deleteRelations", ids: [rid] });
-        pushUndo(batch);
-        await refresh();
-        setRelations(await invoke<RelationInfo[]>("list_relations"));
-      } catch (e) {
-        console.error("placeFileAndLink failed", e);
-      }
-    },
-    [refresh, pushUndo]
-  );
-
-  const addTextAndLink = useCallback(
-    async (fromId: string, x: number, y: number) => {
-      try {
-        const newId = await invoke<string>("create_text_object", { text: "", x, y });
-        const rid = await invoke<number | null>("create_relation", { fromId, toId: newId });
-        setTouched((prev) => new Set(prev).add(newId));
-        const batch: UndoAction[] = [{ kind: "delete", ids: [newId] }];
-        if (rid != null) batch.push({ kind: "deleteRelations", ids: [rid] });
-        pushUndo(batch);
-        await refresh();
-        setRelations(await invoke<RelationInfo[]>("list_relations"));
-      } catch (e) {
-        console.error("addTextAndLink failed", e);
-      }
-    },
-    [refresh, pushUndo]
-  );
-
-  const addNoteAndLink = useCallback(
-    async (fromId: string, x: number, y: number) => {
-      try {
-        const newId = await invoke<string>("create_note", { text: "", x, y });
-        const rid = await invoke<number | null>("create_relation", { fromId, toId: newId });
-        const batch: UndoAction[] = [{ kind: "deleteNotes", ids: [newId] }];
-        if (rid != null) batch.push({ kind: "deleteRelations", ids: [rid] });
-        pushUndo(batch);
-        await refresh();
-        setRelations(await invoke<RelationInfo[]>("list_relations"));
-      } catch (e) {
-        console.error("addNoteAndLink failed", e);
-      }
-    },
-    [refresh, pushUndo]
-  );
+  // 後方で定義する各種「配置」ハンドラ（linkFrom 付き）を、先に定義する handleStartLink
+  // から呼べるように ref で渡す（定義順の都合・TDZ 回避）。毎レンダーで最新を代入する。
+  const linkActionsRef = useRef<{
+    file: (x: number, y: number, linkFrom: string) => void;
+    paste: (x: number, y: number, linkFrom: string) => void;
+    url: (x: number, y: number, linkFrom: string) => void;
+    filter: (builtin: string, x: number, y: number, linkFrom: string) => void;
+    note: (x: number, y: number, linkFrom: string) => void;
+    text: (x: number, y: number, linkFrom: string) => void;
+  }>({
+    file: () => {},
+    paste: () => {},
+    url: () => {},
+    filter: () => {},
+    note: () => {},
+    text: () => {},
+  });
 
   const handleStartLink = useCallback(
     (fromId: string, clientX: number, clientY: number) => {
@@ -502,28 +478,32 @@ function App() {
           return;
         }
         // v1.3.10: 既存ノードでなく空きキャンバスに落としたら、その場にノードを
-        // 作って繋ぐメニューを出す（自分自身への落下は除く）。
+        // 作って繋ぐメニューを出す（自分自身への落下は除く）。カードにできるものは
+        // 全部その場で生やせる（図形は対象外）。
         if (!toId) {
           const cp = screenToCanvas(transformRef.current, me.clientX, me.clientY);
+          const la = linkActionsRef.current;
+          const cx = me.clientX;
+          const cy = me.clientY;
+          const filterSub = [
+            { label: "ドロップポイント（データ入口・自動実行）", onClick: () => la.filter("drop_point", cp.x, cp.y, fromId) },
+            { label: "テキスト: grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
+            { label: "テキスト: 置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
+            { label: "画像: リサイズ（幅指定）...", onClick: () => la.filter("img_resize", cp.x, cp.y, fromId) },
+            { label: "画像: 形式変換...", onClick: () => la.filter("img_convert", cp.x, cp.y, fromId) },
+            { label: "外部プログラム...", onClick: () => la.filter("external", cp.x, cp.y, fromId) },
+          ];
           setMenu({
-            x: me.clientX,
-            y: me.clientY,
+            x: cx,
+            y: cy,
             items: [
-              {
-                label: "ここにファイルを配置して繋ぐ",
-                hint: "ファイルを選んでこの位置に配置し、矢印で繋ぎます。",
-                onClick: () => placeFileAndLink(fromId, cp.x, cp.y),
-              },
-              {
-                label: "テキストカードを作成して繋ぐ",
-                hint: "空のテキストカードをこの位置に作り、矢印で繋ぎます。",
-                onClick: () => addTextAndLink(fromId, cp.x, cp.y),
-              },
-              {
-                label: "コメントを作成して繋ぐ",
-                hint: "空のコメント付箋をこの位置に作り、矢印で繋ぎます。",
-                onClick: () => addNoteAndLink(fromId, cp.x, cp.y),
-              },
+              { label: "ここに作って矢印で繋ぐ", onClick: () => {}, disabled: true },
+              { label: "ファイルを配置...", onClick: () => la.file(cp.x, cp.y, fromId) },
+              { label: "テキストカード", onClick: () => la.text(cp.x, cp.y, fromId) },
+              { label: "コメント", onClick: () => la.note(cp.x, cp.y, fromId) },
+              { label: "クリップボードから貼り付け", onClick: () => la.paste(cp.x, cp.y, fromId) },
+              { label: "URLリンク...", onClick: () => la.url(cp.x, cp.y, fromId) },
+              { label: "フィルタカード ...", onClick: () => setMenu({ x: cx, y: cy, items: filterSub }) },
             ],
           });
         }
@@ -531,7 +511,7 @@ function App() {
       window.addEventListener("mousemove", onMove);
       window.addEventListener("mouseup", onUp);
     },
-    [nodeBoxOf, pushUndo, placeFileAndLink, addTextAndLink, addNoteAndLink]
+    [nodeBoxOf, pushUndo]
   );
 
   const handleDeleteRelation = useCallback(async (id: number) => {
@@ -548,7 +528,7 @@ function App() {
 
   // フィルタカードを作成。引数はプロンプトの連鎖で聞く（フォーム自動生成はフェーズ2）。
   const handleAddFilter = useCallback(
-    (builtin: string, canvasX: number, canvasY: number) => {
+    (builtin: string, canvasX: number, canvasY: number, linkFrom?: string) => {
       // ドロップポイント＝パイプラインのデータ入口カード（投入で下流が自動実行）
       if (builtin === "drop_point") {
         (async () => {
@@ -556,6 +536,7 @@ function App() {
             const vid = await invoke<string>("create_drop_point", { x: canvasX, y: canvasY });
             pushUndo([{ kind: "delete", ids: [vid] }]);
             await refresh();
+            if (linkFrom) await linkNewNode(linkFrom, vid);
           } catch (e) {
             console.error("create_drop_point failed", e);
           }
@@ -572,6 +553,7 @@ function App() {
           });
           pushUndo([{ kind: "delete", ids: [vid] }]);
           await refresh();
+          if (linkFrom) await linkNewNode(linkFrom, vid);
         } catch (e) {
           console.error("create_filter failed", e);
           setConfirm({
@@ -634,7 +616,7 @@ function App() {
         setFilterDlg({ x: canvasX, y: canvasY });
       }
     },
-    [refresh, pushUndo]
+    [refresh, pushUndo, linkNewNode]
   );
 
   // フローを実行（手動トリガー — 確定方針4）。結果カードは緑シグナル＋Ctrl+Zで戻せる。
@@ -1054,7 +1036,7 @@ function App() {
 
   // Add a URL link card (prompt URL, then title).
   const handleAddUrl = useCallback(
-    (canvasX: number, canvasY: number) => {
+    (canvasX: number, canvasY: number, linkFrom?: string) => {
       setPrompt({
         title: "URLを入力",
         initial: "https://",
@@ -1067,6 +1049,7 @@ function App() {
                 const vid = await invoke<string>("create_url", { title, url, x: canvasX, y: canvasY });
                 pushUndo([{ kind: "delete", ids: [vid] }]);
                 await refresh();
+                if (linkFrom) await linkNewNode(linkFrom, vid);
               } catch (e) {
                 console.error("create_url failed", e);
               }
@@ -1075,7 +1058,7 @@ function App() {
         },
       });
     },
-    [refresh, pushUndo]
+    [refresh, pushUndo, linkNewNode]
   );
 
   const handleSetMemo = useCallback(
@@ -1703,7 +1686,7 @@ function App() {
   // 画像はバックエンドで新オブジェクト化。テキストはURLならURLカード、
   // それ以外はコメント（付箋）として作成。
   const handlePaste = useCallback(
-    async (canvasX: number, canvasY: number) => {
+    async (canvasX: number, canvasY: number, linkFrom?: string) => {
       try {
         const res = await invoke<{ kind: string; text: string | null; id: string | null }>(
           "paste_clipboard",
@@ -1712,6 +1695,7 @@ function App() {
         if (res.kind === "image") {
           if (res.id) pushUndo([{ kind: "delete", ids: [res.id] }]);
           await refresh();
+          if (linkFrom && res.id) await linkNewNode(linkFrom, res.id);
         } else if (res.kind === "text" && res.text) {
           const t = res.text.trim();
           let vid: string;
@@ -1724,6 +1708,7 @@ function App() {
           }
           pushUndo([{ kind: "delete", ids: [vid] }]);
           await refresh();
+          if (linkFrom) await linkNewNode(linkFrom, vid);
         } else if (res.kind === "files") {
           // v1.3.4: クリップボードのファイルは貼り付けで取り込まない。
           // 「実身のコピーは実身になる」のが一般原則で、キャンバスは仮身（元ファイル
@@ -1741,7 +1726,7 @@ function App() {
         console.error("paste_clipboard failed", e);
       }
     },
-    [refresh, pushUndo]
+    [refresh, pushUndo, linkNewNode]
   );
 
   // Ctrl+V → ビューポート中央に貼り付け（テキスト入力中は奪わない）。
@@ -2375,16 +2360,43 @@ function App() {
   }, [getSelectionBounds]);
 
   // Notes (free text annotations)
-  const handleAddNote = useCallback(async (canvasX: number, canvasY: number) => {
+  const handleAddNote = useCallback(async (canvasX: number, canvasY: number, linkFrom?: string) => {
     try {
       const id = await invoke<string>("create_note", { text: "", x: canvasX, y: canvasY });
       pushUndo([{ kind: "deleteNotes", ids: [id] }]);
       setNewNoteId(id);
       await refresh();
+      if (linkFrom) await linkNewNode(linkFrom, id);
     } catch (e) {
       console.error("create_note failed", e);
     }
-  }, [refresh, pushUndo]);
+  }, [refresh, pushUndo, linkNewNode]);
+
+  // v1.3.10: 空のテキストカードを作成（リンク矢印からの「その場に作って繋ぐ」用）。
+  const handleAddTextCard = useCallback(
+    async (canvasX: number, canvasY: number, linkFrom?: string) => {
+      try {
+        const vid = await invoke<string>("create_text_object", { text: "", x: canvasX, y: canvasY });
+        setTouched((prev) => new Set(prev).add(vid));
+        pushUndo([{ kind: "delete", ids: [vid] }]);
+        await refresh();
+        if (linkFrom) await linkNewNode(linkFrom, vid);
+      } catch (e) {
+        console.error("create_text_object failed", e);
+      }
+    },
+    [refresh, pushUndo, linkNewNode]
+  );
+
+  // 後方定義のハンドラを ref に載せ、handleStartLink（前方）から呼べるようにする。
+  linkActionsRef.current = {
+    file: handleContextPlace,
+    paste: handlePaste,
+    url: handleAddUrl,
+    filter: handleAddFilter,
+    note: handleAddNote,
+    text: handleAddTextCard,
+  };
 
   const handleNoteMove = useCallback(async (id: string, x: number, y: number) => {
     const prev = notesRef.current.find((n) => n.id === id);
