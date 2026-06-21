@@ -1294,12 +1294,13 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     let vid = uuid();
-    // v1.3.10 窓モデル: 複製先の仮身が「どの実身カードの窓か」を window_of（カードID・不変）
-    // で持つ。内容(real_id)やパスではなくカードIDで追従するので、複製元のリネーム・編集にも
-    // 強い。内部/外部のレーン分け:
-    //   - 複製元が内部仮身（window_of あり）→ その window_of を継承（チェーンの根＝実身を指す）
-    //   - 複製元が内部実身（committed_path あり）→ window_of = 複製元カードの id
+    // v1.3.10「仮身を作成」: 複製先の仮身は常に「複製元カードそのもの」を window_of
+    // （カードID・不変）で指す。内容(real_id)やパスではなくカードIDで追従するので、複製元の
+    // リネーム・編集にも強い。
+    //   - 複製元が内部実身（committed_path あり）→ window_of = 複製元の id（その実身の窓）
+    //   - 複製元が内部仮身（window_of あり）→ window_of = 複製元の id（仮身の仮身・チェーン）
     //   - 複製元が外部仮身（origin_path のみ）→ 従来どおり origin_path を複製（外部レーン・凍結）
+    // ※「窓対象をコピーして元を指す」旧②動作（特別→仮身を複製）は廃止。
     let src: Option<(Option<String>, Option<String>, Option<String>)> = p
         .conn
         .query_row(
@@ -1310,13 +1311,12 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
         .optional()
         .map_err(|e| e.to_string())?;
     let (s_committed, s_origin, s_window) = src.ok_or("複製元が見つかりません")?;
-    let (window_of, origin_path): (Option<String>, Option<String>) = if let Some(w) = s_window {
-        (Some(w), None)
-    } else if s_committed.is_some() {
-        (Some(id.clone()), None)
-    } else {
-        (None, s_origin)
-    };
+    let (window_of, origin_path): (Option<String>, Option<String>) =
+        if s_committed.is_some() || s_window.is_some() {
+            (Some(id.clone()), None)
+        } else {
+            (None, s_origin)
+        };
     p.conn
         .execute(
             "INSERT INTO virtual_bodies
@@ -1943,10 +1943,12 @@ fn make_real(id: String, state: State<AppState>) -> Result<String, String> {
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     // live 内容を CAS へ追従させてからコミット（commit_object_inner と同じ流れ）。
     let path = commit_object_inner(p, &id, false)?;
-    // 元ファイルとの縁を切る → origin が無い＝完全独立の内部実身。
+    // 元ファイルとの縁を切る → origin も window_of も無い＝完全独立の内部実身。
+    // v1.3.10: window_of を残すと「仮身を作成」が元の実身を指してしまう（実身化した
+    // この新ファイルの仮身にならない）。実体を持った時点で窓ではなくなるので消す。
     p.conn
         .execute(
-            "UPDATE virtual_bodies SET origin_path = NULL WHERE id = ?1",
+            "UPDATE virtual_bodies SET origin_path = NULL, window_of = NULL WHERE id = ?1",
             rusqlite::params![id],
         )
         .map_err(|e| e.to_string())?;
