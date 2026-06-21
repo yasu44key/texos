@@ -331,7 +331,11 @@ fn resolve_view_conn(
             return Some((p, if depth == 0 { "committed" } else { "fork-live" }));
         }
     }
-    // ② a committed sibling of the same real body (生きた実身 in this folder)
+    // ② a committed sibling of the same real body (生きた実身 in this folder).
+    // v1.3.9: 同じ real_id を複数の実身が共有しうる（内容一致でCASハッシュが衝突）ため、
+    // 単に「同 real_id の最古の実身」を選ぶと、複製仮身が複製元でない別実身に追従してしまう。
+    // そこで、この仮身の窓対象（origin_path）と committed_path が一致する兄弟＝複製元を優先し、
+    // 一致が無いときだけ従来どおり最古の生存兄弟にフォールバックする。
     if let Ok(mut stmt) = conn.prepare(
         "SELECT committed_path FROM virtual_bodies
          WHERE real_id = ?1 AND id <> ?2 AND committed_path IS NOT NULL
@@ -340,8 +344,21 @@ fn resolve_view_conn(
         if let Ok(rows) = stmt.query_map(rusqlite::params![real_id, vid], |r| {
             r.get::<_, String>(0)
         }) {
-            for cp in rows.flatten() {
-                let p = PathBuf::from(&cp);
+            let sibs: Vec<String> = rows.flatten().collect();
+            // 優先: origin_path（窓の対象＝複製元の実ファイル）に一致する生存兄弟
+            if let Some(op) = &origin {
+                for cp in &sibs {
+                    if cp == op {
+                        let p = PathBuf::from(cp);
+                        if p.exists() {
+                            return Some((p, if depth == 0 { "sibling" } else { "fork-live" }));
+                        }
+                    }
+                }
+            }
+            // フォールバック: 最古の生存兄弟（origin 未記録の旧データ・外部 origin など）
+            for cp in &sibs {
+                let p = PathBuf::from(cp);
                 if p.exists() {
                     return Some((p, if depth == 0 { "sibling" } else { "fork-live" }));
                 }
@@ -1228,12 +1245,17 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     let vid = uuid();
+    // v1.3.9: 実身を複製した仮身は「どの実身の窓か」を origin_path に記録する。
+    // 同じ内容（=同じ real_id）の実身が複数あると兄弟解決が追従先を特定できないため、
+    // 複製元が実身（committed_path あり）なら、その committed_path を origin_path に持たせ、
+    // resolve_view ② が origin 一致でその実身を選べるようにする。複製元が仮身なら origin を継承。
     p.conn
         .execute(
             "INSERT INTO virtual_bodies
                 (id, real_id, label, pos_x, pos_y, created_at, folder_ref, origin_path,
                  kind, filter_ref)
-             SELECT ?1, real_id, label, pos_x + 36.0, pos_y + 36.0, ?2, folder_ref, origin_path,
+             SELECT ?1, real_id, label, pos_x + 36.0, pos_y + 36.0, ?2, folder_ref,
+                 COALESCE(origin_path, committed_path),
                  kind, filter_ref
              FROM virtual_bodies WHERE id = ?3",
             rusqlite::params![vid, db::now_ms(), id],
