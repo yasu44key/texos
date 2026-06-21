@@ -18,6 +18,7 @@ import {
   filterOutputMime,
   isTextMime,
   lostOf,
+  lostRealOf,
   mimeMatches,
   noteSize,
   shapeCenterOn,
@@ -1047,6 +1048,55 @@ function App() {
             });
           } catch (e) {
             console.error("recommit failed", e);
+          }
+        },
+      });
+    },
+    [refresh]
+  );
+
+  // v1.3.9 問題点2: 実体喪失の実身を、移動/改名された正しいファイルへ繋ぎ直す。
+  // committed_path だけ差し替え（real_id・CASは不変）。自動CASロールバックの代替。
+  const handleRelink = useCallback(
+    async (id: string) => {
+      try {
+        const sel = await open({
+          multiple: false,
+          title: "再リンクする実ファイルを選択",
+          defaultPath: project?.path,
+        });
+        if (typeof sel !== "string") return;
+        await invoke("relink_object", { id, newPath: sel });
+        mtimeBaseRef.current.delete(id);
+        await refresh();
+      } catch (e) {
+        console.error("relink failed", e);
+      }
+    },
+    [refresh, project]
+  );
+
+  // v1.3.9 問題点2: 正しいファイルが無いとき、CASスナップショットから実体を書き出す。
+  const handleRestoreFromCas = useCallback(
+    (id: string) => {
+      setConfirm({
+        title: "CASから復元",
+        message:
+          "取り込み時点のスナップショット（CAS）から実体ファイルを書き出して復元します。リネーム／移動した最新版がある場合は、先に「実ファイルを再リンク」を使ってください。",
+        okLabel: "CASから復元",
+        onConfirm: async () => {
+          setConfirm(null);
+          try {
+            await invoke("commit_object", { id, force: true });
+            mtimeBaseRef.current.delete(id);
+            await refresh();
+            setTouched((prev) => {
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+          } catch (e) {
+            console.error("restore from cas failed", e);
           }
         },
       });
@@ -2357,6 +2407,8 @@ function App() {
         openDefault: handleOpenDefault,
         openWith: handleOpenWith,
         commitReveal: handleCommitReveal,
+        relink: handleRelink,
+        restoreFromCas: handleRestoreFromCas,
         editInCanvas: handleEditInCanvas,
         expandView: handleExpandView,
         collapse: handleCollapse,
@@ -2491,6 +2543,8 @@ function App() {
       handleSendToBack,
       handleAutoLayout,
       handleCommitReveal,
+      handleRelink,
+      handleRestoreFromCas,
       handleFocusSelection,
       handlePaste,
       handleShapeAdd,
@@ -2658,7 +2712,7 @@ function App() {
             y={obj.pos_y}
             committed={!!obj.committed_path}
             active={touched.has(obj.id)}
-            lost={lostOf(obj)}
+            lost={lostOf(obj) ?? (lostRealOf(obj) ? "real" : null)}
             isProject={obj.mime_type === PROJECT_MIME || !!obj.project_ref}
             isUrl={!!obj.url_ref}
             isFolder={!!obj.folder_ref}

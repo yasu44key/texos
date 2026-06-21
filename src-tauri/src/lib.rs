@@ -1469,6 +1469,28 @@ fn commit_object_inner(p: &Project, id: &str, force: bool) -> Result<String, Str
     Ok(dest_str)
 }
 
+/// v1.3.9 問題点2: 実体喪失の実身を、リネーム/移動された実ファイルへ繋ぎ直す。
+/// committed_path / committed_mtime だけを差し替える（real_id・CAS は不変）。
+/// 「正しいファイルを選び直す → 無ければ CASから復元（= commit_object force）」の
+/// 前者にあたる。自動 CAS ロールバックの代わりにユーザーが明示的に選ぶための経路。
+#[tauri::command]
+fn relink_object(id: String, new_path: String, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let np = std::path::Path::new(&new_path);
+    if !np.is_file() {
+        return Err("選んだファイルが見つかりません".into());
+    }
+    let mtime = file_mtime_ms(np);
+    p.conn
+        .execute(
+            "UPDATE virtual_bodies SET committed_path = ?1, committed_mtime = ?2 WHERE id = ?3",
+            rusqlite::params![new_path, mtime, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct CommitAllWarning {
     pub label: String,
@@ -3627,6 +3649,7 @@ pub fn run() {
             duplicate_virtual,
             commit_object,
             commit_all,
+            relink_object,
             uncommit_object,
             make_real,
             open_with_default,

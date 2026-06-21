@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { MenuItem } from "./ContextMenu";
 import type { ShapeInfo } from "../objects/ShapeCard";
 import type { NoteInfo, VirtualBodyInfo } from "../model";
-import { SHAPE_COLORS, THEMES, isTextMime, lostOf, isInternalReal } from "../model";
+import { SHAPE_COLORS, THEMES, isTextMime, lostOf, lostRealOf, isInternalReal } from "../model";
 
 // App のハンドラ群。メニュー項目はすべてこの窓口経由で実行する。
 export interface MenuActions {
@@ -52,6 +52,9 @@ export interface MenuActions {
   openDefault: (id: string) => void;
   openWith: (id: string) => void;
   commitReveal: (id: string) => void;
+  // v1.3.9 問題点2: 実体喪失の実身を救う2経路。
+  relink: (id: string) => void;
+  restoreFromCas: (id: string) => void;
   editInCanvas: (id: string) => void;
   expandView: (id: string) => void;
   collapse: (id: string) => void;
@@ -349,6 +352,21 @@ export function buildObjectMenu(
             label: "取り込み時点の内容を復活",
             hint: "失われた窓の先を、CASに残るスナップショットから実身化して表示します。",
             onClick: () => a.commitReveal(targetId),
+          },
+        ]
+      : []),
+    // v1.3.9 問題点2: 実体が失われた実身 → 正しいファイルを選び直す／無ければCAS復元。
+    ...(obj && committed && lostRealOf(obj)
+      ? [
+          {
+            label: "実ファイルを再リンク...",
+            hint: "この実身の実体ファイルが見つかりません（リネーム・フォルダ移動など）。移動先の正しいファイルを選んで繋ぎ直します。",
+            onClick: () => a.relink(targetId),
+          },
+          {
+            label: "CASから復元",
+            hint: "正しいファイルが見つからない場合に、取り込み時点のスナップショット（CAS）から実体を書き出して復元します。",
+            onClick: () => a.restoreFromCas(targetId),
           },
         ]
       : []),

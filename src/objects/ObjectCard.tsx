@@ -22,8 +22,9 @@ interface Props {
   /** interacted with (edited/viewed) this session — transient green marker */
   active?: boolean;
   /** v1.3-⑩ 薄赤: the 仮身's window lost its live target.
-   *  "cas" = showing the import-time CAS snapshot; "none" = nothing found. */
-  lost?: "cas" | "none" | null;
+   *  "cas" = showing the import-time CAS snapshot; "none" = nothing found.
+   *  v1.3.9 問題点2: "real" = 実身カードだが実体ファイルが失われている（再リンク待ち）。 */
+  lost?: "cas" | "none" | "real" | null;
   /** this card references another TexoS project (navigable) */
   isProject?: boolean;
   /** this card is a web URL link */
@@ -273,7 +274,16 @@ export function ObjectCard({
   //   薄赤  = 仮身で窓の先を喪失（CASの写真を表示中／内容なし）(v1.3-⑩)
   //   緑   = 実身で、このセッションで新規導入または変更（次回起動でグレーに）
   //   グレー = 実身（閲覧のみ・変更なし）
-  const status = committed
+  const status = lost === "real"
+    ? {
+        // v1.3.9 問題点2: 実身だが実体ファイルが喪失。再リンク／CAS復元を促す薄赤。
+        color: "#e08a8a",
+        border: "#6b3a3a",
+        filled: true,
+        title:
+          "実身（実体ファイルが見つかりません・リネーム/移動/削除？ 右クリックで再リンクかCAS復元）",
+      }
+    : committed
     ? active
       ? { color: "#3fae6a", border: "#2c4f3c", filled: true, title: "実身（このセッションで導入／変更）" }
       : { color: "#8a93a6", border: "#3a4254", filled: true, title: "実身（プロジェクトのもの）" }
