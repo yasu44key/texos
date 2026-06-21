@@ -2,7 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 interface Props {
-  path: string;
+  /** committed file path to edit (edit mode). Omitted in read-only view mode. */
+  path?: string | null;
+  /** v1.3.9: 仮身 id — used to load LIVE content in read-only view mode. */
+  objId?: string;
+  /** v1.3.9: read-only 閲覧 mode (no commit, no save). Shows an 「編集」 button. */
+  readOnly?: boolean;
+  /** v1.3.9: invoked when the user presses 「編集」 in read-only mode (= commit→edit). */
+  onRequestEdit?: () => void;
   /** vertical offset from the card origin (card height + gap) */
   top: number;
   /** panel width (v1.3.1, user-resizable; persisted by the parent) */
@@ -12,9 +19,23 @@ interface Props {
   onSaved?: () => void;
 }
 
-/** A text editor panel anchored to its parent card (shares the card's origin,
- *  so it moves together when the card is dragged). */
-export function InlineTextEditor({ path, top, width = null, onResizeEnd, onClose, onSaved }: Props) {
+/** A text panel anchored to its parent card (shares the card's origin, so it
+ *  moves together when the card is dragged).
+ *  v1.3.9: two modes —
+ *    edit mode (path set): editable, 保存/保存して閉じる.
+ *    read-only 閲覧 mode (readOnly + objId): loads LIVE content via read_view_text,
+ *    no save; an 「編集」 button promotes to edit (commit→実身) via onRequestEdit. */
+export function InlineTextEditor({
+  path = null,
+  objId,
+  readOnly = false,
+  onRequestEdit,
+  top,
+  width = null,
+  onResizeEnd,
+  onClose,
+  onSaved,
+}: Props) {
   const [content, setContent] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -48,7 +69,12 @@ export function InlineTextEditor({ path, top, width = null, onResizeEnd, onClose
   };
 
   useEffect(() => {
-    invoke<string>("read_text_file", { path })
+    // v1.3.9: read-only view loads LIVE content by id (no commit); edit loads the file.
+    const loader =
+      readOnly && objId
+        ? invoke<string>("read_view_text", { id: objId })
+        : invoke<string>("read_text_file", { path });
+    loader
       .then((t) => {
         setContent(t);
         setLoaded(true);
@@ -57,9 +83,10 @@ export function InlineTextEditor({ path, top, width = null, onResizeEnd, onClose
         setContent(`(読み込みに失敗: ${e})`);
         setLoaded(true);
       });
-  }, [path]);
+  }, [path, objId, readOnly]);
 
   const save = async () => {
+    if (readOnly || !path) return;
     try {
       await invoke("write_text_file", { path, text: content });
       setDirty(false);
@@ -69,7 +96,7 @@ export function InlineTextEditor({ path, top, width = null, onResizeEnd, onClose
     }
   };
 
-  const fileName = path.split(/[\\/]/).pop();
+  const fileName = (path ?? "").split(/[\\/]/).pop();
 
   return (
     <div
@@ -83,7 +110,7 @@ export function InlineTextEditor({ path, top, width = null, onResizeEnd, onClose
         top,
         width: panelW,
         background: "#101820",
-        border: "1px solid #2f6b5e",
+        border: `1px solid ${readOnly ? "#3a4658" : "#2f6b5e"}`,
         borderRadius: 8,
         boxShadow: "0 4px 20px #000000aa",
         fontFamily: "sans-serif",
@@ -103,32 +130,45 @@ export function InlineTextEditor({ path, top, width = null, onResizeEnd, onClose
         }}
       >
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          ✎ {fileName}{dirty ? " *" : ""}
+          {readOnly ? "👁 閲覧（読み取り専用）" : `✎ ${fileName}${dirty ? " *" : ""}`}
         </span>
         <div style={{ display: "flex", gap: 6 }}>
-          <button onClick={save} style={btn("#2f6b5e")}>保存</button>
-          <button
-            onClick={() => {
-              if (dirty) save();
-              onClose();
-            }}
-            style={btn("#3a4658")}
-          >
-            保存して閉じる
-          </button>
-          <button onClick={onClose} style={btn("#5a2f3a")} title="保存せず閉じる">✕</button>
+          {readOnly ? (
+            <button
+              onClick={() => onRequestEdit?.()}
+              style={btn("#2f6b5e")}
+              title="この内容を実身化して編集します"
+            >
+              編集
+            </button>
+          ) : (
+            <>
+              <button onClick={save} style={btn("#2f6b5e")}>保存</button>
+              <button
+                onClick={() => {
+                  if (dirty) save();
+                  onClose();
+                }}
+                style={btn("#3a4658")}
+              >
+                保存して閉じる
+              </button>
+            </>
+          )}
+          <button onClick={onClose} style={btn("#5a2f3a")} title={readOnly ? "閉じる" : "保存せず閉じる"}>✕</button>
         </div>
       </div>
       <textarea
         ref={taRef}
         value={loaded ? content : "読み込み中..."}
-        readOnly={!loaded}
+        readOnly={!loaded || readOnly}
         onChange={(e) => {
+          if (readOnly) return;
           setContent(e.target.value);
           setDirty(true);
         }}
         onKeyDown={(e) => {
-          if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+          if (!readOnly && (e.ctrlKey || e.metaKey) && e.key === "s") {
             e.preventDefault();
             save();
           }
@@ -143,7 +183,7 @@ export function InlineTextEditor({ path, top, width = null, onResizeEnd, onClose
           background: "#0b1116",
           border: "none",
           outline: "none",
-          color: "#e6eef2",
+          color: readOnly ? "#c6d2da" : "#e6eef2",
           fontSize: 13,
           fontFamily: "ui-monospace, Consolas, monospace",
           lineHeight: 1.5,

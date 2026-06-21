@@ -4,6 +4,7 @@ import { InlineTextEditor } from "./InlineTextEditor";
 import { ImagePreview } from "./ImagePreview";
 import { AudioPlayer } from "./AudioPlayer";
 import { MediaPreview } from "./MediaPreview";
+import { isTextMime } from "../model";
 
 // Fixed card geometry so link endpoints are predictable from (x, y) alone.
 export const CARD_W = 150;
@@ -59,6 +60,10 @@ interface Props {
   onPanelResize?: (id: string, width: number) => void;
   onCollapse?: (id: string) => void;
   onAfterSave?: () => void;
+  /** v1.3.9: 読取専用テキスト閲覧から「編集」押下 → 実身化して編集（commit→edit）。 */
+  onRequestEdit?: (id: string) => void;
+  /** v1.3.9: フィルタ/コマンド/ジェネレータの ▶実行 ボタン（ダブルクリックは設定に変更）。 */
+  onRunFlow?: (id: string) => void;
   onMoveEnd?: (id: string, x: number, y: number) => void;
   /** Begin dragging a link from this card. (fromId, clientX, clientY) */
   onStartLink?: (fromId: string, clientX: number, clientY: number) => void;
@@ -131,23 +136,28 @@ function iconFor(mime: string, ext?: string | null): string {
 // v1.5: フィルタカードの Type 別ビジュアル（一目で見分けるビジュアル系TexoS）。
 // 内蔵フィルタ・旧形式はフィルタ扱い（緑）。
 const FILTER_TYPE_STYLES = {
+  // v1.3.9: カードは「名前／種類／実行ボタン」の3行で揃える。操作説明（ダブルクリック＝設定）
+  // は常時表示せず、カードのホバー（title）と右クリックメニューに逃がす。
   filter: {
     bg: "var(--card-bg-filter, #14281e)",
     border: "#3a7a5a",
     text: "#7fd8b0",
-    badge: "⚙ フィルタ（Wクリックで実行）",
+    badge: "⚙ フィルタ",
+    run: "▶ 実行",
   },
   command: {
     bg: "var(--card-bg-filter-cmd, #142828)",
     border: "#3a7a7a",
     text: "#7fd8d8",
-    badge: "⌨ コマンド（Wクリックで実行）",
+    badge: "⌨ コマンド",
+    run: "▶ 実行",
   },
   generator: {
     bg: "var(--card-bg-filter-gen, #2a2114)",
     border: "#7a5d3a",
     text: "#e8c07f",
-    badge: "✨ ジェネレータ（Wクリックで生成）",
+    badge: "✨ ジェネレータ",
+    run: "▶ 生成",
   },
 } as const;
 
@@ -170,7 +180,7 @@ export function ObjectCard({
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onSelect, onGroupDragStart,
-  onMoveEnd, onStartLink, onOpen, onCollapse, onAfterSave,
+  onMoveEnd, onStartLink, onOpen, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
 }: Props) {
   const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
   const posRef = useRef({ x, y });
@@ -181,6 +191,9 @@ export function ObjectCard({
   const isImage = mimeType.startsWith("image/");
   const isVideo = mimeType.startsWith("video/");
   const isPdf = mimeType === "application/pdf" || (ext ?? "").toLowerCase() === "pdf";
+  // v1.3.9: text cards render an inline panel — read-only 閲覧 when uncommitted,
+  // editable when an editable real file (editPath) exists.
+  const isText = isTextMime(mimeType, ext ?? null);
 
   useEffect(() => {
     if (isProject || isUrl || !ext) return;
@@ -327,7 +340,13 @@ export function ObjectCard({
       }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      title={`${mimeType}\nid: ${id}`}
+      title={
+        isFilter
+          ? `${fstyle.badge}\nダブルクリック: 設定を開く ／ ボタン: ${fstyle.run}\n右クリック: メニュー`
+          : isDrop
+          ? "ここにファイルをドロップ→下流を自動実行\nダブルクリック: 投入するファイルを選択"
+          : `${mimeType}\nid: ${id}`
+      }
     >
       {/* inner content clipped to rounded card */}
       <div style={{
@@ -403,6 +422,32 @@ export function ObjectCard({
             )}
             {isFilter && (
               <span style={{ fontSize: 9, color: fstyle.text }}>{fstyle.badge}</span>
+            )}
+            {/* v1.3.9: 実行は明示ボタンで（ダブルクリックは設定）。誤爆を防ぐ。 */}
+            {isFilter && (
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRunFlow?.(id);
+                }}
+                title="このフローを実行します"
+                style={{
+                  marginTop: 2,
+                  padding: "2px 12px",
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: "#fff",
+                  background: fstyle.border,
+                  border: "none",
+                  borderRadius: 5,
+                  cursor: "pointer",
+                  fontFamily: "sans-serif",
+                }}
+              >
+                {fstyle.run}
+              </button>
             )}
             {isDrop && (
               <span style={{ fontSize: 9, color: "#7fb0d8" }}>📥 ここにドロップ→自動実行</span>
@@ -495,9 +540,16 @@ export function ObjectCard({
           onClose={() => onCollapse?.(id)}
         />
       )}
-      {expanded && !isImage && !mimeType.startsWith("audio/") && !isVideo && !isPdf && editPath && (
+      {/* v1.3.9: text panel. editPath present → editable (実身); otherwise
+          read-only 閲覧 of the LIVE content, with an 「編集」 button that
+          commits→edits via onRequestEdit. */}
+      {expanded && !isImage && !mimeType.startsWith("audio/") && !isVideo && !isPdf &&
+        (editPath || isText) && (
         <InlineTextEditor
           path={editPath}
+          objId={id}
+          readOnly={!editPath}
+          onRequestEdit={() => onRequestEdit?.(id)}
           top={CARD_H + 8}
           width={panelW}
           onResizeEnd={(w) => onPanelResize?.(id, w)}

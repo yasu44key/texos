@@ -678,6 +678,55 @@ fn import_file(
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_lowercase());
+
+    // A file already inside the project folder (and not under .texos) IS the
+    // project's real file: register it committed, pointing at itself.
+    let in_project = src.starts_with(&p.root) && !src.starts_with(texos_dir(&p.root));
+
+    // 問題点1（同プロジェクト内の実体を2つ以上の実身にしない＝システムの根幹）:
+    // 既に同じ実ファイルを committed_path に持つ生きたカードがあれば、2枚目以降は
+    // 仮身（窓）として登録する。同 real_id を共有 + committed_path=NULL にすることで、
+    // 兄弟解決（resolve_view ②）でその実身ファイルを映す窓になり、この仮身を削除しても
+    // 実体には触れない。CAS への再保存も不要（既存実身のブロブを共有）。
+    if in_project {
+        let dup_real: Option<String> = p
+            .conn
+            .query_row(
+                "SELECT real_id FROM virtual_bodies
+                 WHERE committed_path = ?1 AND deleted_at IS NULL
+                 ORDER BY created_at LIMIT 1",
+                rusqlite::params![path],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(real_id) = dup_real {
+            let vid = uuid();
+            let stem = src.file_name().and_then(|s| s.to_str()).unwrap_or(&label);
+            let display_label = if label.is_empty() { stem } else { &label };
+            p.conn
+                .execute(
+                    "INSERT INTO virtual_bodies
+                        (id, real_id, label, pos_x, pos_y, created_at,
+                         origin_path, ext, mime_type)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        vid,
+                        real_id,
+                        display_label,
+                        x,
+                        y,
+                        db::now_ms(),
+                        path,
+                        orig_ext,
+                        mime
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(vid);
+        }
+    }
+
     let hash = cas::store_file(&p.cas_root, src).map_err(|e| e.to_string())?;
     let file_size = src.metadata().map_err(|e| e.to_string())?.len();
 
@@ -688,9 +737,6 @@ fn import_file(
     let stem = src.file_name().and_then(|s| s.to_str()).unwrap_or(&label);
     let display_label = if label.is_empty() { stem } else { &label };
 
-    // A file already inside the project folder (and not under .texos) IS the
-    // project's real file: register it committed, pointing at itself.
-    let in_project = src.starts_with(&p.root) && !src.starts_with(texos_dir(&p.root));
     let committed_path = in_project.then(|| path.clone());
     let committed_mtime = if in_project { file_mtime_ms(src) } else { None };
 
@@ -813,7 +859,7 @@ fn get_thumbnail(id: String, state: State<AppState>) -> Result<String, String> {
     let (obj_path, cache_path) = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-        refresh_origin_snapshot(p, &id); // 閲覧時にCASスナップショットを更新
+        // v1.3.9 ②: 閲覧では CAS に書き込まない（スナップは実身化時のみ）。
         let real_id: String = p
             .conn
             .query_row(
@@ -864,7 +910,7 @@ fn get_media_data_url(id: String, state: State<AppState>) -> Result<String, Stri
     let (obj_path, mime) = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-        refresh_origin_snapshot(p, &id);
+        // v1.3.9 ②: 閲覧では CAS に書き込まない。
         let (real_id, mime): (String, String) = p
             .conn
             .query_row(
@@ -887,7 +933,7 @@ fn get_preview(id: String, state: State<AppState>) -> Result<String, String> {
     let obj_path = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-        refresh_origin_snapshot(p, &id);
+        // v1.3.9 ②: 閲覧では CAS に書き込まない。
         let real_id: String = p
             .conn
             .query_row(
@@ -1799,7 +1845,7 @@ fn make_real(id: String, state: State<AppState>) -> Result<String, String> {
 /// Copy a virtual body's real bytes to a throwaway TEMP file with its proper
 /// name/extension and return the path.
 fn materialize_temp(p: &Project, id: &str) -> Result<String, String> {
-    refresh_origin_snapshot(p, id); // 閲覧時にCASスナップショットを更新
+    // v1.3.9 ②: 閲覧では CAS に書き込まない（一時的閲覧も非破壊）。
     // v1.3.6: ファイル名の拡張子・MIME は仮身優先（COALESCE）。空ファイル共有で実身が
     // ods 等に潰れていても、本来の拡張子（.docx 等）で書き出す／開く（.docx.ods を防ぐ）。
     let (real_id, label, mime, stored_ext): (String, String, String, Option<String>) = p
@@ -1842,7 +1888,7 @@ fn view_temp(id: String, state: State<AppState>) -> Result<String, String> {
 fn materialize_view(id: String, state: State<AppState>) -> Result<String, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-    refresh_origin_snapshot(p, &id);
+    // v1.3.9 ②: 閲覧（インラインPDF/動画プレビュー）では CAS に書き込まない。
     let (real_id, mime, stored_ext, committed): (String, String, Option<String>, Option<String>) =
         p.conn
             .query_row(
@@ -2080,6 +2126,25 @@ fn commit_note_to_file(id: String, state: State<AppState>) -> Result<String, Str
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+/// v1.3.9 ①: Read a 仮身's LIVE text content for a read-only inline view,
+/// without committing (= without creating a 実身). Resolves the same window as
+/// 閲覧 (committed → sibling → origin → CAS → fork source) and reads it as UTF-8.
+#[tauri::command]
+fn read_view_text(id: String, state: State<AppState>) -> Result<String, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let real_id: String = p
+        .conn
+        .query_row(
+            "SELECT real_id FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let src = resolve_view_path(p, &id, &real_id);
+    std::fs::read_to_string(&src).map_err(|e| e.to_string())
 }
 
 /// Write a UTF-8 text file (for file-linked notes → in-canvas editing).
@@ -2886,8 +2951,9 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         }
     }
 
-    // 実行ログを memo に記録（最後の実行が常に見える — 確定方針4）
-    let mut log = format!("▶ 実行: 出力{}", report.outputs.len());
+    // 実行ログを memo に記録（最後の実行が常に見える — 確定方針4）。
+    // v1.3.9: 先頭の ▶ は実行ボタンと紛らわしいので「✓ 前回」に変更（これは結果表示）。
+    let mut log = format!("✓ 前回: 出力{}", report.outputs.len());
     if !report.skipped.is_empty() {
         log.push_str(&format!("・スキップ{}", report.skipped.len()));
     }
@@ -3578,6 +3644,7 @@ pub fn run() {
             create_note_linked,
             commit_note_to_file,
             read_text_file,
+            read_view_text,
             write_text_file,
             paste_clipboard,
             copy_objects_to_clipboard,

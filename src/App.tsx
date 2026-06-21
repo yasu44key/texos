@@ -843,19 +843,22 @@ function App() {
   );
 
   // Double-click / 開く. Project objects navigate; files commit+open.
+  // v1.3.9 ①: ダブルクリック＝閲覧（非破壊）。実身化・実行・編集は一切しない。
+  // 「そのカードが何であるかを、状態を変えずに覗く」。重い動詞（編集／実行）は明示操作。
   const handleOpenObject = useCallback(
     async (id: string) => {
       const obj = objectsRef.current.find((o) => o.id === id);
-      // v1.4: フィルタカードのダブルクリック＝そのカードの自然なアクション＝フロー実行。
+      // フィルタカード: 覗く＝定義を見る → 設定を開く（実行はメニュー／▶ボタンで明示）。
       if (obj && (obj.kind === "filter" || obj.filter_ref)) {
-        handleRunFlow(id);
+        handleEditFilter(id, obj.filter_ref ?? "{}");
         return;
       }
-      // v1.4: ドロップポイントのダブルクリック＝ファイルを選んで投入（→自動実行）。
+      // ドロップポイント: ファイルダイアログで明示的に投入（誤爆しない）。
       if (obj?.kind === "drop") {
         handleFeedDrop(id);
         return;
       }
+      // プロジェクト仮身: 入る（ナビゲーション・非破壊）。
       if (obj?.project_ref) {
         try {
           const info = await invoke<ProjectInfo>("open_project_object", { id });
@@ -885,32 +888,26 @@ function App() {
         );
         return;
       }
-      // Double-click does the natural in-canvas action per type.
-      if (obj && (obj.mime_type.startsWith("image/") || obj.mime_type.startsWith("audio/"))) {
-        handleExpandView(id);
+      // インラインプレビューがある種別はキャンバス内で閲覧（仮身のまま・CAS不変）。
+      if (
+        obj &&
+        (obj.mime_type.startsWith("image/") ||
+          obj.mime_type.startsWith("audio/") ||
+          obj.mime_type.startsWith("video/") ||
+          obj.mime_type === "application/pdf" ||
+          (obj.ext ?? "").toLowerCase() === "pdf" ||
+          isTextMime(obj.mime_type, obj.ext))
+      ) {
+        // テキストは未コミットなら読取専用、実身なら編集パネル（ObjectCard が分岐）。
+        // handleExpandView 相当をインライン（定義順より前のため）。
+        invoke("set_expanded", { id, expanded: true }).catch(() => {});
+        setExpanded((prev) => new Set(prev).add(id));
         return;
       }
-      if (obj && isTextMime(obj.mime_type, obj.ext)) {
-        handleEditInCanvas(id);
-        return;
-      }
-      try {
-        const wasCommitted = !!obj?.committed_path;
-        const path = await invoke<string>("commit_object", { id });
-        await refresh();
-        if (!wasCommitted) setTouched((prev) => new Set(prev).add(id));
-        await invoke("open_with_default", { path });
-      } catch (e) {
-        console.error("commit/open failed", e);
-        setConfirm({
-          title: "開けませんでした",
-          message: String(e),
-          okLabel: "OK",
-          onConfirm: () => setConfirm(null),
-        });
-      }
+      // インラインプレビューが無い種別 → 一時的閲覧（最新内容を読取専用で開く・破棄）。
+      invoke("view_temp", { id }).catch((e) => console.error("view_temp failed", e));
     },
-    [refresh, handleRunFlow, handleFeedDrop]
+    [handleEditFilter, handleFeedDrop]
   );
 
   // Place a reference to an existing project as a project-object card.
@@ -2355,6 +2352,7 @@ function App() {
         bulkDelete: handleBulkDelete,
         copyFiles: handleCopyFiles,
         copyImage: handleCopyImage,
+        view: handleOpenObject,
         openObject: handleOpenObject,
         openDefault: handleOpenDefault,
         openWith: handleOpenWith,
@@ -2683,6 +2681,8 @@ function App() {
             onOpen={handleOpenObject}
             onCollapse={handleCollapse}
             onAfterSave={refresh}
+            onRequestEdit={handleEditInCanvas}
+            onRunFlow={handleRunFlow}
           />
         ))}
         {notes.map((n) => (

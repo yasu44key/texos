@@ -46,6 +46,8 @@ export interface MenuActions {
   /** v1.3.8 (G6): 画像カードをビットマップ(CF_DIB)としてクリップボードへ。 */
   copyImage: (id: string) => void;
   // カード
+  // v1.3.9 ①: 閲覧（ダブルクリックと同じ非破壊ディスパッチ）。メニュー先頭に置く。
+  view: (id: string) => void;
   openObject: (id: string) => void;
   openDefault: (id: string) => void;
   openWith: (id: string) => void;
@@ -334,6 +336,12 @@ export function buildObjectMenu(
   // 説明は label から外してツールチップ(hint)へ。compact() で空グループの線を畳む。
   return compact([
     { label: `「${obj?.label ?? ""}」`, onClick: () => {}, disabled: true },
+    // v1.3.9 ①: 閲覧をメニュー先頭に（＝ダブルクリックと同じ非破壊の覗き）。
+    {
+      label: "閲覧",
+      hint: "中身を読み取り専用で表示します（実身化しません）。インラインで表示できない種別は一時コピーで開き、閉じると破棄されます。",
+      onClick: () => a.view(targetId),
+    },
     // v1.3.1: 窓の先を喪失した仮身 → CASのスナップショットから復活。
     ...(obj && lostOf(obj) === "cas"
       ? [
