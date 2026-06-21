@@ -526,7 +526,8 @@ function App() {
               { label: "コメント", onClick: () => la.note(cp.x, cp.y, fromId) },
               { label: "クリップボードから貼り付け", onClick: () => la.paste(cp.x, cp.y, fromId) },
               { label: "URLリンク...", onClick: () => la.url(cp.x, cp.y, fromId) },
-              { label: "フィルタカード ...", onClick: () => setMenu({ x: cx, y: cy, items: filterSub }) },
+              // サブメニューはメニューのクリック閉じの後に開き直す（openSubmenu と同じ定石）。
+              { label: "フィルタカード ...", onClick: () => window.setTimeout(() => setMenu({ x: cx, y: cy, items: filterSub }), 0) },
             ],
           });
         }
