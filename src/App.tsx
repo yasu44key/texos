@@ -811,6 +811,32 @@ function App() {
     });
   }, []);
 
+  // v1.3.10 TexoS内リネーム: 実身の実ファイルを改名（committed_path/label/ext を更新）。
+  // カードIDは不変なので、この実身を指す仮身（window_of）は全部自動追従する。
+  const handleRenameReal = useCallback(
+    (id: string, current: string) => {
+      setPrompt({
+        title: "実ファイルのリネーム（このカードの実体ファイルを改名します）",
+        initial: current,
+        onConfirm: async (name) => {
+          try {
+            await invoke("rename_real", { id, newName: name });
+            await refresh();
+          } catch (e) {
+            console.error("rename_real failed", e);
+            setConfirm({
+              title: "リネームできませんでした",
+              message: String(e),
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          }
+        },
+      });
+    },
+    [refresh]
+  );
+
   const handleDeleteObject = useCallback(async (id: string) => {
     try {
       await invoke("delete_object", { id });
@@ -2427,6 +2453,7 @@ function App() {
         duplicate: handleDuplicate,
         makeReal: handleMakeReal,
         renameObject: handleRenameObject,
+        renameReal: handleRenameReal,
         setMemo: handleSetMemo,
         changeUrl: handleChangeUrl,
         deleteObject: handleDeleteObject,
@@ -2528,6 +2555,7 @@ function App() {
       handleContextPlace,
       handleDeleteObject,
       handleRenameObject,
+      handleRenameReal,
       handleOpenObject,
       handleOpenDefault,
       handleOpenWith,

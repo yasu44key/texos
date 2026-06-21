@@ -65,6 +65,8 @@ export interface MenuActions {
   // v1.3.6 変更②: この仮身が指す内容を独立した内部実身にする（元ファイルから独立）。
   makeReal: (id: string) => void;
   renameObject: (id: string, current: string) => void;
+  // v1.3.10: 実身の実ファイルを TexoS から改名（仮身は window_of で追従）。
+  renameReal: (id: string, current: string) => void;
   setMemo: (id: string, current: string) => void;
   changeUrl: (id: string, current: string) => void;
   deleteObject: (id: string) => void;
@@ -498,8 +500,21 @@ export function buildObjectMenu(
       : []),
     DIV,
     // ── メタ操作 ──
+    // v1.3.10: 実身は実ファイルごと改名（仮身は window_of で自動追従）。仮身は表示名のみ。
+    ...(committed
+      ? [
+          {
+            label: "実ファイルのリネーム...",
+            hint: "このカードの実体ファイルを改名します（連番 (2) を消す等）。この実身を指す仮身は自動で追従します。",
+            onClick: () => a.renameReal(targetId, obj?.label ?? ""),
+          },
+        ]
+      : []),
     {
       label: "表示名を変更...",
+      hint: committed
+        ? "カードの表示名だけを変えます（実ファイル名は変わりません）。"
+        : undefined,
       onClick: () => a.renameObject(targetId, obj?.label ?? ""),
     },
     // 複数選択時の削除も「まとめて ...」サブメニュー側に集約（重複排除）。

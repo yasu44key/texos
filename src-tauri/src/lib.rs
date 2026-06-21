@@ -1344,6 +1344,75 @@ fn rename_object(id: String, label: String, state: State<AppState>) -> Result<()
     Ok(())
 }
 
+/// v1.3.10 TexoS内リネーム: 実身（committed_path を持つカード）の実ファイルを TexoS から
+/// 安全に改名する。実ファイル改名 + committed_path/mtime/label/ext を一括更新。カードIDは
+/// 不変なので window_of で指す仮身は全部自動追従する（OS でリネームすると committed_path が
+/// ずれて喪失＝赤になるのを防ぐ）。連番ファイル名（FILE(2)）の付け替えにも使う。
+#[tauri::command]
+fn rename_real(id: String, new_name: String, state: State<AppState>) -> Result<String, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+
+    let committed: Option<String> = p
+        .conn
+        .query_row(
+            "SELECT committed_path FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten();
+    let cp = committed.ok_or("このカードは実身ではありません（仮身は「表示名を変更」を使ってください）")?;
+    let old = PathBuf::from(&cp);
+    if !old.is_file() {
+        return Err("実ファイルが見つかりません（先に再リンク／CASから復元してください）".into());
+    }
+    // 安全: プロジェクトフォルダ内のファイルだけを改名対象にする。
+    if !old.starts_with(&p.root) {
+        return Err("プロジェクト外のファイルは TexoS から改名できません".into());
+    }
+    let dir = old.parent().ok_or("親フォルダが取得できません")?;
+
+    // 新名に拡張子が無ければ、元ファイルの拡張子を維持する。
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err("名前が空です".into());
+    }
+    let filename = match old.extension().and_then(|s| s.to_str()) {
+        Some(ext) if Path::new(new_name).extension().is_none() => ensure_ext(new_name, ext),
+        _ => new_name.to_string(),
+    };
+    // 同名なら変更なし（unique_path に渡すと自分自身と衝突して (2) が付くのを防ぐ）。
+    if dir.join(&filename) == old {
+        return Ok(cp);
+    }
+    let dest = unique_path(dir, &filename);
+    std::fs::rename(&old, &dest).map_err(|e| e.to_string())?;
+
+    let dest_str = dest.to_string_lossy().to_string();
+    let mtime = file_mtime_ms(&dest).unwrap_or_else(db::now_ms);
+    let new_label = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&filename)
+        .to_string();
+    let new_ext = dest
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
+    p.conn
+        .execute(
+            "UPDATE virtual_bodies
+             SET committed_path = ?1, committed_mtime = ?2, label = ?3, ext = ?4
+             WHERE id = ?5",
+            rusqlite::params![dest_str, mtime, new_label, new_ext, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(dest_str)
+}
+
 #[tauri::command]
 fn create_relation(
     from_id: String,
@@ -3737,6 +3806,7 @@ pub fn run() {
             set_undo_stack,
             get_undo_stack,
             rename_object,
+            rename_real,
             duplicate_virtual,
             commit_object,
             commit_all,
