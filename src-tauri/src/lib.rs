@@ -1317,13 +1317,16 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
         } else {
             (None, s_origin)
         };
+    // v1.3.10 補完: ext/mime_type（そのファイルの属性）も引き継ぐ。空ファイル等は実身を
+    // 共有するため、これを継がないと .docx の仮身が実身(real_bodies)側の型に落ちて text 扱いに
+    // なり、実身化/リネームで .txt になってしまう（UIの気づき2 問題点3）。
     p.conn
         .execute(
             "INSERT INTO virtual_bodies
                 (id, real_id, label, pos_x, pos_y, created_at, folder_ref, origin_path,
-                 window_of, kind, filter_ref)
+                 window_of, kind, filter_ref, ext, mime_type)
              SELECT ?1, real_id, label, pos_x + 36.0, pos_y + 36.0, ?2, folder_ref, ?4,
-                 ?5, kind, filter_ref
+                 ?5, kind, filter_ref, ext, mime_type
              FROM virtual_bodies WHERE id = ?3",
             rusqlite::params![vid, db::now_ms(), id, origin_path, window_of],
         )

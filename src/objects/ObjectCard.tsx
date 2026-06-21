@@ -306,6 +306,10 @@ export function ObjectCard({
   // ＝プレビューと衝突しないよう stopPropagation。
   const titleRenamable =
     !!onRenameTitle && !isFilter && !isDrop && !isProject && !isUrl && !isFolder;
+  // v1.3.10 補完: フィルタ/ドロップは「アイコン/名前/種類/▶実行」の4行で固定サイズ(115px)が
+  // いっぱい。実行ログのメモは5行目になり下端からはみ出てクリップされるので、カード面からは
+  // 外してホバー(title)に移し、余白を詰めて4行を確実に収める。
+  const compactFilter = isFilter || isDrop;
   const onTitleDblClick = titleRenamable
     ? (e: React.MouseEvent) => {
         e.stopPropagation();
@@ -366,9 +370,9 @@ export function ObjectCard({
       onMouseLeave={() => setHover(false)}
       title={
         isFilter
-          ? `${fstyle.badge}\nダブルクリック: 設定を開く ／ ボタン: ${fstyle.run}\n右クリック: メニュー`
+          ? `${fstyle.badge}\nダブルクリック: 設定を開く ／ ボタン: ${fstyle.run}\n右クリック: メニュー${memo ? `\n\n${memo}` : ""}`
           : isDrop
-          ? "ここにファイルをドロップ→下流を自動実行\nダブルクリック: 投入するファイルを選択"
+          ? `ここにファイルをドロップ→下流を自動実行\nダブルクリック: 投入するファイルを選択${memo ? `\n\n${memo}` : ""}`
           : `${mimeType}\nid: ${id}`
       }
     >
@@ -397,7 +401,7 @@ export function ObjectCard({
             />
             <div
               onDoubleClick={onTitleDblClick}
-              title={titleRenamable ? "ダブルクリックでリネーム" : undefined}
+              title={titleRenamable ? "ダブルクリックで表示名を変更" : undefined}
               style={{
                 padding: "4px 8px",
                 overflow: "hidden",
@@ -417,8 +421,8 @@ export function ObjectCard({
             flexDirection: "column",
             alignItems: "center",
             justifyContent: "center",
-            gap: 6,
-            padding: "8px 6px",
+            gap: compactFilter ? 3 : 6,
+            padding: compactFilter ? "5px 6px" : "8px 6px",
           }}>
             {osIcon ? (
               <img
@@ -433,7 +437,7 @@ export function ObjectCard({
             )}
             <span
               onDoubleClick={onTitleDblClick}
-              title={titleRenamable ? "ダブルクリックでリネーム" : undefined}
+              title={titleRenamable ? "ダブルクリックで表示名を変更" : undefined}
               style={{
                 maxWidth: "100%",
                 overflow: "hidden",
@@ -486,7 +490,8 @@ export function ObjectCard({
             {isDrop && (
               <span style={{ fontSize: 9, color: "#7fb0d8" }}>📥 ここにドロップ→自動実行</span>
             )}
-            {memo && (
+            {/* v1.3.10 補完: フィルタ/ドロップはメモ(実行ログ)を面に出さずホバーへ（4行に収める）。 */}
+            {memo && !compactFilter && (
               <span
                 style={{
                   fontSize: 10,

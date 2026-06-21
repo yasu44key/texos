@@ -1268,15 +1268,16 @@ function App() {
     [refresh]
   );
 
-  // v1.3.10: タイトル(ラベル)ダブルクリック → 実身なら実ファイル改名、仮身なら表示名変更。
+  // v1.3.10 補完: タイトル(ラベル)ダブルクリックは実身・仮身とも「表示名を変更」に統一。
+  // 実身だけ実ファイル改名になると混乱する（UIの気づき2 問題点2）。実ファイル名の変更は
+  // 右クリックメニュー（表示名の下）から行う。
   const handleRenameTitle = useCallback(
     (id: string) => {
       const obj = objectsRef.current.find((o) => o.id === id);
       if (!obj) return;
-      if (obj.committed_path) handleRenameReal(id, obj.label);
-      else handleRenameObject(id, obj.label);
+      handleRenameObject(id, obj.label);
     },
-    [handleRenameReal, handleRenameObject]
+    [handleRenameObject]
   );
 
   // 全コミット: materialize every object so the project folder can leave

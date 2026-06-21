@@ -500,16 +500,8 @@ export function buildObjectMenu(
       : []),
     DIV,
     // ── メタ操作 ──
-    // v1.3.10: 実身は実ファイルごと改名（仮身は window_of で自動追従）。仮身は表示名のみ。
-    ...(committed
-      ? [
-          {
-            label: "実ファイルのリネーム...",
-            hint: "このカードの実体ファイルを改名します（連番 (2) を消す等）。この実身を指す仮身は自動で追従します。",
-            onClick: () => a.renameReal(targetId, obj?.label ?? ""),
-          },
-        ]
-      : []),
+    // v1.3.10 補完: 表示名を上、実ファイル名の変更をその下に（ダブルクリック＝表示名に統一した
+    // ので、実ファイル改名はメニューからのみ）。実身だけ「実ファイル名の変更」を出す。
     {
       label: "表示名を変更...",
       hint: committed
@@ -517,6 +509,15 @@ export function buildObjectMenu(
         : undefined,
       onClick: () => a.renameObject(targetId, obj?.label ?? ""),
     },
+    ...(committed
+      ? [
+          {
+            label: "実ファイル名の変更...",
+            hint: "このカードの実体ファイルを改名します（連番 (2) を消す等）。この実身を指す仮身は自動で追従します。",
+            onClick: () => a.renameReal(targetId, obj?.label ?? ""),
+          },
+        ]
+      : []),
     // 複数選択時の削除も「まとめて ...」サブメニュー側に集約（重複排除）。
     ...(!multi
       ? [{ label: "削除", danger: true, shortcut: "Delete", onClick: () => a.requestDelete(targetId) }]
