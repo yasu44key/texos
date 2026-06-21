@@ -1059,8 +1059,17 @@ function App() {
         });
         return;
       }
-      // インラインプレビューが無い種別 → 一時的閲覧（最新内容を読取専用で開く・破棄）。
-      invoke("view_temp", { id }).catch((e) => console.error("view_temp failed", e));
+      // インラインプレビューが無い種別（docx 等）。
+      // v1.3.10 補完: 実身（committed_path あり）は**プロジェクトの実ファイルをそのまま開く**
+      // ＝編集が直接プロジェクトに保存される。一時コピー(texos_view)を開くと編集が破棄され
+      // 保存できない（ユーザー指摘）。仮身は従来どおり一時的閲覧（非破壊・破棄）でよい。
+      if (obj?.committed_path) {
+        invoke("open_with_default", { path: obj.committed_path }).catch((e) =>
+          console.error("open committed failed", e)
+        );
+      } else {
+        invoke("view_temp", { id }).catch((e) => console.error("view_temp failed", e));
+      }
     },
     [handleEditFilter, handleFeedDrop]
   );
