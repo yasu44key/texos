@@ -445,6 +445,24 @@ function App() {
     text: () => {},
   });
 
+  // v1.3.10: 引き出し元カードの仮身をドロップ位置に作って繋ぐ（元々の第一案）。
+  // duplicate_virtual は window_of でその実身を指す（仮身を引き出したなら仮身の仮身）。
+  const handleDuplicateToLink = useCallback(
+    async (fromId: string, x: number, y: number) => {
+      try {
+        const newId = await invoke<string>("duplicate_virtual", { id: fromId });
+        await invoke("move_object", { id: newId, x, y });
+        setTouched((prev) => new Set(prev).add(newId));
+        pushUndo([{ kind: "delete", ids: [newId] }]);
+        await refresh();
+        await linkNewNode(fromId, newId);
+      } catch (e) {
+        console.error("duplicateToLink failed", e);
+      }
+    },
+    [refresh, pushUndo, linkNewNode]
+  );
+
   const handleStartLink = useCallback(
     (fromId: string, clientX: number, clientY: number) => {
       const from = nodeBoxOf(fromId);
@@ -498,6 +516,11 @@ function App() {
             y: cy,
             items: [
               { label: "ここに作って矢印で繋ぐ", onClick: () => {}, disabled: true },
+              {
+                label: "このカードの仮身を配置",
+                hint: "引き出し元カードの仮身（窓）をこの位置に作り、矢印で繋ぎます。",
+                onClick: () => handleDuplicateToLink(fromId, cp.x, cp.y),
+              },
               { label: "ファイルを配置...", onClick: () => la.file(cp.x, cp.y, fromId) },
               { label: "テキストカード", onClick: () => la.text(cp.x, cp.y, fromId) },
               { label: "コメント", onClick: () => la.note(cp.x, cp.y, fromId) },
@@ -511,7 +534,7 @@ function App() {
       window.addEventListener("mousemove", onMove);
       window.addEventListener("mouseup", onUp);
     },
-    [nodeBoxOf, pushUndo]
+    [nodeBoxOf, pushUndo, handleDuplicateToLink]
   );
 
   const handleDeleteRelation = useCallback(async (id: number) => {
