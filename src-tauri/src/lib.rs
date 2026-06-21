@@ -85,6 +85,8 @@ pub struct VirtualBodyInfo {
     pub kind: Option<String>,
     /// kind='filter' のフィルタ定義 JSON（v1.4 オートフロー⑤）
     pub filter_ref: Option<String>,
+    /// v1.3.10 窓モデル: 内部仮身が指す実身カードの id（外部=origin_path とは別レーン）。
+    pub window_of: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -296,10 +298,42 @@ fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// v1.3.10 窓モデル: 内部仮身チェーンの「生きた実ファイル」だけを辿る。
+/// own committed が実在すればそれを、無ければ window_of（複製元の実身カードID）を再帰。
+/// CAS・origin・real_id 兄弟には一切落ちない＝喪失なら None を返し、呼び出し側が
+/// 赤（CAS 保険）に倒す。指し先カードが削除済みでも None（→赤）。
+fn resolve_live_file(conn: &Connection, vid: &str, depth: u32) -> Option<PathBuf> {
+    if depth > 16 {
+        return None;
+    }
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT committed_path, window_of FROM virtual_bodies
+             WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![vid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let (committed, window_of) = row.unwrap_or((None, None));
+    if let Some(cp) = committed {
+        let p = PathBuf::from(&cp);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(w) = window_of {
+        return resolve_live_file(conn, &w, depth + 1);
+    }
+    None
+}
+
 /// v1.3-⑩「仮身は元ファイルへのウインドウ」: resolve the bytes a 仮身 shows,
 /// always preferring the most ALIVE source. Returns (path, source) where
 /// source is one of:
 ///   "committed"  ① own committed file (this 仮身's fixed 実身)
+///   "window"     ★ v1.3.10 内部レーン: window_of の指し先カードの生きた実ファイル
 ///   "sibling"    ② another 仮身 of the same real body, committed in this folder
 ///   "origin"     ③ the original imported file (window to the outside)
 ///   "cas"        ④ import-time CAS snapshot (window lost → 薄赤 candidate)
@@ -314,22 +348,36 @@ fn resolve_view_conn(
     if depth > 16 {
         return None;
     }
-    let row: Option<(Option<String>, Option<String>)> = conn
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT committed_path, origin_path FROM virtual_bodies WHERE id = ?1",
+            "SELECT committed_path, origin_path, window_of FROM virtual_bodies WHERE id = ?1",
             rusqlite::params![vid],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .ok()
         .flatten();
-    let (committed, origin) = row.unwrap_or((None, None));
+    let (committed, origin, window_of) = row.unwrap_or((None, None, None));
     // ① own committed (possibly edited) file at this level
     if let Some(cp) = committed {
         let p = PathBuf::from(&cp);
         if p.exists() {
             return Some((p, if depth == 0 { "committed" } else { "fork-live" }));
         }
+    }
+    // ★ v1.3.10 内部レーン: window_of があれば、指し先の実身カードの「生きた実ファイル」
+    // だけを辿る（カードIDで追従＝リネーム・編集に強い）。外部・CAS・real_id 兄弟には
+    // 落とさない。指し先が実体喪失なら CAS（保険・赤）/ none（赤）で止め、②以降の
+    // 外部レーンには進めない（内部と外部を混ぜない）。
+    if let Some(w) = &window_of {
+        if let Some(p) = resolve_live_file(conn, w, depth + 1) {
+            return Some((p, if depth == 0 { "window" } else { "fork-live" }));
+        }
+        let local = cas::object_path(cas_root, real_id);
+        if local.exists() {
+            return Some((local, if depth == 0 { "cas" } else { "fork-cas" }));
+        }
+        return None;
     }
     // ② a committed sibling of the same real body (生きた実身 in this folder).
     // v1.3.9: 同じ real_id を複数の実身が共有しうる（内容一致でCASハッシュが衝突）ため、
@@ -701,23 +749,23 @@ fn import_file(
     let in_project = src.starts_with(&p.root) && !src.starts_with(texos_dir(&p.root));
 
     // 問題点1（同プロジェクト内の実体を2つ以上の実身にしない＝システムの根幹）:
-    // 既に同じ実ファイルを committed_path に持つ生きたカードがあれば、2枚目以降は
-    // 仮身（窓）として登録する。同 real_id を共有 + committed_path=NULL にすることで、
-    // 兄弟解決（resolve_view ②）でその実身ファイルを映す窓になり、この仮身を削除しても
-    // 実体には触れない。CAS への再保存も不要（既存実身のブロブを共有）。
+    // 既に同じ実ファイルを committed_path に持つ生きた実身カードがあれば、2枚目以降は
+    // 内部仮身として登録する。v1.3.10 窓モデル: window_of = その実身カードの id を持たせ、
+    // カードID で追従する（リネーム・編集に強い・内容ハッシュ衝突に左右されない）。
+    // committed_path=NULL なのでこの仮身を削除しても実体には触れない。
     if in_project {
-        let dup_real: Option<String> = p
+        let dup: Option<(String, String)> = p
             .conn
             .query_row(
-                "SELECT real_id FROM virtual_bodies
+                "SELECT id, real_id FROM virtual_bodies
                  WHERE committed_path = ?1 AND deleted_at IS NULL
                  ORDER BY created_at LIMIT 1",
                 rusqlite::params![path],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if let Some(real_id) = dup_real {
+        if let Some((src_id, real_id)) = dup {
             let vid = uuid();
             let stem = src.file_name().and_then(|s| s.to_str()).unwrap_or(&label);
             let display_label = if label.is_empty() { stem } else { &label };
@@ -725,7 +773,7 @@ fn import_file(
                 .execute(
                     "INSERT INTO virtual_bodies
                         (id, real_id, label, pos_x, pos_y, created_at,
-                         origin_path, ext, mime_type)
+                         window_of, ext, mime_type)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         vid,
@@ -734,7 +782,7 @@ fn import_file(
                         x,
                         y,
                         db::now_ms(),
-                        path,
+                        src_id,
                         orig_ext,
                         mime
                     ],
@@ -799,7 +847,7 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
             "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), v.pos_x, v.pos_y,
                     v.committed_path, v.committed_mtime, v.project_ref, COALESCE(v.ext, r.ext), v.expanded,
                     v.url_ref, v.memo, v.z_order, v.folder_ref, v.origin_path, v.panel_w,
-                    v.kind, v.filter_ref
+                    v.kind, v.filter_ref, v.window_of
              FROM virtual_bodies v
              JOIN real_bodies r ON r.id = v.real_id
              WHERE v.desktop_id IS NULL AND v.deleted_at IS NULL
@@ -840,6 +888,7 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
                 panel_w: row.get(16)?,
                 kind: row.get(17)?,
                 filter_ref: row.get(18)?,
+                window_of: row.get(19)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1245,20 +1294,38 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     let vid = uuid();
-    // v1.3.9: 実身を複製した仮身は「どの実身の窓か」を origin_path に記録する。
-    // 同じ内容（=同じ real_id）の実身が複数あると兄弟解決が追従先を特定できないため、
-    // 複製元が実身（committed_path あり）なら、その committed_path を origin_path に持たせ、
-    // resolve_view ② が origin 一致でその実身を選べるようにする。複製元が仮身なら origin を継承。
+    // v1.3.10 窓モデル: 複製先の仮身が「どの実身カードの窓か」を window_of（カードID・不変）
+    // で持つ。内容(real_id)やパスではなくカードIDで追従するので、複製元のリネーム・編集にも
+    // 強い。内部/外部のレーン分け:
+    //   - 複製元が内部仮身（window_of あり）→ その window_of を継承（チェーンの根＝実身を指す）
+    //   - 複製元が内部実身（committed_path あり）→ window_of = 複製元カードの id
+    //   - 複製元が外部仮身（origin_path のみ）→ 従来どおり origin_path を複製（外部レーン・凍結）
+    let src: Option<(Option<String>, Option<String>, Option<String>)> = p
+        .conn
+        .query_row(
+            "SELECT committed_path, origin_path, window_of FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (s_committed, s_origin, s_window) = src.ok_or("複製元が見つかりません")?;
+    let (window_of, origin_path): (Option<String>, Option<String>) = if let Some(w) = s_window {
+        (Some(w), None)
+    } else if s_committed.is_some() {
+        (Some(id.clone()), None)
+    } else {
+        (None, s_origin)
+    };
     p.conn
         .execute(
             "INSERT INTO virtual_bodies
                 (id, real_id, label, pos_x, pos_y, created_at, folder_ref, origin_path,
-                 kind, filter_ref)
-             SELECT ?1, real_id, label, pos_x + 36.0, pos_y + 36.0, ?2, folder_ref,
-                 COALESCE(origin_path, committed_path),
-                 kind, filter_ref
+                 window_of, kind, filter_ref)
+             SELECT ?1, real_id, label, pos_x + 36.0, pos_y + 36.0, ?2, folder_ref, ?4,
+                 ?5, kind, filter_ref
              FROM virtual_bodies WHERE id = ?3",
-            rusqlite::params![vid, db::now_ms(), id],
+            rusqlite::params![vid, db::now_ms(), id, origin_path, window_of],
         )
         .map_err(|e| e.to_string())?;
     Ok(vid)

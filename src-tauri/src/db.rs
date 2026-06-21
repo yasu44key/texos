@@ -174,6 +174,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     // NULL の行は従来どおり実身へフォールバック（COALESCE(v.*, r.*)）。
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN ext TEXT", []);
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN mime_type TEXT", []);
+    // v1.3.10 窓モデル: 内部の仮身が「どの実身カードの窓か」を ID（不変）で指す。
+    // window_of があるカードだけが内部レーンで解決される（外部=origin_path は従来どおり凍結）。
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN window_of TEXT", []);
     let _ = conn.execute(
         "UPDATE virtual_bodies SET kind='project' WHERE kind IS NULL AND project_ref IS NOT NULL",
         [],

@@ -26,6 +26,8 @@ export interface VirtualBodyInfo {
   kind: string | null;
   /** kind='filter' のフィルタ定義 JSON（v1.4 オートフロー⑤） */
   filter_ref: string | null;
+  /** v1.3.10 窓モデル: 内部仮身が指す実身カードの id（外部=origin_path とは別レーン） */
+  window_of: string | null;
 }
 
 export interface NoteInfo {
@@ -57,7 +59,13 @@ export function isTextMime(mime: string, ext?: string | null): boolean {
 export function lostOf(o: VirtualBodyInfo): "cas" | "none" | null {
   if (o.committed_path || o.project_ref || o.url_ref || o.folder_ref) return null;
   if (o.view_source === "none") return "none";
-  if (o.origin_path && (o.view_source === "cas" || o.view_source === "fork-cas")) return "cas";
+  // v1.3.10: 内部仮身(window_of)も外部仮身(origin_path)も、生きた窓に届かず CAS に
+  // 落ちていれば薄赤。内部仮身は指し先実身がリネーム/喪失で見失われた状態を表す。
+  if (
+    (o.origin_path || o.window_of) &&
+    (o.view_source === "cas" || o.view_source === "fork-cas")
+  )
+    return "cas";
   return null;
 }
 
