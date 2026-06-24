@@ -197,7 +197,8 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
       if (seq.trim() !== "") spec.seq = Math.max(0, parseInt(seq, 10) || 0);
     }
     if (note.trim()) spec.note = note.trim();
-    spec.timeout_secs = timeoutSecs > 0 ? timeoutSecs : 60;
+    // v1.3.11: 0 = 無制限（開発者モード）。負値は60にフォールバック。
+    spec.timeout_secs = timeoutSecs >= 0 ? timeoutSecs : 60;
     onSave(title.trim() || name.trim() || "外部フィルタ", JSON.stringify(spec));
   };
 
@@ -486,11 +487,13 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
             <input
               style={{ ...inputStyle(), width: 80 }}
               type="number"
-              min={1}
+              min={0}
               value={timeoutSecs}
-              onChange={(e) => setTimeoutSecs(Math.max(1, parseInt(e.target.value, 10) || 60))}
+              onChange={(e) => setTimeoutSecs(Math.max(0, parseInt(e.target.value, 10) || 0))}
             />
-            <span style={{ fontSize: 12, color: "#8a93a8" }}>秒で強制終了（暴走対策）</span>
+            <span style={{ fontSize: 12, color: "#8a93a8" }}>
+              {timeoutSecs === 0 ? "秒（0=無制限・中断ボタンで停止）" : "秒で強制終了（暴走対策・0=無制限）"}
+            </span>
           </div>
         )}
 

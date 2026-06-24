@@ -124,6 +124,28 @@ fn texos_dir(root: &Path) -> PathBuf {
     root.join(".texos")
 }
 
+/// v1.3.11 #10: Robust「このパスは parent の中か？」判定。Windows では std の
+/// `Path::starts_with` はコンポーネント単位の大文字小文字を区別するため、ドロップ経路
+/// （DragQueryFileW のディスク表記）とプロジェクトルートの表記（設定保存値）で大小が
+/// 違うと内部ファイルを外部と誤判定し、本来 実身 にすべき取り込みが 仮身 になっていた。
+/// 両者を canonicalize（取れなければ原文）し、区切り正規化＋小文字化した文字列前方一致で
+/// 判定する。
+fn path_inside(child: &Path, parent: &Path) -> bool {
+    let norm = |p: &Path| -> String {
+        let c = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        c.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    let c = norm(child);
+    let pa = norm(parent);
+    if pa.is_empty() {
+        return false;
+    }
+    c == pa || c.starts_with(&(pa.clone() + "\\"))
+}
+
 fn open_project_at(root: &Path) -> Result<Project, String> {
     let texos = texos_dir(root);
     let cas_root = texos.join("cas");
@@ -260,10 +282,10 @@ fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), String> {
              INSERT INTO fork.virtual_bodies
                (id,real_id,label,pos_x,pos_y,desktop_id,created_at,etag,last_modified,
                 committed_path,committed_mtime,project_ref,expanded,url_ref,memo,
-                z_order,folder_ref,origin_path,kind,filter_ref)
+                z_order,folder_ref,origin_path,kind,filter_ref,ext,mime_type)
                SELECT id,real_id,label,pos_x,pos_y,desktop_id,created_at,etag,last_modified,
                 NULL,NULL,project_ref,expanded,url_ref,memo,
-                z_order,folder_ref,origin_path,kind,filter_ref FROM main.virtual_bodies
+                z_order,folder_ref,origin_path,kind,filter_ref,ext,mime_type FROM main.virtual_bodies
                WHERE deleted_at IS NULL;
              INSERT INTO fork.relations (id,from_id,to_id,kind,created_at)
                SELECT id,from_id,to_id,kind,created_at FROM main.relations rel
@@ -286,11 +308,63 @@ fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), String> {
                WHERE deleted_at IS NULL;
              INSERT OR IGNORE INTO fork.meta (key,value) SELECT key,value FROM main.meta;",
         )?;
-        // Record where the (not-yet-copied) real bodies live.
+        // Record where the real bodies live as a deep fallback. 以前はこれが唯一の実体源
+        // だったが、下で参照ブロブを子CASへコピーするので、生きたカードはもう親CASに依存しない。
         src.conn.execute(
             "INSERT OR REPLACE INTO fork.meta (key,value) VALUES ('fork_source_cas', ?1)",
             rusqlite::params![source_cas],
         )?;
+        // v1.3.11: フォークの仮身化を「外部ファイルの取り込み」と同じ形にする（ユーザー指摘の
+        // “ぬけ”の修正）。従来は committed_path を NULL にして origin をコピーするだけで、親で
+        // origin/window_of を持たないカード（内部実身・仮身の複製）が**指し先ゼロの孤児**になり、
+        // 閲覧も実身化も空になっていた。import_file の外部分岐と同様に、各ファイルカードを
+        //   1) 親の今のライブ実体を解決（committed→origin→CAS→親チェーン）
+        //   2) 子CASへ内容アドレスでスナップ（store_file）→ 新 real_id = H
+        //   3) origin_path = 親のライブファイル（最新を見る窓）／committed_path = NULL（仮身）
+        // にする。＝子は「親ファイルを仮身として取り込んだ」状態。閲覧③(origin)／実身化／自前CAS
+        // バックアップ④ が外部取り込みと同じルーチンで成立し、親CAS（⑤）にも依存しない。
+        let fork_cas = texos_dir(new_root).join("cas");
+        let mut file_cards: Vec<(String, String, String, Option<String>)> = Vec::new();
+        {
+            let mut stmt = src.conn.prepare(
+                "SELECT id, real_id, COALESCE(mime_type,'application/octet-stream'), ext
+                 FROM fork.virtual_bodies
+                 WHERE (kind IS NULL OR kind = 'file')
+                   AND url_ref IS NULL AND folder_ref IS NULL AND project_ref IS NULL",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            for r in rows {
+                file_cards.push(r?);
+            }
+        }
+        for (cid, rid, mime, ext) in &file_cards {
+            // 親側でこのカードの今のライブ実体を解決（main 側＝親カードを引く）。
+            let live = resolve_view_path(src, cid, rid);
+            if !live.is_file() {
+                continue; // 実体が解決できない（喪失）カードは据え置き（赤シグナルになる）
+            }
+            let h = match cas::store_file(&fork_cas, &live) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let size = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0) as i64;
+            src.conn.execute(
+                "INSERT OR IGNORE INTO fork.real_bodies (id,mime_type,size,created_at,ext)
+                 VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![h, mime, size, db::now_ms(), ext],
+            )?;
+            src.conn.execute(
+                "UPDATE fork.virtual_bodies SET real_id = ?1, origin_path = ?2 WHERE id = ?3",
+                rusqlite::params![h, live.to_string_lossy().to_string(), cid],
+            )?;
+        }
         Ok(())
     })();
     let _ = src.conn.execute("DETACH DATABASE fork", []);
@@ -383,32 +457,41 @@ fn resolve_view_conn(
     // v1.3.9: 同じ real_id を複数の実身が共有しうる（内容一致でCASハッシュが衝突）ため、
     // 単に「同 real_id の最古の実身」を選ぶと、複製仮身が複製元でない別実身に追従してしまう。
     // そこで、この仮身の窓対象（origin_path）と committed_path が一致する兄弟＝複製元を優先し、
-    // 一致が無いときだけ従来どおり最古の生存兄弟にフォールバックする。
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT committed_path FROM virtual_bodies
-         WHERE real_id = ?1 AND id <> ?2 AND committed_path IS NOT NULL
-         ORDER BY created_at",
-    ) {
-        if let Ok(rows) = stmt.query_map(rusqlite::params![real_id, vid], |r| {
-            r.get::<_, String>(0)
-        }) {
-            let sibs: Vec<String> = rows.flatten().collect();
-            // 優先: origin_path（窓の対象＝複製元の実ファイル）に一致する生存兄弟
-            if let Some(op) = &origin {
-                for cp in &sibs {
-                    if cp == op {
-                        let p = PathBuf::from(cp);
-                        if p.exists() {
-                            return Some((p, if depth == 0 { "sibling" } else { "fork-live" }));
+    // 一致が無いときだけ最古の生存兄弟にフォールバックする。
+    //
+    // v1.3.11 #11: 兄弟解決は「何か（外部の原本）への窓」であるカード＝origin_path を
+    // 持つカードに限定する。origin も window_of も無いカードは authored な新規コンテンツ
+    // （空テキストカード等）で、自分の内容は自分の CAS ブロブ（④）にある。空ファイルは
+    // CAS ハッシュ（real_id）が衝突して同じになるため、ここで兄弟にフォールバックすると
+    // 「新規に作った2枚目が、最初に実身化した1枚目の仮身（窓）になってしまう」という
+    // 不具合になる。origin を持つ窓カードだけが兄弟を辿る。
+    if origin.is_some() {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT committed_path FROM virtual_bodies
+             WHERE real_id = ?1 AND id <> ?2 AND committed_path IS NOT NULL
+             ORDER BY created_at",
+        ) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![real_id, vid], |r| {
+                r.get::<_, String>(0)
+            }) {
+                let sibs: Vec<String> = rows.flatten().collect();
+                // 優先: origin_path（窓の対象＝複製元の実ファイル）に一致する生存兄弟
+                if let Some(op) = &origin {
+                    for cp in &sibs {
+                        if cp == op {
+                            let p = PathBuf::from(cp);
+                            if p.exists() {
+                                return Some((p, if depth == 0 { "sibling" } else { "fork-live" }));
+                            }
                         }
                     }
                 }
-            }
-            // フォールバック: 最古の生存兄弟（origin 未記録の旧データ・外部 origin など）
-            for cp in &sibs {
-                let p = PathBuf::from(cp);
-                if p.exists() {
-                    return Some((p, if depth == 0 { "sibling" } else { "fork-live" }));
+                // フォールバック: 最古の生存兄弟（外部 origin が移動・喪失した窓カード等）
+                for cp in &sibs {
+                    let p = PathBuf::from(cp);
+                    if p.exists() {
+                        return Some((p, if depth == 0 { "sibling" } else { "fork-live" }));
+                    }
                 }
             }
         }
@@ -685,6 +768,36 @@ fn open_project_object(id: String, state: State<AppState>) -> Result<ProjectInfo
     Ok(info)
 }
 
+/// v1.3.11 #1: Open the TexoS project that a borrowed (origin_path) file belongs to.
+/// Walks up from the file's directory looking for `.texos/texos.db`. If found,
+/// opens that project (switches current) and returns its info. If the file is not
+/// inside any TexoS project, returns None (the frontend then just reveals the
+/// containing folder).
+#[tauri::command]
+fn open_origin_project(
+    path: String,
+    state: State<AppState>,
+) -> Result<Option<ProjectInfo>, String> {
+    let start = PathBuf::from(&path);
+    let mut dir: Option<&Path> = if start.is_dir() {
+        Some(start.as_path())
+    } else {
+        start.parent()
+    };
+    while let Some(d) = dir {
+        if texos_dir(d).join("texos.db").exists() {
+            let root = d.to_path_buf();
+            let project = open_project_at(&root)?;
+            let info = project_info(&root);
+            *state.current.lock().unwrap() = Some(project);
+            add_recent(&state.app_data, &info.path);
+            return Ok(Some(info));
+        }
+        dir = d.parent();
+    }
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // Objects
 // ---------------------------------------------------------------------------
@@ -746,7 +859,10 @@ fn import_file(
 
     // A file already inside the project folder (and not under .texos) IS the
     // project's real file: register it committed, pointing at itself.
-    let in_project = src.starts_with(&p.root) && !src.starts_with(texos_dir(&p.root));
+    // v1.3.11 #10: 大文字小文字・パス表記の差で誤判定しないよう path_inside で堅牢に判定
+    // （配置でもドロップでも、プロジェクト内のファイルは実身として取り込む）。
+    let in_project =
+        path_inside(src, &p.root) && !path_inside(src, &texos_dir(&p.root));
 
     // 問題点1（同プロジェクト内の実体を2つ以上の実身にしない＝システムの根幹）:
     // 既に同じ実ファイルを committed_path に持つ生きた実身カードがあれば、2枚目以降は
@@ -859,9 +975,17 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
         .query_map([], |row| {
             let committed_path: Option<String> = row.get(6)?;
             let committed_mtime: Option<i64> = row.get(7)?;
+            let folder_ref: Option<String> = row.get(14)?;
+            // v1.3.11 #12: リンクフォルダカードは folder_ref の存在で cur_mtime を決める
+            // （フォルダが消えていれば None → フロントが薄赤シグナルにする）。
             let cur_mtime = committed_path
                 .as_deref()
-                .and_then(|p| file_mtime_ms(std::path::Path::new(p)));
+                .and_then(|p| file_mtime_ms(std::path::Path::new(p)))
+                .or_else(|| {
+                    folder_ref
+                        .as_deref()
+                        .and_then(|p| file_mtime_ms(std::path::Path::new(p)))
+                });
             let committed_modified = match (cur_mtime, committed_mtime) {
                 (Some(cur), Some(m)) => cur > m,
                 _ => false,
@@ -881,7 +1005,7 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
                 url_ref: row.get(11)?,
                 memo: row.get(12)?,
                 z_order: row.get(13)?,
-                folder_ref: row.get(14)?,
+                folder_ref,
                 origin_path: row.get(15)?,
                 cur_mtime,
                 view_source: None,
@@ -1160,6 +1284,20 @@ fn delete_object(id: String, state: State<AppState>) -> Result<(), String> {
         .flatten();
     if let Some(cp) = committed {
         let path = std::path::Path::new(&cp);
+        // v1.3.11 問題点3（多層防御）: 同じ実ファイル（committed_path）を指す「生きた」
+        // カードが他にもいれば、実ファイルは退避せずカードだけをソフト削除する。問題点1で
+        // 通常は実身は1枚に保たれるが、旧データや想定外経路で2枚以上の実身が同じ実体を
+        // 指してしまった場合に、片方の削除でもう片方の実体まで消える事故を防ぐ。
+        let shared: i64 = p
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM virtual_bodies
+                 WHERE committed_path = ?1 AND id <> ?2 AND deleted_at IS NULL",
+                rusqlite::params![cp, id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let path = if shared > 0 { Path::new("") } else { path };
         // Safety: only touch files inside this project's folder.
         if path.starts_with(&p.root) && path.is_file() {
             let trash = trash_path(&p.root, &id, path);
@@ -1429,10 +1567,12 @@ fn create_relation(
     // v1.4 オートフロー⑤: フィルタカードに入る/出る矢印は自動的にフロー
     // （新しい矢印種のUIは作らない — 確定方針1）。
     let kind = kind.unwrap_or_else(|| {
-        let is_filter = |vid: &str| -> bool {
+        // v1.3.11: フィルタに加えランチャー（kind='launcher'）への矢印もフロー扱い
+        // （ランチャーに入る {in} 入力＝開くファイルを flow エッジで表す）。
+        let is_flow_node = |vid: &str| -> bool {
             p.conn
                 .query_row(
-                    "SELECT 1 FROM virtual_bodies WHERE id = ?1 AND kind = 'filter'",
+                    "SELECT 1 FROM virtual_bodies WHERE id = ?1 AND kind IN ('filter','launcher')",
                     rusqlite::params![vid],
                     |_| Ok(()),
                 )
@@ -1441,7 +1581,7 @@ fn create_relation(
                 .flatten()
                 .is_some()
         };
-        if is_filter(&from_id) || is_filter(&to_id) {
+        if is_flow_node(&from_id) || is_flow_node(&to_id) {
             "flow".to_string()
         } else {
             "link".to_string()
@@ -1650,6 +1790,26 @@ fn relink_object(id: String, new_path: String, state: State<AppState>) -> Result
     Ok(())
 }
 
+/// v1.3.11 #12: リンクフォルダカードの参照先を選び直す（リネーム・移動でリンク切れに
+/// なったフォルダを繋ぎ直す）。folder_ref を更新するだけ。選んだ先が TexoS プロジェクト
+/// なら project_ref に切り替える（フォルダ→プロジェクトの昇格は import_file と同じ扱い）。
+#[tauri::command]
+fn relink_folder(id: String, new_path: String, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let np = std::path::Path::new(&new_path);
+    if !np.is_dir() {
+        return Err("選んだフォルダが見つかりません".into());
+    }
+    p.conn
+        .execute(
+            "UPDATE virtual_bodies SET folder_ref = ?1 WHERE id = ?2",
+            rusqlite::params![new_path, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct CommitAllWarning {
     pub label: String,
@@ -1726,7 +1886,7 @@ fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Result<CommitAll
     };
     for r in rows {
         // v1.4: フィルタ・ドロップポイントはTexoS内の道具であり持ち出し対象ではない
-        if r.kind.as_deref() == Some("filter") || r.kind.as_deref() == Some("drop") {
+        if matches!(r.kind.as_deref(), Some("filter") | Some("drop") | Some("launcher")) {
             report.warnings.push(CommitAllWarning {
                 label: r.label,
                 kind: r.kind.clone().unwrap_or_default(),
@@ -1840,7 +2000,7 @@ fn copy_objects_to_clipboard(
         };
 
         // フィルタ・ドロップポイントはTexoS内の道具で持ち出し対象外（commit_all と同じ）
-        if kind.as_deref() == Some("filter") || kind.as_deref() == Some("drop") {
+        if matches!(kind.as_deref(), Some("filter") | Some("drop") | Some("launcher")) {
             report.warnings.push(CommitAllWarning {
                 label,
                 kind: kind.unwrap_or_default(),
@@ -2101,6 +2261,97 @@ fn materialize_view(id: String, state: State<AppState>) -> Result<String, String
         std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
     }
     Ok(dest.to_string_lossy().to_string())
+}
+
+/// LibreOffice(soffice) を探す: 環境変数PATH → 既定インストール先。
+fn find_soffice() -> Option<PathBuf> {
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for d in std::env::split_paths(&path_var) {
+            let c = d.join("soffice.exe");
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    for base in [
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ] {
+        let p = PathBuf::from(base);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// v1.3.11 #13 第2階層: オフィス系（pptx/ppt/odp/doc/odt 等）を LibreOffice headless で
+/// PDF に変換し、既存の PDF プレビュー（asset protocol）で見られるようにする。変換結果は
+/// temp_view_dir/preview/<id>.pdf にキャッシュ（mtime 比較で再利用）。LibreOffice 未導入は
+/// 分かりやすいエラーを返す（フロントは「一時的に閲覧」へ誘導）。重い処理なので async。
+#[tauri::command(async)]
+fn convert_office_to_pdf(id: String, state: State<AppState>) -> Result<String, String> {
+    // 1) 変換元を temp に materialize（id.ext の決定名で置く）。ロックはここだけ。
+    let (src, ext): (PathBuf, String) = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        let (real_id, mime, stored_ext, committed): (String, String, Option<String>, Option<String>) =
+            p.conn
+                .query_row(
+                    "SELECT v.real_id, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.committed_path
+                     FROM virtual_bodies v JOIN real_bodies r ON r.id = v.real_id
+                     WHERE v.id = ?1",
+                    rusqlite::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|e| e.to_string())?;
+        let s = committed
+            .map(PathBuf::from)
+            .filter(|c| c.is_file())
+            .unwrap_or_else(|| resolve_view_path(p, &id, &real_id));
+        (s, resolve_ext(stored_ext.as_deref(), &mime))
+    };
+
+    let dir = temp_view_dir().join("preview");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let pdf = dir.join(format!("{}.pdf", id));
+    // キャッシュ: PDF が変換元より新しければ再利用。
+    if matches!(
+        (file_mtime_ms(&pdf), file_mtime_ms(&src)),
+        (Some(d), Some(s)) if d >= s
+    ) {
+        return Ok(pdf.to_string_lossy().to_string());
+    }
+
+    // soffice は入力の拡張子で形式を判定するので、決定名 <id>.<ext> にコピーしてから変換。
+    let input = dir.join(ensure_ext(&id, &ext));
+    std::fs::copy(&src, &input).map_err(|e| e.to_string())?;
+
+    let soffice = find_soffice().ok_or(
+        "LibreOffice が見つかりません（PowerPoint等のプレビューに必要）。インストールするか、\
+         『一時的に閲覧』『既定のアプリで開く』をお使いください。",
+    )?;
+    // 専用プロファイルで headless 変換（既存インスタンスと衝突しないように）。
+    let profile = dir.join("lo_profile");
+    let out = std::process::Command::new(&soffice)
+        .arg(format!(
+            "-env:UserInstallation=file:///{}",
+            profile.to_string_lossy().replace('\\', "/")
+        ))
+        .args(["--headless", "--norestore", "--convert-to", "pdf", "--outdir"])
+        .arg(&dir)
+        .arg(&input)
+        .output()
+        .map_err(|e| format!("LibreOffice の実行に失敗しました: {e}"))?;
+    // soffice は <input stem>.pdf を outdir に出力する＝<id>.pdf。
+    if !pdf.is_file() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "PDF 変換に失敗しました（LibreOffice）。{}",
+            stderr.trim()
+        ));
+    }
+    Ok(pdf.to_string_lossy().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2653,6 +2904,115 @@ fn delete_filter_library(name: String, state: State<AppState>) -> Result<(), Str
     write_library(&state.app_data, &list)
 }
 
+// v1.3.11 ランチャーライブラリ（一度登録→リスト化）。フィルタライブラリと同方式・別ファイル。
+fn launcher_library_path(app_data: &Path) -> PathBuf {
+    app_data.join("launcher_library.json")
+}
+fn read_launcher_library(app_data: &Path) -> Vec<LibFilter> {
+    std::fs::read_to_string(launcher_library_path(app_data))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn list_launcher_library(state: State<AppState>) -> Result<Vec<LibFilter>, String> {
+    Ok(read_launcher_library(&state.app_data))
+}
+
+/// ランチャー設定に名前を付けてライブラリへ登録。同名は上書き。
+#[tauri::command]
+fn save_launcher_library(name: String, spec: String, state: State<AppState>) -> Result<(), String> {
+    flow::parse_spec(&spec)?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("名前を入力してください".into());
+    }
+    let mut list = read_launcher_library(&state.app_data);
+    list.retain(|e| e.name != name);
+    list.push(LibFilter {
+        name,
+        spec,
+        created_at: db::now_ms(),
+    });
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+    std::fs::write(launcher_library_path(&state.app_data), json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_launcher_library(name: String, state: State<AppState>) -> Result<(), String> {
+    let mut list = read_launcher_library(&state.app_data);
+    let before = list.len();
+    list.retain(|e| e.name != name);
+    if list.len() == before {
+        return Err(format!("「{name}」はランチャーライブラリにありません"));
+    }
+    let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+    std::fs::write(launcher_library_path(&state.app_data), json).map_err(|e| e.to_string())
+}
+
+/// v1.3.11 #A: スタートメニューのショートカット(.lnk)からインストール済みアプリを列挙。
+/// %ProgramData% と %APPDATA% の Start Menu\Programs を再帰走査。.lnk はそのまま起動でき
+/// アイコンも取れるので、パスを探さず一覧から選べる。
+#[derive(Serialize)]
+pub struct InstalledApp {
+    pub name: String,
+    pub path: String,
+}
+#[tauri::command]
+fn list_installed_apps() -> Result<Vec<InstalledApp>, String> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramData", "APPDATA"] {
+        if let Some(base) = std::env::var_os(var) {
+            roots.push(
+                PathBuf::from(base)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Start Menu")
+                    .join("Programs"),
+            );
+        }
+    }
+    let mut found: Vec<InstalledApp> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // 再帰走査（深さ制限つき）。スタックで回す。
+    let mut stack: Vec<(PathBuf, u32)> = roots.into_iter().map(|r| (r, 0u32)).collect();
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 5 {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+            } else if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("lnk")).unwrap_or(false) {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Uninstall/アンインストール系の .lnk は除外（実用上ノイズ）。
+                if name.is_empty() || name.contains("Uninstall") || name.contains("アンインストール") {
+                    continue;
+                }
+                let key = name.to_lowercase();
+                if seen.insert(key) {
+                    found.push(InstalledApp {
+                        name,
+                        path: path.to_string_lossy().into_owned(),
+                    });
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(found)
+}
+
 /// フィルタ定義（JSON）を更新。フォーム自動生成（JSON Schema）はフェーズ2。
 #[tauri::command]
 fn update_filter(id: String, spec: String, state: State<AppState>) -> Result<(), String> {
@@ -2942,6 +3302,49 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         .map_err(|_| "フィルタカードが見つかりません".to_string())?;
     // 終端フィルタの設定が出力先と命名を決める（prefix連番 / 出力フォルダ）
     let term_spec = flow::parse_spec(fref.as_deref().unwrap_or("{}"))?;
+
+    // v1.3.11 対話シェル: cmd/PowerShell を detached で開いて一行目（cmd）を実行（捕捉しない）。
+    // 接続された最初の入力の生きた実ファイルを {in} に展開する。
+    if let Some(shell) = term_spec.shell.as_deref() {
+        let input: Option<PathBuf> = p
+            .conn
+            .query_row(
+                "SELECT v.id, v.real_id, v.committed_path FROM relations rel
+                 JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                 WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                 ORDER BY rel.created_at LIMIT 1",
+                rusqlite::params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|(vid, real_id, committed)| {
+                committed
+                    .map(PathBuf::from)
+                    .filter(|c| c.is_file())
+                    .unwrap_or_else(|| resolve_view_path(p, &vid, &real_id))
+            });
+        let firstline = term_spec.cmd.clone().unwrap_or_default();
+        let firstline = match &input {
+            Some(pb) => firstline.replace("{in}", &format!("\"{}\"", pb.display())),
+            None => firstline.replace("{in}", ""),
+        };
+        launch_interactive_shell(shell, &firstline, &p.root)?;
+        return Ok(FlowReport {
+            created: vec![],
+            updated: vec![],
+            outputs: vec![],
+            skipped: vec![],
+            errors: vec![],
+        });
+    }
+
     let prefix = term_spec
         .prefix
         .clone()
@@ -3184,6 +3587,240 @@ fn create_drop_point(x: f64, y: f64, state: State<AppState>) -> Result<String, S
         )
         .map_err(|e| e.to_string())?;
     Ok(vid)
+}
+
+// ---------------------------------------------------------------------------
+// v1.3.11 ランチャーカード（一般プログラムの登録・起動＝アイデアメモ #2 の実用最小版）
+// フィルタ（同期・タイムアウト・stdout捕捉）と違い、GUIアプリを detached 起動し待たない。
+// 時間制限なし（暴走停止は当面 Windows タスクマネージャ任せ。将来 Stop を装備）。
+// {in} 接続があればそのファイルを引数で開く。保存後の新規ファイルは import_new_project_files で回収。
+// ---------------------------------------------------------------------------
+
+const LAUNCHER_MIME: &str = "application/vnd.texos.launcher";
+
+/// ランチャーカードを作成（kind='launcher'、定義は filter_ref の JSON を流用）。
+/// spec 例: 一般プログラム {"name":"app.exe","path":"C:\\...\\app.exe","type":"launcher"}
+///          ターミナル     {"name":"cmd","type":"launcher"} / {"name":"powershell",...}
+#[tauri::command]
+fn create_launcher(
+    label: String,
+    spec: String,
+    x: f64,
+    y: f64,
+    state: State<AppState>,
+) -> Result<String, String> {
+    flow::parse_spec(&spec)?; // 保存前に検証
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    p.conn
+        .execute(
+            "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+             VALUES ('launcher:sentinel', ?1, 0, ?2)",
+            rusqlite::params![LAUNCHER_MIME, db::now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+    let vid = uuid();
+    p.conn
+        .execute(
+            "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+             VALUES (?1, 'launcher:sentinel', ?2, ?3, ?4, ?5, 'launcher', ?6)",
+            rusqlite::params![vid, label, x, y, db::now_ms(), spec],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(vid)
+}
+
+/// ランチャーを起動。接続された入力（flow 矢印）の「生きた実ファイル」を引数で開く。
+/// GUI アプリは detached 起動し待たない（時間制限なし）。
+#[tauri::command(async)]
+fn run_launcher(id: String, state: State<AppState>) -> Result<(), String> {
+    let (spec, root, inputs): (flow::FilterSpec, PathBuf, Vec<PathBuf>) = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        let fref: String = p
+            .conn
+            .query_row(
+                "SELECT COALESCE(filter_ref, '{}') FROM virtual_bodies WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let spec = flow::parse_spec(&fref)?;
+        // 入力: このランチャーへ入る flow 矢印（接続順）。編集が永続するよう
+        // committed_path（実身の実ファイル）優先。無ければ窓の今を解決。
+        let mut paths: Vec<PathBuf> = Vec::new();
+        {
+            let mut stmt = p
+                .conn
+                .prepare(
+                    "SELECT v.id, v.real_id, v.committed_path
+                     FROM relations rel
+                     JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                     WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                     ORDER BY rel.created_at",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (vid, real_id, committed) = row.map_err(|e| e.to_string())?;
+                let path = committed
+                    .map(PathBuf::from)
+                    .filter(|c| c.is_file())
+                    .unwrap_or_else(|| resolve_view_path(p, &vid, &real_id));
+                paths.push(path);
+            }
+        }
+        (spec, p.root.clone(), paths)
+    };
+
+    let name = spec.name.as_deref().unwrap_or("").trim().to_lowercase();
+    let root_disp = root.display().to_string();
+
+    // 起動するコマンドライン（cmd /C "<...>" で実行）。`start` で新プロセスを切り離す。
+    let cmdline = if name == "cmd" || name == "cmd.exe" {
+        format!("start \"\" cmd /K cd /d \"{root_disp}\"")
+    } else if name == "powershell" || name == "powershell.exe" || name == "pwsh" {
+        format!("start \"\" powershell -NoExit -Command \"Set-Location -LiteralPath '{root_disp}'\"")
+    } else {
+        let exe = flow::resolve_program(
+            spec.name.as_deref().unwrap_or("").trim(),
+            spec.path.as_deref(),
+            &filters_dir(&root),
+        )
+        .ok_or("登録されたプログラムが見つかりません（パスを確認してください）")?;
+        let mut s = format!("start \"\" \"{}\"", exe.display());
+        for inp in &inputs {
+            s.push_str(&format!(" \"{}\"", inp.display()));
+        }
+        s
+    };
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // run_flow と同じ定石: cmd /C "<cmdline>" を raw_arg で素のまま渡す。
+        // CREATE_NO_WINDOW で親 cmd のコンソールを出さない（start が本体の窓を出す）。
+        std::process::Command::new("cmd")
+            .raw_arg(format!("/C \"{cmdline}\""))
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|e| format!("起動に失敗しました: {e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmdline;
+        let exe = flow::resolve_program(
+            spec.name.as_deref().unwrap_or("").trim(),
+            spec.path.as_deref(),
+            &filters_dir(&root),
+        )
+        .ok_or("登録されたプログラムが見つかりません")?;
+        std::process::Command::new(exe)
+            .args(inputs.iter().map(|p| p.as_os_str()))
+            .spawn()
+            .map_err(|e| format!("起動に失敗しました: {e}"))?;
+    }
+    Ok(())
+}
+
+/// v1.3.11 対話シェル（フィルタの shell モード）: cmd/PowerShell を detached で開き、
+/// 一時スクリプト（cd → 一行目）を実行して対話を継続（cmd /K / powershell -NoExit）。
+/// 引用符の入れ子を避けるため一時 .bat/.ps1 に書き出してから起動する。
+fn launch_interactive_shell(shell: &str, firstline: &str, root: &Path) -> Result<(), String> {
+    let dir = temp_view_dir().join("shell");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let root_disp = root.display().to_string();
+    let cmdline = if shell.eq_ignore_ascii_case("powershell") || shell.eq_ignore_ascii_case("pwsh") {
+        let script = dir.join(format!("{}.ps1", uuid()));
+        let body = format!(
+            "Set-Location -LiteralPath '{}'\r\n{}\r\n",
+            root_disp.replace('\'', "''"),
+            firstline
+        );
+        std::fs::write(&script, body).map_err(|e| e.to_string())?;
+        format!(
+            "start \"\" powershell -NoExit -ExecutionPolicy Bypass -File \"{}\"",
+            script.display()
+        )
+    } else {
+        let script = dir.join(format!("{}.bat", uuid()));
+        let body = format!("@echo off\r\ncd /d \"{}\"\r\n{}\r\n", root_disp, firstline);
+        std::fs::write(&script, body).map_err(|e| e.to_string())?;
+        format!("start \"\" cmd /K \"{}\"", script.display())
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("cmd")
+            .raw_arg(format!("/C \"{cmdline}\""))
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|e| format!("シェルの起動に失敗しました: {e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmdline;
+    }
+    Ok(())
+}
+
+/// v1.3.11: プロジェクトフォルダ直下の「未登録ファイル」を実身として取り込む。
+/// ランチャーで起動したアプリが新規保存したファイルを TexoS に回収する用途（保存→新しい実身）。
+/// .texos 配下とサブフォルダは対象外（フラット運用の原則）。新規カードを (x,y) から並べる。
+#[tauri::command]
+fn import_new_project_files(
+    x: f64,
+    y: f64,
+    state: State<AppState>,
+) -> Result<Vec<String>, String> {
+    // 1) 未登録ファイルを収集（ここだけロック）。import_file が内部で再ロックするため、
+    //    収集後にロックを解放してから取り込む（再ロック＝デッドロック回避）。
+    let candidates: Vec<String> = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        let mut cands = Vec::new();
+        let entries = std::fs::read_dir(&p.root).map_err(|e| e.to_string())?;
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if !path.is_file() {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            let known: bool = p
+                .conn
+                .query_row(
+                    "SELECT 1 FROM virtual_bodies WHERE committed_path = ?1 AND deleted_at IS NULL",
+                    rusqlite::params![path_str],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .is_some();
+            if !known {
+                cands.push(path_str);
+            }
+        }
+        cands
+    };
+
+    // 2) ロック解放後に取り込む（import_file が in_project 判定で実身として登録）。
+    let mut created = Vec::new();
+    for (i, path_str) in candidates.into_iter().enumerate() {
+        let cx = x + (i % 5) as f64 * 170.0;
+        let cy = y + (i / 5) as f64 * 140.0;
+        if let Ok(vid) = import_file(path_str, String::new(), cx, cy, state.clone()) {
+            created.push(vid);
+        }
+    }
+    Ok(created)
 }
 
 /// ドロップポイントへファイルを投入: CASスナップショット＋窓の付け替え。
@@ -3782,6 +4419,7 @@ pub fn run() {
             create_subproject,
             link_project,
             open_project_object,
+            open_origin_project,
             create_url,
             update_url,
             set_memo,
@@ -3812,6 +4450,7 @@ pub fn run() {
             commit_object,
             commit_all,
             relink_object,
+            relink_folder,
             uncommit_object,
             make_real,
             open_with_default,
@@ -3820,6 +4459,7 @@ pub fn run() {
             reveal_in_dir,
             view_temp,
             materialize_view,
+            convert_office_to_pdf,
             create_note,
             list_notes,
             update_note,
@@ -3835,6 +4475,9 @@ pub fn run() {
             copy_objects_to_clipboard,
             copy_image_to_clipboard,
             create_text_object,
+            create_launcher,
+            run_launcher,
+            import_new_project_files,
             create_filter,
             update_filter,
             run_flow,
@@ -3847,6 +4490,10 @@ pub fn run() {
             list_filter_library,
             save_filter_library,
             delete_filter_library,
+            list_launcher_library,
+            save_launcher_library,
+            delete_launcher_library,
+            list_installed_apps,
             create_drop_point,
             drop_into_point,
             set_panel_width,

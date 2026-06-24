@@ -80,6 +80,23 @@ export function lostRealOf(o: VirtualBodyInfo): boolean {
   return o.cur_mtime == null; // committed_path があるのに実ファイルが無い
 }
 
+// v1.3.11 #12: リンクフォルダカードの参照先フォルダが存在しない（リンク切れ）。
+// list_objects は folder_ref が実在すれば cur_mtime を埋めるので、null＝喪失＝薄赤。
+export function lostFolderOf(o: VirtualBodyInfo): boolean {
+  return !!o.folder_ref && o.cur_mtime == null;
+}
+
+// v1.3.11 ランチャー: 登録プログラムの実パス（アイコン表示用）。ターミナル/未設定は null。
+export function launcherPathOf(o: VirtualBodyInfo): string | null {
+  if (o.kind !== "launcher") return null;
+  try {
+    const s = JSON.parse(o.filter_ref ?? "{}");
+    return typeof s.path === "string" && s.path ? s.path : null;
+  } catch {
+    return null;
+  }
+}
+
 // v1.3.6: 内部実身 — プロジェクト内に実体があり、外部の戻り先を持たない実身。
 // 「実身にする」で外部から独立させた実身や、その場取り込み（origin===committed）が該当。
 // これらには「仮身に戻す」「実身化し直す」を出してはいけない（戻り先が無く、

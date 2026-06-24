@@ -13,6 +13,8 @@ export interface MenuActions {
   openSubmenu: (items: MenuItem[]) => void;
   // 空きキャンバス
   contextPlace: (x: number, y: number) => void;
+  // v1.3.11 #8/#9: 新規ファイルをプロジェクトフォルダに作成し実身として配置。
+  newFile: (x: number, y: number) => void;
   addNote: (x: number, y: number) => void;
   paste: (x: number, y: number) => void;
   shapeAdd: (kind: string, x: number, y: number) => void;
@@ -20,6 +22,13 @@ export interface MenuActions {
   // v1.4 オートフロー
   addFilter: (builtin: string, x: number, y: number) => void;
   runFlow: (id: string) => void;
+  // v1.3.11 ランチャー（一般プログラム/cmd/PowerShell の登録・起動）
+  addLauncher: (builtin: string, x: number, y: number) => void;
+  runLauncher: (id: string) => void;
+  // v1.3.11 ランチャーライブラリ（一度登録→リスト）
+  addLibraryLauncher: (name: string, x: number, y: number) => void;
+  saveLauncherToLibrary: (id: string) => void;
+  deleteLibraryLauncher: (name: string) => void;
   editFilter: (id: string, current: string) => void;
   // v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断）
   saveFilterToLibrary: (id: string) => void;
@@ -52,6 +61,10 @@ export interface MenuActions {
   openDefault: (id: string) => void;
   openWith: (id: string) => void;
   commitReveal: (id: string) => void;
+  // v1.3.11 #1: 借用元（origin_path）が属するプロジェクトを開く（無ければフォルダ）。
+  openOriginProject: (path: string) => void;
+  // v1.3.11 #12: リンクフォルダの参照先を選び直す（リンク切れの繋ぎ直し）。
+  relinkFolder: (id: string, currentPath: string) => void;
   // v1.3.9 問題点2: 実体喪失の実身を救う2経路。
   relink: (id: string) => void;
   restoreFromCas: (id: string) => void;
@@ -258,6 +271,23 @@ export function buildObjectMenu(
       ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
   }
+  // v1.3.11 ランチャーカード（一般プログラム/ターミナルの起動）。filter_ref を持つため
+  // フィルタ判定より先に分岐する。
+  if (obj && obj.kind === "launcher") {
+    return [
+      { label: `🚀「${obj.label}」`, onClick: () => {}, disabled: true },
+      { label: "▶ 起動", onClick: () => a.runLauncher(targetId) },
+      {
+        label: "設定を編集...",
+        hint: "登録プログラムのパスや引数（JSON）を編集します。",
+        onClick: () => a.editFilter(targetId, obj.filter_ref ?? "{}"),
+      },
+      { label: "ライブラリに登録...", onClick: () => a.saveLauncherToLibrary(targetId) },
+      ...zItems,
+      { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
+      ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
+    ];
+  }
   // v1.4 オートフロー: フィルタカード（パイプラインの処理ノード）
   if (obj && (obj.kind === "filter" || obj.filter_ref)) {
     return [
@@ -288,6 +318,12 @@ export function buildObjectMenu(
         label: "エクスプローラーで表示",
         onClick: () =>
           invoke("reveal_in_dir", { path: obj.folder_ref! }).catch(() => {}),
+      },
+      // v1.3.11 #12: リンク切れ（リネーム/移動）したフォルダを繋ぎ直す。
+      {
+        label: "リンクし直す...",
+        hint: "参照先フォルダが見つからない（リネーム・移動）ときに、正しいフォルダを選んで繋ぎ直します。元のリンク先の親フォルダが既定で開きます。",
+        onClick: () => a.relinkFolder(targetId, obj.folder_ref!),
       },
       ...zItems,
       { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
@@ -436,6 +472,23 @@ export function buildObjectMenu(
           },
         ]
       : []),
+    // v1.3.11 #13: オフィス系（docx/表計算/プレゼン）の読取専用プレビュー。
+    ...(obj &&
+    ["docx", "xlsx", "xls", "ods", "csv", "tsv", "pptx", "ppt", "doc", "odt", "odp"].includes(
+      (obj.ext ?? "").toLowerCase()
+    )
+      ? [
+          {
+            label: ctx.expanded.has(targetId)
+              ? "プレビューを閉じる"
+              : "キャンバスでプレビュー",
+            onClick: () =>
+              ctx.expanded.has(targetId)
+                ? a.collapse(targetId)
+                : a.expandView(targetId),
+          },
+        ]
+      : []),
     {
       label: "一時的に閲覧",
       hint: "プロジェクトに保存せず、一時コピーで中身を確認します。閉じるとコピーは破棄されます。",
@@ -446,6 +499,13 @@ export function buildObjectMenu(
     ...zItems,
     ...(!committed && obj?.origin_path
       ? [
+          {
+            // v1.3.11 #1: 借用元がTexoSプロジェクト内なら、そのプロジェクトを開く。
+            // プロジェクトでなければ借用元フォルダをエクスプローラで表示（App側で分岐）。
+            label: "借用元のプロジェクトを開く",
+            hint: "借用元のファイルがTexoSプロジェクト内にあれば、そのプロジェクトに切り替えます。プロジェクトでなければ借用元フォルダを開きます。",
+            onClick: () => a.openOriginProject(obj.origin_path!),
+          },
           {
             label: "借用元のフォルダで表示",
             onClick: () => {
@@ -611,6 +671,8 @@ interface CanvasMenuCtx {
   bulkItems: MenuItem[];
   /// v1.5: ライブラリ登録済みフィルタ名（「ユーザーのフィルタ」として列挙）
   library: string[];
+  /// v1.3.11: ライブラリ登録済みランチャー名（「ユーザーのランチャー」として列挙）
+  launcherLibrary: string[];
   /// v1.3.4: メニュー説明ツールチップの現在のオン/オフ（トグル表示用）。
   menuHints: boolean;
 }
@@ -637,6 +699,12 @@ export function buildCanvasMenu(
       : []),
     DIV,
     // ── 配置・追加系 ──
+    {
+      // v1.3.11 #8/#9: プロジェクトフォルダに新規ファイルを作って実身として置く。
+      label: "新規ファイルを作成...",
+      hint: "プロジェクトフォルダに新しいファイル（拡張子つき）を作り、実身としてキャンバスに置きます。開くアプリはOSの関連付けに従います。",
+      onClick: () => a.newFile(pos.canvasX, pos.canvasY),
+    },
     {
       label: "ファイルを配置...",
       onClick: () => a.contextPlace(pos.canvasX, pos.canvasY),
@@ -670,10 +738,25 @@ export function buildCanvasMenu(
       onClick: () =>
         a.openSubmenu([
           { label: "ドロップポイント（データ入口・自動実行）", onClick: () => a.addFilter("drop_point", pos.canvasX, pos.canvasY) },
-          { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
-          { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
-          { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
-          { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
+          // v1.3.11 #3: 内蔵フィルタは「ビルトインフィルタ ...」サブメニューにまとめる
+          // （種類が増えてきたので外部プログラム/ユーザーフィルタと階層で分離）。
+          {
+            label: "ビルトインフィルタ ...",
+            onClick: () =>
+              a.openSubmenu([
+                { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
+                { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
+                { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
+                { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
+                // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
+                { label: "音声: 長さでクリップ...", onClick: () => a.addFilter("audio_clip", pos.canvasX, pos.canvasY) },
+                { label: "音声: ノーマライズ", onClick: () => a.addFilter("audio_norm", pos.canvasX, pos.canvasY) },
+                { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip", pos.canvasX, pos.canvasY) },
+                // v1.3.11 対話シェル（一行目設定可・{in}可・バッチ登録・時間無制限）
+                { label: "対話: コマンドプロンプト（一行目設定可）...", onClick: () => a.addFilter("shell_cmd", pos.canvasX, pos.canvasY) },
+                { label: "対話: PowerShell（一行目設定可）...", onClick: () => a.addFilter("shell_powershell", pos.canvasX, pos.canvasY) },
+              ]),
+          },
           // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
           { label: "外部プログラム...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
           // v1.5: ライブラリ登録済みフィルタのインスタンス化（配置時に所在チェック）
@@ -693,6 +776,40 @@ export function buildCanvasMenu(
                         label: `${name} を削除`,
                         danger: true,
                         onClick: () => a.deleteLibraryFilter(name),
+                      }))
+                    ),
+                },
+              ]
+            : []),
+        ]),
+    },
+    // v1.3.11 ランチャーカード（一般プログラム/ターミナルの登録・起動）
+    {
+      label: "ランチャーカードを追加 ...",
+      hint: "インストール済みのプログラムを起動するカードを作ります。ファイルを繋ぐとそのファイルを開きます。",
+      onClick: () =>
+        a.openSubmenu([
+          { label: "インストール済みアプリから選択...", onClick: () => a.addLauncher("installed", pos.canvasX, pos.canvasY) },
+          { label: "一般プログラム（.exe を選択）...", onClick: () => a.addLauncher("program", pos.canvasX, pos.canvasY) },
+          { label: "コマンドプロンプト", onClick: () => a.addLauncher("cmd", pos.canvasX, pos.canvasY) },
+          { label: "PowerShell", onClick: () => a.addLauncher("powershell", pos.canvasX, pos.canvasY) },
+          // v1.3.11 ランチャーライブラリ（一度登録→リスト・再配置／削除）
+          ...(ctx.launcherLibrary.length
+            ? [
+                { label: "── ユーザーのランチャー ──", onClick: () => {}, disabled: true },
+                ...ctx.launcherLibrary.map((name) => ({
+                  label: `🚀 ${name}`,
+                  onClick: () => a.addLibraryLauncher(name, pos.canvasX, pos.canvasY),
+                })),
+                {
+                  label: "ライブラリから削除 ...",
+                  danger: true,
+                  onClick: () =>
+                    a.openSubmenu(
+                      ctx.launcherLibrary.map((name) => ({
+                        label: `${name} を削除`,
+                        danger: true,
+                        onClick: () => a.deleteLibraryLauncher(name),
                       }))
                     ),
                 },

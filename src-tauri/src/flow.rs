@@ -56,6 +56,10 @@ pub struct FilterSpec {
     /// ユーザーメモ
     #[serde(default)]
     pub note: Option<String>,
+    /// v1.3.11 対話シェル: "cmd" | "powershell"。設定されていれば run_flow は捕捉せず
+    /// 対話ウィンドウを detached で開き、cmd（一行目のコマンド・{in}可）を実行して継続する。
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 /// 外部プログラムの解決: 絶対パス → <project>/.texos/filters → 環境変数PATH の順
@@ -308,7 +312,13 @@ pub fn run_external(
         .stderr(err_file)
         .spawn();
 
-    let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+    // v1.3.11: timeout_secs==0 は「無制限」（開発者モード）。None は既定60秒。
+    // 無制限でも中断ボタン（cancel）と出力上限は効く＝ハンドルを失わない。
+    let timeout: Option<std::time::Duration> = match timeout_secs {
+        Some(0) => None,
+        Some(s) => Some(std::time::Duration::from_secs(s)),
+        None => Some(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+    };
     let started = std::time::Instant::now();
     let status: Result<std::process::ExitStatus, String> = match spawned {
         Err(e) => Err(format!("コマンド起動に失敗: {e}")),
@@ -325,12 +335,14 @@ pub fn run_external(
                 kill_tree(&mut child);
                 break Err("中断されました".into());
             }
-            if started.elapsed() > timeout {
-                kill_tree(&mut child);
-                break Err(format!(
-                    "タイムアウト（{}秒）のため強制終了しました。標準入力待ちのフィルタ型プログラムを引数型で指定していないか確認してください",
-                    timeout.as_secs()
-                ));
+            if let Some(to) = timeout {
+                if started.elapsed() > to {
+                    kill_tree(&mut child);
+                    break Err(format!(
+                        "タイムアウト（{}秒）のため強制終了しました。標準入力待ちのフィルタ型プログラムを引数型で指定していないか確認してください",
+                        to.as_secs()
+                    ));
+                }
             }
             if std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0) > MAX_OUTPUT_BYTES {
                 kill_tree(&mut child);

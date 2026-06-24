@@ -11,6 +11,7 @@ import { ShapeCard, type ShapeInfo } from "./objects/ShapeCard";
 import { ContextMenu, type MenuItem } from "./ui/ContextMenu";
 import { PromptDialog } from "./ui/PromptDialog";
 import { FilterDialog } from "./ui/FilterDialog";
+import { AppPicker } from "./ui/AppPicker";
 import { ConfirmDialog } from "./ui/ConfirmDialog";
 import { ProjectChooser, type ProjectInfo } from "./ui/ProjectChooser";
 import {
@@ -19,6 +20,8 @@ import {
   isTextMime,
   lostOf,
   lostRealOf,
+  lostFolderOf,
+  launcherPathOf,
   mimeMatches,
   noteSize,
   shapeCenterOn,
@@ -107,6 +110,23 @@ function App() {
   useEffect(() => {
     void reloadFilterLibrary();
   }, [reloadFilterLibrary]);
+  // v1.3.11 ランチャーライブラリ（一度登録→リスト）
+  const [launcherLibrary, setLauncherLibrary] = useState<{ name: string; spec: string }[]>([]);
+  const launcherLibraryRef = useRef<{ name: string; spec: string }[]>([]);
+  launcherLibraryRef.current = launcherLibrary;
+  const reloadLauncherLibrary = useCallback(async () => {
+    try {
+      setLauncherLibrary(await invoke<{ name: string; spec: string }[]>("list_launcher_library"));
+    } catch {
+      setLauncherLibrary([]);
+    }
+  }, []);
+  useEffect(() => {
+    void reloadLauncherLibrary();
+  }, [reloadLauncherLibrary]);
+  // v1.3.11 #A: インストール済みアプリのピッカー（Start Menu 走査）。開いている間だけ
+  // 配置先座標と linkFrom を保持する。
+  const [appPicker, setAppPicker] = useState<{ x: number; y: number; linkFrom?: string } | null>(null);
   const [confirm, setConfirm] = useState<{
     title: string;
     message?: string;
@@ -128,6 +148,8 @@ function App() {
   const transformRef = useRef<Transform>({ x: 0, y: 0, scale: 1 });
   const objectsRef = useRef<VirtualBodyInfo[]>([]);
   objectsRef.current = objects;
+  // v1.3.11 ランチャー: 起動後に戻ったとき新規保存ファイルを回収する位置（1回だけ）。
+  const pendingLauncherScanRef = useRef<{ x: number; y: number } | null>(null);
   const shapesRef = useRef<ShapeInfo[]>([]);
   shapesRef.current = shapes;
   const notesRef = useRef<NoteInfo[]>([]);
@@ -280,12 +302,31 @@ function App() {
 
   // Re-check edit state when returning to the window (e.g. after editing externally)
   useEffect(() => {
-    const onFocus = () => {
-      if (project) refresh();
+    const onFocus = async () => {
+      if (!project) return;
+      // v1.3.11 ランチャー: 起動したアプリが新規保存したファイルを実身として回収する
+      // （戻ってきた1回だけ）。位置はランチャーカードの右隣から並べる。
+      const scan = pendingLauncherScanRef.current;
+      if (scan) {
+        pendingLauncherScanRef.current = null;
+        try {
+          const created = await invoke<string[]>("import_new_project_files", {
+            x: scan.x,
+            y: scan.y,
+          });
+          if (created.length) {
+            setTouched((prev) => new Set([...prev, ...created]));
+            pushUndo([{ kind: "delete", ids: created }]);
+          }
+        } catch (e) {
+          console.error("import_new_project_files failed", e);
+        }
+      }
+      refresh();
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [project, refresh]);
+  }, [project, refresh, pushUndo]);
 
   const handleDropFiles = useCallback(
     async (paths: string[], canvasX: number, canvasY: number) => {
@@ -433,18 +474,22 @@ function App() {
   // から呼べるように ref で渡す（定義順の都合・TDZ 回避）。毎レンダーで最新を代入する。
   const linkActionsRef = useRef<{
     file: (x: number, y: number, linkFrom: string) => void;
+    newFile: (x: number, y: number, linkFrom: string) => void;
     paste: (x: number, y: number, linkFrom: string) => void;
     url: (x: number, y: number, linkFrom: string) => void;
     filter: (builtin: string, x: number, y: number, linkFrom: string) => void;
+    launcher: (builtin: string, x: number, y: number, linkFrom: string) => void;
     note: (x: number, y: number, linkFrom: string) => void;
     text: (x: number, y: number, linkFrom: string) => void;
     projectPath: (path: string, x: number, y: number, linkFrom: string) => void;
     projectDialog: (x: number, y: number, linkFrom: string) => void;
   }>({
     file: () => {},
+    newFile: () => {},
     paste: () => {},
     url: () => {},
     filter: () => {},
+    launcher: () => {},
     note: () => {},
     text: () => {},
     projectPath: () => {},
@@ -537,6 +582,11 @@ function App() {
             { label: "テキスト: 置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
             { label: "画像: リサイズ（幅指定）...", onClick: () => la.filter("img_resize", cp.x, cp.y, fromId) },
             { label: "画像: 形式変換...", onClick: () => la.filter("img_convert", cp.x, cp.y, fromId) },
+            { label: "音声: 長さでクリップ...", onClick: () => la.filter("audio_clip", cp.x, cp.y, fromId) },
+            { label: "音声: ノーマライズ", onClick: () => la.filter("audio_norm", cp.x, cp.y, fromId) },
+            { label: "動画: 長さでクリップ...", onClick: () => la.filter("video_clip", cp.x, cp.y, fromId) },
+            { label: "対話: コマンドプロンプト（一行目設定可）...", onClick: () => la.filter("shell_cmd", cp.x, cp.y, fromId) },
+            { label: "対話: PowerShell（一行目設定可）...", onClick: () => la.filter("shell_powershell", cp.x, cp.y, fromId) },
             { label: "外部プログラム...", onClick: () => la.filter("external", cp.x, cp.y, fromId) },
           ];
           setMenu({
@@ -549,6 +599,7 @@ function App() {
                 hint: "引き出し元カードの仮身（窓）をこの位置に作り、矢印で繋ぎます。",
                 onClick: () => handleDuplicateToLink(fromId, cp.x, cp.y),
               },
+              { label: "新規ファイルを作成...", onClick: () => la.newFile(cp.x, cp.y, fromId) },
               { label: "ファイルを配置...", onClick: () => la.file(cp.x, cp.y, fromId) },
               { label: "テキストカード", onClick: () => la.text(cp.x, cp.y, fromId) },
               { label: "コメント", onClick: () => la.note(cp.x, cp.y, fromId) },
@@ -556,6 +607,23 @@ function App() {
               { label: "URLリンク...", onClick: () => la.url(cp.x, cp.y, fromId) },
               // サブメニューはメニューのクリック閉じの後に開き直す（openSubmenu と同じ定石）。
               { label: "フィルタカード ...", onClick: () => window.setTimeout(() => setMenu({ x: cx, y: cy, items: filterSub }), 0) },
+              {
+                label: "ランチャーで開く ...",
+                onClick: () =>
+                  window.setTimeout(
+                    () =>
+                      setMenu({
+                        x: cx,
+                        y: cy,
+                        items: [
+                          { label: "一般プログラム（.exe を選択）...", onClick: () => la.launcher("program", cp.x, cp.y, fromId) },
+                          { label: "コマンドプロンプト", onClick: () => la.launcher("cmd", cp.x, cp.y, fromId) },
+                          { label: "PowerShell", onClick: () => la.launcher("powershell", cp.x, cp.y, fromId) },
+                        ],
+                      }),
+                    0
+                  ),
+              },
               { label: "既存プロジェクトへのリンク ...", onClick: () => openProjectSub() },
             ],
           });
@@ -663,6 +731,64 @@ function App() {
               accept_mime: "image/*",
             }),
         });
+      } else if (builtin === "audio_clip" || builtin === "video_clip") {
+        // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易クリップ（外部コマンドフィルタの
+        // プリセット）。ffmpeg を .texos\filters か PATH に置けば動く。動画は -c copy で
+        // 再エンコードせずに切り出す＝容量が最小・高速（#5「容量が最小限」）。
+        const isVid = builtin === "video_clip";
+        setPrompt({
+          title: "開始位置（秒）",
+          initial: "0",
+          onConfirm: (start) =>
+            setPrompt({
+              title: "長さ（秒）",
+              initial: "10",
+              onConfirm: (dur) => {
+                const s = String(parseFloat(start) || 0);
+                const d = String(parseFloat(dur) || 10);
+                const copy = isVid ? " -c copy" : "";
+                create(
+                  isVid ? `動画クリップ ${s}s+${d}s` : `音声クリップ ${s}s+${d}s`,
+                  {
+                    name: "ffmpeg.exe",
+                    type: "command",
+                    cmd: `-y -ss ${s} -i {in} -t ${d}${copy} {out}`,
+                    output_ext: isVid ? "mp4" : "mp3",
+                    accept_mime: isVid ? "video/*" : "audio/*",
+                    timeout_secs: 600,
+                    note: "ffmpeg が必要（.texos\\filters か PATH に置いてください）",
+                  }
+                );
+              },
+            }),
+        });
+      } else if (builtin === "shell_cmd" || builtin === "shell_powershell") {
+        // v1.3.11 対話シェル（フィルタ）: cmd/PowerShell を開いて一行目を実行・対話継続。
+        // {in} を書くと接続ファイルのパスに置換。時間制限なし（0=無制限）。
+        const isPwsh = builtin === "shell_powershell";
+        setPrompt({
+          title: `${isPwsh ? "PowerShell" : "コマンドプロンプト"}: 最初に実行するコマンド（空欄=開くだけ・{in}使用可）`,
+          initial: "",
+          onConfirm: (line) =>
+            create(isPwsh ? "PowerShell" : "コマンドプロンプト", {
+              shell: isPwsh ? "powershell" : "cmd",
+              cmd: line,
+              accept_mime: "*/*",
+              timeout_secs: 0,
+              note: "対話シェル（ウィンドウが開いて継続）。一行目に {in} で接続ファイルを渡せます。",
+            }),
+        });
+      } else if (builtin === "audio_norm") {
+        // v1.3.11 #4: ラウドネス正規化（EBU R128 loudnorm）。
+        create("音声ノーマライズ", {
+          name: "ffmpeg.exe",
+          type: "command",
+          cmd: `-y -i {in} -af loudnorm {out}`,
+          output_ext: "mp3",
+          accept_mime: "audio/*",
+          timeout_secs: 600,
+          note: "ffmpeg が必要（.texos\\filters か PATH に置いてください）",
+        });
       } else {
         // 外部プログラム: 設定ダイアログ（v1.5）。NAME/PATH/Type/CMD/IN/OUT/Prefix を
         // フォームで設定する — JSON直編集・プロンプト連鎖は現実的でない（実機指摘）。
@@ -670,6 +796,170 @@ function App() {
       }
     },
     [refresh, pushUndo, linkNewNode]
+  );
+
+  // v1.3.11 ランチャー: 一般プログラム/ターミナルを登録するカードを作成。
+  // builtin: "program"（exeをファイル選択）/ "cmd" / "powershell"。
+  const handleAddLauncher = useCallback(
+    (builtin: string, canvasX: number, canvasY: number, linkFrom?: string) => {
+      const create = async (label: string, spec: Record<string, unknown>) => {
+        try {
+          const vid = await invoke<string>("create_launcher", {
+            label,
+            spec: JSON.stringify(spec),
+            x: canvasX,
+            y: canvasY,
+          });
+          pushUndo([{ kind: "delete", ids: [vid] }]);
+          await refresh();
+          if (linkFrom) await linkNewNode(linkFrom, vid);
+        } catch (e) {
+          console.error("create_launcher failed", e);
+          setConfirm({
+            title: "ランチャーを作成できませんでした",
+            message: String(e),
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+      };
+      if (builtin === "installed") {
+        // v1.3.11 #A: インストール済みアプリ（スタートメニュー）から検索して選ぶ。
+        setAppPicker({ x: canvasX, y: canvasY, linkFrom });
+      } else if (builtin === "cmd") {
+        void create("コマンドプロンプト", { name: "cmd", type: "launcher" });
+      } else if (builtin === "powershell") {
+        void create("PowerShell", { name: "powershell", type: "launcher" });
+      } else {
+        // 一般プログラム: exe を選び、表示名を聞いて登録（アイコンは exe から取得）。
+        (async () => {
+          const sel = await open({
+            multiple: false,
+            title: "登録するプログラム（.exe）を選択",
+            filters: [{ name: "プログラム", extensions: ["exe", "lnk", "bat", "cmd", "com"] }],
+          });
+          if (typeof sel !== "string") return;
+          const base = sel.replace(/^.*[\\/]/, "").replace(/\.(exe|lnk|bat|cmd|com)$/i, "");
+          setPrompt({
+            title: "ランチャーの表示名",
+            initial: base || "プログラム",
+            onConfirm: (label) =>
+              create(label, {
+                name: sel.replace(/^.*[\\/]/, ""),
+                path: sel,
+                type: "launcher",
+              }),
+          });
+        })();
+      }
+    },
+    [refresh, pushUndo, linkNewNode]
+  );
+
+  // v1.3.11 ランチャー実行: プログラムを detached 起動（接続ファイルがあれば開く）。
+  // 起動後、ウィンドウに戻ったときプロジェクト直下の新規ファイルを実身として回収する
+  // （アプリが新規保存→新しい実身。pendingLauncherScanRef で1回だけ）。
+  const handleRunLauncher = useCallback(
+    async (id: string) => {
+      try {
+        await invoke("run_launcher", { id });
+        const obj = objectsRef.current.find((o) => o.id === id);
+        pendingLauncherScanRef.current = {
+          x: (obj?.pos_x ?? 0) + 180,
+          y: obj?.pos_y ?? 0,
+        };
+      } catch (e) {
+        console.error("run_launcher failed", e);
+        setConfirm({
+          title: "起動できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    []
+  );
+
+  // v1.3.11 #A: アプリピッカーで選んだインストール済みアプリをランチャーとして配置。
+  const handleCreateLauncherFromApp = useCallback(
+    async (app: { name: string; path: string }) => {
+      const pick = appPicker;
+      setAppPicker(null);
+      if (!pick) return;
+      try {
+        const vid = await invoke<string>("create_launcher", {
+          label: app.name,
+          spec: JSON.stringify({
+            name: app.path.replace(/^.*[\\/]/, ""),
+            path: app.path,
+            type: "launcher",
+          }),
+          x: pick.x,
+          y: pick.y,
+        });
+        pushUndo([{ kind: "delete", ids: [vid] }]);
+        await refresh();
+        if (pick.linkFrom) await linkNewNode(pick.linkFrom, vid);
+      } catch (e) {
+        console.error("create_launcher (app) failed", e);
+      }
+    },
+    [appPicker, refresh, pushUndo, linkNewNode]
+  );
+
+  // v1.3.11 ランチャーライブラリ: 登録／再配置／削除。
+  const handleSaveLauncherToLibrary = useCallback(
+    (id: string) => {
+      const obj = objectsRef.current.find((o) => o.id === id);
+      const spec = obj?.filter_ref;
+      if (!spec) return;
+      setPrompt({
+        title: "ランチャーライブラリに登録: 名前（同名は上書き）",
+        initial: obj?.label ?? "",
+        onConfirm: async (name) => {
+          try {
+            await invoke("save_launcher_library", { name, spec });
+            await reloadLauncherLibrary();
+          } catch (e) {
+            setConfirm({
+              title: "登録できませんでした",
+              message: String(e),
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          }
+        },
+      });
+    },
+    [reloadLauncherLibrary]
+  );
+
+  const handleAddLibraryLauncher = useCallback(
+    async (name: string, x: number, y: number) => {
+      const entry = launcherLibraryRef.current.find((e) => e.name === name);
+      if (!entry) return;
+      try {
+        const vid = await invoke<string>("create_launcher", { label: name, spec: entry.spec, x, y });
+        pushUndo([{ kind: "delete", ids: [vid] }]);
+        await refresh();
+      } catch (e) {
+        console.error("add library launcher failed", e);
+      }
+    },
+    [refresh, pushUndo]
+  );
+
+  const handleDeleteLibraryLauncher = useCallback(
+    async (name: string) => {
+      try {
+        await invoke("delete_launcher_library", { name });
+        await reloadLauncherLibrary();
+      } catch (e) {
+        console.error("delete launcher library failed", e);
+      }
+    },
+    [reloadLauncherLibrary]
   );
 
   // フローを実行（手動トリガー — 確定方針4）。結果カードは緑シグナル＋Ctrl+Zで戻せる。
@@ -996,6 +1286,12 @@ function App() {
   const handleOpenObject = useCallback(
     async (id: string) => {
       const obj = objectsRef.current.find((o) => o.id === id);
+      // v1.3.11 ランチャー: ダブルクリック＝起動（ランチャーの主目的は起動）。
+      // filter_ref を持つため、フィルタ判定より先に処理する。
+      if (obj?.kind === "launcher") {
+        handleRunLauncher(id);
+        return;
+      }
       // フィルタカード: 覗く＝定義を見る → 設定を開く（実行はメニュー／▶ボタンで明示）。
       if (obj && (obj.kind === "filter" || obj.filter_ref)) {
         handleEditFilter(id, obj.filter_ref ?? "{}");
@@ -1037,6 +1333,11 @@ function App() {
         return;
       }
       // インラインプレビューがある種別はキャンバス内で閲覧（仮身のまま・CAS不変）。
+      // v1.3.11 #13: オフィス系（docx=mammoth / 表計算=SheetJS）も DOM プレビュー対象。
+      const DOC_PREVIEW_EXTS = [
+        "docx", "xlsx", "xls", "ods", "csv", "tsv",
+        "pptx", "ppt", "doc", "odt", "odp",
+      ];
       if (
         obj &&
         (obj.mime_type.startsWith("image/") ||
@@ -1044,6 +1345,7 @@ function App() {
           obj.mime_type.startsWith("video/") ||
           obj.mime_type === "application/pdf" ||
           (obj.ext ?? "").toLowerCase() === "pdf" ||
+          DOC_PREVIEW_EXTS.includes((obj.ext ?? "").toLowerCase()) ||
           isTextMime(obj.mime_type, obj.ext))
       ) {
         // v1.3.10: ダブルクリックはプレビューのトグル（再度ダブルクリックで閉じる）。
@@ -1071,7 +1373,7 @@ function App() {
         invoke("view_temp", { id }).catch((e) => console.error("view_temp failed", e));
       }
     },
-    [handleEditFilter, handleFeedDrop]
+    [handleEditFilter, handleFeedDrop, handleRunLauncher]
   );
 
   // Place a reference to an existing project as a project-object card.
@@ -1130,6 +1432,43 @@ function App() {
       });
     },
     [refresh, pushUndo, linkNewNode]
+  );
+
+  // v1.3.11 修正（#8/#9）: 拡張子だけ指定した空ファイルは「正式なファイル」にならない
+  // （docx 等は中身が無いと壊れ、実質テキスト）。そこで OS の「新規作成」を使う方式に変更:
+  // プロジェクトフォルダを既定にした配置ダイアログを開き、ダイアログ内の右クリック→新規作成で
+  // 正しい型のファイルを作って選ぶ（または既存ファイルを選ぶ）。選んだファイルがプロジェクト内
+  // なら実身として取り込まれる（path_inside 判定）。配置位置はクリック位置を維持する。
+  const handleNewFile = useCallback(
+    async (canvasX: number, canvasY: number, linkFrom?: string) => {
+      try {
+        const sel = await open({
+          multiple: false,
+          defaultPath: project?.path,
+          title: "新規ファイルを作成（ダイアログ内で右クリック→新規作成）または選択",
+        });
+        if (typeof sel !== "string") return;
+        const vid = await invoke<string>("import_file", {
+          path: sel,
+          label: "",
+          x: canvasX,
+          y: canvasY,
+        });
+        setTouched((prev) => new Set(prev).add(vid));
+        pushUndo([{ kind: "delete", ids: [vid] }]);
+        await refresh();
+        if (linkFrom) await linkNewNode(linkFrom, vid);
+      } catch (e) {
+        console.error("new file (place) failed", e);
+        setConfirm({
+          title: "新規ファイルを作成できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh, pushUndo, linkNewNode, project]
   );
 
   const handleSetMemo = useCallback(
@@ -1244,6 +1583,27 @@ function App() {
         await refresh();
       } catch (e) {
         console.error("relink failed", e);
+      }
+    },
+    [refresh, project]
+  );
+
+  // v1.3.11 #12: リンクフォルダの参照先を選び直す（リンク切れの繋ぎ直し）。フォルダ名が
+  // 変更された想定で、元のリンク先の「親フォルダ」をデフォルトで開く（旧仕様はデスクトップ）。
+  const handleRelinkFolder = useCallback(
+    async (id: string, currentPath: string) => {
+      const parent = currentPath ? currentPath.replace(/[\\/][^\\/]*$/, "") : undefined;
+      try {
+        const sel = await open({
+          directory: true,
+          title: "リンクし直すフォルダを選択",
+          defaultPath: parent || project?.path,
+        });
+        if (typeof sel !== "string") return;
+        await invoke("relink_folder", { id, newPath: sel });
+        await refresh();
+      } catch (e) {
+        console.error("relink_folder failed", e);
       }
     },
     [refresh, project]
@@ -2242,15 +2602,30 @@ function App() {
         const x = Math.round(Math.min(...items.map((o) => o.x)));
         moved = items.map((o) => ({ ...o, x }));
       } else if (mode === "grid") {
-        // 読み順（上→下、左→右）を保ったまま正方形に近い格子へ。
-        const sorted = [...items].sort((a, b) => a.y - b.y || a.x - b.x);
-        const cols = Math.ceil(Math.sqrt(sorted.length));
+        // v1.3.11 #14: 現在の並びをできるだけ維持して格子にスナップする。
+        // Y が近いものを同じ「段（行）」、X が近いものを同じ「列」にクラスタリングし、
+        // 段番号・列番号を格子座標へ写す。これで横一列は各段で、縦一列は各列で
+        // それぞれ等間隔にそろう（読み順で正方形に詰め直す旧実装からの改良）。
+        const clusterRanks = (vals: number[], threshold: number): number[] => {
+          const order = vals
+            .map((v, i) => ({ v, i }))
+            .sort((a, b) => a.v - b.v);
+          const rank = new Array(vals.length).fill(0);
+          let cur = 0;
+          for (let k = 0; k < order.length; k++) {
+            if (k > 0 && order[k].v - order[k - 1].v > threshold) cur++;
+            rank[order[k].i] = cur;
+          }
+          return rank;
+        };
+        const rowRank = clusterRanks(items.map((o) => o.y), CARD_H * 0.6);
+        const colRank = clusterRanks(items.map((o) => o.x), CARD_W * 0.6);
         const x0 = Math.round(Math.min(...items.map((o) => o.x)));
         const y0 = Math.round(Math.min(...items.map((o) => o.y)));
-        moved = sorted.map((o, i) => ({
+        moved = items.map((o, i) => ({
           ...o,
-          x: x0 + (i % cols) * (CARD_W + GAP),
-          y: y0 + Math.floor(i / cols) * (CARD_H + GAP),
+          x: x0 + colRank[i] * (CARD_W + GAP),
+          y: y0 + rowRank[i] * (CARD_H + GAP),
         }));
       } else {
         // 均等配置: 両端を固定し、間を等間隔に。
@@ -2293,6 +2668,25 @@ function App() {
       void alignSelected("grid", { cards: cardsOnShape(s), notes: notesOnShape(s) });
     },
     [alignSelected, cardsOnShape, notesOnShape]
+  );
+
+  // v1.3.11 #1: 借用元（origin_path）が属するプロジェクトを開く。プロジェクト内なら
+  // 切り替え、そうでなければ借用元フォルダをエクスプローラで表示。
+  const handleOpenOriginProject = useCallback(
+    async (path: string) => {
+      try {
+        const info = await invoke<ProjectInfo | null>("open_origin_project", { path });
+        if (info) {
+          setProject(info);
+        } else {
+          await invoke("reveal_in_dir", { path }).catch(() => {});
+        }
+      } catch (e) {
+        console.error("open_origin_project failed", e);
+        await invoke("reveal_in_dir", { path }).catch(() => {});
+      }
+    },
+    []
   );
 
   // --- Auto layout (重なり解消) ----------------------------------------------
@@ -2463,9 +2857,11 @@ function App() {
   // 後方定義のハンドラを ref に載せ、handleStartLink（前方）から呼べるようにする。
   linkActionsRef.current = {
     file: handleContextPlace,
+    newFile: handleNewFile,
     paste: handlePaste,
     url: handleAddUrl,
     filter: handleAddFilter,
+    launcher: handleAddLauncher,
     note: handleAddNote,
     text: handleAddTextCard,
     projectPath: linkProjectByPath,
@@ -2587,12 +2983,18 @@ function App() {
         openSubmenu: (sub) =>
           window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items: sub }), 0),
         contextPlace: handleContextPlace,
+        newFile: handleNewFile,
         addNote: handleAddNote,
         paste: handlePaste,
         shapeAdd: handleShapeAdd,
         addUrl: handleAddUrl,
         addFilter: handleAddFilter,
         runFlow: handleRunFlow,
+        addLauncher: handleAddLauncher,
+        runLauncher: handleRunLauncher,
+        addLibraryLauncher: handleAddLibraryLauncher,
+        saveLauncherToLibrary: handleSaveLauncherToLibrary,
+        deleteLibraryLauncher: handleDeleteLibraryLauncher,
         editFilter: handleEditFilter,
         saveFilterToLibrary: handleSaveFilterToLibrary,
         addLibraryFilter: handleAddLibraryFilter,
@@ -2623,6 +3025,8 @@ function App() {
         openDefault: handleOpenDefault,
         openWith: handleOpenWith,
         commitReveal: handleCommitReveal,
+        openOriginProject: handleOpenOriginProject,
+        relinkFolder: handleRelinkFolder,
         relink: handleRelink,
         restoreFromCas: handleRestoreFromCas,
         editInCanvas: handleEditInCanvas,
@@ -2725,6 +3129,7 @@ function App() {
             alignItems,
             bulkItems,
             library: filterLibrary.map((e) => e.name),
+            launcherLibrary: launcherLibrary.map((e) => e.name),
             menuHints: showMenuHints,
           },
           actions
@@ -2785,6 +3190,11 @@ function App() {
       handleSaveFilterToLibrary,
       handleAddLibraryFilter,
       handleDeleteLibraryFilter,
+      handleAddLauncher,
+      handleRunLauncher,
+      handleAddLibraryLauncher,
+      handleSaveLauncherToLibrary,
+      handleDeleteLibraryLauncher,
       handleFeedDrop,
       runDownstreamFlows,
       theme,
@@ -2792,6 +3202,7 @@ function App() {
       expanded,
       notes,
       filterLibrary,
+      launcherLibrary,
       cardsOnShape,
       notesOnShape,
     ]
@@ -2930,13 +3341,15 @@ function App() {
             y={obj.pos_y}
             committed={!!obj.committed_path}
             active={touched.has(obj.id)}
-            lost={lostOf(obj) ?? (lostRealOf(obj) ? "real" : null)}
+            lost={lostOf(obj) ?? ((lostRealOf(obj) || lostFolderOf(obj)) ? "real" : null)}
             isProject={obj.mime_type === PROJECT_MIME || !!obj.project_ref}
             isUrl={!!obj.url_ref}
             isFolder={!!obj.folder_ref}
-            isFilter={obj.kind === "filter" || !!obj.filter_ref}
+            isFilter={obj.kind !== "launcher" && (obj.kind === "filter" || !!obj.filter_ref)}
             filterRef={obj.filter_ref}
             isDrop={obj.kind === "drop"}
+            isLauncher={obj.kind === "launcher"}
+            launcherPath={launcherPathOf(obj)}
             memo={obj.memo}
             ext={obj.ext}
             expanded={expanded.has(obj.id)}
@@ -2955,7 +3368,7 @@ function App() {
             onCollapse={handleCollapse}
             onAfterSave={refresh}
             onRequestEdit={handleEditInCanvas}
-            onRunFlow={handleRunFlow}
+            onRunFlow={obj.kind === "launcher" ? handleRunLauncher : handleRunFlow}
           />
         ))}
         {notes.map((n) => (
@@ -3109,6 +3522,12 @@ function App() {
               });
             }
           }}
+        />
+      )}
+      {appPicker && (
+        <AppPicker
+          onPick={handleCreateLauncherFromApp}
+          onCancel={() => setAppPicker(null)}
         />
       )}
       {flowRunning && (

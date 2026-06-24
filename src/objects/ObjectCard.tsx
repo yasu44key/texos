@@ -1,9 +1,14 @@
-import { useRef, useState, useEffect } from "react";
+import { useRef, useState, useEffect, lazy, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { InlineTextEditor } from "./InlineTextEditor";
 import { ImagePreview } from "./ImagePreview";
 import { AudioPlayer } from "./AudioPlayer";
 import { MediaPreview } from "./MediaPreview";
+// v1.3.11 #13: docx=mammoth / 表計算=SheetJS は重いので遅延読み込み（オフィスファイルを
+// プレビューした時だけ取得＝メインバンドルを太らせない）。
+const DocPreview = lazy(() =>
+  import("./DocPreview").then((m) => ({ default: m.DocPreview }))
+);
 import { isTextMime } from "../model";
 
 // Fixed card geometry so link endpoints are predictable from (x, y) alone.
@@ -37,6 +42,10 @@ interface Props {
   filterRef?: string | null;
   /** v1.4 オートフロー: this card is a drop point (pipeline data inlet) */
   isDrop?: boolean;
+  /** v1.3.11: this card is a launcher (registered program / terminal) */
+  isLauncher?: boolean;
+  /** v1.3.11: launcher が起動するプログラムの実パス（アイコン表示用。ターミナルは null） */
+  launcherPath?: string | null;
   /** stacking order (computed by the parent; expanded cards come to front) */
   zIndex?: number;
   /** part of the current rubber-band selection */
@@ -179,6 +188,7 @@ export function ObjectCard({
   id, realId, label, mimeType, x, y,
   committed = false, active = false, lost = null,
   isProject = false, isUrl = false, isFolder = false, isFilter = false, isDrop = false,
+  isLauncher = false, launcherPath = null,
   filterRef = null,
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
@@ -197,13 +207,28 @@ export function ObjectCard({
   // v1.3.9: text cards render an inline panel — read-only 閲覧 when uncommitted,
   // editable when an editable real file (editPath) exists.
   const isText = isTextMime(mimeType, ext ?? null);
+  // v1.3.11 #13: オフィス系のインラインプレビュー（docx=mammoth / 表計算=SheetJS）。
+  // csv/tsv は SheetJS の表として見せたいのでテキスト編集より優先する。
+  const lowExt = (ext ?? "").toLowerCase();
+  // HTML化(mammoth/SheetJS) + LibreOffice→PDF(pptx等) のプレビュー対象。
+  const isDoc = [
+    "docx", "xlsx", "xls", "ods", "csv", "tsv",
+    "pptx", "ppt", "doc", "odt", "odp",
+  ].includes(lowExt);
 
   useEffect(() => {
-    if (isProject || isUrl || !ext) return;
     let alive = true;
+    // v1.3.11: ランチャーは登録プログラムの実パスからアイコンを取得（exe/lnk 個別アイコン）。
+    if (isLauncher) {
+      if (launcherPath) {
+        fetchOsIcon("exe", launcherPath).then((d) => { if (alive) setOsIcon(d); });
+      }
+      return () => { alive = false; };
+    }
+    if (isProject || isUrl || !ext) return;
     fetchOsIcon(ext, editPath).then((d) => { if (alive) setOsIcon(d); });
     return () => { alive = false; };
-  }, [ext, editPath, isProject, isUrl]);
+  }, [ext, editPath, isProject, isUrl, isLauncher, launcherPath]);
 
   useEffect(() => {
     if (!isImage) return;
@@ -279,11 +304,13 @@ export function ObjectCard({
   const status = lost === "real"
     ? {
         // v1.3.9 問題点2: 実身だが実体ファイルが喪失。再リンク／CAS復元を促す薄赤。
+        // v1.3.11 #12: リンクフォルダは参照先フォルダのリンク切れを薄赤で示す。
         color: "#e08a8a",
         border: "#6b3a3a",
         filled: true,
-        title:
-          "実身（実体ファイルが見つかりません・リネーム/移動/削除？ 右クリックで再リンクかCAS復元）",
+        title: isFolder
+          ? "リンクフォルダ（参照先フォルダが見つかりません・移動/削除/リネーム？）"
+          : "実身（実体ファイルが見つかりません・リネーム/移動/削除？ 右クリックで再リンクかCAS復元）",
       }
     : committed
     ? active
@@ -305,11 +332,11 @@ export function ObjectCard({
   // （フィルタ/ドロップ/プロジェクト/URL/フォルダは別アクション）。カードのダブルクリック
   // ＝プレビューと衝突しないよう stopPropagation。
   const titleRenamable =
-    !!onRenameTitle && !isFilter && !isDrop && !isProject && !isUrl && !isFolder;
+    !!onRenameTitle && !isFilter && !isDrop && !isProject && !isUrl && !isFolder && !isLauncher;
   // v1.3.10 補完: フィルタ/ドロップは「アイコン/名前/種類/▶実行」の4行で固定サイズ(115px)が
   // いっぱい。実行ログのメモは5行目になり下端からはみ出てクリップされるので、カード面からは
   // 外してホバー(title)に移し、余白を詰めて4行を確実に収める。
-  const compactFilter = isFilter || isDrop;
+  const compactFilter = isFilter || isDrop || isLauncher;
   const onTitleDblClick = titleRenamable
     ? (e: React.MouseEvent) => {
         e.stopPropagation();
@@ -346,8 +373,10 @@ export function ObjectCard({
           ? fstyle.bg
           : isDrop
           ? "var(--card-bg-drop, #102030)"
+          : isLauncher
+          ? "var(--card-bg-launcher, #14241c)"
           : "var(--card-bg, #111120)",
-        border: `1px ${isDrop ? "dashed" : "solid"} ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? fstyle.border : isDrop ? "#4a90d9" : status.border}`,
+        border: `1px ${isDrop ? "dashed" : "solid"} ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? fstyle.border : isDrop ? "#4a90d9" : isLauncher ? "#2f6a4a" : status.border}`,
         outline: selected ? "2px solid var(--accent, #4a90d9)" : "none",
         outlineOffset: 1,
         borderRadius: 10,
@@ -490,6 +519,35 @@ export function ObjectCard({
             {isDrop && (
               <span style={{ fontSize: 9, color: "#7fb0d8" }}>📥 ここにドロップ→自動実行</span>
             )}
+            {/* v1.3.11 ランチャー: 登録プログラムを起動。接続ファイルがあれば開く。 */}
+            {isLauncher && (
+              <span style={{ fontSize: 9, color: "#7fb0d8" }}>🚀 ランチャー</span>
+            )}
+            {isLauncher && (
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRunFlow?.(id);
+                }}
+                title="このプログラムを起動します（接続したファイルがあれば開きます）"
+                style={{
+                  marginTop: 2,
+                  padding: "2px 12px",
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: "#fff",
+                  background: "#2f6a4a",
+                  border: "none",
+                  borderRadius: 5,
+                  cursor: "pointer",
+                  fontFamily: "sans-serif",
+                }}
+              >
+                ▶ 起動
+              </button>
+            )}
             {/* v1.3.10 補完: フィルタ/ドロップはメモ(実行ログ)を面に出さずホバーへ（4行に収める）。 */}
             {memo && !compactFilter && (
               <span
@@ -512,7 +570,9 @@ export function ObjectCard({
       </div>
 
       {/* status dot (top-left): 琥珀=仮身 / 緑=実身(今セッション変更) / グレー=実身 */}
-      {!isProject && !isUrl && !isFolder && !isFilter && (
+      {/* v1.3.11 #12: 通常カードは常時。リンクフォルダ等は普段ドットを出さないが、
+          リンク切れ（lost==="real"）のときだけ赤シグナルを表示する。 */}
+      {((!isProject && !isUrl && !isFolder && !isFilter && !isLauncher) || lost === "real") && (
       <div
         title={status.title}
         style={{
@@ -579,10 +639,22 @@ export function ObjectCard({
           onClose={() => onCollapse?.(id)}
         />
       )}
+      {/* v1.3.11 #13: オフィス系（docx/表計算）の読取専用インラインプレビュー（遅延読込）。 */}
+      {expanded && isDoc && (
+        <Suspense fallback={null}>
+          <DocPreview
+            objId={id}
+            label={label}
+            ext={lowExt}
+            top={CARD_H + 8}
+            onClose={() => onCollapse?.(id)}
+          />
+        </Suspense>
+      )}
       {/* v1.3.9: text panel. editPath present → editable (実身); otherwise
           read-only 閲覧 of the LIVE content, with an 「編集」 button that
           commits→edits via onRequestEdit. */}
-      {expanded && !isImage && !mimeType.startsWith("audio/") && !isVideo && !isPdf &&
+      {expanded && !isImage && !mimeType.startsWith("audio/") && !isVideo && !isPdf && !isDoc &&
         (editPath || isText) && (
         <InlineTextEditor
           path={editPath}
