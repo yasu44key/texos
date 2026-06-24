@@ -2121,6 +2121,11 @@ fn uncommit_object(id: String, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
 
+    // 「仮身に戻す」＝実ファイルを消してオリジナル（origin）を指す仮身に戻す（編集は破棄）。
+    // 誌操作防止のため「特別」メニューに置き、危険な2ケースは backend でも二重に拒否する:
+    //  ① committed==origin（取り込み元の実ファイルそのもの）→ 消すと元データ喪失（v1.2.1）
+    //  ② origin 無しの内部実身 → 戻り先が無く編集を捨てるだけ（v1.3.6）
+    // 編集を残したい場合はユーザーが「仮身を作成→実身化」しておく運用（残したい/戻したいの両立）。
     let (committed, origin): (Option<String>, Option<String>) = p
         .conn
         .query_row(
@@ -2140,8 +2145,6 @@ fn uncommit_object(id: String, state: State<AppState>) -> Result<(), String> {
             );
         }
     }
-    // v1.3.6: 内部実身（外部の戻り先が無い実身）は仮身に戻せない。戻り先が無いため
-    // 実体を消して編集内容を失うだけになる。UIでも当該メニューは出さないが、二重の安全弁。
     if committed.is_some() && origin.is_none() {
         return Err(
             "これはプロジェクト内部の実身です。戻り先の外部ファイルが無いため仮身に戻せません。\
@@ -2164,21 +2167,27 @@ fn uncommit_object(id: String, state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// v1.3.6 変更②「実身にする」: この仮身が見ている内容をプロジェクト内に確定し、
-/// 外部の元ファイルとの縁を切って独立した内部実身にする。以後は「仮身に戻す／
-/// 実身化し直す」の対象外（戻り先が無く、編集を捨てるだけになるため）。
+/// v1.3.6 変更②「実身にする」: この仮身が見ている内容をプロジェクト内に確定して実身にする。
+/// v1.3.11: 内部窓（window_of）だけ切り、**origin（外部/親ファイルへのリンク）は保持**する。
+/// origin を持つ実身は「仮身に戻す」で元（外部/親）へ戻せる＝フォーク由来・外部取り込み由来の
+/// 実身を後から仮身に戻せる。origin が元々無い内部仮身を実身化した場合のみ戻り先が無く対象外。
 #[tauri::command]
 fn make_real(id: String, state: State<AppState>) -> Result<String, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     // live 内容を CAS へ追従させてからコミット（commit_object_inner と同じ流れ）。
     let path = commit_object_inner(p, &id, false)?;
-    // 元ファイルとの縁を切る → origin も window_of も無い＝完全独立の内部実身。
-    // v1.3.10: window_of を残すと「仮身を作成」が元の実身を指してしまう（実身化した
-    // この新ファイルの仮身にならない）。実体を持った時点で窓ではなくなるので消す。
+    // v1.3.10: window_of（内部窓）はクリアする。残すと「仮身を作成」が元の実身を指して
+    // しまう（実身化したこの新ファイルの仮身にならない）。実体を持った時点で内部窓では
+    // なくなるため。
+    // v1.3.11: origin_path（外部/親ファイルへのリンク）は**保持**する。これがあると
+    // isInternalReal=false のまま＝「仮身に戻す」が出て、外部取り込み実身やフォーク由来の
+    // 実身を仮身（外部参照）へ戻せる。閲覧は①own committed が勝つので表示には影響しない。
+    // committed==origin（プロジェクト内取り込み元そのもの）は uncommit/メニュー側のガードが
+    // 別途守る。以前は origin も消していたため、フォークの実身化で外部リンクが失われていた。
     p.conn
         .execute(
-            "UPDATE virtual_bodies SET origin_path = NULL, window_of = NULL WHERE id = ?1",
+            "UPDATE virtual_bodies SET window_of = NULL WHERE id = ?1",
             rusqlite::params![id],
         )
         .map_err(|e| e.to_string())?;

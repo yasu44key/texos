@@ -340,9 +340,8 @@ export function buildObjectMenu(
   // （戻り先が無く、実行すると編集を捨てるだけ＝危険）。その場取り込みもこれに含む。
   const internalReal = !!obj && isInternalReal(obj);
   // v1.3.6 変更③: 危険度の高い操作（仮身に戻す・実身化し直す・クリップボードにコピー）は
-  // 「特別 ...」サブメニューへ退避して優先度を下げる。
-  // v1.3.10: 「仮身を複製」は廃止（窓対象をコピーして元を指す②の動作が混乱の元。仮身作成は
-  // 常にそのカード自身を指す「仮身を作成」に一本化）。
+  // 「特別 ...」サブメニューへ退避して優先度を下げる（誤操作防止）。「仮身に戻す」は origin を
+  // 指す実身（外部取り込み／フォーク由来）だけに出す＝編集破棄の戻し操作。
   const specialItems: MenuItem[] = compact([
     ...(committed && !internalReal
       ? [
@@ -353,7 +352,7 @@ export function buildObjectMenu(
           },
           {
             label: "仮身に戻す",
-            hint: "プロジェクト内の実体を消し、元ファイルへの参照（仮身）に戻します。",
+            hint: "プロジェクト内の実体を消し、元ファイルへの参照（仮身）に戻します。編集内容は破棄されます。",
             danger: true,
             onClick: () => a.uncommit(targetId),
           },
