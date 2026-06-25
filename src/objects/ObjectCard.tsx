@@ -1,6 +1,7 @@
 import { useRef, useState, useEffect, lazy, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { InlineTextEditor } from "./InlineTextEditor";
+import { ChatPanel } from "./ChatPanel";
 import { ImagePreview } from "./ImagePreview";
 import { AudioPlayer } from "./AudioPlayer";
 import { MediaPreview } from "./MediaPreview";
@@ -184,6 +185,18 @@ function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_
   return "filter";
 }
 
+// v1.4.1: AIフィルタの動作モード判定。"chat"=対話パネル / "transform"=一発変換。
+function aiModeOf(ref: string | null | undefined): "chat" | "transform" | null {
+  if (!ref) return null;
+  try {
+    const s = JSON.parse(ref);
+    if (s.builtin === "ai") return s.mode === "chat" ? "chat" : "transform";
+  } catch {
+    /* 壊れたJSONは無視 */
+  }
+  return null;
+}
+
 export function ObjectCard({
   id, realId, label, mimeType, x, y,
   committed = false, active = false, lost = null,
@@ -196,6 +209,7 @@ export function ObjectCard({
   onMoveEnd, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
 }: Props) {
   const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
+  const isAiChat = aiModeOf(filterRef) === "chat"; // v1.4.1 対話パネルを持つAIカード
   const posRef = useRef({ x, y });
   posRef.current = { x, y };
   const [thumbnail, setThumbnail] = useState<string | null>(null);
@@ -398,7 +412,9 @@ export function ObjectCard({
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       title={
-        isFilter
+        isAiChat
+          ? `🤖 AI対話\nダブルクリック / 💬チャット: パネルを開く\n右クリック → 設定: モデル・システム変更${memo ? `\n\n${memo}` : ""}`
+          : isFilter
           ? `${fstyle.badge}\nダブルクリック: 設定を開く ／ ボタン: ${fstyle.run}\n右クリック: メニュー${memo ? `\n\n${memo}` : ""}`
           : isDrop
           ? `ここにファイルをドロップ→下流を自動実行\nダブルクリック: 投入するファイルを選択${memo ? `\n\n${memo}` : ""}`
@@ -488,18 +504,22 @@ export function ObjectCard({
               <span style={{ fontSize: 9, color: "#d8c47f" }}>🔗 リンクフォルダ ▸</span>
             )}
             {isFilter && (
-              <span style={{ fontSize: 9, color: fstyle.text }}>{fstyle.badge}</span>
+              <span style={{ fontSize: 9, color: fstyle.text }}>
+                {isAiChat ? "🤖 AI対話" : fstyle.badge}
+              </span>
             )}
-            {/* v1.3.9: 実行は明示ボタンで（ダブルクリックは設定）。誤爆を防ぐ。 */}
+            {/* v1.3.9: 実行は明示ボタンで（ダブルクリックは設定）。誤爆を防ぐ。
+                v1.4.1: AI対話カードは「実行」ではなくチャットパネルを開く。 */}
             {isFilter && (
               <button
                 onMouseDown={(e) => e.stopPropagation()}
                 onDoubleClick={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();
-                  onRunFlow?.(id);
+                  if (isAiChat) onOpen?.(id);
+                  else onRunFlow?.(id);
                 }}
-                title="このフローを実行します"
+                title={isAiChat ? "チャットパネルを開きます" : "このフローを実行します"}
                 style={{
                   marginTop: 2,
                   padding: "2px 12px",
@@ -513,7 +533,7 @@ export function ObjectCard({
                   fontFamily: "sans-serif",
                 }}
               >
-                {fstyle.run}
+                {isAiChat ? "💬 チャット" : fstyle.run}
               </button>
             )}
             {isDrop && (
@@ -614,7 +634,15 @@ export function ObjectCard({
       />
 
       {/* expansion — anchored to this card, moves with it */}
-      {expanded && isImage && (
+      {expanded && isAiChat && (
+        <ChatPanel
+          objId={id}
+          label={label}
+          top={CARD_H + 8}
+          onClose={() => onCollapse?.(id)}
+        />
+      )}
+      {expanded && !isAiChat && isImage && (
         <ImagePreview
           objId={id}
           label={label}

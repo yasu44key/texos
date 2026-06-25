@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 /// A currently-open project: a self-contained folder.
 ///   <root>/                  project folder
@@ -34,6 +34,8 @@ pub struct AppState {
     /// run_flow が DB の Mutex を握っている間も break_flow はこれだけを触るので
     /// 外部コマンドがストールしてもブレイクできる。
     pub flow_cancel: std::sync::atomic::AtomicBool,
+    /// v1.4.1 チャット: ストリーミング応答の中断フラグ（停止ボタン → ai_chat_cancel）。
+    pub chat_cancel: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -3577,6 +3579,312 @@ fn break_flow(state: State<AppState>) {
         .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+// --- v1.4.1 AIチャット（builtin:"ai" mode:"chat"）---------------------------
+// 履歴は <root>/.texos/chats/<cardId>.json（source of truth）。system は履歴に
+// 入れず、毎リクエストで spec.system から前置する。応答はストリーミングで
+// "ai-chat-token" / "ai-chat-done" イベントにより UI へ逐次配信。
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ChatMsg {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ChatTokenEvent {
+    id: String,
+    delta: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ChatDoneEvent {
+    id: String,
+    error: Option<String>,
+}
+
+fn chats_dir(root: &Path) -> PathBuf {
+    texos_dir(root).join("chats")
+}
+
+fn chat_file(root: &Path, id: &str) -> PathBuf {
+    // id は uuid（安全文字）だが念のためファイル名に使えない文字を落とす。
+    let safe: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    chats_dir(root).join(format!("{safe}.json"))
+}
+
+fn load_chat_history(root: &Path, id: &str) -> Vec<ChatMsg> {
+    std::fs::read(chat_file(root, id))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_chat_history(root: &Path, id: &str, msgs: &[ChatMsg]) -> Result<(), String> {
+    std::fs::create_dir_all(chats_dir(root)).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec_pretty(msgs).map_err(|e| e.to_string())?;
+    std::fs::write(chat_file(root, id), json).map_err(|e| e.to_string())
+}
+
+/// 会話履歴から人が読む Markdown 実身ログカードを生成/更新する（毎ターン自動）。
+/// 固定名「<ラベル>のログ.md」へ上書き → 既存カードがあれば中身差し替え（位置・矢印維持）、
+/// 無ければ AI カードの隣に作って flow 矢印を張る（run_flow の出力カードと同じ流儀）。
+fn upsert_chat_log_card(
+    p: &Project,
+    ai_id: &str,
+    ai_label: &str,
+    history: &[ChatMsg],
+) -> Result<(), String> {
+    // 1) transcript Markdown（**You:** / **AI:**）
+    let mut md = format!("# {ai_label}\n\n");
+    for m in history {
+        let who = match m.role.as_str() {
+            "user" => "You",
+            "assistant" => "AI",
+            other => other,
+        };
+        md.push_str(&format!("**{who}:** {}\n\n", m.content));
+    }
+    let bytes = md.into_bytes();
+
+    // 2) 固定の出力パス: <root>/<safeLabel>のログ.md
+    let safe: String = ai_label
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .take(24)
+        .collect();
+    let fname = format!("{safe}のログ.md");
+    let dest = p.root.join(&fname);
+    std::fs::write(&dest, &bytes).map_err(|e| format!("ログ書き出し失敗: {e}"))?;
+    let dest_str = dest.to_string_lossy().into_owned();
+
+    // 3) CAS + real_body
+    let hash = cas::store_bytes(&p.cas_root, &bytes).map_err(|e| e.to_string())?;
+    db::insert_real_body(&p.conn, &hash, "text/markdown", bytes.len() as u64, Some("md"))
+        .map_err(|e| e.to_string())?;
+
+    // 4) 既存ログカードがあれば中身差し替え、無ければ作成
+    let existing: Option<String> = p
+        .conn
+        .query_row(
+            "SELECT id FROM virtual_bodies
+             WHERE deleted_at IS NULL AND (committed_path = ?1 OR origin_path = ?1)",
+            rusqlite::params![dest_str],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+
+    let log_id = if let Some(vid) = existing {
+        p.conn
+            .execute(
+                "UPDATE virtual_bodies SET real_id = ?1, committed_mtime = ?2 WHERE id = ?3",
+                rusqlite::params![hash, file_mtime_ms(&dest), vid],
+            )
+            .map_err(|e| e.to_string())?;
+        vid
+    } else {
+        let (fx, fy): (f64, f64) = p
+            .conn
+            .query_row(
+                "SELECT pos_x, pos_y FROM virtual_bodies WHERE id = ?1",
+                rusqlite::params![ai_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((0.0, 0.0));
+        let vid = uuid();
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies
+                    (id, real_id, label, pos_x, pos_y, created_at,
+                     committed_path, committed_mtime, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'file')",
+                rusqlite::params![
+                    vid,
+                    hash,
+                    fname,
+                    fx + 230.0,
+                    fy,
+                    db::now_ms(),
+                    dest_str,
+                    file_mtime_ms(&dest),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        vid
+    };
+
+    // 5) AI → ログ の flow 矢印（無ければ張る）
+    let has_rel: bool = p
+        .conn
+        .query_row(
+            "SELECT 1 FROM relations
+             WHERE from_id = ?1 AND to_id = ?2 AND kind = 'flow' AND deleted_at IS NULL",
+            rusqlite::params![ai_id, log_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap_or(None)
+        .unwrap_or(false);
+    if !has_rel {
+        let _ = p.conn.execute(
+            "INSERT INTO relations (from_id, to_id, kind, created_at) VALUES (?1, ?2, 'flow', ?3)",
+            rusqlite::params![ai_id, log_id, db::now_ms()],
+        );
+    }
+    Ok(())
+}
+
+/// 1ターン送信。ユーザー発話を履歴に積み、ストリーミングで応答を生成して
+/// トークンをイベント配信し、完了後に履歴へ保存する。完成本文を返す。
+#[tauri::command(async)]
+fn ai_chat_send(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    id: String,
+    message: String,
+) -> Result<String, String> {
+    // 1) カードの spec/label/root を短時間ロックで取得（ストリーム中はロックを握らない）
+    let (spec, root, card_label) = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        let (fref, label): (Option<String>, String) = p
+            .conn
+            .query_row(
+                "SELECT filter_ref, label FROM virtual_bodies
+                 WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| "AIカードが見つかりません".to_string())?;
+        let spec = flow::parse_spec(fref.as_deref().unwrap_or("{}"))?;
+        if spec.builtin.as_deref() != Some("ai") {
+            return Err("このカードはAIカードではありません".into());
+        }
+        (spec, p.root.clone(), label)
+    };
+
+    let user = message.trim().to_string();
+    if user.is_empty() {
+        return Err("メッセージが空です".into());
+    }
+
+    let mut history = load_chat_history(&root, &id);
+    history.push(ChatMsg {
+        role: "user".into(),
+        content: user,
+    });
+
+    // リクエスト用 messages（system を前置）
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    if let Some(sys) = spec
+        .system
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        messages.push(serde_json::json!({ "role": "system", "content": sys }));
+    }
+    for m in &history {
+        messages.push(serde_json::json!({ "role": m.role, "content": m.content }));
+    }
+
+    state
+        .chat_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // ストリーミングは tokio 文脈外の素のOSスレッドで（run_ai と同じ理由）。
+    let app = window.app_handle().clone();
+    let result = std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut on_token = |tok: &str| {
+                let _ = app.emit(
+                    "ai-chat-token",
+                    ChatTokenEvent {
+                        id: id.clone(),
+                        delta: tok.to_string(),
+                    },
+                );
+            };
+            flow::run_ai_chat_stream(&spec, &messages, &state.chat_cancel, &mut on_token)
+        })
+        .join()
+        .map_err(|_| "AI実行スレッドが異常終了しました".to_string())?
+    });
+
+    match result {
+        Ok(answer) => {
+            history.push(ChatMsg {
+                role: "assistant".into(),
+                content: answer.clone(),
+            });
+            let _ = save_chat_history(&root, &id, &history);
+            // MD実身ログを毎ターン自動更新（固定名上書き＝位置と矢印を保ち緑シグナル再誕生）。
+            {
+                let guard = state.current.lock().unwrap();
+                if let Some(p) = guard.as_ref() {
+                    if let Err(e) = upsert_chat_log_card(p, &id, &card_label, &history) {
+                        eprintln!("チャットログ更新失敗: {e}");
+                    }
+                }
+            }
+            let _ = app.emit(
+                "ai-chat-done",
+                ChatDoneEvent {
+                    id: id.clone(),
+                    error: None,
+                },
+            );
+            Ok(answer)
+        }
+        Err(e) => {
+            // 失敗時はユーザー発話を保存しない（次回リトライで二重に積まれない）
+            let _ = app.emit(
+                "ai-chat-done",
+                ChatDoneEvent {
+                    id: id.clone(),
+                    error: Some(e.clone()),
+                },
+            );
+            Err(e)
+        }
+    }
+}
+
+/// チャット履歴の読み出し（パネル描画用）。
+#[tauri::command]
+fn ai_chat_history(state: State<AppState>, id: String) -> Result<Vec<ChatMsg>, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    Ok(load_chat_history(&p.root, &id))
+}
+
+/// ストリーミング中断（停止ボタン）。DB ロックを取らないので即座に効く。
+#[tauri::command(async)]
+fn ai_chat_cancel(state: State<AppState>) {
+    state
+        .chat_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 会話をリセット（履歴ファイルを削除）。
+#[tauri::command]
+fn ai_chat_clear(state: State<AppState>, id: String) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let f = chat_file(&p.root, &id);
+    if f.exists() {
+        std::fs::remove_file(&f).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 const DROP_MIME: &str = "application/vnd.texos.drop";
 
 /// ドロップポイント（データ入口カード）を作成。中身は空（sentinel）で始まり、
@@ -4422,6 +4730,7 @@ pub fn run() {
                 current: Mutex::new(current),
                 app_data: app_dir,
                 flow_cancel: std::sync::atomic::AtomicBool::new(false),
+                chat_cancel: std::sync::atomic::AtomicBool::new(false),
             });
             Ok(())
         })
@@ -4496,6 +4805,10 @@ pub fn run() {
             update_filter,
             run_flow,
             break_flow,
+            ai_chat_send,
+            ai_chat_history,
+            ai_chat_cancel,
+            ai_chat_clear,
             check_filter_program,
             list_filter_programs,
             import_filter_program,

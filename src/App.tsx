@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { Canvas, screenToCanvas, type Transform, type CanvasApi } from "./canvas/Canvas";
 import { LinkLayer, type RelationInfo } from "./canvas/LinkLayer";
 import { ObjectCard, CARD_W, CARD_H } from "./objects/ObjectCard";
@@ -11,6 +12,7 @@ import { ShapeCard, type ShapeInfo } from "./objects/ShapeCard";
 import { ContextMenu, type MenuItem } from "./ui/ContextMenu";
 import { PromptDialog } from "./ui/PromptDialog";
 import { FilterDialog } from "./ui/FilterDialog";
+import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { AppPicker } from "./ui/AppPicker";
 import { ConfirmDialog } from "./ui/ConfirmDialog";
 import { ProjectChooser, type ProjectInfo } from "./ui/ProjectChooser";
@@ -95,6 +97,14 @@ function App() {
     x: number;
     y: number;
     edit?: { id: string; label: string; spec: string };
+  } | null>(null);
+  // v1.4.1 AIカード専用の設定ダイアログ（生JSON編集の置き換え／新規作成も兼ねる）。
+  // id あり=既存編集 / create あり=新規作成（保存時に create_filter＋矢印接続）。
+  const [aiDlg, setAiDlg] = useState<{
+    id: string | null;
+    label: string;
+    spec: string;
+    create?: { x: number; y: number; linkFrom?: string };
   } | null>(null);
   // v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断）。メニュー構築が同期なので state に持つ。
   const [filterLibrary, setFilterLibrary] = useState<{ name: string; spec: string }[]>([]);
@@ -237,6 +247,22 @@ function App() {
       console.error("refresh failed", e);
     }
   }, []);
+
+  // v1.4.1 チャット1ターン完了でキャンバスを更新（MD実身ログカードの誕生/更新を反映）。
+  useEffect(() => {
+    let alive = true;
+    let un: (() => void) | undefined;
+    listen("ai-chat-done", () => {
+      void refresh();
+    }).then((u) => {
+      if (alive) un = u;
+      else u();
+    });
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, [refresh]);
 
   // v1.3 メモ② UNDO/REDO — useUndo に分離（v1.3.2 リファクタ）。
   // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y のキーバインドもフック内。
@@ -578,7 +604,8 @@ function App() {
           };
           const filterSub = [
             { label: "ドロップポイント（データ入口・自動実行）", onClick: () => la.filter("drop_point", cp.x, cp.y, fromId) },
-            { label: "AI: チャット（Ollama・MD出力）...", onClick: () => la.filter("ai_chat", cp.x, cp.y, fromId) },
+            { label: "AI: 対話（チャットパネル）...", onClick: () => la.filter("ai_dialog", cp.x, cp.y, fromId) },
+            { label: "AI: 変換（一発・MD出力）...", onClick: () => la.filter("ai_chat", cp.x, cp.y, fromId) },
             { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => la.filter("md_codeblock", cp.x, cp.y, fromId) },
             { label: "テキスト: grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
             { label: "テキスト: 置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
@@ -687,30 +714,30 @@ function App() {
           });
         }
       };
-      if (builtin === "ai_chat") {
-        // v1.4.0 AIフィルタ（Phase 1 最小transform）: text入力→Ollama→MD出力。
-        // モデル名→システムプロンプトをプロンプト連鎖で聞く（フォームはPhase 2+）。
-        setPrompt({
-          title: "AI: モデル名（Ollama・例 qwen2.5:3b）",
-          initial: "qwen2.5:3b",
-          onConfirm: (model) => {
-            const m = model.trim() || "qwen2.5:3b";
-            setPrompt({
-              title: "AI: システムプロンプト（空欄可）",
-              initial: "あなたは有能なアシスタントです。簡潔なMarkdownで答えてください。",
-              onConfirm: (sys) =>
-                create(`AI: ${m}`, {
-                  builtin: "ai",
-                  provider: "ollama",
-                  model: m,
-                  system: sys.trim(),
-                  accept_mime: "text/*",
-                  output_ext: "md",
-                }),
-            });
-          },
+      if (builtin === "ai_dialog" || builtin === "ai_chat") {
+        // v1.4.1 AIカードの作成は専用設定ダイアログで（モデル/システム/温度を一括設定）。
+        // 作成・編集で同じダイアログ＝システムプロンプトも複数行で書ける。
+        const chat = builtin === "ai_dialog";
+        const spec = {
+          builtin: "ai",
+          mode: chat ? "chat" : "transform",
+          provider: "ollama",
+          model: "qwen2.5:3b",
+          system: chat
+            ? "あなたは親切で簡潔なアシスタントです。"
+            : "あなたは有能なアシスタントです。簡潔なMarkdownで答えてください。",
+          accept_mime: chat ? "*/*" : "text/*",
+          output_ext: "md",
+        };
+        setAiDlg({
+          id: null,
+          label: chat ? "AI対話" : "AI変換",
+          spec: JSON.stringify(spec),
+          create: { x: canvasX, y: canvasY, linkFrom },
         });
-      } else if (builtin === "md_codeblock") {
+        return;
+      }
+      if (builtin === "md_codeblock") {
         // v1.4.0 AI後段: Markdownのフェンス付きコードブロックを取り出してソース化。
         // 言語を指定すると拡張子も自動推定（c→.c, py→.py …）。そのままgcc等へ繋げる。
         setPrompt({
@@ -1053,14 +1080,20 @@ function App() {
   // 内蔵フィルタは従来の JSON 直編集（バックエンドが保存前に検証する）。
   const handleEditFilter = useCallback(
     (id: string, current: string) => {
-      let isBuiltin = false;
+      let builtin: string | null = null;
       try {
-        isBuiltin = Boolean(JSON.parse(current || "{}").builtin);
+        const b = JSON.parse(current || "{}").builtin;
+        builtin = typeof b === "string" ? b : null;
       } catch {
-        isBuiltin = false;
+        builtin = null;
       }
-      if (!isBuiltin) {
-        const label = objectsRef.current.find((o) => o.id === id)?.label ?? "";
+      const label = objectsRef.current.find((o) => o.id === id)?.label ?? "";
+      // v1.4.1 AIカードは専用設定ダイアログ。
+      if (builtin === "ai") {
+        setAiDlg({ id, label, spec: current });
+        return;
+      }
+      if (!builtin) {
         setFilterDlg({ x: 0, y: 0, edit: { id, label, spec: current } });
         return;
       }
@@ -1331,6 +1364,25 @@ function App() {
       if (obj?.kind === "launcher") {
         handleRunLauncher(id);
         return;
+      }
+      // v1.4.1 AI対話カード: 覗く＝チャットパネルをトグル（設定は右クリックメニュー）。
+      if (obj?.filter_ref) {
+        try {
+          const s = JSON.parse(obj.filter_ref);
+          if (s.builtin === "ai" && s.mode === "chat") {
+            const isOpen = expandedRef.current.has(id);
+            invoke("set_expanded", { id, expanded: !isOpen }).catch(() => {});
+            setExpanded((prev) => {
+              const next = new Set(prev);
+              if (isOpen) next.delete(id);
+              else next.add(id);
+              return next;
+            });
+            return;
+          }
+        } catch {
+          /* 壊れたJSONは下のフィルタ設定へ流す */
+        }
       }
       // フィルタカード: 覗く＝定義を見る → 設定を開く（実行はメニュー／▶ボタンで明示）。
       if (obj && (obj.kind === "filter" || obj.filter_ref)) {
@@ -3268,7 +3320,7 @@ function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Delete") return;
-      if (prompt || confirm || filterDlg || menu) return;
+      if (prompt || confirm || filterDlg || aiDlg || menu) return;
       const ae = document.activeElement as HTMLElement | null;
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable))
         return;
@@ -3280,7 +3332,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prompt, confirm, filterDlg, menu, handleBulkDelete, handleRequestDelete]);
+  }, [prompt, confirm, filterDlg, aiDlg, menu, handleBulkDelete, handleRequestDelete]);
 
   const handleChosen = useCallback((info: ProjectInfo) => {
     setShowChooser(false);
@@ -3556,6 +3608,43 @@ function App() {
               console.error("filter save failed", e);
               setConfirm({
                 title: "フィルタを保存できませんでした",
+                message: String(e),
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              });
+            }
+          }}
+        />
+      )}
+      {aiDlg && (
+        <AiSettingsDialog
+          initialLabel={aiDlg.label}
+          initialSpec={aiDlg.spec}
+          onCancel={() => setAiDlg(null)}
+          onSave={async (label, spec) => {
+            const dlg = aiDlg;
+            setAiDlg(null);
+            try {
+              if (dlg.id) {
+                await invoke("update_filter", { id: dlg.id, spec });
+                if (label !== dlg.label) {
+                  await invoke("rename_object", { id: dlg.id, label });
+                }
+              } else if (dlg.create) {
+                const vid = await invoke<string>("create_filter", {
+                  label,
+                  spec,
+                  x: dlg.create.x,
+                  y: dlg.create.y,
+                });
+                pushUndo([{ kind: "delete", ids: [vid] }]);
+                if (dlg.create.linkFrom) await linkNewNode(dlg.create.linkFrom, vid);
+              }
+              await refresh();
+            } catch (e) {
+              console.error("ai settings save failed", e);
+              setConfirm({
+                title: "AI設定を保存できませんでした",
                 message: String(e),
                 okLabel: "OK",
                 onConfirm: () => setConfirm(null),

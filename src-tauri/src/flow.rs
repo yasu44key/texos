@@ -79,6 +79,9 @@ pub struct FilterSpec {
     /// v1.4.0 md_codeblock: 抽出するコードブロックの言語（空=最初のブロック）。
     #[serde(default)]
     pub lang: Option<String>,
+    /// v1.4.1 AI動作モード: "transform"（一発変換・既定）| "chat"（対話パネル）。
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// 外部プログラムの解決: 絶対パス → <project>/.texos/filters → 環境変数PATH の順
@@ -409,6 +412,133 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
     Ok((content.into_bytes(), "md".into(), "text/markdown".into()))
 }
 
+/// v1.4.1 チャット: ストリーミング応答。messages は system を含む会話履歴全体。
+/// on_token はトークン断片ごとに呼ばれる（UIへ逐次表示する）。完成した本文を返す。
+/// 呼び出し側は tokio 文脈外の素のOSスレッドで実行すること（run_ai と同じ理由 —
+/// reqwest::blocking の内部ランタイム drop パニックを避ける）。cancel で途中停止。
+pub fn run_ai_chat_stream(
+    spec: &FilterSpec,
+    messages: &[serde_json::Value],
+    cancel: &std::sync::atomic::AtomicBool,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<String, String> {
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering;
+    let provider = spec.provider.as_deref().unwrap_or("ollama");
+    let model = spec
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("AIフィルタにモデルが指定されていません")?;
+    // ストリーミングは長時間。timeout 指定があれば全体上限、無指定/0 は無制限（cancelで停止）。
+    let client = {
+        let mut cb = reqwest::blocking::Client::builder();
+        if let Some(s) = spec.timeout_secs {
+            if s > 0 {
+                cb = cb.timeout(std::time::Duration::from_secs(s));
+            }
+        }
+        cb.build()
+            .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?
+    };
+
+    let mut full = String::new();
+    if provider == "openai" {
+        // OpenAI準拠: SSE（"data: {...}" 行、終端は [DONE]）
+        let endpoint = spec
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("http://localhost:1234/v1")
+            .trim_end_matches('/');
+        let mut body = serde_json::json!({
+            "model": model, "messages": messages, "stream": true,
+        });
+        if let Some(t) = spec.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        let resp = client
+            .post(format!("{endpoint}/chat/completions"))
+            .json(&body)
+            .send()
+            .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
+        if !resp.status().is_success() {
+            return Err(format!("AI APIエラー ({})", resp.status()));
+        }
+        for line in std::io::BufReader::new(resp).lines() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let line = line.map_err(|e| format!("ストリーム読み取り失敗: {e}"))?;
+            let data = match line.trim().strip_prefix("data:") {
+                Some(d) => d.trim(),
+                None => continue,
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(tok) = v["choices"][0]["delta"]["content"].as_str() {
+                    full.push_str(tok);
+                    on_token(tok);
+                }
+            }
+        }
+    } else {
+        // Ollama ネイティブ: NDJSON（1行=1JSON、done:true で終端）
+        let endpoint = spec
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("http://localhost:11434")
+            .trim_end_matches('/');
+        let mut options = serde_json::Map::new();
+        if let Some(t) = spec.temperature {
+            options.insert("temperature".into(), serde_json::json!(t));
+        }
+        let body = serde_json::json!({
+            "model": model, "messages": messages, "stream": true,
+            "keep_alive": "5m", "options": serde_json::Value::Object(options),
+        });
+        let resp = client
+            .post(format!("{endpoint}/api/chat"))
+            .json(&body)
+            .send()
+            .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
+        if !resp.status().is_success() {
+            return Err(format!("AI APIエラー ({})", resp.status()));
+        }
+        for line in std::io::BufReader::new(resp).lines() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let line = line.map_err(|e| format!("ストリーム読み取り失敗: {e}"))?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(err) = v["error"].as_str() {
+                    return Err(format!("AI APIエラー: {err}"));
+                }
+                if let Some(tok) = v["message"]["content"].as_str() {
+                    if !tok.is_empty() {
+                        full.push_str(tok);
+                        on_token(tok);
+                    }
+                }
+                if v["done"].as_bool().unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(full)
+}
+
 /// AI接続失敗を日本語で分かりやすく（Ollama未起動が最頻なので最優先で案内）。
 fn ai_conn_err(provider: &str, endpoint: &str, e: &reqwest::Error) -> String {
     if e.is_connect() {
@@ -668,6 +798,26 @@ mod tests {
         assert_eq!(ext, "md");
         assert_eq!(mime, "text/markdown");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    #[ignore = "ライブOllamaが必要"]
+    fn ai_chat_stream_live() {
+        use std::sync::atomic::AtomicBool;
+        let s = spec(r#"{"builtin":"ai","provider":"ollama","model":"qwen2.5:3b"}"#);
+        let msgs = vec![serde_json::json!({"role":"user","content":"1から5まで数えてください。"})];
+        let cancel = AtomicBool::new(false);
+        let mut tokens = 0usize;
+        let mut acc = String::new();
+        let full = run_ai_chat_stream(&s, &msgs, &cancel, &mut |t| {
+            tokens += 1;
+            acc.push_str(t);
+        })
+        .unwrap();
+        eprintln!("tokens={tokens} full={full}");
+        assert!(tokens > 1, "ストリームが断片で届いていない (tokens={tokens})");
+        assert_eq!(full, acc, "返却本文と逐次累積が一致");
+        assert!(!full.trim().is_empty());
     }
 
     #[test]
