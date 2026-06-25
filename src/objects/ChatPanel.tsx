@@ -240,7 +240,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
         height: size.h,
         display: "flex",
         flexDirection: "column",
-        background: "#11161f",
+        background: "var(--panel-bg, #11161f)",
         border: "1px solid #2f6a4a",
         borderRadius: 8,
         boxShadow: "0 8px 28px #000000aa",
@@ -256,10 +256,10 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
           alignItems: "center",
           gap: 6,
           padding: "6px 8px",
-          background: "#14281e",
+          background: "var(--panel-header-bg, #14281e)",
           borderBottom: "1px solid #2f6a4a",
           fontSize: 12,
-          color: "#7fd8b0",
+          color: "var(--panel-header-text, #7fd8b0)",
         }}
       >
         <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -280,9 +280,9 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
           style={{
             padding: "4px 8px",
             fontSize: 11,
-            color: "#9fc9b3",
-            background: "#0f1b15",
-            borderBottom: "1px solid #233a2e",
+            color: "var(--panel-muted, #9fc9b3)",
+            background: "var(--panel-header-bg, #0f1b15)",
+            borderBottom: "1px solid var(--panel-border, #233a2e)",
             whiteSpace: "nowrap",
             overflow: "hidden",
             textOverflow: "ellipsis",
@@ -297,7 +297,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
 
       {/* v1.4.6 Ollama 状態確認中 */}
       {ollama === "checking" && (
-        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#6b7686", fontSize: 12 }}>
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--panel-muted, #6b7686)", fontSize: 12 }}>
           ローカルAI（Ollama）の状態を確認中…
         </div>
       )}
@@ -305,7 +305,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
       {/* v1.4.6 Ollama 未起動 → セットアップ案内 */}
       {ollama === "setup" && (
         <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 12, justifyContent: "center" }}>
-          <div style={{ fontSize: 13, color: "#d6e8dd", lineHeight: 1.6 }}>
+          <div style={{ fontSize: 13, color: "var(--panel-text, #d6e8dd)", lineHeight: 1.6 }}>
             🦙 ローカルAI「Ollama」が見つかりません。
             <br />
             {setupInfo.installed
@@ -313,7 +313,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
               : "AI対話にはローカルで動く Ollama が必要です。"}
           </div>
           {setupMsg && (
-            <div style={{ fontSize: 12, color: "#9fc9b3", whiteSpace: "pre-wrap" }}>{setupMsg}</div>
+            <div style={{ fontSize: 12, color: "var(--panel-muted, #9fc9b3)", whiteSpace: "pre-wrap" }}>{setupMsg}</div>
           )}
           {!setupBusy && (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -335,7 +335,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
             </div>
           )}
           {setupBusy && (
-            <div style={{ fontSize: 12, color: "#9fc9b3" }}>処理中… しばらくお待ちください</div>
+            <div style={{ fontSize: 12, color: "var(--panel-muted, #9fc9b3)" }}>処理中… しばらくお待ちください</div>
           )}
         </div>
       )}
@@ -345,7 +345,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
       {/* messages */}
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 8, display: "flex", flexDirection: "column", gap: 8 }}>
         {history.length === 0 && streaming == null && (
-          <div style={{ color: "#6b7686", fontSize: 12, textAlign: "center", marginTop: 16 }}>
+          <div style={{ color: "var(--panel-muted, #6b7686)", fontSize: 12, textAlign: "center", marginTop: 16 }}>
             メッセージを入力して会話を始めてください。
           </div>
         )}
@@ -362,7 +362,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
       )}
 
       {/* input */}
-      <div style={{ display: "flex", gap: 6, padding: 8, borderTop: "1px solid #243043", background: "#0e121c" }}>
+      <div style={{ display: "flex", gap: 6, padding: 8, borderTop: "1px solid var(--panel-border, #243043)", background: "var(--panel-header-bg, #0e121c)" }}>
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -372,10 +372,10 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
           style={{
             flex: 1,
             resize: "none",
-            background: "#0a0e16",
-            border: "1px solid #2a3346",
+            background: "var(--panel-input-bg, #0a0e16)",
+            border: "1px solid var(--panel-border, #2a3346)",
             borderRadius: 6,
-            color: "#e6ecf6",
+            color: "var(--panel-text, #e6ecf6)",
             fontSize: 13,
             padding: "6px 8px",
             outline: "none",
@@ -427,9 +427,15 @@ function Bubble({ role, content }: { role: string; content: string }) {
           lineHeight: 1.5,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
-          background: isUser ? "#1e3a5a" : "#1a2620",
-          color: isUser ? "#cfe3fb" : "#d6e8dd",
-          border: `1px solid ${isUser ? "#2f5a8a" : "#2f6a4a"}`,
+          background: isUser
+            ? "var(--chat-bubble-user-bg, #1e3a5a)"
+            : "var(--chat-bubble-ai-bg, #1a2620)",
+          color: isUser
+            ? "var(--chat-bubble-user-text, #cfe3fb)"
+            : "var(--chat-bubble-ai-text, #d6e8dd)",
+          border: `1px solid ${
+            isUser ? "var(--chat-bubble-user-border, #2f5a8a)" : "var(--chat-bubble-ai-border, #2f6a4a)"
+          }`,
         }}
       >
         {content}
@@ -442,9 +448,9 @@ function hdrBtn(): React.CSSProperties {
   return {
     padding: "2px 8px",
     fontSize: 11,
-    color: "#aeb8cc",
-    background: "#1c2a22",
-    border: "1px solid #2f6a4a",
+    color: "#fff",
+    background: "var(--panel-btn-bg, #1c2a22)",
+    border: "1px solid var(--panel-border, #2f6a4a)",
     borderRadius: 5,
     cursor: "pointer",
     flex: "none",

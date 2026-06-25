@@ -29,8 +29,8 @@ export function ImagePreview({ objId, label, top, onClose }: Props) {
         left: 0,
         top,
         width: 420,
-        background: "#0d0f16",
-        border: "1px solid #2a3a5a",
+        background: "var(--panel-bg, #0d0f16)",
+        border: "1px solid var(--panel-border, #2a3a5a)",
         borderRadius: 8,
         boxShadow: "0 4px 20px #000000aa",
         overflow: "hidden",
@@ -44,9 +44,9 @@ export function ImagePreview({ objId, label, top, onClose }: Props) {
           alignItems: "center",
           justifyContent: "space-between",
           padding: "6px 8px",
-          background: "#161b26",
+          background: "var(--panel-header-bg, #161b26)",
           fontSize: 11,
-          color: "#c7d2e6",
+          color: "var(--panel-header-text, #c7d2e6)",
         }}
       >
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -56,7 +56,7 @@ export function ImagePreview({ objId, label, top, onClose }: Props) {
           onClick={onClose}
           style={{
             padding: "3px 9px",
-            background: "#3a4658",
+            background: "var(--panel-btn-bg, #3a4658)",
             color: "#fff",
             border: "none",
             borderRadius: 5,
@@ -75,11 +75,11 @@ export function ImagePreview({ objId, label, top, onClose }: Props) {
           justifyContent: "center",
           // checkerboard so transparency is visible
           background:
-            "repeating-conic-gradient(#1a1f2b 0% 25%, #141821 0% 50%) 50% / 20px 20px",
+            "repeating-conic-gradient(var(--panel-checker-a, #1a1f2b) 0% 25%, var(--panel-checker-b, #141821) 0% 50%) 50% / 20px 20px",
         }}
       >
         {failed ? (
-          <span style={{ color: "#ff7b7b", fontSize: 12, padding: 20 }}>
+          <span style={{ color: "var(--panel-danger, #ff7b7b)", fontSize: 12, padding: 20 }}>
             プレビューを生成できませんでした
           </span>
         ) : src ? (
@@ -89,7 +89,7 @@ export function ImagePreview({ objId, label, top, onClose }: Props) {
             style={{ maxWidth: "100%", maxHeight: 520, display: "block", pointerEvents: "none" }}
           />
         ) : (
-          <span style={{ color: "#7a8aa6", fontSize: 12, padding: 30 }}>読み込み中...</span>
+          <span style={{ color: "var(--panel-muted, #7a8aa6)", fontSize: 12, padding: 30 }}>読み込み中...</span>
         )}
       </div>
     </div>

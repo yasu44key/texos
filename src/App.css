@@ -47,6 +47,28 @@
   --menu-danger-bg: #3a2030;
   --tip-bg: #11151f;
   --tip-text: #aeb8cc;
+  /* v1.4.7: ビュワー系パネル（チャット／テキスト編集／画像・PDF・動画・音声プレビュー）の
+     構造色。テーマ追従させる＝ライトで暗パネルが浮くのを解消。設定ダイアログ系は対象外
+     （暗色固定のままにして「設定中」のアテンションにする）。 */
+  --panel-bg: #0e1118;
+  --panel-header-bg: #161b26;
+  --panel-header-text: #c7d2e6;
+  --panel-text: #e6ecf3;
+  --panel-muted: #7a8aa6;
+  --panel-border: #2a3a5a;
+  --panel-input-bg: #0a0e15;
+  --panel-btn-bg: #3a4658;
+  --panel-checker-a: #1a1f2b;
+  --panel-checker-b: #141821;
+  --panel-danger: #ff7b7b;
+  /* AIチャットの吹き出し（ユーザー＝青系／AI＝緑系）。吹き出しは意味色＝特別扱いだが
+     ライトでも馴染むよう専用に定義する。 */
+  --chat-bubble-user-bg: #1e3a5a;
+  --chat-bubble-user-text: #cfe3fb;
+  --chat-bubble-user-border: #2f5a8a;
+  --chat-bubble-ai-bg: #1a2620;
+  --chat-bubble-ai-text: #d6e8dd;
+  --chat-bubble-ai-border: #2f6a4a;
 }
 
 /* 視認性重視（ライト・高コントラスト） */
@@ -59,6 +81,37 @@
   --card-bg-folder: #faf3dc;
   --card-text: #1c2433;
   --card-label-bg: #ffffffd9;
+  /* フィルタ系カードの面色（ライト追従）。識別色＝枠/ボタンは固定のまま、面だけ淡色に。 */
+  --card-bg-filter: #e3f4ea;
+  --card-bg-filter-cmd: #e0f2f2;
+  --card-bg-filter-gen: #f7eed9;
+  --card-bg-drop: #e6f1fb;
+  --card-bg-launcher: #e4f2ea;
+  /* 識別色のうち「文字」として使う分は、淡色面では濃色版にする（暗テーマは下のフォールバック）。 */
+  --card-filter-text: #1f7a55;
+  --card-filter-cmd-text: #1d7777;
+  --card-filter-gen-text: #9a6a1f;
+  --card-drop-text: #1f6db5;
+  --card-launcher-text: #1f7a55;
+  /* ビュワー系パネル（ライト追従）。設定ダイアログは対象外で暗色固定のまま。 */
+  --panel-bg: #ffffff;
+  --panel-header-bg: #eef1f7;
+  --panel-header-text: #2a3550;
+  --panel-text: #1c2433;
+  --panel-muted: #6a7384;
+  --panel-border: #cdd6e4;
+  --panel-input-bg: #f6f8fc;
+  --panel-btn-bg: #5a6678;
+  --panel-checker-a: #e2e6ee;
+  --panel-checker-b: #f2f4f9;
+  --panel-danger: #c0392b;
+  /* チャット吹き出し（ライト）＝定番の淡ブルー（ユーザー）／淡グリーン（AI）＋濃文字。 */
+  --chat-bubble-user-bg: #dceafc;
+  --chat-bubble-user-text: #14365e;
+  --chat-bubble-user-border: #aecbed;
+  --chat-bubble-ai-bg: #e3f1e9;
+  --chat-bubble-ai-text: #173a2c;
+  --chat-bubble-ai-border: #abd3bf;
   --note-bg: #fff6bf;
   --note-border: #d9c25a;
   --note-text: #3a3214;
@@ -155,6 +208,132 @@
   --menu-danger-bg: #3a2a24;
   --tip-bg: #1f231e;
   --tip-text: #aab0a2;
+}
+
+/* 中間トーン①：スレート（中間・やや暗め。ミッドナイトを持ち上げたクールグレー） */
+[data-texos-theme="slate"] {
+  --canvas-bg: #2b3040;
+  --canvas-bg-drag: #353c50;
+  --card-bg: #353b4a;
+  --card-bg-url: #34415a;
+  --card-bg-project: #3e3a54;
+  --card-bg-folder: #423f33;
+  --card-text: #e3e7ef;
+  --card-label-bg: #00000040;
+  --card-bg-filter: #2e4038;
+  --card-bg-filter-cmd: #2c3e3e;
+  --card-bg-filter-gen: #3c372a;
+  --card-bg-drop: #2f3c50;
+  --card-bg-launcher: #2e4038;
+  --card-filter-text: #8fe0bd;
+  --card-filter-cmd-text: #8fe0e0;
+  --card-filter-gen-text: #ecc88a;
+  --card-drop-text: #8fc0e8;
+  --card-launcher-text: #8fe0bd;
+  --panel-bg: #2c313e;
+  --panel-header-bg: #353c4c;
+  --panel-header-text: #cdd5e4;
+  --panel-text: #e3e7ef;
+  --panel-muted: #8a93a6;
+  --panel-border: #454d60;
+  --panel-input-bg: #232834;
+  --panel-btn-bg: #4a5266;
+  --panel-checker-a: #353b48;
+  --panel-checker-b: #2c313c;
+  --panel-danger: #ff8b7b;
+  --chat-bubble-user-bg: #2f486a;
+  --chat-bubble-user-text: #d8e6fb;
+  --chat-bubble-user-border: #41608a;
+  --chat-bubble-ai-bg: #2a3a30;
+  --chat-bubble-ai-text: #d6e8dd;
+  --chat-bubble-ai-border: #3f7a5a;
+  --note-bg: #3c3d2c;
+  --note-border: #5f6044;
+  --note-text: #ecead0;
+  --note-edit-bg: #323320;
+  --linked-note-bg: #2f3a34;
+  --linked-note-border: #506a5a;
+  --linked-note-text: #ddf0e8;
+  --arrow-color: #6aa0d8;
+  --arrow-temp: #8fc0f0;
+  --arrow-width: 2;
+  --accent: #5a8fd0;
+  --chrome-bg: #313847cc;
+  --chrome-border: #454d60;
+  --chrome-text: #d6deeecc;
+  --card-shadow: 0 2px 16px #00000070;
+  --menu-bg: #313847;
+  --menu-border: #4c5468;
+  --menu-text: #e3e7ef;
+  --menu-dim: #7a8398;
+  --menu-hover: #3c4456;
+  --menu-danger: #ff8b7b;
+  --menu-danger-bg: #4a2a30;
+  --tip-bg: #232a36;
+  --tip-text: #cdd5e4;
+}
+
+/* 中間トーン②：フォグ（中間・やや明るめ。ライトのまぶしさを抑えたくすみグレー） */
+[data-texos-theme="dim"] {
+  --canvas-bg: #c4c8d2;
+  --canvas-bg-drag: #b4bccd;
+  --card-bg: #dde1e8;
+  --card-bg-url: #d2dcea;
+  --card-bg-project: #ddd6ea;
+  --card-bg-folder: #e6e0c8;
+  --card-text: #232a38;
+  --card-label-bg: #ffffffaa;
+  --card-bg-filter: #cfe0d6;
+  --card-bg-filter-cmd: #cce0e0;
+  --card-bg-filter-gen: #e6dcc4;
+  --card-bg-drop: #d2dcea;
+  --card-bg-launcher: #d0e0d6;
+  --card-filter-text: #1f6b4a;
+  --card-filter-cmd-text: #1d6a6a;
+  --card-filter-gen-text: #8a5e1a;
+  --card-drop-text: #1f5fa0;
+  --card-launcher-text: #1f6b4a;
+  --panel-bg: #e4e7ec;
+  --panel-header-bg: #d4d9e2;
+  --panel-header-text: #2a3346;
+  --panel-text: #232a38;
+  --panel-muted: #5d6678;
+  --panel-border: #b6bfd0;
+  --panel-input-bg: #eef1f6;
+  --panel-btn-bg: #6a7384;
+  --panel-checker-a: #cdd1da;
+  --panel-checker-b: #dde0e8;
+  --panel-danger: #b5342a;
+  --chat-bubble-user-bg: #cdddf4;
+  --chat-bubble-user-text: #16365c;
+  --chat-bubble-user-border: #a3c0e4;
+  --chat-bubble-ai-bg: #d6e8dd;
+  --chat-bubble-ai-text: #173a2c;
+  --chat-bubble-ai-border: #9fcab8;
+  --note-bg: #f0e9c4;
+  --note-border: #c8b25a;
+  --note-text: #3a3214;
+  --note-edit-bg: #f6f0d2;
+  --linked-note-bg: #cfe6db;
+  --linked-note-border: #6aa890;
+  --linked-note-text: #1d3a30;
+  --arrow-color: #2a6fae;
+  --arrow-temp: #4a90d9;
+  --arrow-width: 2.1;
+  --accent: #2a6fae;
+  --chrome-bg: #e4e7ecd9;
+  --chrome-border: #b6bfd0;
+  --chrome-text: #2a3346;
+  --card-shadow: 0 2px 12px #00000022;
+  --menu-bg: #e8ebf0;
+  --menu-border: #b6bfd0;
+  --menu-text: #232a38;
+  --menu-dim: #8a93a6;
+  --menu-hover: #d8dde6;
+  --menu-danger: #b5342a;
+  --menu-danger-bg: #f3ddd9;
+  --tip-bg: #2a3344;
+  --tip-text: #e8edf5;
 }
 
 body {

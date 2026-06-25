@@ -36,8 +36,8 @@ export function MediaPreview({ objId, label, kind, top, onClose }: Props) {
         left: 0,
         top,
         width,
-        background: "#0d0f16",
-        border: "1px solid #2a3a5a",
+        background: "var(--panel-bg, #0d0f16)",
+        border: "1px solid var(--panel-border, #2a3a5a)",
         borderRadius: 8,
         boxShadow: "0 4px 20px #000000aa",
         overflow: "hidden",
@@ -51,9 +51,9 @@ export function MediaPreview({ objId, label, kind, top, onClose }: Props) {
           alignItems: "center",
           justifyContent: "space-between",
           padding: "6px 8px",
-          background: "#161b26",
+          background: "var(--panel-header-bg, #161b26)",
           fontSize: 11,
-          color: "#c7d2e6",
+          color: "var(--panel-header-text, #c7d2e6)",
         }}
       >
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -63,7 +63,7 @@ export function MediaPreview({ objId, label, kind, top, onClose }: Props) {
           onClick={onClose}
           style={{
             padding: "3px 9px",
-            background: "#3a4658",
+            background: "var(--panel-btn-bg, #3a4658)",
             color: "#fff",
             border: "none",
             borderRadius: 5,
@@ -75,11 +75,11 @@ export function MediaPreview({ objId, label, kind, top, onClose }: Props) {
         </button>
       </div>
       {failed ? (
-        <div style={{ color: "#ff7b7b", fontSize: 12, padding: 20 }}>
+        <div style={{ color: "var(--panel-danger, #ff7b7b)", fontSize: 12, padding: 20 }}>
           プレビューを生成できませんでした
         </div>
       ) : !src ? (
-        <div style={{ color: "#7a8aa6", fontSize: 12, padding: 30 }}>読み込み中...</div>
+        <div style={{ color: "var(--panel-muted, #7a8aa6)", fontSize: 12, padding: 30 }}>読み込み中...</div>
       ) : kind === "video" ? (
         <video
           src={src}

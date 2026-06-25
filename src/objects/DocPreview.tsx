@@ -74,8 +74,8 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
         left: 0,
         top,
         width: 520,
-        background: "#0d0f16",
-        border: "1px solid #2a3a5a",
+        background: "var(--panel-bg, #0d0f16)",
+        border: "1px solid var(--panel-border, #2a3a5a)",
         borderRadius: 8,
         boxShadow: "0 4px 20px #000000aa",
         overflow: "hidden",
@@ -89,9 +89,9 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
           alignItems: "center",
           justifyContent: "space-between",
           padding: "6px 8px",
-          background: "#161b26",
+          background: "var(--panel-header-bg, #161b26)",
           fontSize: 11,
-          color: "#c7d2e6",
+          color: "var(--panel-header-text, #c7d2e6)",
         }}
       >
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -101,7 +101,7 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
           onClick={onClose}
           style={{
             padding: "3px 9px",
-            background: "#3a4658",
+            background: "var(--panel-btn-bg, #3a4658)",
             color: "#fff",
             border: "none",
             borderRadius: 5,
@@ -113,9 +113,9 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
         </button>
       </div>
       {failed ? (
-        <div style={{ color: "#ff7b7b", fontSize: 12, padding: 20, lineHeight: 1.5 }}>
+        <div style={{ color: "var(--panel-danger, #ff7b7b)", fontSize: 12, padding: 20, lineHeight: 1.5 }}>
           プレビューを生成できませんでした。「一時的に閲覧」や「既定のアプリで開く」をお試しください。
-          <div style={{ color: "#9a6a6a", fontSize: 11, marginTop: 8 }}>{failed}</div>
+          <div style={{ color: "var(--panel-muted, #9a6a6a)", fontSize: 11, marginTop: 8 }}>{failed}</div>
         </div>
       ) : pdfSrc ? (
         <iframe
@@ -124,7 +124,7 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
           style={{ display: "block", width: "100%", height: 600, border: "none", background: "#fff" }}
         />
       ) : html == null ? (
-        <div style={{ color: "#7a8aa6", fontSize: 12, padding: 30 }}>
+        <div style={{ color: "var(--panel-muted, #7a8aa6)", fontSize: 12, padding: 30 }}>
           {isHtmlMode ? "読み込み中..." : "PDFに変換中...（LibreOffice）"}
         </div>
       ) : (

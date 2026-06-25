@@ -154,21 +154,21 @@ const FILTER_TYPE_STYLES = {
   filter: {
     bg: "var(--card-bg-filter, #14281e)",
     border: "#3a7a5a",
-    text: "#7fd8b0",
+    text: "var(--card-filter-text, #7fd8b0)",
     badge: "⚙ フィルタ",
     run: "▶ 実行",
   },
   command: {
     bg: "var(--card-bg-filter-cmd, #142828)",
     border: "#3a7a7a",
-    text: "#7fd8d8",
+    text: "var(--card-filter-cmd-text, #7fd8d8)",
     badge: "⌨ コマンド",
     run: "▶ 実行",
   },
   generator: {
     bg: "var(--card-bg-filter-gen, #2a2114)",
     border: "#7a5d3a",
-    text: "#e8c07f",
+    text: "var(--card-filter-gen-text, #e8c07f)",
     badge: "✨ ジェネレータ",
     run: "▶ 生成",
   },
@@ -548,11 +548,11 @@ export function ObjectCard({
               </button>
             )}
             {isDrop && (
-              <span style={{ fontSize: 9, color: "#7fb0d8" }}>📥 ここにドロップ→自動実行</span>
+              <span style={{ fontSize: 9, color: "var(--card-drop-text, #7fb0d8)" }}>📥 ここにドロップ→自動実行</span>
             )}
             {/* v1.3.11 ランチャー: 登録プログラムを起動。接続ファイルがあれば開く。 */}
             {isLauncher && (
-              <span style={{ fontSize: 9, color: "#7fb0d8" }}>🚀 ランチャー</span>
+              <span style={{ fontSize: 9, color: "var(--card-launcher-text, #7fb0d8)" }}>🚀 ランチャー</span>
             )}
             {isLauncher && (
               <button

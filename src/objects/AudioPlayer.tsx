@@ -28,8 +28,8 @@ export function AudioPlayer({ objId, label, top, onClose }: Props) {
         left: 0,
         top,
         width: 300,
-        background: "#101820",
-        border: "1px solid #2a3a5a",
+        background: "var(--panel-bg, #101820)",
+        border: "1px solid var(--panel-border, #2a3a5a)",
         borderRadius: 8,
         boxShadow: "0 4px 20px #000000aa",
         overflow: "hidden",
@@ -43,9 +43,9 @@ export function AudioPlayer({ objId, label, top, onClose }: Props) {
           alignItems: "center",
           justifyContent: "space-between",
           padding: "6px 8px",
-          background: "#161b26",
+          background: "var(--panel-header-bg, #161b26)",
           fontSize: 11,
-          color: "#c7d2e6",
+          color: "var(--panel-header-text, #c7d2e6)",
         }}
       >
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -55,7 +55,7 @@ export function AudioPlayer({ objId, label, top, onClose }: Props) {
           onClick={onClose}
           style={{
             padding: "3px 9px",
-            background: "#3a4658",
+            background: "var(--panel-btn-bg, #3a4658)",
             color: "#fff",
             border: "none",
             borderRadius: 5,
@@ -68,11 +68,11 @@ export function AudioPlayer({ objId, label, top, onClose }: Props) {
       </div>
       <div style={{ padding: 10 }}>
         {failed ? (
-          <span style={{ color: "#ff7b7b", fontSize: 12 }}>再生できませんでした</span>
+          <span style={{ color: "var(--panel-danger, #ff7b7b)", fontSize: 12 }}>再生できませんでした</span>
         ) : src ? (
           <audio src={src} controls autoPlay style={{ width: "100%" }} />
         ) : (
-          <span style={{ color: "#7a8aa6", fontSize: 12 }}>読み込み中...</span>
+          <span style={{ color: "var(--panel-muted, #7a8aa6)", fontSize: 12 }}>読み込み中...</span>
         )}
       </div>
     </div>

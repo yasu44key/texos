@@ -111,6 +111,8 @@ export function isInternalReal(o: VirtualBodyInfo): boolean {
 export const THEMES: [string, string][] = [
   ["midnight", "ミッドナイト（標準）"],
   ["light", "視認性重視（ライト）"],
+  ["dim", "中間・明るめ（フォグ）"],
+  ["slate", "中間・暗め（スレート）"],
   ["warm", "色調重視（セピア）"],
   ["calm", "疲労防止（低刺激）"],
 ];
