@@ -722,7 +722,7 @@ function App() {
           builtin: "ai",
           mode: chat ? "chat" : "transform",
           provider: "ollama",
-          model: "qwen2.5:3b",
+          model: "gemma3:latest",
           system: chat
             ? "あなたは親切で簡潔なアシスタントです。"
             : "あなたは有能なアシスタントです。簡潔なMarkdownで答えてください。",

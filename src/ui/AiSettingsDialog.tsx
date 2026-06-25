@@ -26,7 +26,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     base.provider === "openai" ? "openai" : "ollama"
   );
   const [endpoint, setEndpoint] = useState(s("endpoint"));
-  const [model, setModel] = useState(s("model", "qwen2.5:3b"));
+  const [model, setModel] = useState(s("model", "gemma3:latest"));
   const [system, setSystem] = useState(s("system"));
   const [temperature, setTemperature] = useState(
     typeof base.temperature === "number" ? String(base.temperature) : ""
@@ -64,7 +64,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
 
   const save = () => {
     const spec: Record<string, unknown> = { ...base, builtin: "ai", provider, mode };
-    spec.model = model.trim() || "qwen2.5:3b";
+    spec.model = model.trim() || "gemma3:latest";
     if (endpoint.trim()) spec.endpoint = endpoint.trim();
     else delete spec.endpoint;
     if (system.trim()) spec.system = system;
@@ -170,7 +170,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
                 style={{ ...inp(), flex: 1 }}
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
-                placeholder="qwen2.5:3b"
+                placeholder="gemma3:latest"
               />
               {models.length > 0 && (
                 <select

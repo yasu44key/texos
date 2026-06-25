@@ -197,6 +197,17 @@ function aiModeOf(ref: string | null | undefined): "chat" | "transform" | null {
   return null;
 }
 
+// v1.4.6: AIカードの provider/endpoint（ChatPanel の Ollama セットアップ案内に渡す）。
+function aiConnOf(ref: string | null | undefined): { provider?: string; endpoint?: string } {
+  if (!ref) return {};
+  try {
+    const s = JSON.parse(ref);
+    return { provider: s.provider, endpoint: s.endpoint };
+  } catch {
+    return {};
+  }
+}
+
 export function ObjectCard({
   id, realId, label, mimeType, x, y,
   committed = false, active = false, lost = null,
@@ -640,6 +651,8 @@ export function ObjectCard({
           label={label}
           top={CARD_H + 8}
           onClose={() => onCollapse?.(id)}
+          provider={aiConnOf(filterRef).provider}
+          endpoint={aiConnOf(filterRef).endpoint}
         />
       )}
       {expanded && !isAiChat && isImage && (

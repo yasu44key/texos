@@ -17,11 +17,104 @@ interface Props {
   /** anchored offset from the card top (other panels use CARD_H + 8) */
   top: number;
   onClose: () => void;
+  /** v1.4.6 Ollama セットアップ案内のゲート用 */
+  provider?: string;
+  endpoint?: string;
 }
 
 const PANEL_W = 380;
 
-export function ChatPanel({ objId, label, top, onClose }: Props) {
+export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Props) {
+  // v1.4.6 Ollama 未導入PC向けのセットアップ案内（OpenAI準拠カードはスキップ）。
+  const isOllama = (provider ?? "ollama") !== "openai";
+  const [ollama, setOllama] = useState<"checking" | "ready" | "setup">(
+    isOllama ? "checking" : "ready"
+  );
+  const [setupInfo, setSetupInfo] = useState({ installed: false, canWinget: false });
+  const [setupMsg, setSetupMsg] = useState<string | null>(null);
+  const [setupBusy, setSetupBusy] = useState(false);
+
+  const ep = () => endpoint?.trim() || null;
+
+  const checkOllama = useCallback(() => {
+    if (!isOllama) {
+      setOllama("ready");
+      return;
+    }
+    setOllama("checking");
+    invoke<{ running: boolean; installed: boolean; can_winget: boolean }>("ai_ollama_status", {
+      endpoint: endpoint?.trim() || null,
+    })
+      .then((st) => {
+        if (st.running) setOllama("ready");
+        else {
+          setSetupInfo({ installed: st.installed, canWinget: st.can_winget });
+          setOllama("setup");
+        }
+      })
+      .catch(() => setOllama("ready")); // 判定不能時は通常表示（送信エラーで気づける）
+  }, [isOllama, endpoint]);
+
+  useEffect(() => {
+    checkOllama();
+  }, [checkOllama]);
+
+  // モデル取得の進捗（自動セットアップ中）。
+  useEffect(() => {
+    let alive = true;
+    let un: (() => void) | undefined;
+    listen<{ status: string; percent: number }>("ollama-pull", (e) => {
+      const p = e.payload.percent ? ` ${e.payload.percent}%` : "";
+      setSetupMsg(`既定モデル gemma3 を取得中… ${e.payload.status}${p}`);
+    }).then((u) => {
+      if (alive) un = u;
+      else u();
+    });
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, []);
+
+  const runSetup = async (mode: "install" | "start") => {
+    setSetupBusy(true);
+    setSetupMsg(
+      mode === "install"
+        ? "Ollama をインストール中…（数分かかることがあります）"
+        : "Ollama を起動中…"
+    );
+    try {
+      if (mode === "install") await invoke("ai_install_ollama");
+      await invoke("ai_start_ollama").catch(() => {});
+      setSetupMsg("サーバの起動を待っています…");
+      let up = false;
+      for (let i = 0; i < 25 && !up; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const st = await invoke<{ running: boolean }>("ai_ollama_status", {
+          endpoint: ep(),
+        }).catch(() => ({ running: false }));
+        up = st.running;
+      }
+      if (!up) {
+        setSetupMsg("起動を確認できませんでした。少し待ってから「再確認」を押してください。");
+        setSetupBusy(false);
+        return;
+      }
+      setSetupMsg("既定モデル gemma3 を取得中…（初回は数分）");
+      await invoke("ai_pull_model", { model: "gemma3:latest", endpoint: ep() });
+      setSetupMsg(null);
+      setSetupBusy(false);
+      setOllama("ready");
+    } catch (e) {
+      setSetupMsg("失敗しました: " + String(e));
+      setSetupBusy(false);
+    }
+  };
+
+  const openDownload = () => {
+    invoke("open_with_default", { path: "https://ollama.com/download" }).catch(() => {});
+  };
+
   const [history, setHistory] = useState<Msg[]>([]);
   const [streaming, setStreaming] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -202,6 +295,53 @@ export function ChatPanel({ objId, label, top, onClose }: Props) {
         </div>
       )}
 
+      {/* v1.4.6 Ollama 状態確認中 */}
+      {ollama === "checking" && (
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#6b7686", fontSize: 12 }}>
+          ローカルAI（Ollama）の状態を確認中…
+        </div>
+      )}
+
+      {/* v1.4.6 Ollama 未起動 → セットアップ案内 */}
+      {ollama === "setup" && (
+        <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 12, justifyContent: "center" }}>
+          <div style={{ fontSize: 13, color: "#d6e8dd", lineHeight: 1.6 }}>
+            🦙 ローカルAI「Ollama」が見つかりません。
+            <br />
+            {setupInfo.installed
+              ? "インストール済みですが、サーバが起動していないようです。"
+              : "AI対話にはローカルで動く Ollama が必要です。"}
+          </div>
+          {setupMsg && (
+            <div style={{ fontSize: 12, color: "#9fc9b3", whiteSpace: "pre-wrap" }}>{setupMsg}</div>
+          )}
+          {!setupBusy && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {setupInfo.installed ? (
+                <button onClick={() => void runSetup("start")} style={setupBtn("#2f6a4a")}>
+                  Ollama を起動して使う
+                </button>
+              ) : setupInfo.canWinget ? (
+                <button onClick={() => void runSetup("install")} style={setupBtn("#2f6a4a")}>
+                  自動インストール（gemma3 も取得）
+                </button>
+              ) : null}
+              <button onClick={openDownload} style={setupBtn("#2a3346")}>
+                ダウンロードページを開く（手動）
+              </button>
+              <button onClick={checkOllama} style={setupBtn("#2a3346")}>
+                ↻ 再確認
+              </button>
+            </div>
+          )}
+          {setupBusy && (
+            <div style={{ fontSize: 12, color: "#9fc9b3" }}>処理中… しばらくお待ちください</div>
+          )}
+        </div>
+      )}
+
+      {ollama === "ready" && (
+        <>
       {/* messages */}
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 8, display: "flex", flexDirection: "column", gap: 8 }}>
         {history.length === 0 && streaming == null && (
@@ -252,6 +392,8 @@ export function ChatPanel({ objId, label, top, onClose }: Props) {
           </button>
         )}
       </div>
+        </>
+      )}
 
       {/* リサイズハンドル（右下） */}
       <div
@@ -306,6 +448,20 @@ function hdrBtn(): React.CSSProperties {
     borderRadius: 5,
     cursor: "pointer",
     flex: "none",
+  };
+}
+
+function setupBtn(bg: string): React.CSSProperties {
+  return {
+    padding: "9px 14px",
+    fontSize: 13,
+    fontWeight: 600,
+    color: "#fff",
+    background: bg,
+    border: "1px solid #2f6a4a",
+    borderRadius: 7,
+    cursor: "pointer",
+    fontFamily: "sans-serif",
   };
 }
 
