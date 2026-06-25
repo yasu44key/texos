@@ -603,6 +603,21 @@ pub fn run_external(
     timeout_secs: Option<u64>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<u8>, String> {
+    run_external_cwd(cmdline, inputs, out_ext, timeout_secs, cancel, None)
+}
+
+/// v1.4.2: 作業ディレクトリ(cwd)を指定できる版。cwd を渡すとコマンドはそこを
+/// 「ここ」として実行する → 相対名や既定名の副産物（gcc の a.exe 等）が cwd に
+/// 落ちる。lib.rs はプロジェクトルートを渡し、副産物がプロジェクト内に収まるようにする。
+/// {in}/{out} は絶対パスなので正規の入出力には影響しない。
+pub fn run_external_cwd(
+    cmdline: &str,
+    inputs: &[(&[u8], &str)],
+    out_ext: &str,
+    timeout_secs: Option<u64>,
+    cancel: &std::sync::atomic::AtomicBool,
+    cwd: Option<&std::path::Path>,
+) -> Result<Vec<u8>, String> {
     use std::sync::atomic::Ordering;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -672,21 +687,29 @@ pub fn run_external(
         // 引用符を含むコマンドが exit 1 で壊れる（v1.4 実機指摘）。
         // さらに全体を "..." で包む — cmd /C は先頭が引用符のとき最初と最後の
         // 引用符を剥がすため、内側のクォートを無傷で残す定石。
-        std::process::Command::new("cmd")
-            .raw_arg(format!("/C \"{cmd}\""))
+        let mut c = std::process::Command::new("cmd");
+        c.raw_arg(format!("/C \"{cmd}\""))
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW（コンソールを出さない）
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(err_file)
-            .spawn()
+            .stderr(err_file);
+        if let Some(dir) = cwd {
+            c.current_dir(dir); // 相対名/既定名の副産物をプロジェクト内に落とす
+        }
+        c.spawn()
     };
     #[cfg(not(windows))]
-    let spawned = std::process::Command::new("sh")
-        .args(["-c", &cmd])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(err_file)
-        .spawn();
+    let spawned = {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", &cmd])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(err_file);
+        if let Some(dir) = cwd {
+            c.current_dir(dir);
+        }
+        c.spawn()
+    };
 
     // v1.3.11: timeout_secs==0 は「無制限」（開発者モード）。None は既定60秒。
     // 無制限でも中断ボタン（cancel）と出力上限は効く＝ハンドルを失わない。

@@ -3098,7 +3098,8 @@ fn eval_filter(
             .unwrap_or("application/octet-stream")
             .to_string();
         let cmdline = build_cmdline(p, &spec)?;
-        let result = flow::run_external(&cmdline, &[], &out_ext, spec.timeout_secs, cancel);
+        let result =
+            flow::run_external_cwd(&cmdline, &[], &out_ext, spec.timeout_secs, cancel, Some(&p.root));
         visited.remove(fid);
         return match result {
             Ok(bytes) => Ok(vec![FlowPayload {
@@ -3222,7 +3223,7 @@ fn eval_filter(
                 .map(|pl| (pl.bytes.as_slice(), pl.ext.as_str()))
                 .collect();
             match build_cmdline(p, &spec).and_then(|cmd| {
-                flow::run_external(&cmd, &ins, &out_ext, spec.timeout_secs, cancel)
+                flow::run_external_cwd(&cmd, &ins, &out_ext, spec.timeout_secs, cancel, Some(&p.root))
             }) {
                 Ok(bytes) => produced.push(FlowPayload {
                     bytes,
@@ -3268,12 +3269,13 @@ fn eval_filter(
                     .unwrap_or("application/octet-stream")
                     .to_string();
                 build_cmdline(p, &spec).and_then(|cmd| {
-                    flow::run_external(
+                    flow::run_external_cwd(
                         &cmd,
                         &[(pl.bytes.as_slice(), pl.ext.as_str())],
                         &out_ext,
                         spec.timeout_secs,
                         cancel,
+                        Some(&p.root),
                     )
                     .map(|b| (b, out_ext, out_mime))
                 })
