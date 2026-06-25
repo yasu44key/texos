@@ -539,6 +539,61 @@ pub fn run_ai_chat_stream(
     Ok(full)
 }
 
+/// v1.4.2 設定ダイアログのモデル一覧。Ollama=/api/tags（name）、OpenAI準拠=/v1/models（id）。
+/// run_ai と同じく tokio 文脈外スレッドへ逃がして blocking 実行する。
+pub fn list_models(provider: &str, endpoint: &str) -> Result<Vec<String>, String> {
+    std::thread::scope(|s| {
+        s.spawn(|| list_models_blocking(provider, endpoint))
+            .join()
+            .map_err(|_| "モデル取得スレッドが異常終了しました".to_string())?
+    })
+}
+
+fn list_models_blocking(provider: &str, endpoint: &str) -> Result<Vec<String>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
+    let ep = endpoint.trim().trim_end_matches('/');
+    let (url, is_openai) = if provider == "openai" {
+        let base = if ep.is_empty() { "http://localhost:1234/v1" } else { ep };
+        (format!("{base}/models"), true)
+    } else {
+        let base = if ep.is_empty() { "http://localhost:11434" } else { ep };
+        (format!("{base}/api/tags"), false)
+    };
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| ai_conn_err(provider, &url, &e))?;
+    if !resp.status().is_success() {
+        return Err(format!("モデル一覧の取得に失敗 ({})", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().map_err(|e| format!("一覧の解析に失敗: {e}"))?;
+    let mut out: Vec<String> = if is_openai {
+        v["data"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["id"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        v["models"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// AI接続失敗を日本語で分かりやすく（Ollama未起動が最頻なので最優先で案内）。
 fn ai_conn_err(provider: &str, endpoint: &str, e: &reqwest::Error) -> String {
     if e.is_connect() {

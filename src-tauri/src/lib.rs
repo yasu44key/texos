@@ -3867,6 +3867,19 @@ fn ai_chat_history(state: State<AppState>, id: String) -> Result<Vec<ChatMsg>, S
     Ok(load_chat_history(&p.root, &id))
 }
 
+/// v1.4.2 設定ダイアログ用: 接続先のモデル一覧を取得（Ollama /api/tags 等）。
+/// プロジェクト非依存（接続先だけで決まる）なので State を取らない。
+#[tauri::command(async)]
+fn ai_list_models(
+    provider: Option<String>,
+    endpoint: Option<String>,
+) -> Result<Vec<String>, String> {
+    flow::list_models(
+        provider.as_deref().unwrap_or("ollama"),
+        endpoint.as_deref().unwrap_or(""),
+    )
+}
+
 /// ストリーミング中断（停止ボタン）。DB ロックを取らないので即座に効く。
 #[tauri::command(async)]
 fn ai_chat_cancel(state: State<AppState>) {
@@ -4811,6 +4824,7 @@ pub fn run() {
             ai_chat_history,
             ai_chat_cancel,
             ai_chat_clear,
+            ai_list_models,
             check_filter_program,
             list_filter_programs,
             import_filter_program,

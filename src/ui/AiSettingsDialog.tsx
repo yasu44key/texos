@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 // v1.4.1 AIカード（builtin:"ai"）専用の設定ダイアログ。生JSON編集の置き換え。
 // 既存 spec の未知フィールド（accept_mime/output_ext 等）は保持してマージする。
@@ -33,6 +34,27 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   const [mode, setMode] = useState<"chat" | "transform">(
     base.mode === "chat" ? "chat" : "transform"
   );
+
+  // v1.4.2 モデル候補（/api/tags 等から取得）。手入力も併用可（datalist）。
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsState, setModelsState] = useState<"idle" | "loading" | "error">("idle");
+  const fetchModels = useCallback(() => {
+    setModelsState("loading");
+    invoke<string[]>("ai_list_models", { provider, endpoint: endpoint.trim() || null })
+      .then((list) => {
+        setModels(list);
+        setModelsState("idle");
+      })
+      .catch(() => {
+        setModels([]);
+        setModelsState("error");
+      });
+  }, [provider, endpoint]);
+  // 初回＋プロバイダ切替で自動取得（エンドポイント変更は「↻取得」で明示）。
+  useEffect(() => {
+    fetchModels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider]);
 
   const endpointPlaceholder =
     provider === "openai"
@@ -139,12 +161,45 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
 
         {row(
           "モデル",
-          <input
-            style={inp()}
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="qwen2.5:3b"
-          />
+          <div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input
+                style={{ ...inp(), flex: 1 }}
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder="qwen2.5:3b"
+              />
+              {models.length > 0 && (
+                <select
+                  value=""
+                  onChange={(e) => {
+                    if (e.target.value) setModel(e.target.value);
+                  }}
+                  style={{ ...inp(), width: 130, flex: "none" }}
+                  title="取得したモデルから選ぶ"
+                >
+                  <option value="">候補 ▼</option>
+                  {models.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <button onClick={fetchModels} style={smallBtn()} title="接続先からモデル一覧を取得">
+                ↻ 取得
+              </button>
+            </div>
+            <div style={{ fontSize: 11, color: "#8a93a8", marginTop: 3 }}>
+              {modelsState === "loading"
+                ? "取得中…"
+                : modelsState === "error"
+                ? "一覧を取得できません（接続先が起動しているか確認）"
+                : models.length
+                ? `${models.length}件取得 — 「候補▼」から選択・手入力も可`
+                : "「↻取得」で候補を表示（手入力も可）"}
+            </div>
+          </div>
         )}
 
         {row(
@@ -219,6 +274,20 @@ function inp(): React.CSSProperties {
     fontSize: 13,
     outline: "none",
     boxSizing: "border-box",
+  };
+}
+
+function smallBtn(): React.CSSProperties {
+  return {
+    padding: "6px 10px",
+    background: "#2a3346",
+    color: "#aeb8cc",
+    border: "1px solid #38445e",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontSize: 12,
+    fontFamily: "sans-serif",
+    flex: "none",
   };
 }
 
