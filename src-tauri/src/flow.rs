@@ -82,6 +82,10 @@ pub struct FilterSpec {
     /// v1.4.1 AI動作モード: "transform"（一発変換・既定）| "chat"（対話パネル）。
     #[serde(default)]
     pub mode: Option<String>,
+    /// v1.4.5 チャットのMDログ保存名（空=「<ラベル>のログ.md」）。カード毎に変えれば
+    /// 同名カードでもログが衝突しない。
+    #[serde(default)]
+    pub log_name: Option<String>,
 }
 
 /// 外部プログラムの解決: 絶対パス → <project>/.texos/filters → 環境変数PATH の順

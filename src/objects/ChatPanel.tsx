@@ -28,7 +28,9 @@ export function ChatPanel({ objId, label, top, onClose }: Props) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [size, setSize] = useState({ w: PANEL_W, h: 420 }); // v1.4.1 リサイズ可能
-  const [contextLabels, setContextLabels] = useState<string[]>([]); // v1.4.4 接続資料
+  const [contextLabels, setContextLabels] = useState<
+    { label: string; kind: string }[]
+  >([]); // v1.4.4 接続資料（kind: image|text|other）
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const startResize = (e: React.MouseEvent) => {
@@ -56,7 +58,7 @@ export function ChatPanel({ objId, label, top, onClose }: Props) {
     invoke<Msg[]>("ai_chat_history", { id: objId })
       .then(setHistory)
       .catch(() => {});
-    invoke<string[]>("ai_context_labels", { id: objId })
+    invoke<{ label: string; kind: string }[]>("ai_context_labels", { id: objId })
       .then(setContextLabels)
       .catch(() => setContextLabels([]));
   }, [objId]);
@@ -193,7 +195,10 @@ export function ChatPanel({ objId, label, top, onClose }: Props) {
             textOverflow: "ellipsis",
           }}
         >
-          📎 資料: {contextLabels.join(" → ")}
+          📎 資料:{" "}
+          {contextLabels
+            .map((c) => `${c.kind === "image" ? "🖼" : c.kind === "text" ? "📄" : "❔"}${c.label}`)
+            .join(" → ")}
         </div>
       )}
 

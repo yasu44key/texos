@@ -34,6 +34,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   const [mode, setMode] = useState<"chat" | "transform">(
     base.mode === "chat" ? "chat" : "transform"
   );
+  const [logName, setLogName] = useState(s("log_name")); // v1.4.5 ログ保存名（chat）
 
   // v1.4.2 モデル候補（/api/tags 等から取得）。手入力も併用可（datalist）。
   const [models, setModels] = useState<string[]>([]);
@@ -71,6 +72,8 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     const t = parseFloat(temperature);
     if (temperature.trim() !== "" && !Number.isNaN(t)) spec.temperature = t;
     else delete spec.temperature;
+    if (mode === "chat" && logName.trim()) spec.log_name = logName.trim();
+    else delete spec.log_name;
     // 接続時型チェック・出力の既定（未設定なら補う）。
     if (!spec.accept_mime) spec.accept_mime = mode === "chat" ? "*/*" : "text/*";
     if (!spec.output_ext) spec.output_ext = "md";
@@ -228,6 +231,17 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             </span>
           </div>
         )}
+
+        {mode === "chat" &&
+          row(
+            "ログ保存名",
+            <input
+              style={inp()}
+              value={logName}
+              onChange={(e) => setLogName(e.target.value)}
+              placeholder="空欄=「<タイトル>のログ.md」（カード毎に変えると衝突しない）"
+            />
+          )}
 
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
           <button onClick={onCancel} style={btn("#2a3346", "#aeb8cc")}>

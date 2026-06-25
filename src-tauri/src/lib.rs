@@ -3637,6 +3637,7 @@ fn upsert_chat_log_card(
     p: &Project,
     ai_id: &str,
     ai_label: &str,
+    log_name: Option<&str>,
     history: &[ChatMsg],
 ) -> Result<(), String> {
     // 1) transcript Markdown（**You:** / **AI:**）
@@ -3651,17 +3652,26 @@ fn upsert_chat_log_card(
     }
     let bytes = md.into_bytes();
 
-    // 2) 固定の出力パス: <root>/<safeLabel>のログ.md
-    let safe: String = ai_label
-        .chars()
-        .map(|c| match c {
-            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .take(24)
-        .collect();
-    let fname = format!("{safe}のログ.md");
+    // 2) 出力ファイル名: log_name 指定があればそれ（.md を補う）、無ければ「<ラベル>のログ.md」。
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                c if c.is_control() => '_',
+                c => c,
+            })
+            .collect()
+    };
+    let fname = match log_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => {
+            let mut n = sanitize(name);
+            if !n.to_lowercase().ends_with(".md") {
+                n.push_str(".md");
+            }
+            n
+        }
+        None => format!("{}のログ.md", sanitize(ai_label).chars().take(24).collect::<String>()),
+    };
     let dest = p.root.join(&fname);
     std::fs::write(&dest, &bytes).map_err(|e| format!("ログ書き出し失敗: {e}"))?;
     let dest_str = dest.to_string_lossy().into_owned();
@@ -3814,6 +3824,15 @@ fn collect_context(
     out
 }
 
+/// 画像か（mime と拡張子の両方で判定 — 取り込み元で mime が欠ける場合に備える）。
+fn is_image(mime: &str, ext: &str) -> bool {
+    mime.starts_with("image/")
+        || matches!(
+            ext.to_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+        )
+}
+
 /// 文脈に使えるテキストか（マルチモーダルは次段。今はテキストのみ注入）。
 fn is_textual(mime: &str, ext: &str) -> bool {
     if mime.starts_with("text/") || mime == "application/json" {
@@ -3839,7 +3858,8 @@ fn build_context_message(context: &[FlowPayload]) -> Option<String> {
                 text = text.chars().take(PER_ITEM_CAP).collect::<String>() + "\n…(長いため以下略)";
             }
             texts.push((it.stem.clone(), text));
-        } else {
+        } else if !is_image(&it.mime, &it.ext) {
+            // 画像は user 発話に添付するのでここでは数えない（音声/PDF 等のみ未対応注記）。
             nontext += 1;
         }
     }
@@ -3921,6 +3941,46 @@ fn ai_chat_send(
         messages.push(serde_json::json!({ "role": m.role, "content": m.content }));
     }
 
+    // v1.4.5 マルチモーダル: 接続された画像カードを現在のユーザー発話に添付する。
+    // provider で形式が違う（Ollama=メッセージの images:[bare base64] / OpenAI準拠=
+    // content を [text, image_url(data URI)] の配列に）。ビジョン対応モデル（gemma3 等）が必要。
+    let images: Vec<(String, String)> = context
+        .iter()
+        .filter(|it| is_image(&it.mime, &it.ext))
+        .map(|it| {
+            (
+                base64::engine::general_purpose::STANDARD.encode(&it.bytes),
+                it.mime.clone(),
+            )
+        })
+        .collect();
+    if !images.is_empty() {
+        let provider = spec.provider.as_deref().unwrap_or("ollama");
+        if let Some(last) = messages.last_mut() {
+            if last.get("role").and_then(|v| v.as_str()) == Some("user") {
+                if provider == "openai" {
+                    let text = last
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
+                    for (b64, mime) in &images {
+                        parts.push(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{mime};base64,{b64}") }
+                        }));
+                    }
+                    last["content"] = serde_json::Value::Array(parts);
+                } else {
+                    let imgs: Vec<serde_json::Value> =
+                        images.iter().map(|(b64, _)| serde_json::json!(b64)).collect();
+                    last["images"] = serde_json::Value::Array(imgs);
+                }
+            }
+        }
+    }
+
     state
         .chat_cancel
         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -3955,7 +4015,9 @@ fn ai_chat_send(
             {
                 let guard = state.current.lock().unwrap();
                 if let Some(p) = guard.as_ref() {
-                    if let Err(e) = upsert_chat_log_card(p, &id, &card_label, &history) {
+                    if let Err(e) =
+                        upsert_chat_log_card(p, &id, &card_label, spec.log_name.as_deref(), &history)
+                    {
                         eprintln!("チャットログ更新失敗: {e}");
                     }
                 }
@@ -3969,7 +4031,11 @@ fn ai_chat_send(
             );
             Ok(answer)
         }
-        Err(e) => {
+        Err(mut e) => {
+            // 画像添付時のエラーはモデル非対応が多い → ヒントを添える。
+            if !images.is_empty() && (e.contains("400") || e.to_lowercase().contains("image")) {
+                e.push_str("\n（ヒント: 画像を見るにはビジョン対応モデルが必要です。例: gemma3:latest。qwen等のテキスト専用モデルは画像を受け付けません）");
+            }
             // 失敗時はユーザー発話を保存しない（次回リトライで二重に積まれない）
             let _ = app.emit(
                 "ai-chat-done",
@@ -3991,25 +4057,55 @@ fn ai_chat_history(state: State<AppState>, id: String) -> Result<Vec<ChatMsg>, S
     Ok(load_chat_history(&p.root, &id))
 }
 
-/// v1.4.4 接続中の文脈カードのラベル（接続順）。パネルの「📎資料」表示用。
-/// 軽量にするため評価はせずラベルだけ返す。
+#[derive(Serialize)]
+struct ContextLabel {
+    label: String,
+    /// "image"（添付対象）/ "text"（資料注入）/ "other"（未対応）。📎表示の診断用。
+    kind: String,
+}
+
+/// v1.4.4 接続中の文脈カード（接続順）。パネルの「📎資料」表示用。
+/// mime/ext から種別を付けて返す（画像が image として認識されているか目視できる）。
 #[tauri::command]
-fn ai_context_labels(state: State<AppState>, id: String) -> Result<Vec<String>, String> {
+fn ai_context_labels(state: State<AppState>, id: String) -> Result<Vec<ContextLabel>, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     let mut stmt = p
         .conn
         .prepare(
-            "SELECT v.label FROM relations rel
+            "SELECT v.label, COALESCE(v.mime_type, r.mime_type, ''), COALESCE(v.ext, r.ext, '')
+             FROM relations rel
              JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+             JOIN real_bodies r ON r.id = v.real_id
              WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
              ORDER BY rel.created_at",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+        .query_map(rusqlite::params![id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
         .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(rows
+        .filter_map(|r| r.ok())
+        .map(|(label, mime, ext)| {
+            let kind = if is_image(&mime, &ext) {
+                "image"
+            } else if is_textual(&mime, &ext) {
+                "text"
+            } else {
+                "other"
+            };
+            ContextLabel {
+                label,
+                kind: kind.into(),
+            }
+        })
+        .collect())
 }
 
 /// v1.4.2 設定ダイアログ用: 接続先のモデル一覧を取得（Ollama /api/tags 等）。
