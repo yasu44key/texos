@@ -203,7 +203,10 @@ export function buildObjectMenu(
   ctx: ObjectMenuCtx,
   a: MenuActions
 ): MenuItem[] {
-  const zItems: MenuItem[] = [
+  // v1.4.x ③: 選択系（selItems）とz順（zOrderItems）を分離。通常カードでは前者を
+  // 「選択」グループ、後者は「その他の機能」サブメニューに振り分けて項目を削減する。
+  // 他種カード（プロジェクト/URL/フォルダ等）は従来どおり zItems をそのまま使う。
+  const selItems: MenuItem[] = [
     ...(ctx.selected.has(targetId)
       ? [{ label: "選択範囲にフォーカス", onClick: () => a.focusSelection() }]
       : []),
@@ -213,9 +216,12 @@ export function buildObjectMenu(
           { label: "選択カードをまとめて ...", onClick: () => a.openSubmenu(ctx.bulkItems) },
         ]
       : []),
+  ];
+  const zOrderItems: MenuItem[] = [
     { label: "最前面へ", onClick: () => a.bringToFront(targetId) },
     { label: "最背面へ", onClick: () => a.sendToBack(targetId) },
   ];
+  const zItems: MenuItem[] = [...selItems, ...zOrderItems];
   const multi = ctx.selected.has(targetId) && ctx.selected.size >= 2;
   // v1.3.7 C: 複数選択時はインラインの削除を出さず「選択カードをまとめて ...」サブ
   // メニューに一本化（重複排除。通常カードと同じ扱いをリンクカードにも横展開）。
@@ -369,6 +375,74 @@ export function buildObjectMenu(
         ]
       : []),
   ]);
+  // v1.4.x ③: 安全だが低頻度の操作を「その他の機能 ...」へ集約してメニューを短くする
+  // （よく使う「開く・編集」「実身⇔仮身」「表示名」「削除」をトップに残す）。
+  const otherItems: MenuItem[] = compact([
+    {
+      label: "アプリを選択して開く／編集...",
+      onClick: () => a.openWith(targetId),
+    },
+    ...(obj?.mime_type.startsWith("image/") && !multi
+      ? [
+          {
+            label: "クリップボードに画像をコピー",
+            hint: "この画像をビットマップとしてOSのクリップボードへ。ペイント等の画像アプリに直接貼り付けられます（Ctrl+C はファイルとしてのコピー）。",
+            onClick: () => a.copyImage(targetId),
+          },
+        ]
+      : []),
+    {
+      label: "一時的に閲覧",
+      hint: "プロジェクトに保存せず、一時コピーで中身を確認します。閉じるとコピーは破棄されます。",
+      onClick: () => a.viewTemp(targetId),
+    },
+    ...zOrderItems,
+    ...(!committed && obj?.origin_path
+      ? [
+          {
+            // v1.3.11 #1: 借用元がTexoSプロジェクト内なら、そのプロジェクトを開く。
+            label: "借用元のプロジェクトを開く",
+            hint: "借用元のファイルがTexoSプロジェクト内にあれば、そのプロジェクトに切り替えます。プロジェクトでなければ借用元フォルダを開きます。",
+            onClick: () => a.openOriginProject(obj.origin_path!),
+          },
+          {
+            label: "借用元のフォルダで表示",
+            onClick: () => {
+              invoke("reveal_in_dir", { path: obj.origin_path! }).catch(() => {});
+            },
+          },
+        ]
+      : []),
+    ...(committed
+      ? [
+          {
+            label: "フォルダで表示",
+            onClick: () => {
+              if (obj?.committed_path)
+                invoke("reveal_in_dir", { path: obj.committed_path });
+            },
+          },
+        ]
+      : []),
+    ...(!committed
+      ? [
+          {
+            label: "実身化（フォルダで表示）",
+            hint: "このカードの内容をプロジェクトに保存して実身（実体）にし、保存先フォルダを開きます。",
+            onClick: () => a.commitReveal(targetId),
+          },
+        ]
+      : []),
+    ...(committed
+      ? [
+          {
+            label: "実ファイル名の変更...",
+            hint: "このカードの実体ファイルを改名します（連番 (2) を消す等）。この実身を指す仮身は自動で追従します。",
+            onClick: () => a.renameReal(targetId, obj?.label ?? ""),
+          },
+        ]
+      : []),
+  ]);
   // v1.3.4: 用語を実身/仮身に統一し、グループを区切り線で分ける。
   // 説明は label から外してツールチップ(hint)へ。compact() で空グループの線を畳む。
   return compact([
@@ -405,14 +479,10 @@ export function buildObjectMenu(
         ]
       : []),
     DIV,
-    // ── 開く・編集系 ──
+    // ── 開く・編集系（よく使う）──
     {
       label: "既定のアプリで開く／編集",
       onClick: () => a.openDefault(targetId),
-    },
-    {
-      label: "アプリを選択して開く／編集...",
-      onClick: () => a.openWith(targetId),
     },
     ...(obj && isTextMime(obj.mime_type, obj.ext)
       ? [
@@ -430,15 +500,6 @@ export function buildObjectMenu(
               ctx.expanded.has(targetId)
                 ? a.collapse(targetId)
                 : a.expandView(targetId),
-          },
-        ]
-      : []),
-    ...(obj?.mime_type.startsWith("image/") && !multi
-      ? [
-          {
-            label: "クリップボードに画像をコピー",
-            hint: "この画像をビットマップとしてOSのクリップボードへ。ペイント等の画像アプリに直接貼り付けられます（Ctrl+C はファイルとしてのコピー）。",
-            onClick: () => a.copyImage(targetId),
           },
         ]
       : []),
@@ -488,57 +549,20 @@ export function buildObjectMenu(
           },
         ]
       : []),
-    {
-      label: "一時的に閲覧",
-      hint: "プロジェクトに保存せず、一時コピーで中身を確認します。閉じるとコピーは破棄されます。",
-      onClick: () => a.viewTemp(targetId),
-    },
     DIV,
-    // ── 配置・表示系 ──
-    ...zItems,
-    ...(!committed && obj?.origin_path
-      ? [
-          {
-            // v1.3.11 #1: 借用元がTexoSプロジェクト内なら、そのプロジェクトを開く。
-            // プロジェクトでなければ借用元フォルダをエクスプローラで表示（App側で分岐）。
-            label: "借用元のプロジェクトを開く",
-            hint: "借用元のファイルがTexoSプロジェクト内にあれば、そのプロジェクトに切り替えます。プロジェクトでなければ借用元フォルダを開きます。",
-            onClick: () => a.openOriginProject(obj.origin_path!),
-          },
-          {
-            label: "借用元のフォルダで表示",
-            onClick: () => {
-              invoke("reveal_in_dir", { path: obj.origin_path! }).catch(() => {});
-            },
-          },
-        ]
-      : []),
-    ...(committed
-      ? [
-          {
-            label: "フォルダで表示",
-            onClick: () => {
-              if (obj?.committed_path)
-                invoke("reveal_in_dir", { path: obj.committed_path });
-            },
-          },
-        ]
-      : []),
+    // ── 選択系（選択があるときだけ）──
+    ...selItems,
     DIV,
     // ── 実身⇔仮身系 ──
     // v1.3.6 変更②: 仮身 →「実身にする」。指す内容を独立した内部実身にする
-    // （元ファイルから独立。以後は仮身に戻す対象外）。
+    // （元ファイルから独立。以後は仮身に戻す対象外）。「実身化（フォルダで表示）」は
+    // v1.4.x ③ で「その他の機能」へ移動。
     ...(!committed
       ? [
           {
             label: "実身にする",
             hint: "この仮身が指す内容のコピーをプロジェクト内に確定し、独立した実身にします。元ファイルとの縁は切れ、以後この実身を編集できます。",
             onClick: () => a.makeReal(targetId),
-          },
-          {
-            label: "実身化（フォルダで表示）",
-            hint: "このカードの内容をプロジェクトに保存して実身（実体）にし、保存先フォルダを開きます。",
-            onClick: () => a.commitReveal(targetId),
           },
         ]
       : []),
@@ -559,8 +583,7 @@ export function buildObjectMenu(
       : []),
     DIV,
     // ── メタ操作 ──
-    // v1.3.10 補完: 表示名を上、実ファイル名の変更をその下に（ダブルクリック＝表示名に統一した
-    // ので、実ファイル改名はメニューからのみ）。実身だけ「実ファイル名の変更」を出す。
+    // v1.3.10 補完: 表示名はトップに残す（実ファイル名の変更は v1.4.x ③ で「その他の機能」へ）。
     {
       label: "表示名を変更...",
       hint: committed
@@ -568,14 +591,9 @@ export function buildObjectMenu(
         : undefined,
       onClick: () => a.renameObject(targetId, obj?.label ?? ""),
     },
-    ...(committed
-      ? [
-          {
-            label: "実ファイル名の変更...",
-            hint: "このカードの実体ファイルを改名します（連番 (2) を消す等）。この実身を指す仮身は自動で追従します。",
-            onClick: () => a.renameReal(targetId, obj?.label ?? ""),
-          },
-        ]
+    // v1.4.x ③: 安全だが低頻度の操作をまとめて「その他の機能 ...」へ退避（項目削減）。
+    ...(otherItems.length
+      ? [{ label: "その他の機能 ...", onClick: () => a.openSubmenu(otherItems) }]
       : []),
     // 複数選択時の削除も「まとめて ...」サブメニュー側に集約（重複排除）。
     ...(!multi
@@ -685,6 +703,74 @@ export function buildCanvasMenu(
   // v1.3.5: フォーカス・整列はカード＋コメントの合計で判定（コメントも整列対象）。
   //         一括操作（まとめて…）はカード専用なのでカード数だけで判定。
   const selTotal = ctx.selectionCount + ctx.noteCount;
+  // v1.4.x ③: 「自動化カードを追加」のサブメニュー。1段階のフラットなリストにし、
+  // ランチャー → フィルタ・処理カード → ユーザーのカード をセクション見出しで区切る。
+  const automationAddSub: MenuItem[] = [
+    // ── ランチャー（プログラム起動）──
+    { label: "── ランチャー ──", onClick: () => {}, disabled: true },
+    { label: "インストール済みアプリから選択...", onClick: () => a.addLauncher("installed", pos.canvasX, pos.canvasY) },
+    { label: "一般プログラム（.exe を選択）...", onClick: () => a.addLauncher("program", pos.canvasX, pos.canvasY) },
+    { label: "コマンドプロンプト", onClick: () => a.addLauncher("cmd", pos.canvasX, pos.canvasY) },
+    { label: "PowerShell", onClick: () => a.addLauncher("powershell", pos.canvasX, pos.canvasY) },
+    // ── フィルタ・処理カード（データ→フィルタ→結果のパイプ）──
+    { label: "── フィルタ・処理カード ──", onClick: () => {}, disabled: true },
+    { label: "ドロップポイント（データ入口・自動実行）", onClick: () => a.addFilter("drop_point", pos.canvasX, pos.canvasY) },
+    // v1.3.11 #3: 内蔵フィルタは数が多いので「ビルトインフィルタ ...」サブメニューに残す。
+    {
+      label: "ビルトインフィルタ ...",
+      onClick: () =>
+        a.openSubmenu([
+          // v1.4.1 AI（Ollama）。矢印引き出しメニューと項目を揃える。
+          { label: "AI: 対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog", pos.canvasX, pos.canvasY) },
+          { label: "AI: 変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat", pos.canvasX, pos.canvasY) },
+          { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => a.addFilter("md_codeblock", pos.canvasX, pos.canvasY) },
+          { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
+          { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
+          { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
+          { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
+          // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
+          { label: "音声: 長さでクリップ...", onClick: () => a.addFilter("audio_clip", pos.canvasX, pos.canvasY) },
+          { label: "音声: ノーマライズ", onClick: () => a.addFilter("audio_norm", pos.canvasX, pos.canvasY) },
+          { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip", pos.canvasX, pos.canvasY) },
+          // v1.3.11 対話シェル（一行目設定可・{in}可・バッチ登録・時間無制限）
+          { label: "対話: コマンドプロンプト（一行目設定可）...", onClick: () => a.addFilter("shell_cmd", pos.canvasX, pos.canvasY) },
+          { label: "対話: PowerShell（一行目設定可）...", onClick: () => a.addFilter("shell_powershell", pos.canvasX, pos.canvasY) },
+        ]),
+    },
+    // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
+    { label: "外部プログラム...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
+    // ── ユーザーのカード（ライブラリ登録済み・登録があるときだけ）──
+    ...(ctx.launcherLibrary.length || ctx.library.length
+      ? [
+          { label: "── ユーザーのカード ──", onClick: () => {}, disabled: true },
+          ...ctx.launcherLibrary.map((name) => ({
+            label: `🚀 ${name}`,
+            onClick: () => a.addLibraryLauncher(name, pos.canvasX, pos.canvasY),
+          })),
+          ...ctx.library.map((name) => ({
+            label: `⚗ ${name}`,
+            onClick: () => a.addLibraryFilter(name, pos.canvasX, pos.canvasY),
+          })),
+          {
+            label: "ライブラリから削除 ...",
+            danger: true,
+            onClick: () =>
+              a.openSubmenu([
+                ...ctx.launcherLibrary.map((name) => ({
+                  label: `🚀 ${name} を削除`,
+                  danger: true,
+                  onClick: () => a.deleteLibraryLauncher(name),
+                })),
+                ...ctx.library.map((name) => ({
+                  label: `⚗ ${name} を削除`,
+                  danger: true,
+                  onClick: () => a.deleteLibraryFilter(name),
+                })),
+              ]),
+          },
+        ]
+      : []),
+  ];
   return compact([
     // ── 選択系（選択があるときだけ）──
     ...(selTotal
@@ -731,94 +817,12 @@ export function buildCanvasMenu(
       label: "URLリンクを追加...",
       onClick: () => a.addUrl(pos.canvasX, pos.canvasY),
     },
-    // v1.4 オートフロー⑤: フィルタカード（データ→フィルタ→結果のパイプ）
+    // v1.4.x ③: 自動化系（ランチャー／フィルタ／ユーザーのカード）を一つのトップ項目に
+    // 集約し、サブメニューは1段階のフラットなリスト（セクション見出し付き）にする。
     {
-      label: "フィルタカードを追加 ...",
-      onClick: () =>
-        a.openSubmenu([
-          { label: "ドロップポイント（データ入口・自動実行）", onClick: () => a.addFilter("drop_point", pos.canvasX, pos.canvasY) },
-          // v1.3.11 #3: 内蔵フィルタは「ビルトインフィルタ ...」サブメニューにまとめる
-          // （種類が増えてきたので外部プログラム/ユーザーフィルタと階層で分離）。
-          {
-            label: "ビルトインフィルタ ...",
-            onClick: () =>
-              a.openSubmenu([
-                // v1.4.1 AI（Ollama）。矢印引き出しメニューと項目を揃える。
-                { label: "AI: 対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog", pos.canvasX, pos.canvasY) },
-                { label: "AI: 変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat", pos.canvasX, pos.canvasY) },
-                { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => a.addFilter("md_codeblock", pos.canvasX, pos.canvasY) },
-                { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
-                { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
-                { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
-                { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
-                // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
-                { label: "音声: 長さでクリップ...", onClick: () => a.addFilter("audio_clip", pos.canvasX, pos.canvasY) },
-                { label: "音声: ノーマライズ", onClick: () => a.addFilter("audio_norm", pos.canvasX, pos.canvasY) },
-                { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip", pos.canvasX, pos.canvasY) },
-                // v1.3.11 対話シェル（一行目設定可・{in}可・バッチ登録・時間無制限）
-                { label: "対話: コマンドプロンプト（一行目設定可）...", onClick: () => a.addFilter("shell_cmd", pos.canvasX, pos.canvasY) },
-                { label: "対話: PowerShell（一行目設定可）...", onClick: () => a.addFilter("shell_powershell", pos.canvasX, pos.canvasY) },
-              ]),
-          },
-          // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
-          { label: "外部プログラム...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
-          // v1.5: ライブラリ登録済みフィルタのインスタンス化（配置時に所在チェック）
-          ...(ctx.library.length
-            ? [
-                { label: "── ユーザーのフィルタ ──", onClick: () => {}, disabled: true },
-                ...ctx.library.map((name) => ({
-                  label: `⚗ ${name}`,
-                  onClick: () => a.addLibraryFilter(name, pos.canvasX, pos.canvasY),
-                })),
-                {
-                  label: "ライブラリから削除 ...",
-                  danger: true,
-                  onClick: () =>
-                    a.openSubmenu(
-                      ctx.library.map((name) => ({
-                        label: `${name} を削除`,
-                        danger: true,
-                        onClick: () => a.deleteLibraryFilter(name),
-                      }))
-                    ),
-                },
-              ]
-            : []),
-        ]),
-    },
-    // v1.3.11 ランチャーカード（一般プログラム/ターミナルの登録・起動）
-    {
-      label: "ランチャーカードを追加 ...",
-      hint: "インストール済みのプログラムを起動するカードを作ります。ファイルを繋ぐとそのファイルを開きます。",
-      onClick: () =>
-        a.openSubmenu([
-          { label: "インストール済みアプリから選択...", onClick: () => a.addLauncher("installed", pos.canvasX, pos.canvasY) },
-          { label: "一般プログラム（.exe を選択）...", onClick: () => a.addLauncher("program", pos.canvasX, pos.canvasY) },
-          { label: "コマンドプロンプト", onClick: () => a.addLauncher("cmd", pos.canvasX, pos.canvasY) },
-          { label: "PowerShell", onClick: () => a.addLauncher("powershell", pos.canvasX, pos.canvasY) },
-          // v1.3.11 ランチャーライブラリ（一度登録→リスト・再配置／削除）
-          ...(ctx.launcherLibrary.length
-            ? [
-                { label: "── ユーザーのランチャー ──", onClick: () => {}, disabled: true },
-                ...ctx.launcherLibrary.map((name) => ({
-                  label: `🚀 ${name}`,
-                  onClick: () => a.addLibraryLauncher(name, pos.canvasX, pos.canvasY),
-                })),
-                {
-                  label: "ライブラリから削除 ...",
-                  danger: true,
-                  onClick: () =>
-                    a.openSubmenu(
-                      ctx.launcherLibrary.map((name) => ({
-                        label: `${name} を削除`,
-                        danger: true,
-                        onClick: () => a.deleteLibraryLauncher(name),
-                      }))
-                    ),
-                },
-              ]
-            : []),
-        ]),
+      label: "自動化カードを追加 ...",
+      hint: "プログラムを起動するランチャーカードや、データを処理するフィルタカードを追加します。",
+      onClick: () => a.openSubmenu(automationAddSub),
     },
     DIV,
     // ── プロジェクト系 ──

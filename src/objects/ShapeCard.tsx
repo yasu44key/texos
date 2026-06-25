@@ -41,7 +41,7 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
   const s = shape;
   const ref = useRef<HTMLDivElement>(null);
 
-  const startDrag = (e: React.MouseEvent<HTMLElement>, mode: "move" | "resize") => {
+  const startDrag = (e: React.MouseEvent<HTMLElement>, mode: "move" | "resize" | "resize-tl") => {
     if (e.button !== 0 || e.altKey) return;
     e.stopPropagation();
     e.preventDefault();
@@ -58,7 +58,7 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
     const startMouseX = e.clientX;
     const startMouseY = e.clientY;
     const start = { x: s.pos_x, y: s.pos_y, w: s.width, h: s.height };
-    let dx = 0, dy = 0, curW = start.w, curH = start.h;
+    let dx = 0, dy = 0, curX = start.x, curY = start.y, curW = start.w, curH = start.h;
     let moved = false;
 
     const onMove = (me: globalThis.MouseEvent) => {
@@ -68,6 +68,15 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
       if (mode === "move") {
         el.style.transform = `translate(${start.x + dx}px, ${start.y + dy}px) rotate(${s.rotation}deg)`;
         if (!solo) onDragCards?.(s.id, dx, dy, false);
+      } else if (mode === "resize-tl") {
+        // 左上ハンドル: 右下角を固定したまま左上方向へ拡縮（pos と size を同時に動かす）。
+        curW = Math.max(60, start.w - dx);
+        curH = Math.max(40, start.h - dy);
+        curX = start.x + start.w - curW;
+        curY = start.y + start.h - curH;
+        el.style.width = `${curW}px`;
+        el.style.height = `${curH}px`;
+        el.style.transform = `translate(${curX}px, ${curY}px) rotate(${s.rotation}deg)`;
       } else {
         curW = Math.max(60, start.w + dx);
         curH = Math.max(40, start.h + dy);
@@ -86,6 +95,8 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
       if (mode === "move") {
         if (!solo) onDragCards?.(s.id, dx, dy, true);
         onGeomEnd?.(s.id, start.x + dx, start.y + dy, start.w, start.h);
+      } else if (mode === "resize-tl") {
+        onGeomEnd?.(s.id, Math.round(curX), Math.round(curY), Math.round(curW), Math.round(curH));
       } else {
         onGeomEnd?.(s.id, start.x, start.y, Math.round(curW), Math.round(curH));
       }
@@ -166,6 +177,23 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
           {s.label}
         </div>
       )}
+
+      {/* resize handle (top-left) — 右下角を固定して左上方向へ拡縮 */}
+      <div
+        onMouseDown={(e) => startDrag(e, "resize-tl")}
+        title="サイズを変更（左上）"
+        style={{
+          position: "absolute",
+          left: -2,
+          top: -2,
+          width: 14,
+          height: 14,
+          cursor: "nwse-resize",
+          borderLeft: `2px solid ${borderColor}`,
+          borderTop: `2px solid ${borderColor}`,
+          borderTopLeftRadius: 6,
+        }}
+      />
 
       {/* resize handle (bottom-right) */}
       <div
