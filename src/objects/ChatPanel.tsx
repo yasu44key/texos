@@ -28,6 +28,7 @@ export function ChatPanel({ objId, label, top, onClose }: Props) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [size, setSize] = useState({ w: PANEL_W, h: 420 }); // v1.4.1 リサイズ可能
+  const [contextLabels, setContextLabels] = useState<string[]>([]); // v1.4.4 接続資料
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const startResize = (e: React.MouseEvent) => {
@@ -55,6 +56,9 @@ export function ChatPanel({ objId, label, top, onClose }: Props) {
     invoke<Msg[]>("ai_chat_history", { id: objId })
       .then(setHistory)
       .catch(() => {});
+    invoke<string[]>("ai_context_labels", { id: objId })
+      .then(setContextLabels)
+      .catch(() => setContextLabels([]));
   }, [objId]);
 
   useEffect(() => {
@@ -173,6 +177,25 @@ export function ChatPanel({ objId, label, top, onClose }: Props) {
           ✕
         </button>
       </div>
+
+      {/* v1.4.4 接続中の文脈カード（矢印を引いた順 = 資料の順番） */}
+      {contextLabels.length > 0 && (
+        <div
+          title="このカードへ矢印で繋いだカードを資料として参照します（接続順）"
+          style={{
+            padding: "4px 8px",
+            fontSize: 11,
+            color: "#9fc9b3",
+            background: "#0f1b15",
+            borderBottom: "1px solid #233a2e",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          📎 資料: {contextLabels.join(" → ")}
+        </div>
+      )}
 
       {/* messages */}
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 8, display: "flex", flexDirection: "column", gap: 8 }}>

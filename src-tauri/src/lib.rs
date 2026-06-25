@@ -3743,6 +3743,124 @@ fn upsert_chat_log_card(
     Ok(())
 }
 
+/// v1.4.4 マルチコンテキスト: AIカードへ flow 矢印で繋がった上流カードの内容を
+/// 接続順（rel.created_at）に集める。データカードは現在値を読み、フィルタカードは
+/// 評価して結果を文脈にする（URL→取得→テキスト等のパイプライン結果も使える）。
+/// bytes+mime を保持して返すのでマルチモーダル（画像→image_url）への拡張は
+/// メッセージ組立側の分岐追加だけで済む。
+fn collect_context(
+    p: &Project,
+    ai_id: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<FlowPayload> {
+    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
+        let mut stmt = match p.conn.prepare(
+            "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
+             FROM relations rel
+             JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+             JOIN real_bodies r ON r.id = v.real_id
+             WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+             ORDER BY rel.created_at",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(rusqlite::params![ai_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        });
+        match rows {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut report = FlowReport {
+        created: vec![],
+        updated: vec![],
+        outputs: vec![],
+        skipped: vec![],
+        errors: vec![],
+    };
+    let mut visited = std::collections::HashSet::new();
+    for (vid, real_id, vlabel, mime, ext, kind) in &inputs {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        if kind.as_deref() == Some("filter") {
+            if let Ok(v) = eval_filter(p, vid, &mut visited, &mut report, cancel) {
+                out.extend(v);
+            }
+        } else if real_id.starts_with("drop:") {
+            continue;
+        } else {
+            refresh_origin_snapshot(p, vid);
+            let path = resolve_view_path(p, vid, real_id);
+            if let Ok(d) = std::fs::read(&path) {
+                let stem = std::path::Path::new(vlabel)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(vlabel)
+                    .to_string();
+                out.push(FlowPayload {
+                    bytes: d,
+                    ext: ext.clone().unwrap_or_else(|| "bin".into()),
+                    mime: mime.clone(),
+                    stem,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// 文脈に使えるテキストか（マルチモーダルは次段。今はテキストのみ注入）。
+fn is_textual(mime: &str, ext: &str) -> bool {
+    if mime.starts_with("text/") || mime == "application/json" {
+        return true;
+    }
+    matches!(
+        ext.to_lowercase().as_str(),
+        "txt" | "md" | "csv" | "tsv" | "json" | "xml" | "yaml" | "yml" | "toml" | "ini" | "log"
+            | "html" | "py" | "js" | "ts" | "rs" | "c" | "cpp" | "h" | "css"
+    )
+}
+
+/// 収集した文脈から system 資料メッセージを組み立てる（接続順・各資料を上限で切る）。
+/// テキスト以外（画像等）は今は除外し、件数だけ末尾に注記する（マルチモーダルは次段）。
+fn build_context_message(context: &[FlowPayload]) -> Option<String> {
+    const PER_ITEM_CAP: usize = 8000; // 1資料あたりの文字数上限（コンテキスト溢れ対策）
+    let mut texts: Vec<(String, String)> = Vec::new();
+    let mut nontext = 0usize;
+    for it in context {
+        if is_textual(&it.mime, &it.ext) {
+            let mut text = String::from_utf8_lossy(&it.bytes).into_owned();
+            if text.chars().count() > PER_ITEM_CAP {
+                text = text.chars().take(PER_ITEM_CAP).collect::<String>() + "\n…(長いため以下略)";
+            }
+            texts.push((it.stem.clone(), text));
+        } else {
+            nontext += 1;
+        }
+    }
+    if texts.is_empty() {
+        return None;
+    }
+    let mut msg = String::from(
+        "以下の資料を参考に、ユーザーの質問へ日本語で答えてください。\
+         資料に記載が無い事柄は推測せず「資料には記載がありません」と述べてください。\n\n",
+    );
+    for (i, (label, text)) in texts.iter().enumerate() {
+        msg.push_str(&format!("=== 資料{}: {} ===\n{}\n\n", i + 1, label, text));
+    }
+    if nontext > 0 {
+        msg.push_str(&format!(
+            "（このほかテキスト以外の入力が{nontext}件接続されていますが、現在は未対応です）\n"
+        ));
+    }
+    Some(msg)
+}
+
 /// 1ターン送信。ユーザー発話を履歴に積み、ストリーミングで応答を生成して
 /// トークンをイベント配信し、完了後に履歴へ保存する。完成本文を返す。
 #[tauri::command(async)]
@@ -3752,8 +3870,8 @@ fn ai_chat_send(
     id: String,
     message: String,
 ) -> Result<String, String> {
-    // 1) カードの spec/label/root を短時間ロックで取得（ストリーム中はロックを握らない）
-    let (spec, root, card_label) = {
+    // 1) カードの spec/label/root と接続文脈を短時間ロックで取得（ストリーム中は握らない）
+    let (spec, root, card_label, context) = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
         let (fref, label): (Option<String>, String) = p
@@ -3769,7 +3887,9 @@ fn ai_chat_send(
         if spec.builtin.as_deref() != Some("ai") {
             return Err("このカードはAIカードではありません".into());
         }
-        (spec, p.root.clone(), label)
+        // v1.4.4 マルチコンテキスト: 接続カードを毎ターン収集（編集が即反映）。
+        let context = collect_context(p, &id, &std::sync::atomic::AtomicBool::new(false));
+        (spec, p.root.clone(), label, context)
     };
 
     let user = message.trim().to_string();
@@ -3783,7 +3903,7 @@ fn ai_chat_send(
         content: user,
     });
 
-    // リクエスト用 messages（system を前置）
+    // リクエスト用 messages（system → 接続文脈 → 会話履歴 の順）
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(sys) = spec
         .system
@@ -3792,6 +3912,10 @@ fn ai_chat_send(
         .filter(|s| !s.is_empty())
     {
         messages.push(serde_json::json!({ "role": "system", "content": sys }));
+    }
+    // v1.4.4 接続カードの内容を資料として注入（接続順・テキストのみ・画像は次段）。
+    if let Some(ctx) = build_context_message(&context) {
+        messages.push(serde_json::json!({ "role": "system", "content": ctx }));
     }
     for m in &history {
         messages.push(serde_json::json!({ "role": m.role, "content": m.content }));
@@ -3865,6 +3989,27 @@ fn ai_chat_history(state: State<AppState>, id: String) -> Result<Vec<ChatMsg>, S
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     Ok(load_chat_history(&p.root, &id))
+}
+
+/// v1.4.4 接続中の文脈カードのラベル（接続順）。パネルの「📎資料」表示用。
+/// 軽量にするため評価はせずラベルだけ返す。
+#[tauri::command]
+fn ai_context_labels(state: State<AppState>, id: String) -> Result<Vec<String>, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let mut stmt = p
+        .conn
+        .prepare(
+            "SELECT v.label FROM relations rel
+             JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+             WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+             ORDER BY rel.created_at",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// v1.4.2 設定ダイアログ用: 接続先のモデル一覧を取得（Ollama /api/tags 等）。
@@ -4822,6 +4967,7 @@ pub fn run() {
             break_flow,
             ai_chat_send,
             ai_chat_history,
+            ai_context_labels,
             ai_chat_cancel,
             ai_chat_clear,
             ai_list_models,
