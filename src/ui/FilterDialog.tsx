@@ -155,14 +155,23 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
     setName(exe.split(/[\\/]/).pop() ?? "");
   };
 
+  // 同梱ソース: PATH欄が空でも、NAME が .texos\filters / 環境変数PATH から解決できた
+  // フルパス（resolved）を使う（バグ修正: PATH空だと同梱ボタンが押せなかった）。
+  const resolvedPath =
+    typeof resolved === "string" && resolved !== "checking" ? resolved : "";
+  // すでに .texos\filters に同梱済みなら再同梱は無意味（その場合は「同梱解除」を出す）。
+  const alreadyBundled = resolvedPath.includes("\\.texos\\filters\\");
+  const bundleSrc = path.trim() || resolvedPath;
+
   const importProgram = async () => {
-    const src = path.trim();
+    const src = bundleSrc;
     if (!src) return;
     try {
       const n = await invoke<string>("import_filter_program", { src });
       setName(n);
       setPath(""); // 同梱したので絶対パスは不要 → filters から解決（可搬）
       setBundled(await invoke<string[]>("list_filter_programs"));
+      setCheckTick((t) => t + 1); // 解決結果を .texos\filters 側に更新
     } catch (e) {
       console.error("import_filter_program failed", e);
     }
@@ -292,8 +301,12 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
             />
             <button
               style={smallBtn()}
-              title="プログラムを .texos\filters にコピーしてプロジェクトごと持ち運べるようにする"
-              disabled={!path.trim()}
+              title={
+                alreadyBundled
+                  ? "すでに .texos\\filters に同梱済みです"
+                  : "プログラムを .texos\\filters にコピーしてプロジェクトごと持ち運べるようにする（PATH空欄でも解決済みプログラムを同梱できます）"
+              }
+              disabled={!bundleSrc || alreadyBundled || resolved === "checking"}
               onClick={() => void importProgram()}
             >
               同梱⬇
