@@ -3254,7 +3254,12 @@ fn eval_filter(
             }
             let result: Result<(Vec<u8>, String, String), String> = if let Some(b) = &spec.builtin
             {
-                flow::run_builtin(&spec, b, &pl.bytes)
+                // v1.4.0 AIフィルタは builtin だがネットワークを使う別経路（同期blocking）。
+                if b == "ai" {
+                    flow::run_ai(&spec, &pl.bytes)
+                } else {
+                    flow::run_builtin(&spec, b, &pl.bytes)
+                }
             } else if spec.name.is_some() || spec.cmd.is_some() {
                 let out_ext = spec.output_ext.clone().unwrap_or_else(|| pl.ext.clone());
                 let out_mime = mime_for_ext(&out_ext)

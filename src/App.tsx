@@ -578,6 +578,8 @@ function App() {
           };
           const filterSub = [
             { label: "ドロップポイント（データ入口・自動実行）", onClick: () => la.filter("drop_point", cp.x, cp.y, fromId) },
+            { label: "AI: チャット（Ollama・MD出力）...", onClick: () => la.filter("ai_chat", cp.x, cp.y, fromId) },
+            { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => la.filter("md_codeblock", cp.x, cp.y, fromId) },
             { label: "テキスト: grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
             { label: "テキスト: 置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
             { label: "画像: リサイズ（幅指定）...", onClick: () => la.filter("img_resize", cp.x, cp.y, fromId) },
@@ -685,7 +687,45 @@ function App() {
           });
         }
       };
-      if (builtin === "text_grep") {
+      if (builtin === "ai_chat") {
+        // v1.4.0 AIフィルタ（Phase 1 最小transform）: text入力→Ollama→MD出力。
+        // モデル名→システムプロンプトをプロンプト連鎖で聞く（フォームはPhase 2+）。
+        setPrompt({
+          title: "AI: モデル名（Ollama・例 qwen2.5:3b）",
+          initial: "qwen2.5:3b",
+          onConfirm: (model) => {
+            const m = model.trim() || "qwen2.5:3b";
+            setPrompt({
+              title: "AI: システムプロンプト（空欄可）",
+              initial: "あなたは有能なアシスタントです。簡潔なMarkdownで答えてください。",
+              onConfirm: (sys) =>
+                create(`AI: ${m}`, {
+                  builtin: "ai",
+                  provider: "ollama",
+                  model: m,
+                  system: sys.trim(),
+                  accept_mime: "text/*",
+                  output_ext: "md",
+                }),
+            });
+          },
+        });
+      } else if (builtin === "md_codeblock") {
+        // v1.4.0 AI後段: Markdownのフェンス付きコードブロックを取り出してソース化。
+        // 言語を指定すると拡張子も自動推定（c→.c, py→.py …）。そのままgcc等へ繋げる。
+        setPrompt({
+          title: "コード抽出: 言語（空欄=最初のブロック。例 c / py / rust）",
+          initial: "c",
+          onConfirm: (lang) => {
+            const l = lang.trim().toLowerCase();
+            create(l ? `コード抽出: ${l}` : "コード抽出", {
+              builtin: "md_codeblock",
+              ...(l ? { lang: l } : {}),
+              accept_mime: "text/*",
+            });
+          },
+        });
+      } else if (builtin === "text_grep") {
         setPrompt({
           title: "grep: 抽出する正規表現",
           initial: "",

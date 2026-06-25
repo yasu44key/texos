@@ -60,6 +60,25 @@ pub struct FilterSpec {
     /// 対話ウィンドウを detached で開き、cmd（一行目のコマンド・{in}可）を実行して継続する。
     #[serde(default)]
     pub shell: Option<String>,
+    // --- v1.4.0 AIフィルタ（builtin:"ai"）。デュアルプロバイダ設計 ---
+    /// "ollama"（既定・ネイティブ /api/chat）| "openai"（OpenAI準拠 /v1/chat/completions）
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// API ベースURL。空=provider既定（ollama: http://localhost:11434 / openai: http://localhost:1234/v1）
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// モデル名（例: qwen2.5:3b）
+    #[serde(default)]
+    pub model: Option<String>,
+    /// システムプロンプト（空可）
+    #[serde(default)]
+    pub system: Option<String>,
+    /// 生成温度（未指定はモデル既定にまかせる）
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// v1.4.0 md_codeblock: 抽出するコードブロックの言語（空=最初のブロック）。
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 /// 外部プログラムの解決: 絶対パス → <project>/.texos/filters → 環境変数PATH の順
@@ -170,7 +189,234 @@ pub fn run_builtin(
             }
             Ok((buf.into_inner(), ext.into(), mime.into()))
         }
+        "md_codeblock" => {
+            // v1.4.0: Markdown のフェンス付きコードブロック(```lang ... ```)から中身を取り出す。
+            // AI出力(.md)を gcc 等のコンパイラへ渡す前処理。lang 指定で言語を絞り込み、
+            // 無指定なら最初のブロック。複数ブロックは最初の1つを採用（Phase1）。
+            let text = String::from_utf8_lossy(input);
+            let want = spec
+                .lang
+                .as_deref()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty());
+            let mut in_block = false;
+            let mut cur_lang = String::new();
+            let mut cur: Vec<&str> = Vec::new();
+            let mut found: Option<(String, String)> = None;
+            for line in text.lines() {
+                let t = line.trim_start();
+                if !in_block {
+                    if let Some(rest) = t.strip_prefix("```") {
+                        in_block = true;
+                        cur_lang = rest.trim().to_lowercase();
+                        cur.clear();
+                    }
+                } else if t.starts_with("```") {
+                    in_block = false;
+                    let ok = want.as_ref().map(|w| &cur_lang == w).unwrap_or(true);
+                    if ok && found.is_none() {
+                        found = Some((cur_lang.clone(), cur.join("\n")));
+                    }
+                } else {
+                    cur.push(line);
+                }
+            }
+            let (lang, mut code) = found.ok_or_else(|| match &want {
+                Some(w) => format!("`{w}` のコードブロックが見つかりません"),
+                None => "コードブロック(```...```)が見つかりません".to_string(),
+            })?;
+            if !code.is_empty() && !code.ends_with('\n') {
+                code.push('\n'); // 末尾改行（コンパイラ・POSIXツールが好む）
+            }
+            // 拡張子: output_ext 指定 > 言語からの推定 > 言語トークン > txt
+            let ext = spec
+                .output_ext
+                .clone()
+                .map(|e| e.trim().trim_start_matches('.').to_string())
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| lang_to_ext(&lang));
+            Ok((code.into_bytes(), ext, "text/plain".into()))
+        }
         other => Err(format!("未知の内蔵フィルタ: {other}")),
+    }
+}
+
+/// md_codeblock: フェンスの言語トークンから出力拡張子を推定（未知はトークンをそのまま）。
+fn lang_to_ext(lang: &str) -> String {
+    match lang {
+        "c" => "c",
+        "cpp" | "c++" | "cxx" | "cc" => "cpp",
+        "rust" | "rs" => "rs",
+        "python" | "py" => "py",
+        "javascript" | "js" => "js",
+        "typescript" | "ts" => "ts",
+        "go" | "golang" => "go",
+        "java" => "java",
+        "kotlin" | "kt" => "kt",
+        "ruby" | "rb" => "rb",
+        "html" => "html",
+        "css" => "css",
+        "json" => "json",
+        "xml" => "xml",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "sql" => "sql",
+        "sh" | "bash" | "shell" | "zsh" => "sh",
+        "powershell" | "ps1" => "ps1",
+        "bat" | "batch" | "cmd" => "bat",
+        "" => "txt",
+        other => other,
+    }
+    .to_string()
+}
+
+/// AI応答の既定タイムアウト（生成は外部コマンドより長くかかるため別値）。
+const AI_DEFAULT_TIMEOUT_SECS: u64 = 180;
+
+/// v1.4.0 AIフィルタ（builtin:"ai"）: 入力テキストをユーザープロンプトとしてLLMに送り、
+/// 応答 Markdown を返す。provider="ollama"（既定・ネイティブ /api/chat）または
+/// "openai"（OpenAI準拠 /v1/chat/completions）。
+/// Phase 1 は単発変換（履歴なし）。
+///
+/// 重要: reqwest::blocking は内部で tokio ランタイムを生成・破棄する。run_flow は
+/// #[tauri::command(async)] = tokio ワーカースレッド上で走るため、その非同期文脈の中で
+/// blocking クライアントの内部ランタイムを drop すると tokio が
+/// 「Cannot drop a runtime in a context where blocking is not allowed」でパニックし、
+/// 握っている DB Mutex を poison させてアプリ全体を巻き込む。そこで HTTP は
+/// tokio 文脈を持たない素の OS スレッドに逃がして実行する（scope で借用は安全）。
+pub fn run_ai(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, String), String> {
+    std::thread::scope(|s| {
+        s.spawn(|| run_ai_blocking(spec, input))
+            .join()
+            .map_err(|_| "AI実行スレッドが異常終了しました".to_string())?
+    })
+}
+
+fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, String), String> {
+    let provider = spec.provider.as_deref().unwrap_or("ollama");
+    let model = spec
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("AIフィルタにモデルが指定されていません")?;
+    let user = String::from_utf8_lossy(input).into_owned();
+    if user.trim().is_empty() {
+        return Err("入力テキストが空です".into());
+    }
+    let system = spec
+        .system
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // タイムアウト: Some(0)=無制限 / 未指定=180秒。
+    let timeout = match spec.timeout_secs {
+        Some(0) => None,
+        Some(s) => Some(std::time::Duration::from_secs(s)),
+        None => Some(std::time::Duration::from_secs(AI_DEFAULT_TIMEOUT_SECS)),
+    };
+    let mut cb = reqwest::blocking::Client::builder();
+    if let Some(t) = timeout {
+        cb = cb.timeout(t);
+    }
+    let client = cb
+        .build()
+        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
+
+    let mut messages = Vec::new();
+    if let Some(s) = system {
+        messages.push(serde_json::json!({ "role": "system", "content": s }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": user }));
+
+    let content = if provider == "openai" {
+        let endpoint = spec
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("http://localhost:1234/v1")
+            .trim_end_matches('/');
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+        });
+        if let Some(t) = spec.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        let resp = client
+            .post(format!("{endpoint}/chat/completions"))
+            .json(&body)
+            .send()
+            .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
+        let status = resp.status();
+        let v: serde_json::Value = resp
+            .json()
+            .map_err(|e| format!("AI応答の解析に失敗: {e}"))?;
+        if !status.is_success() {
+            let msg = v["error"]["message"]
+                .as_str()
+                .or_else(|| v["error"].as_str())
+                .unwrap_or("不明なエラー");
+            return Err(format!("AI APIエラー ({status}): {msg}"));
+        }
+        v["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or("AI応答に content がありません")?
+            .to_string()
+    } else {
+        let endpoint = spec
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("http://localhost:11434")
+            .trim_end_matches('/');
+        let mut options = serde_json::Map::new();
+        if let Some(t) = spec.temperature {
+            options.insert("temperature".into(), serde_json::json!(t));
+        }
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            // モデルをVRAMに5分常駐 → 連続実行でロード待ちを避ける（効率化）。
+            "keep_alive": "5m",
+            "options": serde_json::Value::Object(options),
+        });
+        let resp = client
+            .post(format!("{endpoint}/api/chat"))
+            .json(&body)
+            .send()
+            .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
+        let status = resp.status();
+        let v: serde_json::Value = resp
+            .json()
+            .map_err(|e| format!("AI応答の解析に失敗: {e}"))?;
+        if !status.is_success() {
+            // Ollama はエラーを {"error":"..."} で返す
+            let msg = v["error"].as_str().unwrap_or("不明なエラー");
+            return Err(format!("AI APIエラー ({status}): {msg}"));
+        }
+        v["message"]["content"]
+            .as_str()
+            .ok_or("AI応答に content がありません")?
+            .to_string()
+    };
+
+    Ok((content.into_bytes(), "md".into(), "text/markdown".into()))
+}
+
+/// AI接続失敗を日本語で分かりやすく（Ollama未起動が最頻なので最優先で案内）。
+fn ai_conn_err(provider: &str, endpoint: &str, e: &reqwest::Error) -> String {
+    if e.is_connect() {
+        format!("{provider} に接続できません（{endpoint}）。Ollama が起動しているか確認してください")
+    } else if e.is_timeout() {
+        format!("AI応答がタイムアウトしました（{endpoint}）。制限時間を延ばすか軽いモデルを試してください")
+    } else {
+        format!("AIリクエストに失敗（{endpoint}）: {e}")
     }
 }
 
@@ -385,6 +631,72 @@ mod tests {
 
     fn spec(json: &str) -> FilterSpec {
         parse_spec(json).unwrap()
+    }
+
+    // v1.4.0 AIフィルタの実機検証。ライブの Ollama(localhost:11434) と qwen2.5:3b が要るので
+    // 既定では無視。実行: `cargo test --lib -- --ignored ai_live`
+    #[test]
+    #[ignore = "ライブOllamaが必要"]
+    fn ai_live_ollama_roundtrip() {
+        let s = spec(
+            r#"{"builtin":"ai","provider":"ollama","model":"qwen2.5:3b","system":"地名だけを一語で答えよ。"}"#,
+        );
+        let (out, ext, mime) = run_ai(&s, "日本の首都は？".as_bytes()).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        // run_ai の契約は「非空のMDを返す」こと。回答内容の正確さはモデル依存なので問わない。
+        assert_eq!(ext, "md");
+        assert_eq!(mime, "text/markdown");
+        assert!(!text.trim().is_empty(), "空の応答が返った");
+        eprintln!("AI応答: {text}");
+    }
+
+    // 回帰テスト: 本番(Tauri #[command(async)])と同じく tokio ランタイム文脈の中から
+    // 同期 run_ai を呼ぶ。修正前はここで reqwest::blocking の内部ランタイム drop が
+    // 「Cannot drop a runtime in a context where blocking is not allowed」でパニックして
+    // アプリごと落ちた。thread::scope で素のOSスレッドに逃がす修正が効いていれば通る。
+    #[test]
+    #[ignore = "ライブOllamaが必要"]
+    fn ai_inside_tokio_runtime_does_not_panic() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(async {
+            let s = spec(
+                r#"{"builtin":"ai","provider":"ollama","model":"qwen2.5:3b","system":"一語で答えよ。"}"#,
+            );
+            run_ai(&s, "日本の首都は？".as_bytes())
+        });
+        let (out, ext, mime) = res.expect("tokio文脈内でrun_aiが失敗");
+        assert_eq!(ext, "md");
+        assert_eq!(mime, "text/markdown");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn md_codeblock_extracts_fenced_code() {
+        let md = "説明文\n```c\n#include <stdio.h>\nint main(){return 0;}\n```\n末尾の解説。";
+        let s = spec(r#"{"builtin":"md_codeblock","lang":"c"}"#);
+        let (out, ext, mime) = run_builtin(&s, "md_codeblock", md.as_bytes()).unwrap();
+        let code = String::from_utf8(out).unwrap();
+        assert_eq!(ext, "c");
+        assert_eq!(mime, "text/plain");
+        assert!(code.starts_with("#include <stdio.h>"));
+        assert!(!code.contains("```"), "フェンスが残っている");
+        assert!(!code.contains("説明文"), "ブロック外の文が混入");
+        assert!(code.ends_with('\n'), "末尾改行が無い");
+    }
+
+    #[test]
+    fn md_codeblock_first_block_when_no_lang() {
+        let md = "```py\nprint(1)\n```\n```js\nconsole.log(2)\n```";
+        let s = spec(r#"{"builtin":"md_codeblock"}"#);
+        let (out, ext, _) = run_builtin(&s, "md_codeblock", md.as_bytes()).unwrap();
+        assert_eq!(ext, "py"); // 言語トークン py → 拡張子 py
+        assert_eq!(String::from_utf8(out).unwrap(), "print(1)\n");
+    }
+
+    #[test]
+    fn md_codeblock_missing_block_is_error() {
+        let s = spec(r#"{"builtin":"md_codeblock","lang":"rust"}"#);
+        assert!(run_builtin(&s, "md_codeblock", b"plain text only").is_err());
     }
 
     #[test]
