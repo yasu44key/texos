@@ -109,6 +109,10 @@ function App() {
   } | null>(null);
   // フロー実行中の表示と中断ボタン（外部コマンドのストール対策）
   const [flowRunning, setFlowRunning] = useState(false);
+  // v1.4.9: 実行中のカードが stdin 停止対応（record:true）かどうか。true のときだけ「停止」を出す
+  // （文字起こし等ふつうの実行で停止ボタンが出ると紛らわしいため）。stopCmdRun=送る文字（既定 q）。
+  const [recordingRun, setRecordingRun] = useState(false);
+  const [stopCmdRun, setStopCmdRun] = useState("q");
   // v1.5 外部プログラムフィルタの設定ダイアログ（作成 or 既存カードの編集）
   const [filterDlg, setFilterDlg] = useState<{
     x: number;
@@ -129,6 +133,15 @@ function App() {
     y: number;
     linkFrom?: string;
   } | null>(null);
+  // v1.4.9: 録音プリセット用の dshow 音声デバイス名（メニューは同期構築なので state に持つ）。
+  const [audioDevices, setAudioDevices] = useState<string[]>([]);
+  const audioDevicesRef = useRef<string[]>([]);
+  audioDevicesRef.current = audioDevices;
+  useEffect(() => {
+    invoke<string[]>("list_audio_devices")
+      .then(setAudioDevices)
+      .catch(() => setAudioDevices([]));
+  }, []);
   // v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断）。メニュー構築が同期なので state に持つ。
   const [filterLibrary, setFilterLibrary] = useState<{ name: string; spec: string }[]>([]);
   const filterLibraryRef = useRef<{ name: string; spec: string }[]>([]);
@@ -636,6 +649,20 @@ function App() {
             { label: "画像: 形式変換...", onClick: () => la.filter("img_convert", cp.x, cp.y, fromId) },
             { label: "音声: 長さでクリップ...", onClick: () => la.filter("audio_clip", cp.x, cp.y, fromId) },
             { label: "音声: ノーマライズ", onClick: () => la.filter("audio_norm", cp.x, cp.y, fromId) },
+            {
+              label: "音声: マイク録音（録音→停止で確定）...",
+              onClick: () => {
+                const devs = audioDevicesRef.current;
+                const items = devs.length
+                  ? devs.map((d) => ({
+                      label: `🎙 ${d}`,
+                      onClick: () => la.filter(`mic_record:${d}`, cp.x, cp.y, fromId),
+                    }))
+                  : [{ label: "（マイクが見つかりません／ffmpeg 未検出）", onClick: () => {}, disabled: true }];
+                // サブメニューはクリック閉じの後に開き直す（openSubmenu と同じ定石）。
+                window.setTimeout(() => setMenu({ x: cx, y: cy, items }), 0);
+              },
+            },
             { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => la.filter("to_wav16k", cp.x, cp.y, fromId) },
             { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => la.filter("whisper", cp.x, cp.y, fromId) },
             { label: "動画: 長さでクリップ...", onClick: () => la.filter("video_clip", cp.x, cp.y, fromId) },
@@ -909,6 +936,21 @@ function App() {
             console.error("whisper_status failed", e);
           }
         })();
+      } else if (builtin.startsWith("mic_record:")) {
+        // v1.4.9: マイク録音ジェネレータ。record:true で stdin を開き、実行中パネルの
+        // 「停止」が 'q' を送って ffmpeg を正常終了→WAV確定。-ar 16000 -ac 1 で Whisper 直結可。
+        const device = builtin.slice("mic_record:".length);
+        create("マイク録音", {
+          name: "ffmpeg.exe",
+          type: "generator",
+          record: true,
+          stop_cmd: "q",
+          cmd: `-hide_banner -f dshow -i "audio=${device}" -ar 16000 -ac 1 -y {out}`,
+          output_ext: "wav",
+          accept_mime: "audio/*",
+          timeout_secs: 0,
+          note: `マイク録音（${device}）。▶実行で録音開始 → 実行中パネルの「停止」で終了し WAV を確定（16kHz mono・Whisper 直結可）。`,
+        });
       } else {
         // 外部プログラム: 設定ダイアログ（v1.5）。NAME/PATH/Type/CMD/IN/OUT/Prefix を
         // フォームで設定する — JSON直編集・プロンプト連鎖は現実的でない（実機指摘）。
@@ -1085,6 +1127,21 @@ function App() {
   // フローを実行（手動トリガー — 確定方針4）。結果カードは緑シグナル＋Ctrl+Zで戻せる。
   const handleRunFlow = useCallback(
     async (id: string) => {
+      // 対象カードが stdin 停止対応（record:true）なら「停止」を出す＋送る文字を拾う。
+      let isRec = false;
+      let sc = "q";
+      try {
+        const obj = objectsRef.current.find((o) => o.id === id);
+        if (obj?.filter_ref) {
+          const s = JSON.parse(obj.filter_ref);
+          isRec = !!s.record;
+          if (typeof s.stop_cmd === "string" && s.stop_cmd) sc = s.stop_cmd;
+        }
+      } catch {
+        /* spec が読めなければ停止対応扱いしない */
+      }
+      setRecordingRun(isRec);
+      setStopCmdRun(sc);
       setFlowRunning(true);
       try {
         const res = await invoke<{
@@ -1124,6 +1181,7 @@ function App() {
         });
       } finally {
         setFlowRunning(false);
+        setRecordingRun(false);
       }
     },
     [refresh, pushUndo]
@@ -3275,6 +3333,7 @@ function App() {
             bulkItems,
             library: filterLibrary.map((e) => e.name),
             launcherLibrary: launcherLibrary.map((e) => e.name),
+            audioDevices: audioDevicesRef.current,
             menuHints: showMenuHints,
           },
           actions
@@ -3762,7 +3821,28 @@ function App() {
           }}
         >
           <span>フロー実行中…</span>
+          {/* v1.4.9: 停止＝stdin に停止コマンドを送って正常終了（録音=WAV確定）。stdin停止対応
+              カードのときだけ出す。中断＝強制終了（kill）。 */}
+          {recordingRun && (
+            <button
+              title={`stdin に "${stopCmdRun}" を送って正常終了させます（録音は WAV を確定）`}
+              onClick={() => void invoke("flow_send_stdin", { text: stopCmdRun }).catch(() => {})}
+              style={{
+                padding: "6px 16px",
+                background: "#2f6f4f",
+                color: "#ffffff",
+                border: "none",
+                borderRadius: 6,
+                cursor: "pointer",
+                fontSize: 13,
+                fontFamily: "sans-serif",
+              }}
+            >
+              ⏹ 停止（正常終了）
+            </button>
+          )}
           <button
+            title="プロセスツリーを強制終了します（出力は破棄）"
             onClick={() => void invoke("break_flow")}
             style={{
               padding: "6px 16px",

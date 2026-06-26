@@ -62,6 +62,11 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
   const [timeoutSecs, setTimeoutSecs] = useState(
     typeof init.timeout_secs === "number" ? (init.timeout_secs as number) : 60
   );
+  // v1.4.9: 停止コマンド（stdin）— お行儀のよいプログラム（ffmpeg録音・対話プログラム）を
+  // kill ではなく stdin への文字（既定 'q'）で正常終了させる。チェック時は実行中パネルに
+  // 「停止」ボタンが出る。この設定は保存される（旧バグ: 編集保存で record が消えていた）。
+  const [stdinStop, setStdinStop] = useState<boolean>(init.record === true);
+  const [stopCmd, setStopCmd] = useState(str("stop_cmd") || "q");
 
   // 事前チェック: NAME/PATH からプログラムを解決できるか（解決順は backend と同一）
   const [resolved, setResolved] = useState<string | null | "checking">(null);
@@ -208,6 +213,12 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
     if (note.trim()) spec.note = note.trim();
     // v1.3.11: 0 = 無制限（開発者モード）。負値は60にフォールバック。
     spec.timeout_secs = timeoutSecs >= 0 ? timeoutSecs : 60;
+    // v1.4.9: 停止コマンド（stdin）。チェック時は record=true（バックエンドが stdin を開く）
+    // ＋ stop_cmd（実行中パネルの「停止」が送る文字列。既定 'q'）を保存する。
+    if (stdinStop) {
+      spec.record = true;
+      spec.stop_cmd = stopCmd.trim() || "q";
+    }
     onSave(title.trim() || name.trim() || "外部フィルタ", JSON.stringify(spec));
   };
 
@@ -507,6 +518,38 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
             <span style={{ fontSize: 12, color: "#8a93a8" }}>
               {timeoutSecs === 0 ? "秒（0=無制限・中断ボタンで停止）" : "秒で強制終了（暴走対策・0=無制限）"}
             </span>
+          </div>
+        )}
+
+        {/* v1.4.9: 停止コマンド（stdin）。お行儀のよいプログラムを kill せず正常終了させる。 */}
+        {row(
+          "停止コマンド",
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <label style={{ display: "flex", gap: 6, alignItems: "center", cursor: "pointer", fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={stdinStop}
+                onChange={(e) => setStdinStop(e.target.checked)}
+              />
+              stdin で正常終了する（録音・対話プログラム向け）
+            </label>
+            {stdinStop && (
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span style={{ fontSize: 12, color: "#8a93a8" }}>送る文字</span>
+                <input
+                  style={{ ...inputStyle(), width: 70 }}
+                  value={stopCmd}
+                  onChange={(e) => setStopCmd(e.target.value)}
+                  placeholder="q"
+                />
+              </div>
+            )}
+          </div>
+        )}
+        {stdinStop && (
+          <div style={{ fontSize: 11, color: "#8a93a8", margin: "-4px 0 10px 92px" }}>
+            実行中パネルに「停止」が出ます。停止＝この文字を stdin に送って正常終了（ffmpeg 録音は "q"）。
+            届かない場合は「中断」で強制終了します。
           </div>
         )}
 

@@ -690,6 +690,8 @@ interface CanvasMenuCtx {
   library: string[];
   /// v1.3.11: ライブラリ登録済みランチャー名（「ユーザーのランチャー」として列挙）
   launcherLibrary: string[];
+  /// v1.4.9: dshow 音声デバイス名（「マイク録音」プリセットの選択肢）。
+  audioDevices: string[];
   /// v1.3.4: メニュー説明ツールチップの現在のオン/オフ（トグル表示用）。
   menuHints: boolean;
 }
@@ -731,6 +733,25 @@ export function buildCanvasMenu(
           // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
           { label: "音声: 長さでクリップ...", onClick: () => a.addFilter("audio_clip", pos.canvasX, pos.canvasY) },
           { label: "音声: ノーマライズ", onClick: () => a.addFilter("audio_norm", pos.canvasX, pos.canvasY) },
+          // v1.4.9: マイク録音（録音→「停止」で確定。デバイスはサブメニューで選ぶ）。
+          {
+            label: "音声: マイク録音（録音→停止で確定）...",
+            onClick: () =>
+              a.openSubmenu(
+                ctx.audioDevices.length
+                  ? ctx.audioDevices.map((d) => ({
+                      label: `🎙 ${d}`,
+                      onClick: () => a.addFilter(`mic_record:${d}`, pos.canvasX, pos.canvasY),
+                    }))
+                  : [
+                      {
+                        label: "（マイクが見つかりません／ffmpeg 未検出）",
+                        onClick: () => {},
+                        disabled: true,
+                      },
+                    ]
+              ),
+          },
           // v1.4.8 ①: Whisper の入力アダプタ（m4a/動画/ステレオ → 16kHz mono WAV）と本体。
           { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => a.addFilter("to_wav16k", pos.canvasX, pos.canvasY) },
           { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => a.addFilter("whisper", pos.canvasX, pos.canvasY) },

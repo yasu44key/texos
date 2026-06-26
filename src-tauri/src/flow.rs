@@ -86,6 +86,11 @@ pub struct FilterSpec {
     /// 同名カードでもログが衝突しない。
     #[serde(default)]
     pub log_name: Option<String>,
+    /// v1.4.9 録音モード（ジェネレータ）: true なら stdin をパイプで開いたまま起動し、
+    /// 子プロセスへ制御文字列（ffmpeg の 'q' 等）を送れるようにする（汎用 stdin チャネル）。
+    /// 録音は自分で終わらない（-t 不要）ので「停止」で 'q' を送って正常終了させ WAV を確定する。
+    #[serde(default)]
+    pub record: bool,
 }
 
 /// 外部プログラムの解決: 絶対パス → <project>/.texos/filters → 環境変数PATH の順
@@ -662,8 +667,13 @@ pub fn run_external(
     timeout_secs: Option<u64>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<u8>, String> {
-    run_external_cwd(cmdline, inputs, out_ext, timeout_secs, cancel, None)
+    run_external_cwd(cmdline, inputs, out_ext, timeout_secs, cancel, None, None)
 }
+
+/// v1.4.9: 子プロセスへ制御を送る汎用 stdin チャネル。`Some(slot)` を渡すと stdin を
+/// パイプで開いたまま起動し、その書き込み端を `slot` に置く（別コマンド flow_send_stdin が
+/// 'q' 等を書ける）。`None` なら従来どおり stdin を閉じる（標準入力待ちのストール防止）。
+pub type StdinSlot = std::sync::Mutex<Option<std::process::ChildStdin>>;
 
 /// v1.4.2: 作業ディレクトリ(cwd)を指定できる版。cwd を渡すとコマンドはそこを
 /// 「ここ」として実行する → 相対名や既定名の副産物（gcc の a.exe 等）が cwd に
@@ -676,6 +686,7 @@ pub fn run_external_cwd(
     timeout_secs: Option<u64>,
     cancel: &std::sync::atomic::AtomicBool,
     cwd: Option<&std::path::Path>,
+    stdin_slot: Option<&StdinSlot>,
 ) -> Result<Vec<u8>, String> {
     use std::sync::atomic::Ordering;
     let nanos = std::time::SystemTime::now()
@@ -744,6 +755,14 @@ pub fn run_external_cwd(
         }
     }
 
+    // v1.4.9: 録音など制御を送りたいときは stdin をパイプで開く。それ以外は閉じる。
+    let stdin_cfg = || {
+        if stdin_slot.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        }
+    };
     #[cfg(windows)]
     let spawned = {
         use std::os::windows::process::CommandExt;
@@ -755,7 +774,7 @@ pub fn run_external_cwd(
         let mut c = std::process::Command::new("cmd");
         c.raw_arg(format!("/C \"{cmd}\""))
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW（コンソールを出さない）
-            .stdin(std::process::Stdio::null())
+            .stdin(stdin_cfg())
             .stdout(std::process::Stdio::null())
             .stderr(err_file);
         if let Some(dir) = cwd {
@@ -767,7 +786,7 @@ pub fn run_external_cwd(
     let spawned = {
         let mut c = std::process::Command::new("sh");
         c.args(["-c", &cmd])
-            .stdin(std::process::Stdio::null())
+            .stdin(stdin_cfg())
             .stdout(std::process::Stdio::null())
             .stderr(err_file);
         if let Some(dir) = cwd {
@@ -787,6 +806,15 @@ pub fn run_external_cwd(
     let status: Result<std::process::ExitStatus, String> = match spawned {
         Err(e) => Err(format!("コマンド起動に失敗: {e}")),
         Ok(mut child) => loop {
+            // v1.4.9: stdin の書き込み端を共有スロットへ（別コマンドが 'q' 等を送れる）。
+            // 取り出しは一度だけ（child.stdin は2回目以降 None）。
+            if let Some(slot) = stdin_slot {
+                if let Some(si) = child.stdin.take() {
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(si);
+                    }
+                }
+            }
             match child.try_wait() {
                 Ok(Some(s)) => break Ok(s),
                 Ok(None) => {}
@@ -815,6 +843,13 @@ pub fn run_external_cwd(
             std::thread::sleep(std::time::Duration::from_millis(100));
         },
     };
+
+    // v1.4.9: プロセス終了後は stdin スロットを空に（以後の送信は「実行中なし」になる）。
+    if let Some(slot) = stdin_slot {
+        if let Ok(mut g) = slot.lock() {
+            *g = None;
+        }
+    }
 
     // stderr の先頭だけ拾ってエラーメッセージに添える（長大ログは切る）
     let stderr_snip = || -> String {

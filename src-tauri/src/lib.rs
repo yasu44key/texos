@@ -36,6 +36,9 @@ pub struct AppState {
     pub flow_cancel: std::sync::atomic::AtomicBool,
     /// v1.4.1 チャット: ストリーミング応答の中断フラグ（停止ボタン → ai_chat_cancel）。
     pub chat_cancel: std::sync::atomic::AtomicBool,
+    /// v1.4.9 子プロセス stdin チャネル: 実行中フィルタ（録音など record モード）の
+    /// stdin 書き込み端。flow_send_stdin が 'q' 等を書いて graceful 停止に使う。
+    pub rec_stdin: flow::StdinSlot,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -3078,6 +3081,7 @@ fn eval_filter(
     visited: &mut std::collections::HashSet<String>,
     report: &mut FlowReport,
     cancel: &std::sync::atomic::AtomicBool,
+    stdin_slot: &flow::StdinSlot,
 ) -> Result<Vec<FlowPayload>, String> {
     if !visited.insert(fid.to_string()) {
         return Err("フローに循環があります".into());
@@ -3101,8 +3105,17 @@ fn eval_filter(
             .unwrap_or("application/octet-stream")
             .to_string();
         let cmdline = build_cmdline(p, &spec)?;
-        let result =
-            flow::run_external_cwd(&cmdline, &[], &out_ext, spec.timeout_secs, cancel, Some(&p.root));
+        // v1.4.9: record モードのジェネレータ（録音）は stdin を開いて 'q' で停止可能に。
+        let slot = if spec.record { Some(stdin_slot) } else { None };
+        let result = flow::run_external_cwd(
+            &cmdline,
+            &[],
+            &out_ext,
+            spec.timeout_secs,
+            cancel,
+            Some(&p.root),
+            slot,
+        );
         visited.remove(fid);
         return match result {
             Ok(bytes) => Ok(vec![FlowPayload {
@@ -3151,7 +3164,7 @@ fn eval_filter(
             break;
         }
         let payloads: Vec<FlowPayload> = if kind.as_deref() == Some("filter") {
-            match eval_filter(p, vid, visited, report, cancel) {
+            match eval_filter(p, vid, visited, report, cancel, stdin_slot) {
                 Ok(v) => v,
                 Err(e) => {
                     report.errors.push(format!("{vlabel}: {e}"));
@@ -3226,7 +3239,7 @@ fn eval_filter(
                 .map(|pl| (pl.bytes.as_slice(), pl.ext.as_str()))
                 .collect();
             match build_cmdline(p, &spec).and_then(|cmd| {
-                flow::run_external_cwd(&cmd, &ins, &out_ext, spec.timeout_secs, cancel, Some(&p.root))
+                flow::run_external_cwd(&cmd, &ins, &out_ext, spec.timeout_secs, cancel, Some(&p.root), None)
             }) {
                 Ok(bytes) => produced.push(FlowPayload {
                     bytes,
@@ -3279,6 +3292,7 @@ fn eval_filter(
                         spec.timeout_secs,
                         cancel,
                         Some(&p.root),
+                        None,
                     )
                     .map(|b| (b, out_ext, out_mime))
                 })
@@ -3400,7 +3414,7 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         .flow_cancel
         .store(false, std::sync::atomic::Ordering::Relaxed);
     let mut visited = std::collections::HashSet::new();
-    let payloads = eval_filter(p, &id, &mut visited, &mut report, &state.flow_cancel)?;
+    let payloads = eval_filter(p, &id, &mut visited, &mut report, &state.flow_cancel, &state.rec_stdin)?;
     if payloads.is_empty() && report.skipped.is_empty() && report.errors.is_empty() {
         return Err("入力がありません。データカードからフィルタへ矢印を引いてください".into());
     }
@@ -3765,6 +3779,7 @@ fn collect_context(
     p: &Project,
     ai_id: &str,
     cancel: &std::sync::atomic::AtomicBool,
+    stdin_slot: &flow::StdinSlot,
 ) -> Vec<FlowPayload> {
     let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
         let mut stmt = match p.conn.prepare(
@@ -3801,7 +3816,7 @@ fn collect_context(
             break;
         }
         if kind.as_deref() == Some("filter") {
-            if let Ok(v) = eval_filter(p, vid, &mut visited, &mut report, cancel) {
+            if let Ok(v) = eval_filter(p, vid, &mut visited, &mut report, cancel, stdin_slot) {
                 out.extend(v);
             }
         } else if real_id.starts_with("drop:") {
@@ -3911,7 +3926,7 @@ fn ai_chat_send(
             return Err("このカードはAIカードではありません".into());
         }
         // v1.4.4 マルチコンテキスト: 接続カードを毎ターン収集（編集が即反映）。
-        let context = collect_context(p, &id, &std::sync::atomic::AtomicBool::new(false));
+        let context = collect_context(p, &id, &std::sync::atomic::AtomicBool::new(false), &state.rec_stdin);
         (spec, p.root.clone(), label, context)
     };
 
@@ -4639,6 +4654,51 @@ fn whisper_set_model(state: State<AppState>, model: String) -> Result<(), String
     cfg.whisper_model = Some(model.trim().to_string());
     write_config(&state.app_data, &cfg);
     Ok(())
+}
+
+// --- v1.4.9 子プロセス stdin チャネル（汎用）＋ 録音デバイス列挙 ---------------------
+// A の最小版: 実行中フィルタ（record モード）の stdin へ文字列を送る道。録音停止は "q"。
+// 将来は対話プログラムへの入力やキー転送（キャンバス内ターミナル）へ拡張できる。
+// 暴走プログラムの停止（CTRL_BREAK シグナル＋Job Object）は別チャネル＝#4 で実装予定。
+
+/// 実行中の子プロセスの stdin に文字列（+改行）を送る。録音の正常停止は text="q"。
+#[tauri::command(async)]
+fn flow_send_stdin(state: State<AppState>, text: String) -> Result<(), String> {
+    use std::io::Write;
+    let mut guard = state.rec_stdin.lock().unwrap();
+    match guard.as_mut() {
+        Some(si) => {
+            si.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            si.write_all(b"\n").map_err(|e| e.to_string())?;
+            si.flush().map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        None => Err("制御を受け付ける実行中プロセスがありません".into()),
+    }
+}
+
+/// dshow の音声入力デバイス名一覧（録音プリセットの選択用）。
+/// `ffmpeg -list_devices true -f dshow -i dummy` の stderr を解析する（要 ffmpeg）。
+#[tauri::command(async)]
+fn list_audio_devices() -> Result<Vec<String>, String> {
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("ffmpeg を実行できません（PATH にありますか）: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    // 形式: [...] "デバイス名" (audio)
+    let re = regex::Regex::new(r#""([^"]+)"\s+\(audio\)"#).map_err(|e| e.to_string())?;
+    let names: Vec<String> = re
+        .captures_iter(&text)
+        .map(|c| c[1].to_string())
+        .collect();
+    Ok(names)
 }
 
 const DROP_MIME: &str = "application/vnd.texos.drop";
@@ -5487,6 +5547,7 @@ pub fn run() {
                 app_data: app_dir,
                 flow_cancel: std::sync::atomic::AtomicBool::new(false),
                 chat_cancel: std::sync::atomic::AtomicBool::new(false),
+                rec_stdin: std::sync::Mutex::new(None),
             });
             Ok(())
         })
@@ -5576,6 +5637,8 @@ pub fn run() {
             whisper_install,
             whisper_download_model,
             whisper_set_model,
+            flow_send_stdin,
+            list_audio_devices,
             check_filter_program,
             list_filter_programs,
             import_filter_program,
