@@ -710,7 +710,13 @@ pub fn run_external_cwd(
         }
     };
     // プレースホルダ展開: {in*} → 全入力（各個クォート）/ {inN} → N番目 / {in} → 1番目
-    let mut cmd = cmdline.replace("{out}", &out_path.to_string_lossy());
+    // {out} → 出力ファイル（拡張子つき）/ {out_noext} → 拡張子を除いたパス
+    // （whisper.cpp の `-of <ベース名>` のように、ツール側が拡張子を自分で付ける場合に使う。
+    //  output_ext を txt にしておけば whisper が書く <base>.txt が {out} と一致する）。
+    // {out_noext} を先に置換する（{out} は "{out_noext}" の部分文字列にならないが順序を明示）。
+    let out_noext = out_path.with_extension("");
+    let mut cmd = cmdline.replace("{out_noext}", &out_noext.to_string_lossy());
+    cmd = cmd.replace("{out}", &out_path.to_string_lossy());
     if cmd.contains("{in*}") {
         let joined = in_paths
             .iter()
@@ -1022,6 +1028,22 @@ mod tests {
         let out =
             run_external("copy \"{in}\" \"{out}\"", &one(b"hello"), "txt", None, &no_cancel())
                 .unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    /// {out_noext} が拡張子を除いたパスに展開され、ツールが付ける `.txt` が {out} と
+    /// 一致して読み戻せること（whisper.cpp の `-of <ベース名>` 想定の回帰テスト）。
+    #[cfg(windows)]
+    #[test]
+    fn out_noext_placeholder_strips_extension() {
+        let out = run_external(
+            "copy \"{in}\" \"{out_noext}.txt\"",
+            &one(b"hello"),
+            "txt",
+            None,
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(out, b"hello");
     }
 

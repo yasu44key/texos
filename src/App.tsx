@@ -13,6 +13,23 @@ import { ContextMenu, type MenuItem } from "./ui/ContextMenu";
 import { PromptDialog } from "./ui/PromptDialog";
 import { FilterDialog } from "./ui/FilterDialog";
 import { AiSettingsDialog } from "./ui/AiSettingsDialog";
+import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
+
+// v1.4.8 ①: Whisper 文字起こしカードの spec（外部コマンドフィルタ）。
+// whisper-cli は app_data 共有・絶対パス参照。-of {out_noext} が <base>.txt を書き {out} と一致。
+// 言語は日本語既定（-l ja）。前段に「Whisper用WAVに変換」を繋げば m4a/動画も扱える。
+function whisperSpec(st: WhisperStatus) {
+  return {
+    name: "whisper-cli.exe",
+    path: st.cli_path,
+    type: "command",
+    cmd: `-m "${st.model_path}" -f {in} -otxt -of {out_noext} -l ja`,
+    output_ext: "txt",
+    accept_mime: "audio/*",
+    timeout_secs: 1800,
+    note: `Whisper 文字起こし（モデル: ${st.current_model}）。前段に「Whisper用WAVに変換」を繋ぐと m4a・動画も扱えます。`,
+  };
+}
 import { AppPicker } from "./ui/AppPicker";
 import { ConfirmDialog } from "./ui/ConfirmDialog";
 import { ProjectChooser, type ProjectInfo } from "./ui/ProjectChooser";
@@ -105,6 +122,12 @@ function App() {
     label: string;
     spec: string;
     create?: { x: number; y: number; linkFrom?: string };
+  } | null>(null);
+  // v1.4.8 ①: Whisper セットアップダイアログ（未導入時に開く。作成位置を保持）。
+  const [whisperDlg, setWhisperDlg] = useState<{
+    x: number;
+    y: number;
+    linkFrom?: string;
   } | null>(null);
   // v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断）。メニュー構築が同期なので state に持つ。
   const [filterLibrary, setFilterLibrary] = useState<{ name: string; spec: string }[]>([]);
@@ -613,6 +636,8 @@ function App() {
             { label: "画像: 形式変換...", onClick: () => la.filter("img_convert", cp.x, cp.y, fromId) },
             { label: "音声: 長さでクリップ...", onClick: () => la.filter("audio_clip", cp.x, cp.y, fromId) },
             { label: "音声: ノーマライズ", onClick: () => la.filter("audio_norm", cp.x, cp.y, fromId) },
+            { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => la.filter("to_wav16k", cp.x, cp.y, fromId) },
+            { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => la.filter("whisper", cp.x, cp.y, fromId) },
             { label: "動画: 長さでクリップ...", onClick: () => la.filter("video_clip", cp.x, cp.y, fromId) },
             { label: "対話: コマンドプロンプト（一行目設定可）...", onClick: () => la.filter("shell_cmd", cp.x, cp.y, fromId) },
             { label: "対話: PowerShell（一行目設定可）...", onClick: () => la.filter("shell_powershell", cp.x, cp.y, fromId) },
@@ -856,6 +881,34 @@ function App() {
           timeout_secs: 600,
           note: "ffmpeg が必要（.texos\\filters か PATH に置いてください）",
         });
+      } else if (builtin === "to_wav16k") {
+        // v1.4.8 ①: Whisper の入力アダプタ。m4a（標準サウンドレコーダー）/動画/ステレオ等を
+        // whisper.cpp が要求する 16kHz mono WAV に変換する。Whisper カードの前段に繋ぐ。
+        // -vn で動画が来ても音声だけ取り出す（将来「動画から取り出し」等の専用プリセットへ拡張予定）。
+        create("Whisper用WAVに変換", {
+          name: "ffmpeg.exe",
+          type: "command",
+          cmd: `-y -i {in} -ar 16000 -ac 1 -vn {out}`,
+          output_ext: "wav",
+          accept_mime: "audio/*",
+          timeout_secs: 600,
+          note: "ffmpeg が必要（.texos\\filters か PATH に置いてください）。16kHz mono WAV に変換します（Whisper の前段）。",
+        });
+      } else if (builtin === "whisper") {
+        // v1.4.8 ①: Whisper 文字起こし。導入済み（ffmpeg/whisper本体/モデル）なら即カード化、
+        // 未導入ならセットアップダイアログを開く（A案・app_data共有）。
+        void (async () => {
+          try {
+            const s = await invoke<WhisperStatus>("whisper_status");
+            if (s.ffmpeg && s.whisper && s.current_ready) {
+              create("Whisper 文字起こし", whisperSpec(s));
+            } else {
+              setWhisperDlg({ x: canvasX, y: canvasY, linkFrom });
+            }
+          } catch (e) {
+            console.error("whisper_status failed", e);
+          }
+        })();
       } else {
         // 外部プログラム: 設定ダイアログ（v1.5）。NAME/PATH/Type/CMD/IN/OUT/Prefix を
         // フォームで設定する — JSON直編集・プロンプト連鎖は現実的でない（実機指摘）。
@@ -3320,7 +3373,7 @@ function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Delete") return;
-      if (prompt || confirm || filterDlg || aiDlg || menu) return;
+      if (prompt || confirm || filterDlg || aiDlg || whisperDlg || menu) return;
       const ae = document.activeElement as HTMLElement | null;
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable))
         return;
@@ -3332,7 +3385,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prompt, confirm, filterDlg, aiDlg, menu, handleBulkDelete, handleRequestDelete]);
+  }, [prompt, confirm, filterDlg, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete]);
 
   const handleChosen = useCallback((info: ProjectInfo) => {
     setShowChooser(false);
@@ -3657,6 +3710,34 @@ function App() {
         <AppPicker
           onPick={handleCreateLauncherFromApp}
           onCancel={() => setAppPicker(null)}
+        />
+      )}
+      {whisperDlg && (
+        <WhisperSetupDialog
+          onCancel={() => setWhisperDlg(null)}
+          onCreate={async (st) => {
+            const dlg = whisperDlg;
+            setWhisperDlg(null);
+            try {
+              const vid = await invoke<string>("create_filter", {
+                label: "Whisper 文字起こし",
+                spec: JSON.stringify(whisperSpec(st)),
+                x: dlg.x,
+                y: dlg.y,
+              });
+              pushUndo([{ kind: "delete", ids: [vid] }]);
+              if (dlg.linkFrom) await linkNewNode(dlg.linkFrom, vid);
+              await refresh();
+            } catch (e) {
+              console.error("create whisper card failed", e);
+              setConfirm({
+                title: "Whisperカードを作成できませんでした",
+                message: String(e),
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              });
+            }
+          }}
         />
       )}
       {flowRunning && (

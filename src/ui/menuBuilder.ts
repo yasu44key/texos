@@ -731,6 +731,9 @@ export function buildCanvasMenu(
           // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
           { label: "音声: 長さでクリップ...", onClick: () => a.addFilter("audio_clip", pos.canvasX, pos.canvasY) },
           { label: "音声: ノーマライズ", onClick: () => a.addFilter("audio_norm", pos.canvasX, pos.canvasY) },
+          // v1.4.8 ①: Whisper の入力アダプタ（m4a/動画/ステレオ → 16kHz mono WAV）と本体。
+          { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => a.addFilter("to_wav16k", pos.canvasX, pos.canvasY) },
+          { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => a.addFilter("whisper", pos.canvasX, pos.canvasY) },
           { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip", pos.canvasX, pos.canvasY) },
           // v1.3.11 対話シェル（一行目設定可・{in}可・バッチ登録・時間無制限）
           { label: "対話: コマンドプロンプト（一行目設定可）...", onClick: () => a.addFilter("shell_cmd", pos.canvasX, pos.canvasY) },
