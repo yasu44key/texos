@@ -55,6 +55,33 @@ impl Drop for RunningGuard<'_> {
     }
 }
 
+/// v1.4.11 非ブロッキング実行: current プロジェクトを**短時間だけ**ロックしてクロージャを
+/// 実行し、即座に解放する。長時間実行（execute_node = 外部/AI/録音）はこのロックの外で
+/// 行うことで「実行中は DB を手放す」を成立させる（録音/AI 中も UI が固まらない）。
+/// 注意: std の Mutex は**非再入**。with_db のクロージャ内でさらに with_db を呼ばないこと。
+/// （eval_filter / collect_context は各 DB 接触を別々の短い with_db に分け、その間＝
+/// 実行・再帰・ファイル読みではロックを保持しない設計。）
+fn with_db<T>(
+    state: &AppState,
+    f: impl FnOnce(&Project) -> Result<T, String>,
+) -> Result<T, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    f(p)
+}
+
+/// v1.4.11: フロー実行中はプロジェクト切替を拒否する。非ブロッキング実行では run_flow が
+/// 実行中に DB ロックを手放すため、途中で current が別プロジェクトに差し替わると、評価や
+/// 結果の書き込みが別プロジェクトに当たって壊れる。切替系コマンドの入口でこれを弾く。
+fn ensure_no_flow_running(state: &AppState) -> Result<(), String> {
+    if state.flow_running.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(
+            "フロー実行中はプロジェクトを切り替えられません（完了／録音は「停止」してから）".into(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
     recent: Vec<String>,
@@ -223,6 +250,7 @@ fn add_recent(app_data: &Path, path: &str) {
 /// Create a new project rooted at `path` (folder is created if missing).
 #[tauri::command]
 fn new_project(path: String, state: State<AppState>) -> Result<ProjectInfo, String> {
+    ensure_no_flow_running(state.inner())?;
     let root = PathBuf::from(&path);
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let project = open_project_at(&root)?;
@@ -235,6 +263,7 @@ fn new_project(path: String, state: State<AppState>) -> Result<ProjectInfo, Stri
 /// Open an existing TexoS project folder.
 #[tauri::command]
 fn open_project(path: String, state: State<AppState>) -> Result<ProjectInfo, String> {
+    ensure_no_flow_running(state.inner())?;
     let root = PathBuf::from(&path);
     if !texos_dir(&root).join("texos.db").exists() {
         return Err("このフォルダはTexoSプロジェクトではありません".into());
@@ -767,6 +796,7 @@ fn update_url(id: String, url: String, state: State<AppState>) -> Result<(), Str
 /// Open the project referenced by a project-object 仮身 (navigation).
 #[tauri::command]
 fn open_project_object(id: String, state: State<AppState>) -> Result<ProjectInfo, String> {
+    ensure_no_flow_running(state.inner())?;
     let target: String = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
@@ -800,6 +830,7 @@ fn open_origin_project(
     path: String,
     state: State<AppState>,
 ) -> Result<Option<ProjectInfo>, String> {
+    ensure_no_flow_running(state.inner())?;
     let start = PathBuf::from(&path);
     let mut dir: Option<&Path> = if start.is_dir() {
         Some(start.as_path())
@@ -2763,9 +2794,9 @@ fn filters_dir(root: &Path) -> PathBuf {
 
 /// 外部フィルタの実行コマンドラインを組み立てる。
 /// 新形式（name あり）: プログラムを解決して `"exe" + CMD書式`。旧形式: cmd をそのまま。
-fn build_cmdline(p: &Project, spec: &flow::FilterSpec) -> Result<String, String> {
+fn build_cmdline(root: &Path, spec: &flow::FilterSpec) -> Result<String, String> {
     if let Some(name) = spec.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let exe = flow::resolve_program(name, spec.path.as_deref(), &filters_dir(&p.root))
+        let exe = flow::resolve_program(name, spec.path.as_deref(), &filters_dir(root))
             .ok_or_else(|| {
                 format!(
                     "プログラム「{name}」が見つかりません（指定パス → .texos\\filters → 環境変数PATH の順で探索）"
@@ -3123,7 +3154,7 @@ struct NodeRun {
 /// - Builtin / Ai … 必ず1個
 /// - External … ファンアウト時1個 / 集約時 N 個
 fn execute_node(
-    p: &Project,
+    root: &Path,
     spec: &flow::FilterSpec,
     kind: flow::NodeKind,
     inputs: &[(&[u8], &str, &str)],
@@ -3158,7 +3189,7 @@ fn execute_node(
             let out_mime = mime_for_ext(&out_ext)
                 .unwrap_or("application/octet-stream")
                 .to_string();
-            let cmdline = build_cmdline(p, spec)?;
+            let cmdline = build_cmdline(root, spec)?;
             let ins: Vec<(&[u8], &str)> = inputs.iter().map(|(b, e, _)| (*b, *e)).collect();
             // v1.4.9: record モードのジェネレータ（録音）だけ stdin を開いて 'q' で停止可能に。
             let slot = if kind == NodeKind::Generator && spec.record {
@@ -3172,7 +3203,7 @@ fn execute_node(
                 &out_ext,
                 spec.timeout_secs,
                 cancel,
-                Some(&p.root),
+                Some(root),
                 slot,
             )?;
             let exit_code = o.exit_code;
@@ -3192,7 +3223,8 @@ fn execute_node(
 /// 入力にフィルタカードが繋がっていれば先にそれを評価し、結果をこのフィルタに通す。
 /// `visited` は評価中パスのスタックで、循環を検出したらエラー。
 fn eval_filter(
-    p: &Project,
+    state: &AppState,
+    root: &Path,
     fid: &str,
     visited: &mut std::collections::HashSet<String>,
     report: &mut FlowReport,
@@ -3202,22 +3234,24 @@ fn eval_filter(
     if !visited.insert(fid.to_string()) {
         return Err("フローに循環があります".into());
     }
-    let spec_json: Option<String> = p
-        .conn
-        .query_row(
-            "SELECT filter_ref FROM virtual_bodies
-             WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
-            rusqlite::params![fid],
-            |r| r.get(0),
-        )
-        .map_err(|_| "フィルタカードが見つかりません".to_string())?;
+    // 短ロック: フィルタ spec を読む（実行はこのあとロック外で）。
+    let spec_json: Option<String> = with_db(state, |p| {
+        p.conn
+            .query_row(
+                "SELECT filter_ref FROM virtual_bodies
+                 WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
+                rusqlite::params![fid],
+                |r| r.get(0),
+            )
+            .map_err(|_| "フィルタカードが見つかりません".to_string())
+    })?;
     let spec = flow::parse_spec(spec_json.as_deref().unwrap_or("{}"))?;
     let accept = spec.accept_mime.clone().unwrap_or_else(|| "*/*".into());
 
     // ジェネレータ型: 入力を取らず1回実行してファイルを生む（入力矢印は無視）。
     // §4.1: 実行は execute_node に一任し、ここは命名（stem＝prefix or "output"）だけ担う。
     if spec.node_kind() == flow::NodeKind::Generator {
-        let run = execute_node(p, &spec, flow::NodeKind::Generator, &[], cancel, stdin_slot);
+        let run = execute_node(root, &spec, flow::NodeKind::Generator, &[], cancel, stdin_slot);
         visited.remove(fid);
         return run.map(|r| {
             let stem = spec
@@ -3241,25 +3275,27 @@ fn eval_filter(
     // §4.3 拡張点アンカー: 将来 relations.kind='flow' に「成功時/失敗時/常に」の制御属性を
     // 持たせる（オートメーション設計メモ §1.2）。そのとき execute_node が返す NodeRun.exit_code
     // を見て分岐し、矢印の制御属性でこの収集をフィルタする。今はモデルを汚さず収集は無条件。
-    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
-        let mut stmt = p
-            .conn
-            .prepare(
-                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
-                 FROM relations rel
-                 JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
-                 JOIN real_bodies r ON r.id = v.real_id
-                 WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
-                 ORDER BY rel.created_at",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![fid], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
-    };
+    // 短ロック: このフィルタへ入る flow 矢印（接続順）を取得。
+    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> =
+        with_db(state, |p| {
+            let mut stmt = p
+                .conn
+                .prepare(
+                    "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
+                     FROM relations rel
+                     JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                     JOIN real_bodies r ON r.id = v.real_id
+                     WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                     ORDER BY rel.created_at",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![fid], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        })?;
 
     let mut produced = Vec::new();
     // フェーズ1: 全入力のペイロードを接続順に収集（{inN} の番号は矢印を張った順）
@@ -3272,7 +3308,8 @@ fn eval_filter(
             break;
         }
         let payloads: Vec<FlowPayload> = if kind.as_deref() == Some("filter") {
-            match eval_filter(p, vid, visited, report, cancel, stdin_slot) {
+            // 再帰評価（呼び出し先が自分で短ロックを取る。ここではロックを保持しない）。
+            match eval_filter(state, root, vid, visited, report, cancel, stdin_slot) {
                 Ok(v) => v,
                 Err(e) => {
                     report.errors.push(format!("{vlabel}: {e}"));
@@ -3285,8 +3322,17 @@ fn eval_filter(
                 .push(format!("{vlabel}（まだファイルが投入されていません）"));
             continue;
         } else {
-            refresh_origin_snapshot(p, vid);
-            let path = resolve_view_path(p, vid, real_id);
+            // 短ロック: 窓の今を解決（snapshot 更新＋ビューパス）。ファイル読みはロック外。
+            let path = match with_db(state, |p| {
+                refresh_origin_snapshot(p, vid);
+                Ok(resolve_view_path(p, vid, real_id))
+            }) {
+                Ok(path) => path,
+                Err(e) => {
+                    report.errors.push(format!("{vlabel}: {e}"));
+                    continue;
+                }
+            };
             match std::fs::read(&path) {
                 Ok(d) => {
                     let stem = std::path::Path::new(vlabel)
@@ -3338,7 +3384,7 @@ fn eval_filter(
                 .iter()
                 .map(|pl| (pl.bytes.as_slice(), pl.ext.as_str(), pl.mime.as_str()))
                 .collect();
-            match execute_node(p, &spec, kind, &ins, cancel, stdin_slot) {
+            match execute_node(root, &spec, kind, &ins, cancel, stdin_slot) {
                 Ok(run) => {
                     let stem = collected[0].stem.clone();
                     for (bytes, ext, mime) in run.outputs {
@@ -3370,7 +3416,7 @@ fn eval_filter(
                 }
             }
             let ins = [(pl.bytes.as_slice(), pl.ext.as_str(), pl.mime.as_str())];
-            match execute_node(p, &spec, kind, &ins, cancel, stdin_slot) {
+            match execute_node(root, &spec, kind, &ins, cancel, stdin_slot) {
                 Ok(run) => {
                     for (bytes, ext, mime) in run.outputs {
                         produced.push(FlowPayload {
@@ -3410,55 +3456,60 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
     }
     let _running = RunningGuard(&state.flow_running);
 
-    let guard = state.current.lock().unwrap();
-    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-
-    let (fx, fy, flabel, fref): (f64, f64, String, Option<String>) = p
-        .conn
-        .query_row(
-            "SELECT pos_x, pos_y, label, filter_ref FROM virtual_bodies
-             WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .map_err(|_| "フィルタカードが見つかりません".to_string())?;
+    // 短ロック: 終端フィルタの位置・ラベル・spec と root を取得（実行中はロックを手放す）。
+    let (fx, fy, flabel, fref, root): (f64, f64, String, Option<String>, PathBuf) =
+        with_db(state.inner(), |p| {
+            let (fx, fy, flabel, fref): (f64, f64, String, Option<String>) = p
+                .conn
+                .query_row(
+                    "SELECT pos_x, pos_y, label, filter_ref FROM virtual_bodies
+                     WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(|_| "フィルタカードが見つかりません".to_string())?;
+            Ok((fx, fy, flabel, fref, p.root.clone()))
+        })?;
     // 終端フィルタの設定が出力先と命名を決める（prefix連番 / 出力フォルダ）
     let term_spec = flow::parse_spec(fref.as_deref().unwrap_or("{}"))?;
 
     // v1.3.11 対話シェル: cmd/PowerShell を detached で開いて一行目（cmd）を実行（捕捉しない）。
     // 接続された最初の入力の生きた実ファイルを {in} に展開する。§4.2: 種別判定は is_shell() に集約。
     if term_spec.is_shell() {
-        let shell = term_spec.shell.as_deref().unwrap_or("");
-        let input: Option<PathBuf> = p
-            .conn
-            .query_row(
-                "SELECT v.id, v.real_id, v.committed_path FROM relations rel
-                 JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
-                 WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
-                 ORDER BY rel.created_at LIMIT 1",
-                rusqlite::params![id],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| e.to_string())?
-            .map(|(vid, real_id, committed)| {
-                committed
-                    .map(PathBuf::from)
-                    .filter(|c| c.is_file())
-                    .unwrap_or_else(|| resolve_view_path(p, &vid, &real_id))
-            });
+        let shell = term_spec.shell.as_deref().unwrap_or("").to_string();
+        // 短ロック: 接続された最初の入力の生きた実ファイルを解決（起動はロック外）。
+        let input: Option<PathBuf> = with_db(state.inner(), |p| {
+            Ok(p
+                .conn
+                .query_row(
+                    "SELECT v.id, v.real_id, v.committed_path FROM relations rel
+                     JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                     WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                     ORDER BY rel.created_at LIMIT 1",
+                    rusqlite::params![id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .map(|(vid, real_id, committed)| {
+                    committed
+                        .map(PathBuf::from)
+                        .filter(|c| c.is_file())
+                        .unwrap_or_else(|| resolve_view_path(p, &vid, &real_id))
+                }))
+        })?;
         let firstline = term_spec.cmd.clone().unwrap_or_default();
         let firstline = match &input {
             Some(pb) => firstline.replace("{in}", &format!("\"{}\"", pb.display())),
             None => firstline.replace("{in}", ""),
         };
-        launch_interactive_shell(shell, &firstline, &p.root)?;
+        launch_interactive_shell(&shell, &firstline, &root)?;
         return Ok(FlowReport {
             created: vec![],
             updated: vec![],
@@ -3487,7 +3538,7 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
             }
             (pb, true)
         }
-        None => (p.root.clone(), false),
+        None => (root.clone(), false),
     };
 
     let mut report = FlowReport {
@@ -3502,7 +3553,17 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         .flow_cancel
         .store(false, std::sync::atomic::Ordering::Relaxed);
     let mut visited = std::collections::HashSet::new();
-    let payloads = eval_filter(p, &id, &mut visited, &mut report, &state.flow_cancel, &state.rec_stdin)?;
+    // 評価フェーズ: eval_filter が DB 接触ごとに短ロックを取り、実行（外部/AI/録音）は
+    // ロック外で走る。録音/AI 中も他のコマンドが state.current を取れる＝UI が固まらない。
+    let payloads = eval_filter(
+        state.inner(),
+        &root,
+        &id,
+        &mut visited,
+        &mut report,
+        &state.flow_cancel,
+        &state.rec_stdin,
+    )?;
     if payloads.is_empty() && report.skipped.is_empty() && report.errors.is_empty() {
         return Err("入力がありません。データカードからフィルタへ矢印を引いてください".into());
     }
@@ -3518,6 +3579,8 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         .take(24)
         .collect();
 
+    // マテリアライズ（DB と fs のみ・長時間プロセスなし → 1回の短ロックでまとめて書く）。
+    with_db(state.inner(), |p| {
     let mut out_i = 0usize;
     for pl in &payloads {
         // 結果の置き場と名前: prefix＋連番→「prefix連番.ext」（空き番号まで進める）、
@@ -3673,6 +3736,8 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         "UPDATE virtual_bodies SET memo = ?1 WHERE id = ?2",
         rusqlite::params![log, id],
     );
+    Ok(())
+    })?;
 
     Ok(report)
 }
@@ -3864,31 +3929,34 @@ fn upsert_chat_log_card(
 /// bytes+mime を保持して返すのでマルチモーダル（画像→image_url）への拡張は
 /// メッセージ組立側の分岐追加だけで済む。
 fn collect_context(
-    p: &Project,
+    state: &AppState,
+    root: &Path,
     ai_id: &str,
     cancel: &std::sync::atomic::AtomicBool,
     stdin_slot: &flow::StdinSlot,
 ) -> Vec<FlowPayload> {
-    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
-        let mut stmt = match p.conn.prepare(
-            "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
-             FROM relations rel
-             JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
-             JOIN real_bodies r ON r.id = v.real_id
-             WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
-             ORDER BY rel.created_at",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt.query_map(rusqlite::params![ai_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
-        });
-        match rows {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(_) => Vec::new(),
-        }
-    };
+    // 短ロック: 接続カードを取得（best-effort・失敗は空）。評価・読みはロック外。
+    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> =
+        with_db(state, |p| {
+            let mut stmt = p
+                .conn
+                .prepare(
+                    "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
+                     FROM relations rel
+                     JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                     JOIN real_bodies r ON r.id = v.real_id
+                     WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                     ORDER BY rel.created_at",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![ai_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                })
+                .map_err(|e| e.to_string())?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
 
     let mut out = Vec::new();
     let mut report = FlowReport {
@@ -3904,14 +3972,20 @@ fn collect_context(
             break;
         }
         if kind.as_deref() == Some("filter") {
-            if let Ok(v) = eval_filter(p, vid, &mut visited, &mut report, cancel, stdin_slot) {
+            if let Ok(v) = eval_filter(state, root, vid, &mut visited, &mut report, cancel, stdin_slot) {
                 out.extend(v);
             }
         } else if real_id.starts_with("drop:") {
             continue;
         } else {
-            refresh_origin_snapshot(p, vid);
-            let path = resolve_view_path(p, vid, real_id);
+            // 短ロック: 窓の今を解決。ファイル読みはロック外。
+            let path = match with_db(state, |p| {
+                refresh_origin_snapshot(p, vid);
+                Ok(resolve_view_path(p, vid, real_id))
+            }) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
             if let Ok(d) = std::fs::read(&path) {
                 let stem = std::path::Path::new(vlabel)
                     .file_stem()
@@ -3996,10 +4070,8 @@ fn ai_chat_send(
     id: String,
     message: String,
 ) -> Result<String, String> {
-    // 1) カードの spec/label/root と接続文脈を短時間ロックで取得（ストリーム中は握らない）
-    let (spec, root, card_label, context) = {
-        let guard = state.current.lock().unwrap();
-        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // 1) カードの spec/label/root を短時間ロックで取得（ストリーム中・文脈評価中は握らない）。
+    let (spec, root, card_label) = with_db(state.inner(), |p| {
         let (fref, label): (Option<String>, String) = p
             .conn
             .query_row(
@@ -4013,10 +4085,17 @@ fn ai_chat_send(
         if spec.builtin.as_deref() != Some("ai") {
             return Err("このカードはAIカードではありません".into());
         }
-        // v1.4.4 マルチコンテキスト: 接続カードを毎ターン収集（編集が即反映）。
-        let context = collect_context(p, &id, &std::sync::atomic::AtomicBool::new(false), &state.rec_stdin);
-        (spec, p.root.clone(), label, context)
-    };
+        Ok((spec, p.root.clone(), label))
+    })?;
+    // v1.4.4 マルチコンテキスト: 接続カードを毎ターン収集（編集が即反映）。v1.4.11: ロック外で
+    // 評価する（上流にフィルタ連鎖があっても DB を握らない＝他操作が固まらない）。
+    let context = collect_context(
+        state.inner(),
+        &root,
+        &id,
+        &std::sync::atomic::AtomicBool::new(false),
+        &state.rec_stdin,
+    );
 
     let user = message.trim().to_string();
     if user.is_empty() {
