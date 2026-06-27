@@ -93,6 +93,59 @@ pub struct FilterSpec {
     pub record: bool,
 }
 
+/// v1.4.10 リファクタリング（§4.2 ノード種別の体系化）: いままで eval_filter / run_flow に
+/// 散在していた「このカードはどう実行するか」の判定（`filter_type=="generator"`・`builtin`
+/// 有無・`builtin=="ai"`・`name`/`cmd` 有無）を1つの列挙に集約する。FilterSpec の各フィールドは
+/// そのまま（serde 後方互換を維持）。判別だけをここへ寄せ、execute_node が一本道で分岐できるようにする。
+///
+/// 注意（挙動不変の要）: 対話シェル（`shell`）は終端カードのときだけ run_flow が特別扱いする
+/// 概念で、eval_filter の連鎖評価では一切見ない。そのため NodeKind には Shell を含めない
+/// （= execute_node 側の分類は従来の eval_filter と完全一致）。シェル判定は run_flow が
+/// `FilterSpec::is_shell()` で行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    /// 入力を取らず1回実行してファイルを生む外部プログラム（`type:"generator"`）。
+    /// `record` 指定なら stdin チャネルを開いたまま起動する（録音の停止制御）。
+    Generator,
+    /// builtin:"ai" — ネットワーク経由の LLM 変換（同期 blocking・別経路）。
+    Ai,
+    /// その他の内蔵フィルタ（text_grep / text_replace / img_* / md_codeblock …）。
+    Builtin,
+    /// 外部コマンド／プログラム（{in}/{out} 展開）。集約か個別かは is_aggregate() で。
+    External,
+    /// builtin も cmd も name も無い不正な定義。
+    Invalid,
+}
+
+impl FilterSpec {
+    /// このカードの実行種別を判定する。判定順序は現行 eval_filter の優先順位を保つ:
+    /// generator（`type`）→ builtin（`ai` を含む）→ external（`name`/`cmd`）→ invalid。
+    pub fn node_kind(&self) -> NodeKind {
+        if self.filter_type.as_deref() == Some("generator") {
+            return NodeKind::Generator;
+        }
+        if let Some(b) = self.builtin.as_deref() {
+            return if b == "ai" { NodeKind::Ai } else { NodeKind::Builtin };
+        }
+        if self.name.is_some() || self.cmd.is_some() {
+            return NodeKind::External;
+        }
+        NodeKind::Invalid
+    }
+
+    /// 終端カードを対話シェルとして開くか（run_flow 専用。連鎖評価では使わない）。
+    pub fn is_shell(&self) -> bool {
+        self.shell.is_some()
+    }
+
+    /// External が集約実行（全入力を集めて1回）か。{in*} か {in2} 以降があれば集約、
+    /// {in}/{in1} のみなら入力ごとに実行（ファンアウト）。集約は External のときだけ意味を持つ。
+    pub fn is_aggregate(&self) -> bool {
+        self.node_kind() == NodeKind::External
+            && cmd_is_aggregate(self.cmd.as_deref().unwrap_or(""))
+    }
+}
+
 /// 外部プログラムの解決: 絶対パス → <project>/.texos/filters → 環境変数PATH の順
 /// （v1.5 確定方針: 明示パスが見つからなくても後段へフォールバックして探す）。
 pub fn resolve_program(
@@ -648,6 +701,46 @@ pub fn cmd_is_aggregate(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// v1.4.10 リファクタリング（§4.1）: 外部プロセスを最後まで走らせた結果を「捨てずに」返す型。
+/// 従来 run_external_cwd は exit code を握りつぶし、stderr も失敗時しか使っていなかった。
+/// 将来の exit code 分岐（§4.3 成功時/失敗時の矢印）を載せられるよう、完走したプロセスの
+/// 終了コード・stderr 抜粋・出力バイト列をそのまま持ち上げる。成否ポリシー（非0→エラー /
+/// 出力なし→エラー）は into_bytes() に閉じ込め、従来契約（run_external_cwd）はその薄い適用。
+#[derive(Debug, Clone)]
+pub struct ExternalOutput {
+    /// プロセス終了コード（Unix でシグナル終了した場合は None）。
+    pub exit_code: Option<i32>,
+    /// stderr の先頭 ~500 字（trim 済み。無ければ空文字）。
+    pub stderr: String,
+    /// {out} を読み出せた場合のみ Some（プログラムが出力を書かなければ None）。
+    pub output: Option<Vec<u8>>,
+}
+
+impl ExternalOutput {
+    /// 終了コード 0 を成功とみなす（std の ExitStatus::success と等価）。
+    pub fn success(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+
+    /// 従来の run_external 契約（成功→出力バイト列 / 失敗→日本語エラー）へ落とす。
+    /// エラーメッセージは旧 run_external_cwd と同一文面を保つ（回帰の安全網）。
+    pub fn into_bytes(self) -> Result<Vec<u8>, String> {
+        if !self.success() {
+            let tail = if self.stderr.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", self.stderr)
+            };
+            return Err(format!(
+                "コマンドが失敗しました (exit {:?}){}",
+                self.exit_code, tail
+            ));
+        }
+        self.output
+            .ok_or_else(|| "コマンドは成功しましたが {out} に出力がありません".to_string())
+    }
+}
+
 /// 外部コマンドの実行（逃げ道）: プレースホルダを一時ファイルパスに置換してシェル実行。
 /// 一時ファイルは読み取り後すぐ削除する（TEMP孤児を作らない方針）。
 ///
@@ -688,6 +781,22 @@ pub fn run_external_cwd(
     cwd: Option<&std::path::Path>,
     stdin_slot: Option<&StdinSlot>,
 ) -> Result<Vec<u8>, String> {
+    run_external_full(cmdline, inputs, out_ext, timeout_secs, cancel, cwd, stdin_slot)?.into_bytes()
+}
+
+/// v1.4.10（§4.1）: run_external_cwd の中身。完走したプロセスの exit code・stderr・出力を
+/// ExternalOutput としてそのまま返す（成否ポリシーを適用しない）。Err になるのは起動失敗・
+/// タイムアウト・中断・出力上限超過・監視失敗といった「そもそも完走しなかった」場合のみ。
+/// 従来契約が要るところは run_external_cwd（= 本関数 + into_bytes）を使う。
+pub fn run_external_full(
+    cmdline: &str,
+    inputs: &[(&[u8], &str)],
+    out_ext: &str,
+    timeout_secs: Option<u64>,
+    cancel: &std::sync::atomic::AtomicBool,
+    cwd: Option<&std::path::Path>,
+    stdin_slot: Option<&StdinSlot>,
+) -> Result<ExternalOutput, String> {
     use std::sync::atomic::Ordering;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -851,31 +960,30 @@ pub fn run_external_cwd(
         }
     }
 
-    // stderr の先頭だけ拾ってエラーメッセージに添える（長大ログは切る）
+    // stderr の先頭だけ拾う（長大ログは切る）。先頭 ~500 字・trim 済み、無ければ空。
     let stderr_snip = || -> String {
         match std::fs::read(&err_path) {
             Ok(b) if !b.is_empty() => {
                 let s = String::from_utf8_lossy(&b);
-                let head: String = s.trim().chars().take(500).collect();
-                format!("\n{head}")
+                s.trim().chars().take(500).collect()
             }
             _ => String::new(),
         }
     };
-    let result = match status {
+    // 完走したプロセスは exit code・stderr・出力をそのまま持ち上げる（成否判定はしない）。
+    // Err は「完走しなかった」場合のみ（起動失敗・タイムアウト・中断・出力上限・監視失敗）。
+    let outcome = match status {
         Err(e) => Err(e),
-        Ok(s) if !s.success() => Err(format!(
-            "コマンドが失敗しました (exit {:?}){}",
-            s.code(),
-            stderr_snip()
-        )),
-        Ok(_) => std::fs::read(&out_path)
-            .map_err(|_| "コマンドは成功しましたが {out} に出力がありません".to_string()),
+        Ok(s) => Ok(ExternalOutput {
+            exit_code: s.code(),
+            stderr: stderr_snip(),
+            output: std::fs::read(&out_path).ok(),
+        }),
     };
     cleanup_inputs(&in_paths);
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
-    result
+    outcome
 }
 
 #[cfg(test)]
@@ -1198,6 +1306,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("{in2}"), "{err}");
+    }
+
+    /// §4.2 ノード種別判定が現行 eval_filter の分類と一致すること。
+    #[test]
+    fn node_kind_classification() {
+        assert_eq!(spec(r#"{"type":"generator","name":"rec.exe"}"#).node_kind(), NodeKind::Generator);
+        assert_eq!(spec(r#"{"builtin":"ai","model":"x"}"#).node_kind(), NodeKind::Ai);
+        assert_eq!(spec(r#"{"builtin":"text_grep"}"#).node_kind(), NodeKind::Builtin);
+        assert_eq!(spec(r#"{"name":"sp2tab.exe"}"#).node_kind(), NodeKind::External);
+        assert_eq!(spec(r#"{"cmd":"sort < {in} > {out}"}"#).node_kind(), NodeKind::External);
+        assert_eq!(spec(r#"{}"#).node_kind(), NodeKind::Invalid);
+        // generator は builtin/name より優先（eval_filter の早期 return と同順）。
+        assert_eq!(
+            spec(r#"{"type":"generator","builtin":"text_grep","name":"x"}"#).node_kind(),
+            NodeKind::Generator
+        );
+    }
+
+    /// 集約判定は External のときだけ true（builtin に {in*} があっても集約ではない）。
+    #[test]
+    fn is_aggregate_only_for_external() {
+        assert!(spec(r#"{"cmd":"{in*} -o {out}"}"#).is_aggregate());
+        assert!(spec(r#"{"name":"convert","cmd":"\"{in1}\" \"{in2}\" {out}"}"#).is_aggregate());
+        assert!(!spec(r#"{"cmd":"\"{in}\" {out}"}"#).is_aggregate());
+        assert!(!spec(r#"{"builtin":"text_grep","cmd":"{in*}"}"#).is_aggregate());
+    }
+
+    /// shell 判定（run_flow 終端の対話シェル）。
+    #[test]
+    fn is_shell_detection() {
+        assert!(spec(r#"{"shell":"cmd"}"#).is_shell());
+        assert!(!spec(r#"{"cmd":"sort"}"#).is_shell());
+    }
+
+    /// §4.1 run_external_full が非0終了コードを「捨てずに」持ち上げること。
+    #[cfg(windows)]
+    #[test]
+    fn external_full_captures_nonzero_exit_code() {
+        let o = run_external_full("exit 3", &one(b""), "txt", Some(10), &no_cancel(), None, None)
+            .unwrap();
+        assert_eq!(o.exit_code, Some(3));
+        assert!(!o.success());
+        // 出力が無いので従来契約（into_bytes）は exit を含むエラーへ落ちる。
+        assert!(o.into_bytes().unwrap_err().contains("exit"));
+    }
+
+    /// 成功時は exit 0 と出力バイト列をそのまま持つこと。
+    #[cfg(windows)]
+    #[test]
+    fn external_full_captures_success_and_output() {
+        let o = run_external_full(
+            "copy \"{in}\" \"{out}\"",
+            &one(b"hi"),
+            "txt",
+            None,
+            &no_cancel(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(o.exit_code, Some(0));
+        assert!(o.success());
+        assert_eq!(o.output.as_deref(), Some(&b"hi"[..]));
     }
 
     #[test]
