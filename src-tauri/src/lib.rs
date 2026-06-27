@@ -3049,6 +3049,21 @@ fn update_filter(id: String, spec: String, state: State<AppState>) -> Result<(),
     Ok(())
 }
 
+// ============================================================================
+// フローレーン（構造の実行）— §4.4 共有2レーンの境界
+// ----------------------------------------------------------------------------
+// ここから下（FlowReport / FlowPayload / NodeRun / execute_node / eval_filter /
+// run_flow / build_cmdline と、フィルタ／ランチャーライブラリ群）は「部分グラフの
+// 実行と spec の取り回し」= フローレーン。実身/仮身/origin/CAS の「中身の共有」=
+// データレーンとはコードパスを分けて考える（混ぜると食い違う、設計メモ §4.4）。
+//
+// 将来の整理メモ:
+//  - この一群は flow_run.rs として lib.rs から切り出せる（v1.5 のファイル分割候補）。
+//  - filter_library / launcher_library は現状「単一カード」だけを共有する。設計メモ §2 の
+//    「部分グラフ＝モジュール」へ一般化する余地を残す（execute_node が部分グラフの
+//    1ノード実行になっているのはその布石）。
+// ============================================================================
+
 #[derive(Serialize)]
 pub struct FlowReport {
     /// 新しく生まれた結果カードの vid（front は緑シグナル＋UNDO登録に使う）
@@ -3208,7 +3223,10 @@ fn eval_filter(
         });
     }
 
-    // 入力: このフィルタへ入る flow 矢印（生きているカードのみ・接続順）
+    // 入力: このフィルタへ入る flow 矢印（生きているカードのみ・接続順）。
+    // §4.3 拡張点アンカー: 将来 relations.kind='flow' に「成功時/失敗時/常に」の制御属性を
+    // 持たせる（オートメーション設計メモ §1.2）。そのとき execute_node が返す NodeRun.exit_code
+    // を見て分岐し、矢印の制御属性でこの収集をフィルタする。今はモデルを汚さず収集は無条件。
     let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
         let mut stmt = p
             .conn
