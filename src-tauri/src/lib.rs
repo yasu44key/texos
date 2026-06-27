@@ -3072,6 +3072,93 @@ struct FlowPayload {
     stem: String,
 }
 
+/// §4.1 リファクタリング: ノード1回分の実行結果。`outputs` は生成物（builtin/ai は1個、
+/// 外部は1個、ジェネレータは1個）。`exit_code`/`stderr` は外部プロセスを完走させたときの
+/// 情報で、現状 eval_filter は使わない — 将来の exit code 分岐（§4.3「成功時/失敗時」の
+/// flow 矢印）でここを見るための土台アンカー。
+struct NodeRun {
+    outputs: Vec<(Vec<u8>, String, String)>, // (bytes, ext, mime)
+    #[allow(dead_code)] // §4.3 で消費予定
+    exit_code: Option<i32>,
+    #[allow(dead_code)] // §4.3 で消費予定
+    stderr: String,
+}
+
+/// §4.1 実行ディスパッチの一本道: 「ノード種別 → 実行 → 結果（payload + exit code + stderr）」。
+/// 種別判定（flow::NodeKind）に応じて内蔵フィルタ / AI / 外部プロセスへ振り分ける。
+/// 入力の収集・型チェック・命名（stem）は呼び出し側（eval_filter）の責務で、ここは
+/// 「与えられた入力でこの spec を1回実行する」ことだけに専念する（データ/フローの関心を分離）。
+///
+/// inputs は (bytes, ext, mime) の並び:
+/// - Generator … 空（入力を取らない）
+/// - Builtin / Ai … 必ず1個
+/// - External … ファンアウト時1個 / 集約時 N 個
+fn execute_node(
+    p: &Project,
+    spec: &flow::FilterSpec,
+    kind: flow::NodeKind,
+    inputs: &[(&[u8], &str, &str)],
+    cancel: &std::sync::atomic::AtomicBool,
+    stdin_slot: &flow::StdinSlot,
+) -> Result<NodeRun, String> {
+    use flow::NodeKind;
+    let plain = |bytes: Vec<u8>, ext: String, mime: String| NodeRun {
+        outputs: vec![(bytes, ext, mime)],
+        exit_code: None,
+        stderr: String::new(),
+    };
+    match kind {
+        NodeKind::Builtin => {
+            // builtin 名は node_kind が Builtin と判定した時点で Some（"ai" 以外）。
+            let b = spec.builtin.as_deref().unwrap_or("");
+            let (bytes, ext, mime) = flow::run_builtin(spec, b, inputs[0].0)?;
+            Ok(plain(bytes, ext, mime))
+        }
+        NodeKind::Ai => {
+            // v1.4.0 AIフィルタは builtin だがネットワークを使う別経路（同期blocking）。
+            let (bytes, ext, mime) = flow::run_ai(spec, inputs[0].0)?;
+            Ok(plain(bytes, ext, mime))
+        }
+        NodeKind::Generator | NodeKind::External => {
+            // 出力拡張子: output_ext 指定 > 最初の入力の拡張子 > "bin"
+            //（ジェネレータは入力が無いので "bin"、外部は入力拡張子に追従）。
+            let out_ext = spec
+                .output_ext
+                .clone()
+                .unwrap_or_else(|| inputs.first().map(|i| i.1.to_string()).unwrap_or_else(|| "bin".into()));
+            let out_mime = mime_for_ext(&out_ext)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let cmdline = build_cmdline(p, spec)?;
+            let ins: Vec<(&[u8], &str)> = inputs.iter().map(|(b, e, _)| (*b, *e)).collect();
+            // v1.4.9: record モードのジェネレータ（録音）だけ stdin を開いて 'q' で停止可能に。
+            let slot = if kind == NodeKind::Generator && spec.record {
+                Some(stdin_slot)
+            } else {
+                None
+            };
+            let o = flow::run_external_full(
+                &cmdline,
+                &ins,
+                &out_ext,
+                spec.timeout_secs,
+                cancel,
+                Some(&p.root),
+                slot,
+            )?;
+            let exit_code = o.exit_code;
+            let stderr = o.stderr.clone();
+            let bytes = o.into_bytes()?; // 非0終了/出力なしは従来どおりエラー（挙動不変）
+            Ok(NodeRun {
+                outputs: vec![(bytes, out_ext, out_mime)],
+                exit_code,
+                stderr,
+            })
+        }
+        NodeKind::Invalid => Err("フィルタ定義に builtin も cmd もありません".into()),
+    }
+}
+
 /// フィルタを再帰評価する（pull型連鎖 — 実行モデル3）。
 /// 入力にフィルタカードが繋がっていれば先にそれを評価し、結果をこのフィルタに通す。
 /// `visited` は評価中パスのスタックで、循環を検出したらエラー。
@@ -3098,38 +3185,27 @@ fn eval_filter(
     let spec = flow::parse_spec(spec_json.as_deref().unwrap_or("{}"))?;
     let accept = spec.accept_mime.clone().unwrap_or_else(|| "*/*".into());
 
-    // ジェネレータ型: 入力を取らず1回実行してファイルを生む（入力矢印は無視）
-    if spec.filter_type.as_deref() == Some("generator") {
-        let out_ext = spec.output_ext.clone().unwrap_or_else(|| "bin".into());
-        let out_mime = mime_for_ext(&out_ext)
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let cmdline = build_cmdline(p, &spec)?;
-        // v1.4.9: record モードのジェネレータ（録音）は stdin を開いて 'q' で停止可能に。
-        let slot = if spec.record { Some(stdin_slot) } else { None };
-        let result = flow::run_external_cwd(
-            &cmdline,
-            &[],
-            &out_ext,
-            spec.timeout_secs,
-            cancel,
-            Some(&p.root),
-            slot,
-        );
+    // ジェネレータ型: 入力を取らず1回実行してファイルを生む（入力矢印は無視）。
+    // §4.1: 実行は execute_node に一任し、ここは命名（stem＝prefix or "output"）だけ担う。
+    if spec.node_kind() == flow::NodeKind::Generator {
+        let run = execute_node(p, &spec, flow::NodeKind::Generator, &[], cancel, stdin_slot);
         visited.remove(fid);
-        return match result {
-            Ok(bytes) => Ok(vec![FlowPayload {
-                bytes,
-                ext: out_ext,
-                mime: out_mime,
-                stem: spec
-                    .prefix
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "output".into()),
-            }]),
-            Err(e) => Err(e),
-        };
+        return run.map(|r| {
+            let stem = spec
+                .prefix
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "output".into());
+            r.outputs
+                .into_iter()
+                .map(|(bytes, ext, mime)| FlowPayload {
+                    bytes,
+                    ext,
+                    mime,
+                    stem: stem.clone(),
+                })
+                .collect()
+        });
     }
 
     // 入力: このフィルタへ入る flow 矢印（生きているカードのみ・接続順）
@@ -3202,13 +3278,12 @@ fn eval_filter(
         collected.extend(payloads);
     }
 
-    // フェーズ2: 実行。CMD の書き方でモードを自動判別 —
-    // {in*} か {in2} 以降がある = 全入力を集めて1回実行（集約: gcc分割ソース・画像合成）、
-    // {in}/{in1} のみ = 入力ごとに実行（従来のファンアウト）。
-    let aggregate = spec.builtin.is_none()
-        && (spec.name.is_some() || spec.cmd.is_some())
-        && flow::cmd_is_aggregate(spec.cmd.as_deref().unwrap_or(""));
-    if aggregate {
+    // フェーズ2: 実行。種別ごとの分岐は execute_node へ一本化（§4.1）。ここに残るのは
+    // 「型チェック（受け入れMIME・想定拡張子）」と「集約/ファンアウトの入力の束ね方」だけ。
+    // 集約か個別かは CMD の書き方で決まる（{in*} か {in2} 以降があれば全入力を1回 = 集約:
+    // gcc分割ソース・画像合成 / {in}/{in1} のみなら入力ごとに実行 = 従来のファンアウト）。
+    let kind = spec.node_kind();
+    if spec.is_aggregate() {
         // 集約実行は引数の位置・本数が意味を持つ → 合わない入力はスキップではなくエラー
         let mut bad = Vec::new();
         for pl in &collected {
@@ -3227,26 +3302,17 @@ fn eval_filter(
         if !bad.is_empty() {
             report.errors.extend(bad);
         } else if !collected.is_empty() {
-            let out_ext = spec
-                .output_ext
-                .clone()
-                .unwrap_or_else(|| collected[0].ext.clone());
-            let out_mime = mime_for_ext(&out_ext)
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            let ins: Vec<(&[u8], &str)> = collected
+            let ins: Vec<(&[u8], &str, &str)> = collected
                 .iter()
-                .map(|pl| (pl.bytes.as_slice(), pl.ext.as_str()))
+                .map(|pl| (pl.bytes.as_slice(), pl.ext.as_str(), pl.mime.as_str()))
                 .collect();
-            match build_cmdline(p, &spec).and_then(|cmd| {
-                flow::run_external_cwd(&cmd, &ins, &out_ext, spec.timeout_secs, cancel, Some(&p.root), None)
-            }) {
-                Ok(bytes) => produced.push(FlowPayload {
-                    bytes,
-                    ext: out_ext,
-                    mime: out_mime,
-                    stem: collected[0].stem.clone(),
-                }),
+            match execute_node(p, &spec, kind, &ins, cancel, stdin_slot) {
+                Ok(run) => {
+                    let stem = collected[0].stem.clone();
+                    for (bytes, ext, mime) in run.outputs {
+                        produced.push(FlowPayload { bytes, ext, mime, stem: stem.clone() });
+                    }
+                }
                 Err(e) => report.errors.push(format!("{}: {e}", collected[0].stem)),
             }
         }
@@ -3271,41 +3337,18 @@ fn eval_filter(
                     continue;
                 }
             }
-            let result: Result<(Vec<u8>, String, String), String> = if let Some(b) = &spec.builtin
-            {
-                // v1.4.0 AIフィルタは builtin だがネットワークを使う別経路（同期blocking）。
-                if b == "ai" {
-                    flow::run_ai(&spec, &pl.bytes)
-                } else {
-                    flow::run_builtin(&spec, b, &pl.bytes)
+            let ins = [(pl.bytes.as_slice(), pl.ext.as_str(), pl.mime.as_str())];
+            match execute_node(p, &spec, kind, &ins, cancel, stdin_slot) {
+                Ok(run) => {
+                    for (bytes, ext, mime) in run.outputs {
+                        produced.push(FlowPayload {
+                            bytes,
+                            ext,
+                            mime,
+                            stem: pl.stem.clone(),
+                        });
+                    }
                 }
-            } else if spec.name.is_some() || spec.cmd.is_some() {
-                let out_ext = spec.output_ext.clone().unwrap_or_else(|| pl.ext.clone());
-                let out_mime = mime_for_ext(&out_ext)
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-                build_cmdline(p, &spec).and_then(|cmd| {
-                    flow::run_external_cwd(
-                        &cmd,
-                        &[(pl.bytes.as_slice(), pl.ext.as_str())],
-                        &out_ext,
-                        spec.timeout_secs,
-                        cancel,
-                        Some(&p.root),
-                        None,
-                    )
-                    .map(|b| (b, out_ext, out_mime))
-                })
-            } else {
-                Err("フィルタ定義に builtin も cmd もありません".into())
-            };
-            match result {
-                Ok((bytes, ext, mime)) => produced.push(FlowPayload {
-                    bytes,
-                    ext,
-                    mime,
-                    stem: pl.stem,
-                }),
                 Err(e) => report.errors.push(format!("{}: {e}", pl.stem)),
             }
         }
@@ -3339,8 +3382,9 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
     let term_spec = flow::parse_spec(fref.as_deref().unwrap_or("{}"))?;
 
     // v1.3.11 対話シェル: cmd/PowerShell を detached で開いて一行目（cmd）を実行（捕捉しない）。
-    // 接続された最初の入力の生きた実ファイルを {in} に展開する。
-    if let Some(shell) = term_spec.shell.as_deref() {
+    // 接続された最初の入力の生きた実ファイルを {in} に展開する。§4.2: 種別判定は is_shell() に集約。
+    if term_spec.is_shell() {
+        let shell = term_spec.shell.as_deref().unwrap_or("");
         let input: Option<PathBuf> = p
             .conn
             .query_row(

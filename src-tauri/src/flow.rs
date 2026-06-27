@@ -753,6 +753,10 @@ impl ExternalOutput {
 /// - stdin は常に閉じる — 標準入力待ちのプログラムは即 EOF を受けて終わる
 /// - タイムアウト・出力サイズ上限・`cancel`（UIの中断ボタン）でツリーごと強制終了
 /// - stderr はファイルに受けて、失敗時のエラーメッセージに含める
+///
+/// §4.1 後: 本体は run_external_full に移り、これは「cwd/stdin 不要・成否のみ欲しい」呼び出し
+/// 向けの薄い互換ラッパ（現状はテストが利用）。
+#[allow(dead_code)]
 pub fn run_external(
     cmdline: &str,
     inputs: &[(&[u8], &str)],
@@ -772,6 +776,9 @@ pub type StdinSlot = std::sync::Mutex<Option<std::process::ChildStdin>>;
 /// 「ここ」として実行する → 相対名や既定名の副産物（gcc の a.exe 等）が cwd に
 /// 落ちる。lib.rs はプロジェクトルートを渡し、副産物がプロジェクト内に収まるようにする。
 /// {in}/{out} は絶対パスなので正規の入出力には影響しない。
+///
+/// §4.1 後: exit code を見ない呼び出し向けに run_external_full + into_bytes を束ねた互換ラッパ。
+#[allow(dead_code)]
 pub fn run_external_cwd(
     cmdline: &str,
     inputs: &[(&[u8], &str)],
