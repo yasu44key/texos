@@ -109,6 +109,10 @@ function App() {
   } | null>(null);
   // フロー実行中の表示と中断ボタン（外部コマンドのストール対策）
   const [flowRunning, setFlowRunning] = useState(false);
+  // v1.4.10 二度押し抑止: 実行中の再入を同期的に弾くためのミラー（state は非同期更新で
+  // 連打に間に合わない）。バックエンド run_flow にも再入ガードがあるが、ここで先に止めて
+  // 「他のフロー実行中」エラーダイアログを出さない（録音ハングバグの UX 側修正）。
+  const flowRunningRef = useRef(false);
   // v1.4.9: 実行中のカードが stdin 停止対応（record:true）かどうか。true のときだけ「停止」を出す
   // （文字起こし等ふつうの実行で停止ボタンが出ると紛らわしいため）。stopCmdRun=送る文字（既定 q）。
   const [recordingRun, setRecordingRun] = useState(false);
@@ -1127,6 +1131,10 @@ function App() {
   // フローを実行（手動トリガー — 確定方針4）。結果カードは緑シグナル＋Ctrl+Zで戻せる。
   const handleRunFlow = useCallback(
     async (id: string) => {
+      // v1.4.10 二度押し抑止: すでに実行中なら無視（録音中に▶を連打して run_flow が
+      // 積み上がり、停止しても次の録音が走るハングを防ぐ）。解放は finally で。
+      if (flowRunningRef.current) return;
+      flowRunningRef.current = true;
       // 対象カードが stdin 停止対応（record:true）なら「停止」を出す＋送る文字を拾う。
       let isRec = false;
       let sc = "q";
@@ -1182,6 +1190,7 @@ function App() {
       } finally {
         setFlowRunning(false);
         setRecordingRun(false);
+        flowRunningRef.current = false;
       }
     },
     [refresh, pushUndo]

@@ -39,6 +39,20 @@ pub struct AppState {
     /// v1.4.9 子プロセス stdin チャネル: 実行中フィルタ（録音など record モード）の
     /// stdin 書き込み端。flow_send_stdin が 'q' 等を書いて graceful 停止に使う。
     pub rec_stdin: flow::StdinSlot,
+    /// v1.4.10 多重起動ガード: run_flow 実行中フラグ。録音など長時間フロー中に実行ボタンを
+    /// 再度押すと、2回目の run_flow が state.current ロック待ちで積み上がり、停止しても
+    /// 積まれた次の録音が走ってハングしたように見える（v1.4.9 バグ）。フローは単一スロット
+    /// 設計（flow_cancel/rec_stdin が各1個）＝同時実行は1つ前提なので、再入を即エラーで弾く。
+    pub flow_running: std::sync::atomic::AtomicBool,
+}
+
+/// run_flow の多重起動ガード。drop で flow_running を false に戻す
+/// （早期 return / panic / `?` のどの離脱でも確実に解放する）。
+struct RunningGuard<'a>(&'a std::sync::atomic::AtomicBool);
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -3384,6 +3398,18 @@ fn eval_filter(
 // 外部コマンドがストールするとイベントループごと固まり中断ボタンが届かない。
 #[tauri::command(async)]
 fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
+    // v1.4.10 多重起動ガード（録音ハングの修正）: 実行中なら state.current をロックする前に
+    // 即エラーで弾く。ロック前に弾くのが要点 — ここで待つと録音中フローの裏で積み上がる。
+    if state
+        .flow_running
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(
+            "ほかのフローを実行中です。完了（録音は「停止」）してからもう一度実行してください".into(),
+        );
+    }
+    let _running = RunningGuard(&state.flow_running);
+
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
 
@@ -5610,6 +5636,7 @@ pub fn run() {
                 flow_cancel: std::sync::atomic::AtomicBool::new(false),
                 chat_cancel: std::sync::atomic::AtomicBool::new(false),
                 rec_stdin: std::sync::Mutex::new(None),
+                flow_running: std::sync::atomic::AtomicBool::new(false),
             });
             Ok(())
         })
