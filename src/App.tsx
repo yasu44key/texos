@@ -32,6 +32,7 @@ function whisperSpec(st: WhisperStatus) {
 }
 import { AppPicker } from "./ui/AppPicker";
 import { ConfirmDialog } from "./ui/ConfirmDialog";
+import { ShortcutHelp } from "./ui/ShortcutHelp";
 import { ProjectChooser, type ProjectInfo } from "./ui/ProjectChooser";
 import {
   PROJECT_MIME,
@@ -177,6 +178,8 @@ function App() {
   // v1.3.11 #A: インストール済みアプリのピッカー（Start Menu 走査）。開いている間だけ
   // 配置先座標と linkFrom を保持する。
   const [appPicker, setAppPicker] = useState<{ x: number; y: number; linkFrom?: string } | null>(null);
+  // v1.4.12: キーボードショートカットのヘルプ・オーバーレイ（? / F1 で開閉）。
+  const [helpOpen, setHelpOpen] = useState(false);
   const [confirm, setConfirm] = useState<{
     title: string;
     message?: string;
@@ -204,6 +207,8 @@ function App() {
   shapesRef.current = shapes;
   const notesRef = useRef<NoteInfo[]>([]);
   notesRef.current = notes;
+  const relationsRef = useRef<RelationInfo[]>([]);
+  relationsRef.current = relations;
   // Actual rendered note sizes (ResizeObserver) — arrows/selection use these;
   // noteSize() stays as the pre-measurement fallback only.
   const [noteSizes, setNoteSizes] = useState<Map<string, { w: number; h: number }>>(new Map());
@@ -2206,6 +2211,70 @@ function App() {
     [refresh, pushUndo]
   );
 
+  // v1.4.12 #4: Ctrl+D = 選択カードの仮身をまとめて作成（既存「仮身を作成」のキー化）。
+  // 各カードの隣（duplicate_virtual の +36,+36 オフセット）に仮身を生やす。
+  const handleDuplicateSelected = useCallback(async () => {
+    const ids = objectsRef.current.filter((o) => selectedRef.current.has(o.id)).map((o) => o.id);
+    if (!ids.length) return;
+    try {
+      const newIds: string[] = [];
+      for (const id of ids) {
+        const vid = await invoke<string>("duplicate_virtual", { id });
+        newIds.push(vid);
+        setTouched((prev) => new Set(prev).add(vid));
+      }
+      pushUndo([{ kind: "delete", ids: newIds }]);
+      await refresh();
+      setSelected(new Set(newIds));
+    } catch (e) {
+      console.error("duplicate selected failed", e);
+    }
+  }, [refresh, pushUndo, setSelected]);
+
+  // v1.4.12: Alt+クリック／右クリック「つながりを選択」= 関係矢印でつながった連結成分を
+  // まるごと選択（向きは問わない＝両方向に辿る）。フロー／モジュールを一掴みするための基盤。
+  // relations は カード・コメント両方を端点に取りうるので、結果を selected/selectedNotes に振り分ける。
+  const handleSelectConnected = useCallback(
+    (startId: string) => {
+      const adj = new Map<string, string[]>();
+      for (const r of relationsRef.current) {
+        (adj.get(r.from_id) ?? adj.set(r.from_id, []).get(r.from_id)!).push(r.to_id);
+        (adj.get(r.to_id) ?? adj.set(r.to_id, []).get(r.to_id)!).push(r.from_id);
+      }
+      const seen = new Set<string>();
+      const stack = [startId];
+      while (stack.length) {
+        const id = stack.pop()!;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        for (const nb of adj.get(id) ?? []) if (!seen.has(nb)) stack.push(nb);
+      }
+      const cardIds = objectsRef.current.filter((o) => seen.has(o.id)).map((o) => o.id);
+      const noteIds = notesRef.current.filter((n) => seen.has(n.id)).map((n) => n.id);
+      setSelected(new Set(cardIds));
+      setSelectedNotes(new Set(noteIds));
+    },
+    [setSelected, setSelectedNotes]
+  );
+
+  // v1.4.12 #3: Ctrl+左ドラッグでこのカードの仮身（化身）をドロップ位置に作る。
+  // duplicate_virtual は filter_ref/kind も継ぐのでフィルタ系カードも複製できる。
+  const handleCtrlClone = useCallback(
+    async (id: string, clientX: number, clientY: number) => {
+      const cp = screenToCanvas(transformRef.current, clientX, clientY);
+      try {
+        const vid = await invoke<string>("duplicate_virtual", { id });
+        await invoke("move_object", { id: vid, x: cp.x, y: cp.y });
+        setTouched((prev) => new Set(prev).add(vid));
+        pushUndo([{ kind: "delete", ids: [vid] }]);
+        await refresh();
+      } catch (e) {
+        console.error("ctrl-clone failed", e);
+      }
+    },
+    [refresh, pushUndo]
+  );
+
   // v1.3.6 変更②「実身にする」: 仮身が指す内容を独立した内部実身に確定する。
   // 元ファイルから独立 → 緑（このセッションで導入）→ 次回オープンでグレー。
   const handleMakeReal = useCallback(
@@ -3225,7 +3294,9 @@ function App() {
             return nv;
           }),
         switchProject: () => setShowChooser(true),
+        showHelp: () => setHelpOpen(true),
         focusSelection: handleFocusSelection,
+        selectConnected: handleSelectConnected,
         alignSelected,
         bulkCommit: handleBulkCommit,
         bulkUncommit: handleBulkUncommit,
@@ -3362,6 +3433,7 @@ function App() {
       handleRecommit,
       handleUncommit,
       handleDuplicate,
+      handleSelectConnected,
       handleViewTemp,
       handleNewSubproject,
       handleLinkProject,
@@ -3426,15 +3498,82 @@ function App() {
   //  いるため、Esc で閉じると意図しない動作になる — ユーザー指摘 2026-06-19, トグルは v1.3.10）。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setSelected(new Set());
-        setSelectedNotes(new Set());
-        setSelectedShapes(new Set());
+      if (e.key !== "Escape") return;
+      // v1.4.12: ヘルプが開いていれば Esc はまずそれを閉じる（選択は解除しない）。
+      if (helpOpen) {
+        setHelpOpen(false);
+        return;
+      }
+      setSelected(new Set());
+      setSelectedNotes(new Set());
+      setSelectedShapes(new Set());
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [helpOpen, setSelected, setSelectedNotes, setSelectedShapes]);
+
+  // v1.4.12 #4: グローバルなショートカット。?(Shift+/)/F1=ヘルプ開閉、
+  // Ctrl+A=全選択、Ctrl+D=選択を仮身化、Ctrl+G=整列メニュー。
+  // テキスト入力中・ダイアログ/メニュー表示中は（ヘルプ開閉を除き）奪わない。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const ae = document.activeElement as HTMLElement | null;
+      const typing =
+        !!ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable);
+      // ヘルプは入力中以外ならいつでも開閉できる（F1 はブラウザヘルプを潰す）。
+      if (e.key === "F1" || (e.key === "?" && !typing)) {
+        e.preventDefault();
+        setHelpOpen((v) => !v);
+        return;
+      }
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || typing) return;
+      if (prompt || confirm || filterDlg || aiDlg || whisperDlg || menu || appPicker) return;
+      const k = e.key.toLowerCase();
+      if (k === "a") {
+        e.preventDefault();
+        setSelected(new Set(objectsRef.current.map((o) => o.id)));
+        setSelectedNotes(new Set(notesRef.current.map((n) => n.id)));
+      } else if (k === "d") {
+        e.preventDefault();
+        void handleDuplicateSelected();
+      } else if (k === "g") {
+        e.preventDefault();
+        const cards = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
+        const ns = notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
+        if (cards.length + ns.length < 2) return;
+        const xs = [...cards.map((o) => o.pos_x), ...ns.map((n) => n.pos_x)];
+        const ys = [...cards.map((o) => o.pos_y), ...ns.map((n) => n.pos_y)];
+        const cx = xs.reduce((a, b) => a + b, 0) / xs.length;
+        const cy = ys.reduce((a, b) => a + b, 0) / ys.length;
+        const t = transformRef.current;
+        setMenu({
+          x: cx * t.scale + t.x,
+          y: cy * t.scale + t.y,
+          items: [
+            { label: "横一列に整列（水平）", onClick: () => alignSelected("row") },
+            { label: "縦一列に整列（垂直）", onClick: () => alignSelected("col") },
+            { label: "格子状に整列", onClick: () => alignSelected("grid") },
+            { label: "横方向に均等配置", onClick: () => alignSelected("dist-h") },
+            { label: "縦方向に均等配置", onClick: () => alignSelected("dist-v") },
+          ],
+        });
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [
+    prompt,
+    confirm,
+    filterDlg,
+    aiDlg,
+    whisperDlg,
+    menu,
+    appPicker,
+    handleDuplicateSelected,
+    alignSelected,
+    setSelected,
+    setSelectedNotes,
+  ]);
 
   // Delete キー = 選択カードを削除（確認・一括Undoは既存の削除フローに乗せる）。
   // テキスト入力中・ダイアログ/メニュー表示中は奪わない。
@@ -3572,6 +3711,8 @@ function App() {
             zIndex={cardZ(obj.id)}
             selected={selected.has(obj.id)}
             onToggleSelect={handleCardToggleSelect}
+            onCtrlClone={handleCtrlClone}
+            onSelectConnected={handleSelectConnected}
             onSelect={handleCardSelectOnly}
             onGroupDragStart={handleGroupDragStart}
             onMoveEnd={handleMoveEnd}
@@ -3670,6 +3811,31 @@ function App() {
           TexoS v{appVersion}
         </div>
       )}
+
+      {/* v1.4.12: ショートカット・ヘルプを開く（? / F1 でも開閉） */}
+      <div
+        onClick={() => setHelpOpen(true)}
+        title="キーボードショートカット（? または F1）"
+        style={{
+          position: "fixed",
+          top: 8,
+          right: 64,
+          width: 24,
+          height: 24,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "var(--chrome-text, #cdd6e6cc)",
+          fontSize: 13,
+          fontFamily: "sans-serif",
+          background: "var(--chrome-bg, #1c2130cc)",
+          border: "1px solid var(--chrome-border, #2a3346)",
+          borderRadius: 6,
+          cursor: "pointer",
+        }}
+      >
+        ?
+      </div>
 
       {/* 終了ボタン（自動保存済みのまま閉じる） */}
       <div
@@ -3780,6 +3946,7 @@ function App() {
           onCancel={() => setAppPicker(null)}
         />
       )}
+      {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {whisperDlg && (
         <WhisperSetupDialog
           onCancel={() => setWhisperDlg(null)}

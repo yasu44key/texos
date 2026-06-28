@@ -53,6 +53,10 @@ interface Props {
   selected?: boolean;
   /** Ctrl+click: toggle this card in/out of the selection (v1.3 メモ２追加). */
   onToggleSelect?: (id: string) => void;
+  /** v1.4.12: Ctrl+左ドラッグでこのカードの仮身（化身）をドロップ位置に作る。(id, clientX, clientY) */
+  onCtrlClone?: (id: string, clientX: number, clientY: number) => void;
+  /** v1.4.12: Alt+クリックで関係矢印の連結成分（つながり）をまるごと選択。 */
+  onSelectConnected?: (id: string) => void;
   /** 素クリック（未選択時）: このカードだけを選択（v1.3.8 マウスモデル刷新）。 */
   onSelect?: (id: string) => void;
   /** When set and this card is selected, delegate the drag to the parent
@@ -216,7 +220,7 @@ export function ObjectCard({
   filterRef = null,
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
-  zIndex = 0, selected = false, onToggleSelect, onSelect, onGroupDragStart,
+  zIndex = 0, selected = false, onToggleSelect, onCtrlClone, onSelectConnected, onSelect, onGroupDragStart,
   onMoveEnd, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
 }: Props) {
   const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
@@ -266,13 +270,37 @@ export function ObjectCard({
   }, [id, realId, isImage]);
 
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (e.button !== 0 || e.altKey) return;
+    if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
 
-    // Ctrl+クリック = 選択に個別追加／解除（ドラッグは始めない）。
+    // v1.4.12: Alt+クリック = 関係矢印でつながった連結成分（つながり）をまるごと選択。
+    if (e.altKey) {
+      onSelectConnected?.(id);
+      return;
+    }
+
+    // Ctrl+クリック = 選択に個別追加／解除。Ctrl+左ドラッグ = この場に仮身（化身）を作る。
+    // クリックとドラッグは移動量で区別する（4px 超で化身、未満で選択トグル）。
     if (e.ctrlKey || e.metaKey) {
-      onToggleSelect?.(id);
+      const sx = e.clientX;
+      const sy = e.clientY;
+      let dragged = false;
+      const onCtrlMove = (me: globalThis.MouseEvent) => {
+        if (!dragged && Math.hypot(me.clientX - sx, me.clientY - sy) > 4) {
+          dragged = true;
+          document.body.style.cursor = "copy";
+        }
+      };
+      const onCtrlUp = (me: globalThis.MouseEvent) => {
+        window.removeEventListener("mousemove", onCtrlMove);
+        window.removeEventListener("mouseup", onCtrlUp);
+        document.body.style.cursor = "";
+        if (dragged && onCtrlClone) onCtrlClone(id, me.clientX, me.clientY);
+        else onToggleSelect?.(id);
+      };
+      window.addEventListener("mousemove", onCtrlMove);
+      window.addEventListener("mouseup", onCtrlUp);
       return;
     }
 
@@ -429,7 +457,7 @@ export function ObjectCard({
           ? `${fstyle.badge}\nダブルクリック: 設定を開く ／ ボタン: ${fstyle.run}\n右クリック: メニュー${memo ? `\n\n${memo}` : ""}`
           : isDrop
           ? `ここにファイルをドロップ→下流を自動実行\nダブルクリック: 投入するファイルを選択${memo ? `\n\n${memo}` : ""}`
-          : `${mimeType}\nid: ${id}`
+          : `${mimeType}\nid: ${id}${memo ? `\n\n${memo}` : ""}`
       }
     >
       {/* inner content clipped to rounded card */}

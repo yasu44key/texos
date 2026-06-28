@@ -44,8 +44,12 @@ export interface MenuActions {
   // v1.3.4: メニューの説明ツールチップ表示のオン/オフ。
   toggleMenuHints: () => void;
   switchProject: () => void;
+  // v1.4.12: キーボードショートカット一覧（? / F1 でも開閉）。
+  showHelp: () => void;
   // 選択
   focusSelection: () => void;
+  // v1.4.12: 関係矢印でつながった連結成分（つながり）をまるごと選択（Alt+クリックと同じ）。
+  selectConnected: (id: string) => void;
   alignSelected: (mode: "row" | "col" | "grid" | "dist-h" | "dist-v") => void;
   bulkCommit: () => void;
   bulkUncommit: () => void;
@@ -272,7 +276,9 @@ export function buildObjectMenu(
       { label: `📥「${obj.label}」`, onClick: () => {}, disabled: true },
       { label: "ファイルを選んで投入（→自動実行）...", onClick: () => a.feedDrop(targetId) },
       { label: "▶ 下流のフローを実行", onClick: () => a.runDrop(targetId) },
+      { label: "つながりを選択", hint: "関係矢印でつながったカード全体を選択します（Alt+クリックと同じ）。", onClick: () => a.selectConnected(targetId) },
       ...zItems,
+      { label: obj.memo ? "コメントを編集..." : "コメントを追加...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
       ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
@@ -283,6 +289,7 @@ export function buildObjectMenu(
     return [
       { label: `🚀「${obj.label}」`, onClick: () => {}, disabled: true },
       { label: "▶ 起動", onClick: () => a.runLauncher(targetId) },
+      { label: "つながりを選択", hint: "関係矢印でつながったカード全体を選択します（Alt+クリックと同じ）。", onClick: () => a.selectConnected(targetId) },
       {
         label: "設定を編集...",
         hint: "登録プログラムのパスや引数（JSON）を編集します。",
@@ -290,6 +297,7 @@ export function buildObjectMenu(
       },
       { label: "ライブラリに登録...", onClick: () => a.saveLauncherToLibrary(targetId) },
       ...zItems,
+      { label: obj.memo ? "コメントを編集..." : "コメントを追加...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
       ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
@@ -299,6 +307,7 @@ export function buildObjectMenu(
     return [
       { label: `⚗「${obj.label}」`, onClick: () => {}, disabled: true },
       { label: "▶ フローを実行", onClick: () => a.runFlow(targetId) },
+      { label: "つながりを選択", hint: "関係矢印でつながったカード全体を選択します（Alt+クリックと同じ）。", onClick: () => a.selectConnected(targetId) },
       {
         // 外部プログラムは設定ダイアログ、内蔵フィルタはJSON編集（App側で分岐）
         label: "フィルタ設定を編集...",
@@ -307,6 +316,7 @@ export function buildObjectMenu(
       // v1.5: 設定済みフィルタに名前を付けてプロジェクト横断で再利用
       { label: "ライブラリに登録...", onClick: () => a.saveFilterToLibrary(targetId) },
       ...zItems,
+      { label: obj.memo ? "コメントを編集..." : "コメントを追加...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
       ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
@@ -442,6 +452,16 @@ export function buildObjectMenu(
           },
         ]
       : []),
+    // v1.4.12: 任意カードにコメント（メモ）。ホバー時にツールチップで表示される。
+    ...(!multi
+      ? [
+          {
+            label: obj?.memo ? "コメントを編集..." : "コメントを追加...",
+            hint: "このカードに自由なメモを付けます。カードにマウスを乗せるとツールチップとして表示されます。",
+            onClick: () => a.setMemo(targetId, obj?.memo ?? ""),
+          },
+        ]
+      : []),
   ]);
   // v1.3.4: 用語を実身/仮身に統一し、グループを区切り線で分ける。
   // 説明は label から外してツールチップ(hint)へ。compact() で空グループの線を畳む。
@@ -550,7 +570,10 @@ export function buildObjectMenu(
         ]
       : []),
     DIV,
-    // ── 選択系（選択があるときだけ）──
+    // ── 選択系 ──
+    // v1.4.12: つながり（関係矢印の連結成分）をまるごと選択。Alt+クリックと同じ。
+    { label: "つながりを選択", hint: "このカードと関係矢印でつながったカード全体を選択します（Alt+クリックと同じ）。", onClick: () => a.selectConnected(targetId) },
+    // ── 一括（選択があるときだけ）──
     ...selItems,
     DIV,
     // ── 実身⇔仮身系 ──
@@ -896,6 +919,11 @@ export function buildCanvasMenu(
     {
       label: "プロジェクトを切り替え...",
       onClick: () => a.switchProject(),
+    },
+    {
+      label: "ショートカット一覧（?）",
+      hint: "キーボードショートカットの一覧を表示します（? または F1 キーでも開閉できます）。",
+      onClick: () => a.showHelp(),
     },
   ]);
 }

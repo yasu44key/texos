@@ -31,6 +31,10 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   const [temperature, setTemperature] = useState(
     typeof base.temperature === "number" ? String(base.temperature) : ""
   );
+  // v1.4.12 制限時間（秒）。空欄=既定（変換180秒/対話無制限）・0=無制限。
+  const [timeoutSecs, setTimeoutSecs] = useState(
+    typeof base.timeout_secs === "number" ? String(base.timeout_secs) : ""
+  );
   const [mode, setMode] = useState<"chat" | "transform">(
     base.mode === "chat" ? "chat" : "transform"
   );
@@ -72,6 +76,9 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     const t = parseFloat(temperature);
     if (temperature.trim() !== "" && !Number.isNaN(t)) spec.temperature = t;
     else delete spec.temperature;
+    const to = parseInt(timeoutSecs, 10);
+    if (timeoutSecs.trim() !== "" && !Number.isNaN(to) && to >= 0) spec.timeout_secs = to;
+    else delete spec.timeout_secs;
     if (mode === "chat" && logName.trim()) spec.log_name = logName.trim();
     else delete spec.log_name;
     // 接続時型チェック・出力の既定（未設定なら補う）。
@@ -228,6 +235,22 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             />
             <span style={{ fontSize: 11, color: "#8a93a8" }}>
               0=厳密 / 0.7=標準 / 高=多様（空欄=モデル既定）
+            </span>
+          </div>
+        )}
+
+        {row(
+          "制限時間",
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <input
+              style={{ ...inp(), width: 100 }}
+              value={timeoutSecs}
+              onChange={(e) => setTimeoutSecs(e.target.value)}
+              placeholder={mode === "chat" ? "空欄=無制限" : "空欄=180"}
+              inputMode="numeric"
+            />
+            <span style={{ fontSize: 11, color: "#8a93a8" }}>
+              秒で打ち切り（0=無制限）。応答が遅い時は延ばすか 0 に
             </span>
           </div>
         )}
