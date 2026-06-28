@@ -1,0 +1,62 @@
+1.録音のボタンを2度以上押すことができるためハングアップする
+icrosoft Windows [Version 10.0.26200.8737]
+(c) Microsoft Corporation. All rights reserved.
+
+C:\Users\yoshi\dev\texos>npm run tauri dev
+
+> texos@1.4.9 tauri
+> tauri dev
+
+     Running BeforeDevCommand (`npm run dev`)
+
+> texos@1.4.9 dev
+> vite
+
+
+  VITE v7.3.5  ready in 286 ms
+
+  ➜  Local:   http://localhost:1420/
+     Running DevCommand (`cargo  run --no-default-features --color always --`)
+        Info Watching C:\Users\yoshi\dev\texos\src-tauri for changes...
+warning: function `store_root` is never used
+ --> src\cas.rs:7:8
+  |
+7 | pub fn store_root(app_data: &Path) -> PathBuf {
+  |        ^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `read_object` is never used
+  --> src\cas.rs:66:8
+   |
+66 | pub fn read_object(root: &Path, hash: &str) -> std::io::Result<Vec<u8>> {
+   |        ^^^^^^^^^^^
+
+warning: function `exists` is never used
+  --> src\cas.rs:71:8
+   |
+71 | pub fn exists(root: &Path, hash: &str) -> bool {
+   |        ^^^^^^
+
+warning: fields `note` and `mode` are never read
+  --> src\flow.rs:58:9
+   |
+ 8 | pub struct FilterSpec {
+   |            ---------- fields in this struct
+...
+58 |     pub note: Option<String>,
+   |         ^^^^
+...
+84 |     pub mode: Option<String>,
+   |         ^^^^
+   |
+   = note: `FilterSpec` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: `texos` (lib) generated 4 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running `target\debug\texos.exe`
+error: process didn't exit successfully: `target\debug\texos.exe` (exit code: 0xcfffffff)
+
+ここでハングアップしている：
+ｖ1.4.9でも起こるのでリファクタリングのせいではないが要修正。
+
