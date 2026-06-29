@@ -38,6 +38,8 @@ export function InlineTextEditor({
 }: Props) {
   const [content, setContent] = useState("");
   const [loaded, setLoaded] = useState(false);
+  // v1.4.13 仮身の閲覧で推定したエンコ名（UTF-8 以外のときだけバッジ表示）。
+  const [encoding, setEncoding] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [panelW, setPanelW] = useState(width ?? 360);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -70,19 +72,29 @@ export function InlineTextEditor({
 
   useEffect(() => {
     // v1.3.9: read-only view loads LIVE content by id (no commit); edit loads the file.
-    const loader =
-      readOnly && objId
-        ? invoke<string>("read_view_text", { id: objId })
-        : invoke<string>("read_text_file", { path });
-    loader
-      .then((t) => {
-        setContent(t);
-        setLoaded(true);
-      })
-      .catch((e) => {
-        setContent(`(読み込みに失敗: ${e})`);
-        setLoaded(true);
-      });
+    // v1.4.13: 閲覧は非UTF-8を推定デコードして {text, encoding} を返す（非破壊）。
+    if (readOnly && objId) {
+      invoke<{ text: string; encoding: string }>("read_view_text", { id: objId })
+        .then((r) => {
+          setContent(r.text);
+          setEncoding(r.encoding);
+          setLoaded(true);
+        })
+        .catch((e) => {
+          setContent(`(読み込みに失敗: ${e})`);
+          setLoaded(true);
+        });
+    } else {
+      invoke<string>("read_text_file", { path })
+        .then((t) => {
+          setContent(t);
+          setLoaded(true);
+        })
+        .catch((e) => {
+          setContent(`(読み込みに失敗: ${e})`);
+          setLoaded(true);
+        });
+    }
   }, [path, objId, readOnly]);
 
   const save = async () => {
@@ -130,7 +142,9 @@ export function InlineTextEditor({
         }}
       >
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {readOnly ? "👁 閲覧（読み取り専用）" : `✎ ${fileName}${dirty ? " *" : ""}`}
+          {readOnly
+            ? `👁 閲覧（読み取り専用）${encoding && encoding !== "UTF-8" ? ` ・ ${encoding} 推定` : ""}`
+            : `✎ ${fileName}${dirty ? " *" : ""}`}
         </span>
         <div style={{ display: "flex", gap: 6 }}>
           {readOnly ? (

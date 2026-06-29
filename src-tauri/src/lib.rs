@@ -2624,11 +2624,41 @@ fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
+/// v1.4.13: Decode arbitrary text bytes for a read-only 仮身 view, WITHOUT
+/// touching the source bytes. Tries BOM → strict UTF-8 → chardetng-detected
+/// legacy encoding (Shift_JIS / EUC-JP / UTF-16 …). Converting the file to
+/// UTF-8 (実身化) is the filter pipeline's job, not this view's.
+fn decode_text_bytes(bytes: &[u8]) -> (String, String) {
+    // BOM が付いていればそれを最優先（encoding_rs が BOM 除去まで面倒を見る）。
+    if let Some((enc, _bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        let (cow, _, _) = enc.decode(bytes);
+        return (cow.into_owned(), enc.name().to_string());
+    }
+    // 速い道: 正当な UTF-8 ならそのまま（大半のケース）。
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return (s.to_string(), "UTF-8".to_string());
+    }
+    // それ以外はレガシーエンコーディングを推定してデコード。
+    let mut det = chardetng::EncodingDetector::new();
+    det.feed(bytes, true);
+    let enc = det.guess(None, true);
+    let (cow, _, _) = enc.decode(bytes);
+    (cow.into_owned(), enc.name().to_string())
+}
+
+/// 仮身ビューの読み取り結果。`encoding` は推定に使ったエンコ名（UI のバッジ用）。
+#[derive(Serialize)]
+pub struct ViewText {
+    pub text: String,
+    pub encoding: String,
+}
+
 /// v1.3.9 ①: Read a 仮身's LIVE text content for a read-only inline view,
 /// without committing (= without creating a 実身). Resolves the same window as
-/// 閲覧 (committed → sibling → origin → CAS → fork source) and reads it as UTF-8.
+/// 閲覧 (committed → sibling → origin → CAS → fork source).
+/// v1.4.13: 非UTF-8（Shift_JIS 等）は推定デコードして表示する（非破壊）。
 #[tauri::command]
-fn read_view_text(id: String, state: State<AppState>) -> Result<String, String> {
+fn read_view_text(id: String, state: State<AppState>) -> Result<ViewText, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     let real_id: String = p
@@ -2640,7 +2670,9 @@ fn read_view_text(id: String, state: State<AppState>) -> Result<String, String> 
         )
         .map_err(|e| e.to_string())?;
     let src = resolve_view_path(p, &id, &real_id);
-    std::fs::read_to_string(&src).map_err(|e| e.to_string())
+    let bytes = std::fs::read(&src).map_err(|e| e.to_string())?;
+    let (text, encoding) = decode_text_bytes(&bytes);
+    Ok(ViewText { text, encoding })
 }
 
 /// Write a UTF-8 text file (for file-linked notes → in-canvas editing).
@@ -5834,4 +5866,39 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod text_decode_tests {
+    use super::decode_text_bytes;
+
+    #[test]
+    fn plain_utf8_is_passthrough() {
+        let (text, enc) = decode_text_bytes("あいうABC".as_bytes());
+        assert_eq!(text, "あいうABC");
+        assert_eq!(enc, "UTF-8");
+    }
+
+    #[test]
+    fn shift_jis_is_detected_and_decoded() {
+        // Shift_JIS でエンコードした日本語（read_to_string なら壊れていた入力）。
+        let (bytes, _, had_err) = encoding_rs::SHIFT_JIS.encode("日本語のテキスト");
+        assert!(!had_err);
+        let (text, enc) = decode_text_bytes(&bytes);
+        assert_eq!(text, "日本語のテキスト");
+        assert_eq!(enc, "Shift_JIS");
+    }
+
+    #[test]
+    fn utf16le_bom_is_honored() {
+        // encoding_rs は UTF-16 への encode を持たないので UTF-16LE バイトを手で組む。
+        let s = "BOM付きUTF-16";
+        let mut with_bom = vec![0xFF, 0xFE];
+        for u in s.encode_utf16() {
+            with_bom.extend_from_slice(&u.to_le_bytes());
+        }
+        let (text, enc) = decode_text_bytes(&with_bom);
+        assert_eq!(text, "BOM付きUTF-16");
+        assert_eq!(enc, "UTF-16LE");
+    }
 }

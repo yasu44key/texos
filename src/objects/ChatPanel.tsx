@@ -427,6 +427,10 @@ function Bubble({ role, content }: { role: string; content: string }) {
           lineHeight: 1.5,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
+          // v1.4.13 Canvas の userSelect:none を打ち消し、応答を選択コピー可能に。
+          userSelect: "text",
+          WebkitUserSelect: "text",
+          cursor: "text",
           background: isUser
             ? "var(--chat-bubble-user-bg, #1e3a5a)"
             : "var(--chat-bubble-ai-bg, #1a2620)",

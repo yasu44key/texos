@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# サードパーティ製ツール（nkf 等）の置き場。著作権上リポジトリには含めない。
+/Lib/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
