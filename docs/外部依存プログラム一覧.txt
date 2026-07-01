@@ -1,0 +1,15 @@
+
+gcc
+
+python
+
+ffmpeg
+
+whisper
+
+grep
+
+nkf
+
+pandoc
+
