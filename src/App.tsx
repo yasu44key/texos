@@ -96,6 +96,16 @@ function App() {
   // v1.3 メモ①: カンバス左下に表示するアプリバージョン。
   const [appVersion, setAppVersion] = useState("");
   const [theme, setTheme] = useState<string>(() => localStorage.getItem("texos-theme") ?? "midnight");
+  // v1.4.16 遊び心: 画面全体の明るさ・コントラストのお手軽調整（filter方式・段階値）。
+  const [uiAdjust, setUiAdjust] = useState<{ bright: number; contrast: number }>(() => {
+    try {
+      const s = JSON.parse(localStorage.getItem("texos-ui-adjust") ?? "");
+      if (s && typeof s.bright === "number" && typeof s.contrast === "number") return s;
+    } catch {
+      /* ignore */
+    }
+    return { bright: 0, contrast: 0 };
+  });
   // v1.3.4: メニュー項目の説明ツールチップを出すか（既定オン、設定で切替・永続化）。
   const [showMenuHints, setShowMenuHints] = useState<boolean>(
     () => localStorage.getItem("texos-menu-hints") !== "0"
@@ -388,6 +398,39 @@ function App() {
     else document.documentElement.dataset.texosTheme = theme;
     localStorage.setItem("texos-theme", theme);
   }, [theme]);
+
+  // v1.4.16 遊び心: 明るさ・コントラストのお手軽調整。html に filter をかける
+  // （html＝ビューポートなので fixed 要素＝メニュー/ダイアログの位置はズレない）。
+  useEffect(() => {
+    const { bright, contrast } = uiAdjust;
+    const f =
+      bright === 0 && contrast === 0
+        ? ""
+        : `brightness(${(1 + bright * 0.06).toFixed(3)}) contrast(${(1 + contrast * 0.08).toFixed(3)})`;
+    document.documentElement.style.filter = f;
+    localStorage.setItem("texos-ui-adjust", JSON.stringify(uiAdjust));
+  }, [uiAdjust]);
+
+  const handleUiAdjust = useCallback(
+    (kind: "brighter" | "darker" | "contrastUp" | "contrastDown" | "reset") => {
+      setUiAdjust((prev) => {
+        const clamp = (n: number) => Math.max(-4, Math.min(4, n));
+        switch (kind) {
+          case "brighter":
+            return { ...prev, bright: clamp(prev.bright + 1) };
+          case "darker":
+            return { ...prev, bright: clamp(prev.bright - 1) };
+          case "contrastUp":
+            return { ...prev, contrast: clamp(prev.contrast + 1) };
+          case "contrastDown":
+            return { ...prev, contrast: clamp(prev.contrast - 1) };
+          case "reset":
+            return { bright: 0, contrast: 0 };
+        }
+      });
+    },
+    []
+  );
 
   // Re-check edit state when returning to the window (e.g. after editing externally)
   useEffect(() => {
@@ -3469,6 +3512,47 @@ function App() {
     [notes, pushUndo]
   );
 
+  // v1.4.16 付箋の充実: 付箋の色を設定（color=null で既定の黄へ）。楽観更新＋refresh不要。
+  const handleNoteColor = useCallback(async (id: string, color: string | null) => {
+    try {
+      await invoke("set_note_color", { id, color });
+      setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, color } : n)));
+    } catch (e) {
+      console.error("set_note_color failed", e);
+    }
+  }, []);
+
+  // v1.4.16 付箋の充実: 先頭行を見出しにする（titleSize=null で見出しなし）。
+  const handleNoteTitle = useCallback(async (id: string, titleSize: number | null) => {
+    try {
+      await invoke("set_note_title", { id, titleSize });
+      setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, title_size: titleSize } : n)));
+    } catch (e) {
+      console.error("set_note_title failed", e);
+    }
+  }, []);
+
+  // 自由なカラーピッカー: 一時的な <input type=color> を生成してダイアログを開く。
+  const handleNoteColorPick = useCallback(
+    (id: string) => {
+      const cur = notesRef.current.find((n) => n.id === id)?.color;
+      const input = document.createElement("input");
+      input.type = "color";
+      input.value = cur && /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : "#3a3520";
+      input.style.position = "fixed";
+      input.style.left = "-9999px";
+      document.body.appendChild(input);
+      const done = () => {
+        const v = input.value;
+        input.remove();
+        handleNoteColor(id, v);
+      };
+      input.addEventListener("change", done, { once: true });
+      input.click();
+    },
+    [handleNoteColor]
+  );
+
   const handleDeleteNote = useCallback(async (id: string) => {
     try {
       await invoke("delete_note", { id });
@@ -3534,6 +3618,7 @@ function App() {
         cleanCaches: handleCleanCaches,
         gcCas: handleGcCas,
         setTheme,
+        uiAdjust: handleUiAdjust,
         toggleMenuHints: () =>
           setShowMenuHints((v) => {
             const nv = !v;
@@ -3600,6 +3685,9 @@ function App() {
         bringToFront: handleBringToFront,
         sendToBack: handleSendToBack,
         noteStyle: handleNoteStyle,
+        noteColor: handleNoteColor,
+        noteColorPick: handleNoteColorPick,
+        noteTitle: handleNoteTitle,
         noteToTextCard: handleNoteToTextCard,
         deleteNote: handleDeleteNote,
         shapeClickSelect: handleShapeClickSelect,
@@ -3710,6 +3798,7 @@ function App() {
       handleSendSelectionPickFolder,
       handleCleanCaches,
       handleGcCas,
+      handleUiAdjust,
       handleViewTemp,
       handleNewSubproject,
       handleLinkProject,
@@ -3720,6 +3809,9 @@ function App() {
       handleChangeUrl,
       handleSetMemo,
       handleNoteStyle,
+      handleNoteColor,
+      handleNoteColorPick,
+      handleNoteTitle,
       handleEditInCanvas,
       handleExpandView,
       handleCollapse,
@@ -4011,6 +4103,8 @@ function App() {
             width={n.width}
             fontSize={n.font_size}
             bold={n.bold}
+            color={n.color}
+            titleSize={n.title_size}
             fileRef={n.file_ref}
             startEditing={n.id === newNoteId}
             zIndex={objects.length + 10}

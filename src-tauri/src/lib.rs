@@ -165,6 +165,9 @@ pub struct NoteInfo {
     pub font_size: f64,
     pub bold: bool,
     pub file_ref: Option<String>,
+    // v1.4.16 付箋の充実: 色（NULL=既定の黄）と見出し行フォントサイズ（NULL=見出しなし）。
+    pub color: Option<String>,
+    pub title_size: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -359,8 +362,8 @@ fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), String> {
                    SELECT 1 FROM main.notes dn
                    WHERE dn.deleted_at IS NOT NULL AND (dn.id = rel.from_id OR dn.id = rel.to_id)
                  );
-             INSERT INTO fork.notes (id,text,pos_x,pos_y,created_at,width,font_size,bold,file_ref)
-               SELECT id,text,pos_x,pos_y,created_at,width,font_size,bold,NULL FROM main.notes
+             INSERT INTO fork.notes (id,text,pos_x,pos_y,created_at,width,font_size,bold,file_ref,color,title_size)
+               SELECT id,text,pos_x,pos_y,created_at,width,font_size,bold,NULL,color,title_size FROM main.notes
                WHERE deleted_at IS NULL;
              INSERT INTO fork.shapes
                (id,kind,pos_x,pos_y,width,height,rotation,fill,opacity,z_order,label,created_at)
@@ -1908,23 +1911,38 @@ fn send_selection_to_project(
         // コメント（付箋）。file_ref は元のコミット先を指すので NULL にリセット（fork と同様）。
         for old_id in &note_ids {
             let new_id = id_map.get(old_id).unwrap().clone();
-            let n: Option<(String, f64, f64, f64, f64, i64)> = p
+            let n: Option<(String, f64, f64, f64, f64, i64, Option<String>, Option<f64>)> = p
                 .conn
                 .query_row(
-                    "SELECT text,pos_x,pos_y,width,font_size,bold FROM main.notes
+                    "SELECT text,pos_x,pos_y,width,font_size,bold,color,title_size FROM main.notes
                      WHERE id = ?1 AND deleted_at IS NULL",
                     rusqlite::params![old_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
-            let Some((text, x, y, width, font_size, bold)) = n else { continue };
+            let Some((text, x, y, width, font_size, bold, color, title_size)) = n else {
+                continue;
+            };
             p.conn
                 .execute(
                     "INSERT INTO dst.notes
-                        (id,text,pos_x,pos_y,created_at,width,font_size,bold,file_ref)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
-                    rusqlite::params![new_id, text, x, y, db::now_ms(), width, font_size, bold],
+                        (id,text,pos_x,pos_y,created_at,width,font_size,bold,file_ref,color,title_size)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9,?10)",
+                    rusqlite::params![
+                        new_id, text, x, y, db::now_ms(), width, font_size, bold, color, title_size
+                    ],
                 )
                 .map_err(|e| e.to_string())?;
             moved += 1;
@@ -2945,7 +2963,7 @@ fn list_notes(state: State<AppState>) -> Result<Vec<NoteInfo>, String> {
     let mut stmt = p
         .conn
         .prepare(
-            "SELECT id, text, pos_x, pos_y, width, font_size, bold, file_ref
+            "SELECT id, text, pos_x, pos_y, width, font_size, bold, file_ref, color, title_size
              FROM notes WHERE deleted_at IS NULL ORDER BY created_at",
         )
         .map_err(|e| e.to_string())?;
@@ -2960,6 +2978,8 @@ fn list_notes(state: State<AppState>) -> Result<Vec<NoteInfo>, String> {
                 font_size: row.get(5)?,
                 bold: row.get::<_, i64>(6)? != 0,
                 file_ref: row.get(7)?,
+                color: row.get(8)?,
+                title_size: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -3051,6 +3071,39 @@ fn set_note_style(
         .execute(
             "UPDATE notes SET width = ?1, font_size = ?2, bold = ?3 WHERE id = ?4",
             rusqlite::params![width, font_size, bold as i64, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// v1.4.16 付箋の充実: 付箋の色を設定（`color=None` で既定＝テーマの黄に戻す）。
+#[tauri::command]
+fn set_note_color(id: String, color: Option<String>, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    p.conn
+        .execute(
+            "UPDATE notes SET color = ?1 WHERE id = ?2",
+            rusqlite::params![color, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// v1.4.16 付箋の充実: 先頭行を見出しにするフォントサイズを設定（`title_size=None` で
+/// 見出しなし＝全体を本文サイズで表示）。
+#[tauri::command]
+fn set_note_title(
+    id: String,
+    title_size: Option<f64>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    p.conn
+        .execute(
+            "UPDATE notes SET title_size = ?1 WHERE id = ?2",
+            rusqlite::params![title_size, id],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -7001,6 +7054,8 @@ pub fn run() {
             move_note,
             delete_note,
             set_note_style,
+            set_note_color,
+            set_note_title,
             create_note_linked,
             commit_note_to_file,
             read_text_file,

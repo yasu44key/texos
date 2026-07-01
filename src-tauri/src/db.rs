@@ -140,6 +140,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE notes ADD COLUMN file_ref TEXT", []);
+    // v1.4.16 付箋の充実: 付箋の色（NULL = テーマ既定の黄）と先頭行を見出しにする
+    // ときの見出しフォントサイズ（NULL = 見出しなし＝全体を font_size で表示）。
+    let _ = conn.execute("ALTER TABLE notes ADD COLUMN color TEXT", []);
+    let _ = conn.execute("ALTER TABLE notes ADD COLUMN title_size REAL", []);
     let _ = conn.execute(
         "ALTER TABLE virtual_bodies ADD COLUMN expanded INTEGER NOT NULL DEFAULT 0",
         [],

@@ -336,6 +336,233 @@
   --tip-text: #e8edf5;
 }
 
+/* ===== v1.4.16 遊び心: カラフルなプリセット ============================== */
+
+/* 明るい系テーマ共通の“クローム”（パネル/メニュー/ツールチップ/フィルタ面/チャット吹き出し）。
+   各テーマはキャンバス・カード・付箋・アクセント・矢印の色味だけを上書きする（重複を抑える）。 */
+[data-texos-theme="pastel-cool"],
+[data-texos-theme="pastel-warm"],
+[data-texos-theme="spring"],
+[data-texos-theme="summer"],
+[data-texos-theme="winter"] {
+  --card-text: #24303f;
+  --card-label-bg: #ffffffcc;
+  --card-bg-filter: #e3f4ea;
+  --card-bg-filter-cmd: #e0f2f2;
+  --card-bg-filter-gen: #f7eed9;
+  --card-bg-drop: #e6f1fb;
+  --card-bg-launcher: #e4f2ea;
+  --card-filter-text: #1f7a55;
+  --card-filter-cmd-text: #1d7777;
+  --card-filter-gen-text: #9a6a1f;
+  --card-drop-text: #1f6db5;
+  --card-launcher-text: #1f7a55;
+  --panel-bg: #ffffff;
+  --panel-header-bg: #eef1f7;
+  --panel-header-text: #2a3550;
+  --panel-text: #1c2433;
+  --panel-muted: #6a7384;
+  --panel-border: #cdd6e4;
+  --panel-input-bg: #f6f8fc;
+  --panel-btn-bg: #5a6678;
+  --panel-checker-a: #e2e6ee;
+  --panel-checker-b: #f2f4f9;
+  --panel-danger: #c0392b;
+  --chat-bubble-user-bg: #dceafc;
+  --chat-bubble-user-text: #14365e;
+  --chat-bubble-user-border: #aecbed;
+  --chat-bubble-ai-bg: #e3f1e9;
+  --chat-bubble-ai-text: #173a2c;
+  --chat-bubble-ai-border: #abd3bf;
+  --menu-bg: #ffffff;
+  --menu-border: #cdd6e4;
+  --menu-text: #1c2433;
+  --menu-dim: #9aa3b4;
+  --menu-hover: #eef2f8;
+  --menu-danger: #c0392b;
+  --menu-danger-bg: #fbe9e7;
+  --tip-bg: #2a3344;
+  --tip-text: #e8edf5;
+  --card-shadow: 0 2px 12px #00000022;
+  --arrow-width: 2.1;
+}
+
+/* パステル（クール）＝ラベンダー×ソフトブルー */
+[data-texos-theme="pastel-cool"] {
+  --canvas-bg: #eef1fb;
+  --canvas-bg-drag: #e0e7f8;
+  --card-bg: #ffffff;
+  --card-bg-url: #e9eefc;
+  --card-bg-project: #efeafb;
+  --card-bg-folder: #eef1f8;
+  --note-bg: #e7ecfb;
+  --note-border: #b9c4ea;
+  --note-text: #2a3352;
+  --note-edit-bg: #f2f5ff;
+  --linked-note-bg: #e2f0ec;
+  --linked-note-border: #9dc9ba;
+  --linked-note-text: #204035;
+  --arrow-color: #7d8fd6;
+  --arrow-temp: #a3b3ef;
+  --accent: #7d8fd6;
+  --chrome-bg: #ffffffd9;
+  --chrome-border: #d0d8ec;
+  --chrome-text: #3a4568;
+}
+
+/* パステル（ウォーム）＝ピーチ×クリーム */
+[data-texos-theme="pastel-warm"] {
+  --canvas-bg: #f8f0ea;
+  --canvas-bg-drag: #f3e4d8;
+  --card-bg: #fffaf6;
+  --card-bg-url: #fdeee6;
+  --card-bg-project: #f7ebe6;
+  --card-bg-folder: #f9f0df;
+  --note-bg: #fdeede;
+  --note-border: #e6c9a8;
+  --note-text: #4a3624;
+  --note-edit-bg: #fff6ec;
+  --linked-note-bg: #eef1e0;
+  --linked-note-border: #c2c98f;
+  --linked-note-text: #3a3e20;
+  --arrow-color: #d98a6a;
+  --arrow-temp: #eeae92;
+  --accent: #d98a6a;
+  --chrome-bg: #fffaf6d9;
+  --chrome-border: #ecd8c8;
+  --chrome-text: #5a4636;
+}
+
+/* スプリング（春）＝新緑×ソフトピンク */
+[data-texos-theme="spring"] {
+  --canvas-bg: #eef7ec;
+  --canvas-bg-drag: #e0f0dc;
+  --card-bg: #ffffff;
+  --card-bg-url: #e9f5ec;
+  --card-bg-project: #f3ecf7;
+  --card-bg-folder: #f4f6e2;
+  --note-bg: #fbeef2;
+  --note-border: #e6b9c8;
+  --note-text: #4a2a38;
+  --note-edit-bg: #fff2f6;
+  --linked-note-bg: #e2f0e0;
+  --linked-note-border: #a0c99a;
+  --linked-note-text: #234020;
+  --arrow-color: #5fae6a;
+  --arrow-temp: #86c98e;
+  --accent: #5fae6a;
+  --chrome-bg: #ffffffd9;
+  --chrome-border: #cfe4cb;
+  --chrome-text: #2e4a2e;
+}
+
+/* サマー（夏）＝アクア×サニーイエロー */
+[data-texos-theme="summer"] {
+  --canvas-bg: #e6f5f7;
+  --canvas-bg-drag: #d3edf1;
+  --card-bg: #ffffff;
+  --card-bg-url: #e2f3f6;
+  --card-bg-project: #eaf0fa;
+  --card-bg-folder: #fdf4d9;
+  --note-bg: #fff3c9;
+  --note-border: #e6cf7a;
+  --note-text: #4a3d14;
+  --note-edit-bg: #fffbe2;
+  --linked-note-bg: #d8f0ea;
+  --linked-note-border: #7ec4b2;
+  --linked-note-text: #1d403a;
+  --arrow-color: #1fb0c0;
+  --arrow-temp: #58cdd9;
+  --accent: #1fb0c0;
+  --chrome-bg: #ffffffd9;
+  --chrome-border: #c6e2e6;
+  --chrome-text: #1d5058;
+}
+
+/* ウィンター（冬）＝アイシーブルー */
+[data-texos-theme="winter"] {
+  --canvas-bg: #eef2f8;
+  --canvas-bg-drag: #dfe8f4;
+  --card-bg: #fbfdff;
+  --card-bg-url: #e8f0fb;
+  --card-bg-project: #eceef7;
+  --card-bg-folder: #eef2f6;
+  --note-bg: #e8eef6;
+  --note-border: #bcccdf;
+  --note-text: #2a3648;
+  --note-edit-bg: #f4f8fd;
+  --linked-note-bg: #dfeef0;
+  --linked-note-border: #a3c8cc;
+  --linked-note-text: #1f3a3d;
+  --arrow-color: #5a86b8;
+  --arrow-temp: #86a8d2;
+  --accent: #5a86b8;
+  --chrome-bg: #fbfdffd9;
+  --chrome-border: #ccd8e6;
+  --chrome-text: #33445c;
+}
+
+/* ビビッド＝暗い下地にネオンのアクセント（暗い系＝パネルは :root の暗色を継承） */
+[data-texos-theme="vivid"] {
+  --canvas-bg: #12101e;
+  --canvas-bg-drag: #1e1836;
+  --card-bg: #1a1730;
+  --card-bg-url: #201a44;
+  --card-bg-project: #2a1a40;
+  --card-bg-folder: #2a2418;
+  --card-text: #ece6ff;
+  --note-bg: #3a1f44;
+  --note-border: #7a3f8a;
+  --note-text: #f6e6ff;
+  --note-edit-bg: #2c1834;
+  --linked-note-bg: #163040;
+  --linked-note-border: #2f7f8a;
+  --linked-note-text: #dff4ff;
+  --arrow-color: #ff4d9d;
+  --arrow-temp: #ff86c0;
+  --arrow-width: 2.4;
+  --accent: #ff4d9d;
+  --chrome-bg: #1a1730cc;
+  --chrome-border: #3a2f5e;
+  --chrome-text: #e0d4ffcc;
+  --menu-bg: #1a1730;
+  --menu-border: #3a2f5e;
+  --menu-text: #ece6ff;
+  --menu-hover: #2a2346;
+}
+
+/* オータム（秋）＝ブラウン×パンプキンオレンジ（暗い系） */
+[data-texos-theme="autumn"] {
+  --canvas-bg: #241813;
+  --canvas-bg-drag: #33221a;
+  --card-bg: #2e2019;
+  --card-bg-url: #33241a;
+  --card-bg-project: #3a2620;
+  --card-bg-folder: #3a2e1a;
+  --card-text: #f0dcc4;
+  --note-bg: #422a18;
+  --note-border: #7a5230;
+  --note-text: #f6e2c8;
+  --note-edit-bg: #33210f;
+  --linked-note-bg: #3a3620;
+  --linked-note-border: #7a6a3a;
+  --linked-note-text: #efe6c8;
+  --arrow-color: #e0762e;
+  --arrow-temp: #f0995a;
+  --accent: #e0762e;
+  --chrome-bg: #2e2019cc;
+  --chrome-border: #4a3524;
+  --chrome-text: #e8d4bccc;
+  --menu-bg: #2e2019;
+  --menu-border: #4a3524;
+  --menu-text: #f0dcc4;
+  --menu-hover: #3a281c;
+  --menu-danger: #ff9b7b;
+  --menu-danger-bg: #4a2418;
+  --tip-bg: #241813;
+  --tip-text: #d8c4a8;
+}
+
 body {
   overflow: hidden;
   background: var(--canvas-bg);

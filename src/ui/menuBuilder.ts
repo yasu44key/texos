@@ -45,6 +45,8 @@ export interface MenuActions {
   // v1.4.15 データの掃除B（正規化）: どのカードからも参照されない孤立CASデータを削除。
   gcCas: () => void;
   setTheme: (key: string) => void;
+  // v1.4.16 遊び心: 画面全体の明るさ・コントラストのお手軽調整。
+  uiAdjust: (kind: "brighter" | "darker" | "contrastUp" | "contrastDown" | "reset") => void;
   // v1.3.4: メニューの説明ツールチップ表示のオン/オフ。
   toggleMenuHints: () => void;
   switchProject: () => void;
@@ -100,6 +102,11 @@ export interface MenuActions {
   sendToBack: (id: string) => void;
   // コメント（付箋）
   noteStyle: (id: string, fontSize: number, bold: boolean) => void;
+  // v1.4.16 付箋の充実: 色を設定（null=既定の黄に戻す）／自由なカラーピッカーを開く。
+  noteColor: (id: string, color: string | null) => void;
+  noteColorPick: (id: string) => void;
+  // v1.4.16 付箋の充実: 先頭行を見出しにするフォントサイズ（null=見出しなし）。
+  noteTitle: (id: string, titleSize: number | null) => void;
   // v1.3.5: コメント内容から独立したテキスト仮身カードを作成（実身化の後継）。
   noteToTextCard: (id: string) => void;
   deleteNote: (id: string) => void;
@@ -194,20 +201,87 @@ export function buildBulkItems(
   ];
 }
 
+// v1.4.16 付箋の充実: テーマ（暗色）に馴染む控えめな付箋カラーのパレット。
+// 値は付箋の背景色（hex）。文字色・枠は NoteCard が明度から自動決定する。
+export const NOTE_COLORS: [string, string][] = [
+  ["イエロー", "#3f3a1e"],
+  ["オレンジ", "#402c1c"],
+  ["グリーン", "#233c2b"],
+  ["ティール", "#1f332f"],
+  ["ブルー", "#223247"],
+  ["パープル", "#322544"],
+  ["ピンク", "#3f2330"],
+  ["グレー", "#2f3542"],
+];
+
 export function buildNoteMenu(
   noteId: string,
   note: NoteInfo | undefined,
   a: MenuActions
 ): MenuItem[] {
-  const cur = note ?? { font_size: 13, bold: false };
+  const cur = note ?? { font_size: 13, bold: false, title_size: null };
+  const bodySizes: [string, number][] = [
+    ["極小", 11],
+    ["小", 13],
+    ["中", 15],
+    ["大", 18],
+    ["特大", 24],
+  ];
+  const titleSizes: [string, number][] = [
+    ["小", 18],
+    ["中", 22],
+    ["大", 28],
+    ["特大", 36],
+  ];
   return [
     { label: note?.file_ref ? "リンクテキスト" : "コメント", onClick: () => {}, disabled: true },
-    { label: "見出し（大）", onClick: () => a.noteStyle(noteId, 24, true) },
-    { label: "小見出し（中）", onClick: () => a.noteStyle(noteId, 17, true) },
-    { label: "本文（小）", onClick: () => a.noteStyle(noteId, 13, false) },
+    {
+      label: "文字サイズ ...",
+      hint: "本文（見出し行以外）のフォントサイズを選びます。",
+      onClick: () =>
+        a.openSubmenu(
+          bodySizes.map(([n, s]) => ({
+            label: (Math.round(cur.font_size) === s ? "✓ " : "　") + `${n}（${s}）`,
+            onClick: () => a.noteStyle(noteId, s, cur.bold),
+          }))
+        ),
+    },
     {
       label: cur.bold ? "太字を解除" : "太字",
       onClick: () => a.noteStyle(noteId, cur.font_size, !cur.bold),
+    },
+    {
+      label: "見出し行 ...",
+      hint: "先頭行を見出しとして大きく太字で表示します（残りは本文サイズ）。マップの案内役に。",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: (cur.title_size == null ? "✓ " : "　") + "オフ（見出しなし）",
+            onClick: () => a.noteTitle(noteId, null),
+          },
+          ...titleSizes.map(([n, s]) => ({
+            label: (cur.title_size === s ? "✓ " : "　") + `${n}（${s}）`,
+            onClick: () => a.noteTitle(noteId, s),
+          })),
+        ]),
+    },
+    {
+      label: "色 ...",
+      hint: "付箋の色を変えます。マップの案内役として色分けできます。",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "標準（既定の黄）",
+            swatch: "#3a3520",
+            onClick: () => a.noteColor(noteId, null),
+          },
+          ...NOTE_COLORS.map(([name, hex]) => ({
+            label: name,
+            swatch: hex,
+            onClick: () => a.noteColor(noteId, hex),
+          })),
+          { label: "その他の色...", onClick: () => a.noteColorPick(noteId) },
+        ]),
     },
     // v1.3.5: コメントの内容から独立したテキスト仮身カードを作る（コメントは不変）。
     // コピペで作るテキスト仮身（create_text_object）と全く同じ。実身化（旧）は廃止。
@@ -745,6 +819,40 @@ interface CanvasMenuCtx {
   menuHints: boolean;
 }
 
+// v1.4.16: UIカラーの連続比較用サブメニュー。選んでもメニューは閉じず（keepOpen）、
+// ✓ を選択中テーマへ付け替えて開き直す。末尾の OK で閉じる。
+function themeSubmenu(a: MenuActions, sel: string): MenuItem[] {
+  return [
+    ...THEMES.map(([key, name]) => ({
+      label: (sel === key ? "✓ " : "　") + name,
+      keepOpen: true,
+      onClick: () => {
+        a.setTheme(key);
+        a.openSubmenu(themeSubmenu(a, key));
+      },
+    })),
+    DIV,
+    { label: "OK（閉じる）", onClick: () => {} },
+  ];
+}
+
+// v1.4.16: 明るさ・コントラストの連続操作用サブメニュー（keepOpen）。OK で閉じる。
+function adjustSubmenu(a: MenuActions): MenuItem[] {
+  const item = (
+    label: string,
+    kind: "brighter" | "darker" | "contrastUp" | "contrastDown" | "reset"
+  ): MenuItem => ({ label, keepOpen: true, onClick: () => a.uiAdjust(kind) });
+  return [
+    item("明るく", "brighter"),
+    item("暗く", "darker"),
+    item("コントラストを強く", "contrastUp"),
+    item("コントラストを弱く", "contrastDown"),
+    item("調整をリセット", "reset"),
+    DIV,
+    { label: "OK（閉じる）", onClick: () => {} },
+  ];
+}
+
 export function buildCanvasMenu(
   pos: { canvasX: number; canvasY: number },
   ctx: CanvasMenuCtx,
@@ -939,13 +1047,14 @@ export function buildCanvasMenu(
     // ── 設定系 ──
     {
       label: "UIカラー ...",
-      onClick: () =>
-        a.openSubmenu(
-          THEMES.map(([key, name]) => ({
-            label: (ctx.theme === key ? "✓ " : "　") + name,
-            onClick: () => a.setTheme(key),
-          }))
-        ),
+      // v1.4.16: 連続で見比べられるよう、選んでもメニューは開いたまま（keepOpen）。
+      // 選ぶたびに ✓ が付いた状態で開き直し、OK で閉じる。
+      onClick: () => a.openSubmenu(themeSubmenu(a, ctx.theme)),
+    },
+    {
+      label: "明るさ・コントラスト ...",
+      hint: "画面全体をワンタッチで明るく／暗く、コントラストを強く／弱く調整します（テーマはそのまま）。連続で操作でき、OKで閉じます。",
+      onClick: () => a.openSubmenu(adjustSubmenu(a)),
     },
     {
       // v1.3.4: メニュー項目の説明ツールチップを出すか。慣れたらオフにできる。

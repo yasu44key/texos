@@ -1,6 +1,40 @@
 import { useRef, useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+// v1.4.16 付箋の充実: 付箋色（hex）から背景・枠・文字色を決める。色未指定（null）は
+// 従来どおりテーマ CSS 変数（fileRef 有無で黄／ティール）。明度で文字色を自動反転。
+function noteColors(color: string | null | undefined, fileRef: string | null) {
+  const m = color ? /^#?([0-9a-fA-F]{6})$/.exec(color.trim()) : null;
+  if (m) {
+    const hex = `#${m[1]}`;
+    const n = parseInt(m[1], 16);
+    const r = (n >> 16) & 255;
+    const g = (n >> 8) & 255;
+    const b = n & 255;
+    const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    const dark = lum < 0.5;
+    return {
+      bg: hex,
+      editBg: hex,
+      border: dark ? "rgba(255,255,255,0.28)" : "rgba(0,0,0,0.32)",
+      text: dark ? "#f3ecd0" : "#161616",
+    };
+  }
+  return fileRef
+    ? {
+        bg: "var(--linked-note-bg, #1f2c2a)",
+        editBg: "var(--linked-note-bg, #162421)",
+        border: "var(--linked-note-border, #3c6b5e)",
+        text: "var(--linked-note-text, #dff0ea)",
+      }
+    : {
+        bg: "var(--note-bg, #3a3520)",
+        editBg: "var(--note-edit-bg, #2c2818)",
+        border: "var(--note-border, #6b5f2e)",
+        text: "var(--note-text, #f3ecd0)",
+      };
+}
+
 interface Props {
   id: string;
   text: string;
@@ -9,6 +43,9 @@ interface Props {
   width?: number;
   fontSize?: number;
   bold?: boolean;
+  color?: string | null;
+  /** v1.4.16: 先頭行を見出しにするフォントサイズ（null=見出しなし）。 */
+  titleSize?: number | null;
   fileRef?: string | null;
   startEditing?: boolean;
   /** stacking order (kept above plain cards, below expanded panels) */
@@ -32,10 +69,11 @@ interface Props {
 
 export function NoteCard({
   id, text, x, y,
-  width = 220, fontSize = 13, bold = false, fileRef = null,
+  width = 220, fontSize = 13, bold = false, color = null, titleSize = null, fileRef = null,
   startEditing, zIndex = 0, selected = false,
   onToggleSelect, onSelect, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onSave, onResize,
 }: Props) {
+  const c = noteColors(color, fileRef);
   const posRef = useRef({ x, y });
   posRef.current = { x, y };
   const [editing, setEditing] = useState(!!startEditing);
@@ -153,13 +191,13 @@ export function NoteCard({
         width,
         minHeight: 40,
         zIndex,
-        background: fileRef ? "var(--linked-note-bg, #1f2c2a)" : "var(--note-bg, #3a3520)",
-        border: `1px solid ${fileRef ? "var(--linked-note-border, #3c6b5e)" : "var(--note-border, #6b5f2e)"}`,
+        background: c.bg,
+        border: `1px solid ${c.border}`,
         borderRadius: 8,
         boxShadow: "var(--card-shadow, 0 2px 14px #00000070)",
         outline: selected ? "2px solid var(--accent, #4a90d9)" : "none",
         outlineOffset: 1,
-        color: fileRef ? "var(--linked-note-text, #dff0ea)" : "var(--note-text, #f3ecd0)",
+        color: c.text,
         fontSize,
         fontWeight: bold ? 700 : 400,
         fontFamily: "sans-serif",
@@ -204,7 +242,7 @@ export function NoteCard({
             minHeight: 100,
             boxSizing: "border-box",
             resize: "vertical",
-            background: fileRef ? "var(--linked-note-bg, #162421)" : "var(--note-edit-bg, #2c2818)",
+            background: c.editBg,
             border: "none",
             outline: "none",
             color: "inherit",
@@ -217,7 +255,33 @@ export function NoteCard({
           }}
         />
       ) : content ? (
-        content
+        titleSize ? (
+          // v1.4.16: 先頭行を見出し（大きく太字）、以降を本文サイズで表示。
+          (() => {
+            const nl = content.indexOf("\n");
+            const head = nl === -1 ? content : content.slice(0, nl);
+            const body = nl === -1 ? "" : content.slice(nl + 1);
+            return (
+              <>
+                <div style={{ fontSize: titleSize, fontWeight: 700, lineHeight: 1.3 }}>{head}</div>
+                {body && (
+                  <div
+                    style={{
+                      fontSize,
+                      fontWeight: bold ? 700 : 400,
+                      lineHeight: 1.5,
+                      marginTop: 4,
+                    }}
+                  >
+                    {body}
+                  </div>
+                )}
+              </>
+            );
+          })()
+        ) : (
+          content
+        )
       ) : (
         <span style={{ opacity: 0.55, fontWeight: 400 }}>（ダブルクリックで編集）</span>
       )}

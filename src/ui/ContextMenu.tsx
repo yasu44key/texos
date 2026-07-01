@@ -11,6 +11,10 @@ export interface MenuItem {
   divider?: boolean;
   // v1.3.7: 対応するショートカット（"Ctrl+C" 等）。ラベル右に淡色で併記。
   shortcut?: string;
+  // v1.4.16: 付箋の色メニュー等でラベル左に出す色スウォッチ（hex）。
+  swatch?: string;
+  // v1.4.16: クリックしてもメニューを閉じない（連続で試す用。OK項目で閉じる）。
+  keepOpen?: boolean;
 }
 
 interface ContextMenuProps {
@@ -94,7 +98,7 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
               onClick={() => {
                 if (item.disabled) return;
                 item.onClick();
-                onClose();
+                if (!item.keepOpen) onClose();
               }}
               style={{
                 display: "flex",
@@ -131,7 +135,21 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
                 setTip(null);
               }}
             >
-              <span>{item.label}</span>
+              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                {item.swatch && (
+                  <span
+                    style={{
+                      width: 13,
+                      height: 13,
+                      borderRadius: 3,
+                      background: item.swatch,
+                      border: "1px solid #ffffff40",
+                      flex: "0 0 auto",
+                    }}
+                  />
+                )}
+                {item.label}
+              </span>
               {item.shortcut && (
                 <span style={{ color: "var(--menu-dim, #5a6378)", fontSize: 11, whiteSpace: "nowrap" }}>
                   {item.shortcut}

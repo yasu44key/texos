@@ -39,6 +39,9 @@ export interface NoteInfo {
   font_size: number;
   bold: boolean;
   file_ref: string | null;
+  // v1.4.16 付箋の充実: 色（null=既定の黄）と見出し行フォントサイズ（null=見出しなし）。
+  color: string | null;
+  title_size: number | null;
 }
 
 export const PROJECT_MIME = "application/vnd.texos.project";
@@ -115,6 +118,14 @@ export const THEMES: [string, string][] = [
   ["slate", "中間・暗め（スレート）"],
   ["warm", "色調重視（セピア）"],
   ["calm", "疲労防止（低刺激）"],
+  // v1.4.16 遊び心: カラフルなプリセット（明るい系5＋暗い系2）。
+  ["pastel-cool", "パステル（クール）"],
+  ["pastel-warm", "パステル（ウォーム）"],
+  ["spring", "スプリング（春）"],
+  ["summer", "サマー（夏）"],
+  ["winter", "ウィンター（冬）"],
+  ["vivid", "ビビッド"],
+  ["autumn", "オータム（秋）"],
 ];
 
 // v1.3-②: 図形のカラーパレット
