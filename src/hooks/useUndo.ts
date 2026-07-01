@@ -289,6 +289,23 @@ export function useUndo({
     redoStack.current = [];
   }, []);
 
+  // v1.4.15 データの掃除A: 現プロジェクトの UNDO/REDO 履歴を消して DB にも空で永続化する
+  // （resetStacks はメモリだけ・切替時用。こちらは明示クリアなので DB も空にする）。
+  // 戻り値＝消去した履歴エントリ数（掃除ダイアログの表示用）。
+  const clearHistory = useCallback(async () => {
+    const n = undoStack.current.length + redoStack.current.length;
+    if (undoSaveTimer.current) {
+      window.clearTimeout(undoSaveTimer.current);
+      undoSaveTimer.current = null;
+    }
+    undoStack.current = [];
+    redoStack.current = [];
+    await invoke("set_undo_stack", {
+      json: JSON.stringify({ undo: [], redo: [] }),
+    }).catch(() => {});
+    return n;
+  }, []);
+
   // このプロジェクトのDBに保存されている履歴を読み込む（再起動後も続く）。
   const loadStacks = useCallback(() => {
     invoke<string | null>("get_undo_stack")
@@ -320,5 +337,6 @@ export function useUndo({
     applyShapeGeoms,
     resetStacks,
     loadStacks,
+    clearHistory,
   };
 }

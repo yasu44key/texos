@@ -335,6 +335,7 @@ function App() {
     applyShapeGeoms,
     resetStacks,
     loadStacks,
+    clearHistory,
   } = useUndo({ objectsRef, notesRef, shapesRef, setObjects, setNotes, setShapes, refresh });
 
   // Windows: swap in the custom OLE drop target (files + URL drops).
@@ -2148,11 +2149,13 @@ function App() {
   // 対象はファイル系カードのみ — プロジェクト/URL/フォルダリンクはスキップ。
 
   // まとめて実身化（コミット）: 未コミットのファイル系カードを全部実身に。
+  // フィルタ/ランチャー/AI 等の自動化カード（filter_ref を持つ＝中身の実体が無い）は
+  // 実身化の対象外（単体でも実身化コマンドは出さない）。件数表示と挙動を揃える。
   const handleBulkCommit = useCallback(async () => {
     const targets = objectsRef.current.filter(
       (o) =>
         selectedRef.current.has(o.id) &&
-        !o.committed_path && !o.project_ref && !o.url_ref && !o.folder_ref
+        !o.committed_path && !o.project_ref && !o.url_ref && !o.folder_ref && !o.filter_ref
     );
     if (!targets.length) return;
     const done: string[] = [];
@@ -2322,6 +2325,181 @@ function App() {
       setSelectedNotes(new Set(noteIds));
     },
     [setSelected, setSelectedNotes]
+  );
+
+  // v1.4.14 プロジェクト間ワークフロー共有: 選択した部分グラフ（カード＋コメント＋内部の
+  // 関係矢印）を別プロジェクトへ送る。mode="copy"=仮身化してコピー（元に依存・元は残る）/
+  // "move"=実身化して移動（送り先に独立実身・元はソフトデリート＝Ctrl+Z 復活可）。
+  const handleSendSelectionToProject = useCallback(
+    async (mode: "copy" | "move", targetPath: string, targetName: string) => {
+      const cardIds = [...selectedRef.current];
+      const noteIds = [...selectedNotesRef.current];
+      if (!cardIds.length && !noteIds.length) return;
+      const run = async () => {
+        try {
+          const n = await invoke<number>("send_selection_to_project", {
+            cardIds,
+            noteIds,
+            targetPath,
+            moveOut: mode === "move",
+          });
+          if (mode === "move") {
+            await refresh();
+            setConfirm({
+              title: "移動しました",
+              message: `${n}件を「${targetName}」へ移動しました。実体が送り先へ移り、元プロジェクトからは削除されました（Ctrl+Z では復活できません）。送り先を開くと反映されます。`,
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          } else {
+            setConfirm({
+              title: "コピーしました",
+              message: `${n}件を「${targetName}」へ仮身としてコピーしました。送り先プロジェクトを開くと反映されます。`,
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          }
+        } catch (e) {
+          console.error("send_selection_to_project failed", e);
+          setConfirm({
+            title: "送れませんでした",
+            message: String(e),
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+      };
+      if (mode === "move") {
+        const total = cardIds.length + noteIds.length;
+        setConfirm({
+          title: "別プロジェクトへ移動",
+          message: `${total}件を「${targetName}」へ移動します。実体が送り先へ移るため、元プロジェクトからは削除され、Ctrl+Z では復活できません。よろしいですか？（元にも残したい場合は「仮身化してコピー」を使ってください）`,
+          okLabel: "移動する",
+          onConfirm: () => {
+            setConfirm(null);
+            run();
+          },
+        });
+      } else {
+        run();
+      }
+    },
+    [refresh]
+  );
+
+  // v1.4.15 データの掃除A（履歴・キャッシュ）: UNDO/REDO履歴＋サムネイル・一時プレビュー
+  // キャッシュを掃除。ゴミ箱（削除の復活）・孤立CASは対象外（B=正規化GCで別途）。
+  const handleCleanCaches = useCallback(() => {
+    setConfirm({
+      title: "履歴・キャッシュを掃除",
+      message:
+        "UNDO/REDO履歴と、サムネイル・一時プレビューのキャッシュを掃除します。\n\n" +
+        "・UNDO履歴は消え、Ctrl+Z / Ctrl+Y で戻せなくなります（削除の「復活の呪文」＝ゴミ箱は残ります）。\n" +
+        "・キャッシュは必要時に自動で再生成されます。",
+      okLabel: "掃除する",
+      onConfirm: async () => {
+        setConfirm(null);
+        try {
+          const r = await invoke<{
+            thumbs_count: number;
+            thumbs_bytes: number;
+            temp_count: number;
+            temp_bytes: number;
+          }>("clean_caches");
+          const cleared = await clearHistory();
+          const mb = (b: number) => (b / 1048576).toFixed(1);
+          const freed = r.thumbs_bytes + r.temp_bytes;
+          setConfirm({
+            title: "掃除しました",
+            message:
+              `サムネイル ${r.thumbs_count}件・一時プレビュー ${r.temp_count}件（合計 ${mb(freed)}MB）を削除し、` +
+              `UNDO/REDO履歴 ${cleared}件をクリアしました。`,
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        } catch (e) {
+          console.error("clean_caches failed", e);
+          setConfirm({
+            title: "掃除できませんでした",
+            message: String(e),
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+      },
+    });
+  }, [clearHistory]);
+
+  // v1.4.15 データの掃除B（正規化）: どのカードからも参照されない孤立CASを削除。
+  // まず dry-run（gc_cas_scan）で件数・サイズを出し、確認してから gc_cas_clean。
+  const handleGcCas = useCallback(async () => {
+    const mb = (b: number) => (b / 1048576).toFixed(1);
+    try {
+      const s = await invoke<{ orphan_count: number; orphan_bytes: number; total_count: number }>(
+        "gc_cas_scan"
+      );
+      if (!s.orphan_count) {
+        setConfirm({
+          title: "孤立データはありません",
+          message: `CAS 内 ${s.total_count}件はすべて生きたカードから参照されています。削除対象はありませんでした。`,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+      setConfirm({
+        title: "孤立データを削除（正規化）",
+        message:
+          `どのカードからも参照されない実身データ（CAS）${s.orphan_count}件・${mb(s.orphan_bytes)}MB を削除します。\n\n` +
+          "・削除すると元に戻せません（生きたカード・ゴミ箱＝削除の復活・UNDO対象は残ります）。\n" +
+          "・古い（自己完結化前の）フォークが元プロジェクトのデータを参照している場合は、先にそのフォークを作り直してください。",
+        okLabel: "削除する",
+        onConfirm: async () => {
+          setConfirm(null);
+          try {
+            const r = await invoke<{ orphan_count: number; orphan_bytes: number }>("gc_cas_clean");
+            setConfirm({
+              title: "掃除しました",
+              message: `孤立データ ${r.orphan_count}件（${mb(r.orphan_bytes)}MB）を削除しました。`,
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          } catch (e) {
+            console.error("gc_cas_clean failed", e);
+            setConfirm({
+              title: "削除できませんでした",
+              message: String(e),
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          }
+        },
+      });
+    } catch (e) {
+      console.error("gc_cas_scan failed", e);
+      setConfirm({
+        title: "確認できませんでした",
+        message: String(e),
+        okLabel: "OK",
+        onConfirm: () => setConfirm(null),
+      });
+    }
+  }, []);
+
+  // 送り先を最近一覧に無いフォルダから選ぶ（フォールバック）。
+  const handleSendSelectionPickFolder = useCallback(
+    async (mode: "copy" | "move") => {
+      try {
+        const picked = await open({ directory: true, title: "送り先プロジェクトのフォルダを選択" });
+        if (typeof picked === "string") {
+          const name = picked.split(/[\\/]/).filter(Boolean).pop() || picked;
+          await handleSendSelectionToProject(mode, picked, name);
+        }
+      } catch (e) {
+        console.error("pick target project failed", e);
+      }
+    },
+    [handleSendSelectionToProject]
   );
 
   // v1.4.12 #3: Ctrl+左ドラッグでこのカードの仮身（化身）をドロップ位置に作る。
@@ -3353,6 +3531,8 @@ function App() {
         linkProject: handleLinkProject,
         autoLayout: handleAutoLayout,
         commitAll: handleCommitAll,
+        cleanCaches: handleCleanCaches,
+        gcCas: handleGcCas,
         setTheme,
         toggleMenuHints: () =>
           setShowMenuHints((v) => {
@@ -3368,6 +3548,30 @@ function App() {
         bulkCommit: handleBulkCommit,
         bulkUncommit: handleBulkUncommit,
         bulkDelete: handleBulkDelete,
+        // v1.4.14: 選択を別プロジェクトへ（送り先の最近一覧を非同期取得してサブメニューを開く）。
+        sendSelection: async (mode) => {
+          let recents: ProjectInfo[] = [];
+          try {
+            recents = await invoke<ProjectInfo[]>("list_recent_projects");
+          } catch (e) {
+            console.error("list_recent_projects failed", e);
+          }
+          const curPath = currentProjectRef.current?.path;
+          const items = [
+            ...recents
+              .filter((r) => r.path !== curPath)
+              .map((r) => ({
+                label: `📁 ${r.name}`,
+                hint: r.path,
+                onClick: () => handleSendSelectionToProject(mode, r.path, r.name),
+              })),
+            {
+              label: "その他のプロジェクト...",
+              onClick: () => handleSendSelectionPickFolder(mode),
+            },
+          ];
+          window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items }), 0);
+        },
         copyFiles: handleCopyFiles,
         copyImage: handleCopyImage,
         view: handleOpenObject,
@@ -3430,7 +3634,8 @@ function App() {
       const bulkItems = buildBulkItems(
         {
           commitable: selObjs.filter(
-            (o) => !o.committed_path && !o.project_ref && !o.url_ref && !o.folder_ref
+            (o) =>
+              !o.committed_path && !o.project_ref && !o.url_ref && !o.folder_ref && !o.filter_ref
           ).length,
           uncommitable: selObjs.filter(
             (o) => !!o.committed_path && !!o.origin_path && o.origin_path !== o.committed_path
@@ -3501,6 +3706,10 @@ function App() {
       handleUncommit,
       handleDuplicate,
       handleSelectConnected,
+      handleSendSelectionToProject,
+      handleSendSelectionPickFolder,
+      handleCleanCaches,
+      handleGcCas,
       handleViewTemp,
       handleNewSubproject,
       handleLinkProject,

@@ -40,6 +40,10 @@ export interface MenuActions {
   linkProject: (x: number, y: number) => void;
   autoLayout: () => void;
   commitAll: () => void;
+  // v1.4.15 データの掃除A: UNDO/REDO履歴＋サムネイル・一時プレビューのキャッシュを掃除。
+  cleanCaches: () => void;
+  // v1.4.15 データの掃除B（正規化）: どのカードからも参照されない孤立CASデータを削除。
+  gcCas: () => void;
   setTheme: (key: string) => void;
   // v1.3.4: メニューの説明ツールチップ表示のオン/オフ。
   toggleMenuHints: () => void;
@@ -54,6 +58,10 @@ export interface MenuActions {
   bulkCommit: () => void;
   bulkUncommit: () => void;
   bulkDelete: () => void;
+  // v1.4.14: 選択した部分グラフ（カード＋コメント＋内部の関係矢印）を別プロジェクトへ
+  // コピー／移動する。送り先は最近のプロジェクト一覧から選ぶ（sendSelection が非同期で
+  // 一覧を取得してサブメニューを開く）。
+  sendSelection: (mode: "copy" | "move") => void;
   // v1.3.4 クリップボード持ち出し（選択カードをファイルとして）
   copyFiles: (ids: string[]) => void;
   /** v1.3.8 (G6): 画像カードをビットマップ(CF_DIB)としてクリップボードへ。 */
@@ -158,6 +166,24 @@ export function buildBulkItems(
       shortcut: "Ctrl+C",
       disabled: !counts.total,
       onClick: () => a.copyFiles(counts.ids),
+    },
+    {
+      label: "選択を別プロジェクトへ...",
+      hint: "選択したカード・コメントと、その内部の関係矢印を別プロジェクトへコピー／移動します。フィルタ等の設定も引き継ぎます。",
+      disabled: !counts.total,
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "仮身化してコピー...",
+            hint: "送り先には仮身として置きます（中身は元プロジェクトのファイルを指す窓＝元に依存）。元プロジェクトはそのまま残ります。",
+            onClick: () => a.sendSelection("copy"),
+          },
+          {
+            label: "実身化して移動...",
+            hint: "送り先に独立した実身（実ファイル）として置き、元プロジェクトからは削除します。実体が移るため Ctrl+Z では復活できません（元にも残す場合は「仮身化してコピー」を）。",
+            onClick: () => a.sendSelection("move"),
+          },
+        ]),
     },
     {
       label: `まとめて削除（${counts.total}件）`,
@@ -898,6 +924,16 @@ export function buildCanvasMenu(
       label: "すべて実身化（持ち出し）...",
       hint: "プロジェクト内のすべての仮身を実身化し、データをプロジェクトフォルダに書き出します。",
       onClick: () => a.commitAll(),
+    },
+    {
+      label: "履歴・キャッシュを掃除...",
+      hint: "UNDO/REDO履歴と、サムネイル・一時プレビューのキャッシュを掃除します。キャッシュは必要時に自動再生成されます（ゴミ箱＝削除の復活は残ります）。",
+      onClick: () => a.cleanCaches(),
+    },
+    {
+      label: "孤立データを削除（正規化）...",
+      hint: "どのカードからも参照されなくなった実身データ（CAS）を削除して容量を回収します。まず件数・サイズを確認してから実行します（生きたカード・ゴミ箱・履歴は残ります）。",
+      onClick: () => a.gcCas(),
     },
     DIV,
     // ── 設定系 ──

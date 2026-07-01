@@ -1490,6 +1490,158 @@ fn get_undo_stack(state: State<AppState>) -> Result<Option<String>, String> {
     db::meta_get(&p.conn, "ui_undo_stack").map_err(|e| e.to_string())
 }
 
+/// ディレクトリ内のファイル数・合計バイトを再帰集計（存在しなければ 0,0）。
+fn dir_stats(dir: &Path) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            match e.metadata() {
+                Ok(m) if m.is_dir() => {
+                    let (c, b) = dir_stats(&e.path());
+                    count += c;
+                    bytes += b;
+                }
+                Ok(m) => {
+                    count += 1;
+                    bytes += m.len();
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    (count, bytes)
+}
+
+#[derive(Serialize, Default)]
+struct CleanReport {
+    thumbs_count: u64,
+    thumbs_bytes: u64,
+    temp_count: u64,
+    temp_bytes: u64,
+}
+
+/// v1.4.15 データの掃除A（履歴・キャッシュ）: サムネイル（`.texos/thumbs`）と一時プレビュー
+/// （`TEMP/texos_view`）のキャッシュを削除する。どちらも内容アドレス（不変）／一時ファイルで、
+/// 必要時に自動再生成されるので消して安全。UNDO/REDO 履歴のクリアはフロント（useUndo の
+/// clearHistory）が担当。**ゴミ箱（`.texos/trash`＝削除の「復活の呪文」）と孤立CASの掃除は
+/// 本コマンドでは触らない**（B＝正規化GCの担当。到達可能性の判定が要るため別リビジョンで）。
+#[tauri::command]
+fn clean_caches(state: State<AppState>) -> Result<CleanReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let thumbs = texos_dir(&p.root).join("thumbs");
+    let (thumbs_count, thumbs_bytes) = dir_stats(&thumbs);
+    let _ = std::fs::remove_dir_all(&thumbs); // 無ければ無視。次回サムネイル生成で再作成される。
+    let temp = temp_view_dir();
+    let (temp_count, temp_bytes) = dir_stats(&temp);
+    let _ = std::fs::remove_dir_all(&temp);
+    Ok(CleanReport {
+        thumbs_count,
+        thumbs_bytes,
+        temp_count,
+        temp_bytes,
+    })
+}
+
+/// v1.4.15 データの掃除B（正規化＝孤立CASのGC）の中核。CAS 内の全ブロブを走査し、**生きた
+/// 参照に含まれない孤立ブロブ**の一覧（パスとサイズ）と CAS 総数を返す。
+///
+/// 到達可能性（生存）の定義＝**`virtual_bodies` に存在する real_id（deleted_at 問わず）**。
+/// ソフト削除中（ゴミ箱＝復活の呪文で戻せる）カードの実身も生存扱いにするため、行が存在すれば
+/// 参照とみなす。notes は CAS を参照しない。ブロブのハッシュはパス（`<first2>/<rest>`）から
+/// 復元するので中身は読まない。
+///
+/// 注意（既知の限界）: 本判定は**現プロジェクト単体**の視点。v1.3.11 以降のフォークは子CASへ
+/// 内容をスナップして自己完結するため親CASに依存しないが、**それ以前の古いフォークが親（この
+/// プロジェクト）のCASに依存している場合、親でその実身のカードが消えていると孤立扱いになりうる**。
+/// 掃除は dry-run→確認つきで、古いフォークは作り直し（再フォーク／コミット）を案内する。
+fn scan_orphan_cas(p: &Project) -> Result<(Vec<(PathBuf, u64)>, u64), String> {
+    let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let mut stmt = p
+            .conn
+            .prepare("SELECT DISTINCT real_id FROM virtual_bodies")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for r in rows.flatten() {
+            reachable.insert(r);
+        }
+    }
+    let mut orphans: Vec<(PathBuf, u64)> = Vec::new();
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(&p.cas_root) {
+        for sub in rd.flatten() {
+            let subpath = sub.path();
+            let prefix = match subpath.file_name().and_then(|s| s.to_str()) {
+                Some(s) if s.len() == 2 => s.to_string(),
+                _ => continue, // ハッシュの先頭2文字ディレクトリ以外は無視
+            };
+            if let Ok(files) = std::fs::read_dir(&subpath) {
+                for f in files.flatten() {
+                    let meta = match f.metadata() {
+                        Ok(m) if m.is_file() => m,
+                        _ => continue,
+                    };
+                    total += 1;
+                    let Some(rest) = f.file_name().to_str().map(|s| s.to_string()) else {
+                        continue;
+                    };
+                    let hash = format!("{}{}", prefix, rest);
+                    if !reachable.contains(&hash) {
+                        orphans.push((f.path(), meta.len()));
+                    }
+                }
+            }
+        }
+    }
+    Ok((orphans, total))
+}
+
+#[derive(Serialize, Default)]
+struct GcCasReport {
+    orphan_count: u64,
+    orphan_bytes: u64,
+    total_count: u64,
+}
+
+/// B: 孤立CASの dry-run（削除せずに件数・サイズだけ返す。確認ダイアログ用）。
+#[tauri::command]
+fn gc_cas_scan(state: State<AppState>) -> Result<GcCasReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let (orphans, total) = scan_orphan_cas(p)?;
+    let orphan_bytes: u64 = orphans.iter().map(|(_, b)| *b).sum();
+    Ok(GcCasReport {
+        orphan_count: orphans.len() as u64,
+        orphan_bytes,
+        total_count: total,
+    })
+}
+
+/// B: 孤立CASを実際に削除する（元に戻せない・フロントで確認済み前提）。
+#[tauri::command]
+fn gc_cas_clean(state: State<AppState>) -> Result<GcCasReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let (orphans, total) = scan_orphan_cas(p)?;
+    let mut removed = 0u64;
+    let mut freed = 0u64;
+    for (path, bytes) in &orphans {
+        if std::fs::remove_file(path).is_ok() {
+            removed += 1;
+            freed += *bytes;
+        }
+    }
+    Ok(GcCasReport {
+        orphan_count: removed,
+        orphan_bytes: freed,
+        total_count: total,
+    })
+}
+
 #[tauri::command]
 fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, String> {
     let guard = state.current.lock().unwrap();
@@ -1533,6 +1685,345 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
         )
         .map_err(|e| e.to_string())?;
     Ok(vid)
+}
+
+/// v1.4.13 プロジェクト間ワークフロー共有: 選択した部分グラフ（カード＋コメント＋
+/// 選択内どうしの関係矢印）を別プロジェクトの DB+CAS へ書き込む（`fork_structure_into`
+/// を「現プロジェクト全体」から「選択部分グラフ」へ一般化したもの）。
+///   - `move_out=false` ＝仮身化してコピー: 送り先CASへ中身をスナップし、`origin_path` で
+///     元プロジェクトのライブファイルを指す仮身にする（＝跨プロジェクトの窓・元に依存・元は残る）。
+///   - `move_out=true` ＝実身化して移動: 送り先ルートにコミット済みの独立した実身として置き、
+///     元プロジェクトからはソフトデリート（Ctrl+Zで復活可・実ファイルは .texos/trash へ退避）。
+/// フィルタ／ランチャー等の設定（filter_ref/kind/url_ref…）も継承する。プロジェクト境界を
+/// またぐ矢印は張らない（両端が選択内の relations だけ運ぶ）。戻り値＝運んだカード＋コメント数。
+#[tauri::command]
+fn send_selection_to_project(
+    card_ids: Vec<String>,
+    note_ids: Vec<String>,
+    target_path: String,
+    move_out: bool,
+    state: State<AppState>,
+) -> Result<usize, String> {
+    ensure_no_flow_running(state.inner())?;
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+
+    let dest_root = PathBuf::from(&target_path);
+    // 送り先が自分自身は不可。
+    if let (Ok(a), Ok(b)) = (
+        std::fs::canonicalize(&dest_root),
+        std::fs::canonicalize(&p.root),
+    ) {
+        if a == b {
+            return Err("送り先が現在のプロジェクトと同じです".into());
+        }
+    }
+    let dest_db = texos_dir(&dest_root).join("texos.db");
+    if !dest_db.exists() {
+        return Err("送り先はTexoSプロジェクトではありません".into());
+    }
+    let dest_cas = texos_dir(&dest_root).join("cas");
+    std::fs::create_dir_all(&dest_cas).map_err(|e| e.to_string())?;
+
+    // ID再割当（旧→新UUID）。カード・コメント両方を送り先で新IDにして衝突を避け、
+    // window_of・relations 端点を貼り替える。
+    let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for old in card_ids.iter().chain(note_ids.iter()) {
+        id_map.entry(old.clone()).or_insert_with(uuid);
+    }
+
+    struct CardRow {
+        real_id: String,
+        label: String,
+        x: f64,
+        y: f64,
+        kind: Option<String>,
+        filter_ref: Option<String>,
+        url_ref: Option<String>,
+        folder_ref: Option<String>,
+        project_ref: Option<String>,
+        memo: Option<String>,
+        z: i64,
+        ext: Option<String>,
+        mime_type: Option<String>,
+        window_of: Option<String>,
+        mime: String,
+    }
+
+    p.conn
+        .execute(
+            "ATTACH DATABASE ?1 AS dst",
+            rusqlite::params![dest_db.to_string_lossy()],
+        )
+        .map_err(|e| e.to_string())?;
+
+    let result = (|| -> Result<usize, String> {
+        let mut moved = 0usize;
+
+        for old_id in &card_ids {
+            let row: Option<CardRow> = p
+                .conn
+                .query_row(
+                    "SELECT v.real_id, v.label, v.pos_x, v.pos_y, v.kind, v.filter_ref,
+                            v.url_ref, v.folder_ref, v.project_ref, v.memo, v.z_order,
+                            v.ext, v.mime_type, v.window_of,
+                            COALESCE(v.mime_type, r.mime_type)
+                     FROM main.virtual_bodies v JOIN main.real_bodies r ON r.id = v.real_id
+                     WHERE v.id = ?1 AND v.deleted_at IS NULL",
+                    rusqlite::params![old_id],
+                    |r| {
+                        Ok(CardRow {
+                            real_id: r.get(0)?,
+                            label: r.get(1)?,
+                            x: r.get(2)?,
+                            y: r.get(3)?,
+                            kind: r.get(4)?,
+                            filter_ref: r.get(5)?,
+                            url_ref: r.get(6)?,
+                            folder_ref: r.get(7)?,
+                            project_ref: r.get(8)?,
+                            memo: r.get(9)?,
+                            z: r.get(10)?,
+                            ext: r.get(11)?,
+                            mime_type: r.get(12)?,
+                            window_of: r.get(13)?,
+                            mime: r.get(14)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let Some(c) = row else { continue };
+            let new_id = id_map.get(old_id).unwrap().clone();
+            // window_of は指し先が選択内なら新IDへ貼替、選択外なら NULL（跨プロジェクトの
+            // 内部窓は張らない＝実体はスナップ／origin で解決する）。
+            let new_window = c.window_of.as_ref().and_then(|w| id_map.get(w).cloned());
+
+            // 参照する real_body 行を送り先へ（filter/url 等の実体無しカードも型情報を運ぶ）。
+            p.conn
+                .execute(
+                    "INSERT OR IGNORE INTO dst.real_bodies
+                        (id,mime_type,size,created_at,codec_ref,tags,ext)
+                     SELECT id,mime_type,size,created_at,codec_ref,tags,ext
+                     FROM main.real_bodies WHERE id = ?1",
+                    rusqlite::params![c.real_id],
+                )
+                .map_err(|e| e.to_string())?;
+
+            // カード本体を新IDで挿入。committed_path/mtime は一旦 NULL、project_ref は
+            // 持ち出さない（プロジェクト参照は跨がない）。
+            p.conn
+                .execute(
+                    "INSERT INTO dst.virtual_bodies
+                        (id,real_id,label,pos_x,pos_y,created_at,kind,filter_ref,url_ref,
+                         folder_ref,memo,z_order,ext,mime_type,window_of)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                    rusqlite::params![
+                        new_id,
+                        c.real_id,
+                        c.label,
+                        c.x,
+                        c.y,
+                        db::now_ms(),
+                        c.kind,
+                        c.filter_ref,
+                        c.url_ref,
+                        c.folder_ref,
+                        c.memo,
+                        c.z,
+                        c.ext,
+                        c.mime_type,
+                        new_window,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+
+            // ファイル種カード（URL/フォルダ/プロジェクトでない）は中身を送り先へ運ぶ。
+            let is_file = c.kind.as_deref().map(|k| k == "file").unwrap_or(true)
+                && c.url_ref.is_none()
+                && c.folder_ref.is_none()
+                && c.project_ref.is_none();
+            if is_file {
+                let live = resolve_view_path(p, old_id, &c.real_id);
+                if live.is_file() {
+                    // 送り先CASへ内容アドレスでスナップ（新 real_id = H）。
+                    if let Ok(h) = cas::store_file(&dest_cas, &live) {
+                        let size = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0) as i64;
+                        p.conn
+                            .execute(
+                                "INSERT OR IGNORE INTO dst.real_bodies
+                                    (id,mime_type,size,created_at,ext)
+                                 VALUES (?1,?2,?3,?4,?5)",
+                                rusqlite::params![h, c.mime, size, db::now_ms(), c.ext],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        if move_out {
+                            // 実身化: 送り先ルートへ実ファイルを書き出し、独立した実身にする。
+                            let ext = resolve_ext(c.ext.as_deref(), &c.mime);
+                            let filename = ensure_ext(&c.label, &ext);
+                            let dest_file = unique_path(&dest_root, &filename);
+                            std::fs::copy(&live, &dest_file).map_err(|e| e.to_string())?;
+                            let mtime = file_mtime_ms(&dest_file).unwrap_or_else(db::now_ms);
+                            p.conn
+                                .execute(
+                                    "UPDATE dst.virtual_bodies
+                                     SET real_id = ?1, committed_path = ?2, committed_mtime = ?3,
+                                         origin_path = NULL, window_of = NULL
+                                     WHERE id = ?4",
+                                    rusqlite::params![
+                                        h,
+                                        dest_file.to_string_lossy().to_string(),
+                                        mtime,
+                                        new_id
+                                    ],
+                                )
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            // 仮身化してコピー: 元のライブファイルを origin で指す窓にする
+                            // （中身は送り先CASの H が保険。fork の per-file 処理と同型）。
+                            // window_of（内部窓）は NULL にする＝跨プロジェクトでは内部レーンを
+                            // 使わず外部レーン(origin)で解決させる（内部窓の指し先も同じくコピー
+                            // された未コミット仮身なので resolve_live_file が None を返し、CAS
+                            // 保険＝薄赤に倒れてしまうのを防ぐ。import_file 外部取り込みと同じ形）。
+                            p.conn
+                                .execute(
+                                    "UPDATE dst.virtual_bodies
+                                     SET real_id = ?1, origin_path = ?2, committed_path = NULL,
+                                         window_of = NULL
+                                     WHERE id = ?3",
+                                    rusqlite::params![
+                                        h,
+                                        live.to_string_lossy().to_string(),
+                                        new_id
+                                    ],
+                                )
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+            }
+            moved += 1;
+        }
+
+        // コメント（付箋）。file_ref は元のコミット先を指すので NULL にリセット（fork と同様）。
+        for old_id in &note_ids {
+            let new_id = id_map.get(old_id).unwrap().clone();
+            let n: Option<(String, f64, f64, f64, f64, i64)> = p
+                .conn
+                .query_row(
+                    "SELECT text,pos_x,pos_y,width,font_size,bold FROM main.notes
+                     WHERE id = ?1 AND deleted_at IS NULL",
+                    rusqlite::params![old_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let Some((text, x, y, width, font_size, bold)) = n else { continue };
+            p.conn
+                .execute(
+                    "INSERT INTO dst.notes
+                        (id,text,pos_x,pos_y,created_at,width,font_size,bold,file_ref)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL)",
+                    rusqlite::params![new_id, text, x, y, db::now_ms(), width, font_size, bold],
+                )
+                .map_err(|e| e.to_string())?;
+            moved += 1;
+        }
+
+        // 関係矢印: 両端が選択内のものだけ、新IDへ貼り替えて運ぶ。先に Vec へ集めてから挿入
+        // （prepared statement と execute の借用が重ならないように）。
+        let edges: Vec<(String, String, String)> = {
+            let mut stmt = p
+                .conn
+                .prepare(
+                    "SELECT from_id,to_id,kind FROM main.relations WHERE deleted_at IS NULL",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+        for (f, t, k) in edges {
+            if let (Some(nf), Some(nt)) = (id_map.get(&f), id_map.get(&t)) {
+                p.conn
+                    .execute(
+                        "INSERT INTO dst.relations (from_id,to_id,kind,created_at)
+                         VALUES (?1,?2,?3,?4)",
+                        rusqlite::params![nf, nt, k, db::now_ms()],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok(moved)
+    })();
+
+    let _ = p.conn.execute("DETACH DATABASE dst", []);
+    let moved = result?;
+
+    // 移動: 元プロジェクトからソフトデリート（既存の削除フローと同じ deleted_at 方式・
+    // Ctrl+Z で復活可）。コミット済み実ファイルは .texos/trash へ退避（delete_object と同じ
+    // 共有ガード付き＝同じ実体を指す別の生きたカードがいれば退避しない）。
+    if move_out {
+        for old_id in &card_ids {
+            let committed: Option<String> = p
+                .conn
+                .query_row(
+                    "SELECT committed_path FROM virtual_bodies WHERE id = ?1",
+                    rusqlite::params![old_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .flatten();
+            if let Some(cp) = committed {
+                let shared: i64 = p
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM virtual_bodies
+                         WHERE committed_path = ?1 AND id <> ?2 AND deleted_at IS NULL",
+                        rusqlite::params![cp, old_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let path = Path::new(&cp);
+                if shared == 0 && path.starts_with(&p.root) && path.is_file() {
+                    let trash = trash_path(&p.root, old_id, path);
+                    if let Some(parent) = trash.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::rename(path, &trash).is_err() {
+                        if std::fs::copy(path, &trash).is_ok() {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
+            }
+            let _ = p.conn.execute(
+                "UPDATE virtual_bodies SET deleted_at = ?1 WHERE id = ?2",
+                rusqlite::params![db::now_ms(), old_id],
+            );
+        }
+        for old_id in &note_ids {
+            let _ = p.conn.execute(
+                "UPDATE notes SET deleted_at = ?1 WHERE id = ?2",
+                rusqlite::params![db::now_ms(), old_id],
+            );
+        }
+        // 端点が選択（カード or コメント）に触れる矢印もソフトデリート。復活の呪文で戻る。
+        let all_ids: Vec<&String> = card_ids.iter().chain(note_ids.iter()).collect();
+        for id in all_ids {
+            let _ = p.conn.execute(
+                "UPDATE relations SET deleted_at = ?1
+                 WHERE deleted_at IS NULL AND (from_id = ?2 OR to_id = ?2)",
+                rusqlite::params![db::now_ms(), id],
+            );
+        }
+    }
+
+    Ok(moved)
 }
 
 #[tauri::command]
@@ -6487,6 +6978,10 @@ pub fn run() {
             rename_object,
             rename_real,
             duplicate_virtual,
+            send_selection_to_project,
+            clean_caches,
+            gc_cas_scan,
+            gc_cas_clean,
             commit_object,
             commit_all,
             relink_object,
@@ -6608,5 +7103,60 @@ mod text_decode_tests {
         let (text, enc) = decode_text_bytes(&with_bom);
         assert_eq!(text, "BOM付きUTF-16");
         assert_eq!(enc, "UTF-16LE");
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    /// scan_orphan_cas は「どのカード（deleted_at 問わず）からも参照されない」ブロブだけを
+    /// 孤立として返し、生きたカード・ソフト削除カードが指す実身は残すこと。
+    #[test]
+    fn orphan_cas_reachability() {
+        let dir = std::env::temp_dir().join(format!("texos_gc_test_{}", db::now_ms()));
+        let cas_root = dir.join(".texos").join("cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
+        let p = Project {
+            conn,
+            root: dir.clone(),
+            cas_root: cas_root.clone(),
+        };
+
+        // 生きたカードが指す実身、ソフト削除カードが指す実身、どのカードも指さない孤立実身。
+        let live = cas::store_bytes(&cas_root, b"live-content").unwrap();
+        let trashed = cas::store_bytes(&cas_root, b"trashed-content").unwrap();
+        let orphan = cas::store_bytes(&cas_root, b"orphan-content").unwrap();
+
+        for h in [&live, &trashed, &orphan] {
+            db::insert_real_body(&p.conn, h, "text/plain", 12, Some("txt")).unwrap();
+        }
+        db::insert_virtual_body(&p.conn, "v-live", &live, "live", 0.0, 0.0, None, None).unwrap();
+        db::insert_virtual_body(&p.conn, "v-trash", &trashed, "trash", 0.0, 0.0, None, None)
+            .unwrap();
+        // ソフト削除（ゴミ箱＝復活の呪文で戻せる）カードも real_id は生存扱い。
+        p.conn
+            .execute(
+                "UPDATE virtual_bodies SET deleted_at = ?1 WHERE id = 'v-trash'",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+
+        let (orphans, total) = scan_orphan_cas(&p).unwrap();
+        assert_eq!(total, 3, "CAS には3ブロブある");
+        let orphan_hashes: Vec<String> = orphans
+            .iter()
+            .map(|(path, _)| {
+                let file = path.file_name().unwrap().to_str().unwrap();
+                let prefix = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
+                format!("{}{}", prefix, file)
+            })
+            .collect();
+        assert_eq!(orphan_hashes, vec![orphan.clone()], "孤立は orphan のみ");
+        assert!(!orphan_hashes.contains(&live));
+        assert!(!orphan_hashes.contains(&trashed));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
