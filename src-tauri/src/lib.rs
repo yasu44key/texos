@@ -44,6 +44,9 @@ pub struct AppState {
     /// 積まれた次の録音が走ってハングしたように見える（v1.4.9 バグ）。フローは単一スロット
     /// 設計（flow_cancel/rec_stdin が各1個）＝同時実行は1つ前提なので、再入を即エラーで弾く。
     pub flow_running: std::sync::atomic::AtomicBool,
+    /// v1.5 Text-To-Image: TexoS が起動・管理する diffusers 常駐デーモン（t2i_server.py）の
+    /// 子プロセスハンドル。t2i_stop_server で明示停止できるよう保持する。
+    pub t2i_server: Mutex<Option<std::process::Child>>,
 }
 
 /// run_flow の多重起動ガード。drop で flow_running を false に戻す
@@ -89,6 +92,13 @@ struct Config {
     /// v1.4.8: 現在選択中の Whisper モデル名（"small"/"medium" 等。既定 small）。
     #[serde(default)]
     whisper_model: Option<String>,
+    /// v1.5: 現在選択中の Text-To-Image モデル名（"sd1.5" 等。既定 sd1.5）。
+    #[serde(default)]
+    t2i_model: Option<String>,
+    /// v1.5: Hugging Face トークン（ゲート付き FLUX 公式モデルの取得に使う）。
+    /// デーモン起動時に環境変数 HF_TOKEN として渡す。
+    #[serde(default)]
+    t2i_hf_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3211,6 +3221,24 @@ fn execute_node(
             let (bytes, ext, mime) = flow::run_ai(spec, inputs[0].0)?;
             Ok(plain(bytes, ext, mime))
         }
+        NodeKind::T2i => {
+            // v1.5 Text-To-Image: 入力を種別で振り分け＝テキスト→プロンプト / 画像→元画像(img2img)。
+            // 集約ノードなので inputs に複数（プロンプト＋元画像）が来る。AI 同様ネットワーク別経路。
+            let mut prompt: Option<&[u8]> = None;
+            let mut init: Option<&[u8]> = None;
+            for (bytes, _ext, mime) in inputs {
+                if mime.starts_with("image/") {
+                    if init.is_none() {
+                        init = Some(*bytes);
+                    }
+                } else if prompt.is_none() {
+                    prompt = Some(*bytes); // テキスト等はプロンプト扱い（最初の1本）
+                }
+            }
+            let prompt = prompt.ok_or("プロンプト（テキスト入力）が接続されていません")?;
+            let (bytes, ext, mime) = flow::run_t2i(spec, prompt, init)?;
+            Ok(plain(bytes, ext, mime))
+        }
         NodeKind::Generator | NodeKind::External => {
             // 出力拡張子: output_ext 指定 > 最初の入力の拡張子 > "bin"
             //（ジェネレータは入力が無いので "bin"、外部は入力拡張子に追従）。
@@ -3393,7 +3421,8 @@ fn eval_filter(
     // 集約か個別かは CMD の書き方で決まる（{in*} か {in2} 以降があれば全入力を1回 = 集約:
     // gcc分割ソース・画像合成 / {in}/{in1} のみなら入力ごとに実行 = 従来のファンアウト）。
     let kind = spec.node_kind();
-    if spec.is_aggregate() {
+    // T2i は集約ノード（プロンプト＋元画像など全入力を集めて1回実行＝1枚生成）。
+    if spec.is_aggregate() || kind == flow::NodeKind::T2i {
         // 集約実行は引数の位置・本数が意味を持つ → 合わない入力はスキップではなくエラー
         let mut bad = Vec::new();
         for pl in &collected {
@@ -3504,6 +3533,12 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         })?;
     // 終端フィルタの設定が出力先と命名を決める（prefix連番 / 出力フォルダ）
     let term_spec = flow::parse_spec(fref.as_deref().unwrap_or("{}"))?;
+
+    // v1.5 Text-To-Image: 終端が t2i カードなら生成デーモンを先に起こしておく（▶実行を
+    // 「ただ押せば動く」に）。best-effort — 起動できなければ run_t2i が分かりやすく案内する。
+    if term_spec.node_kind() == flow::NodeKind::T2i {
+        let _ = t2i_ensure_server(&state.app_data, state.inner());
+    }
 
     // v1.3.11 対話シェル: cmd/PowerShell を detached で開いて一行目（cmd）を実行（捕捉しない）。
     // 接続された最初の入力の生きた実ファイルを {in} に展開する。§4.2: 種別判定は is_shell() に集約。
@@ -3781,6 +3816,8 @@ fn break_flow(state: State<AppState>) {
     state
         .flow_cancel
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    // 画像生成中ならデーモン側の生成も止める（GPU を握り続けないように）。best-effort。
+    flow::t2i_post_cancel();
 }
 
 // --- v1.4.1 AIチャット（builtin:"ai" mode:"chat"）---------------------------
@@ -5718,6 +5755,668 @@ fn uuid() -> String {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// --- v1.5 Text-To-Image（builtin:"t2i"）: 常駐 diffusers デーモンの管理 ----------------
+// Whisper/Ollama と同じ流儀: 共有 app-data 配下にモデル/スクリプトを置き、status コマンド＋
+// 進捗イベント（"t2i-model"）でセットアップを案内する。デーモン本体（t2i_server.py）は
+// ビルドに埋め込み、起動時に app-data へ書き出す（リリースでも resources 設定不要）。
+
+/// デーモン本体を実行ファイルへ埋め込む（src-tauri/src → ../../python）。
+const T2I_SERVER_PY: &str = include_str!("../../python/t2i_server.py");
+
+/// 期待するデーモンの版（t2i_server.py の SERVER_VERSION と一致させること）。
+/// 稼働中デーモンの版がこれと違えば「古い」と見なして起動し直す（再ビルド反映）。
+const T2I_SERVER_VERSION: &str = "7";
+
+/// 既知モデル（friendly name → 表示名）。t2i_server.py の MODELS と対応させること。
+/// (name, label, gated, hf_url)。gated=true は HF 認証（HF_TOKEN）が必要。
+/// hf_url はライセンス承諾ページ（ユーザーが開いて Agree する先）。
+const T2I_KNOWN_MODELS: &[(&str, &str, bool, &str)] = &[
+    ("sd1.5", "Stable Diffusion 1.5（軽量・高速・~2GB）", false,
+     "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5"),
+    ("dreamshaper", "Dreamshaper 8（SD1.5系・高品質・~2GB）", false,
+     "https://huggingface.co/Lykon/dreamshaper-8"),
+    ("flux-lite", "FLUX.1 Lite 8B（オープン・高品質・~26GB）", false,
+     "https://huggingface.co/Freepik/flux.1-lite-8B"),
+    ("flux-schnell", "FLUX.1 schnell（公式・要HF認証・~34GB）", true,
+     "https://huggingface.co/black-forest-labs/FLUX.1-schnell"),
+    ("flux-dev", "FLUX.1 dev（公式・非商用・要HF認証・~34GB）", true,
+     "https://huggingface.co/black-forest-labs/FLUX.1-dev"),
+];
+
+fn t2i_root(app_data: &Path) -> PathBuf {
+    app_data.join("t2i")
+}
+fn t2i_models_dir(app_data: &Path) -> PathBuf {
+    t2i_root(app_data).join("models")
+}
+fn t2i_server_script(app_data: &Path) -> PathBuf {
+    t2i_root(app_data).join("t2i_server.py")
+}
+
+/// config の HF トークンをデーモンが読むファイル（<home>/hf_token）へ書き出す（無ければ削除）。
+/// デーモンは pull のたびにこのファイルを読むので、これだけで再起動なしにトークンが効く。
+fn sync_t2i_token_file(app_data: &Path) {
+    let f = t2i_root(app_data).join("hf_token");
+    match read_config(app_data).t2i_hf_token.filter(|t| !t.trim().is_empty()) {
+        Some(tok) => {
+            let _ = std::fs::create_dir_all(t2i_root(app_data));
+            let _ = std::fs::write(&f, tok.trim());
+        }
+        None => {
+            let _ = std::fs::remove_file(&f);
+        }
+    }
+}
+
+/// 取得済みモデル（diffusers 構造＝model_index.json がある）を列挙。
+/// モデルフォルダ配下に `.incomplete`（HF の DL 途中マーカー）があるか（再帰）。
+fn t2i_has_incomplete(dir: &Path) -> bool {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if t2i_has_incomplete(&p) {
+                    return true;
+                }
+            } else if e
+                .file_name()
+                .to_str()
+                .map(|n| n.ends_with(".incomplete"))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// diffusers フォルダ d が**完全**か（daemon の _diffusers_complete と同判定）。
+/// model_index.json＋重みコンポーネントの重み一式＋シャード・`.incomplete` 無し。
+fn t2i_dir_complete(d: &Path) -> bool {
+    let idx = d.join("model_index.json");
+    if !idx.is_file() || t2i_has_incomplete(d) {
+        return false;
+    }
+    let mi: serde_json::Value = match std::fs::read_to_string(&idx)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    let obj = match mi.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    const NO_WEIGHT: &[&str] = &[
+        "scheduler", "tokenizer", "tokenizer_2", "tokenizer_3",
+        "feature_extractor", "safety_checker", "image_encoder",
+    ];
+    for (comp, val) in obj {
+        if comp.starts_with('_') || NO_WEIGHT.contains(&comp.as_str()) {
+            continue;
+        }
+        // 値は [library, class]。library が null（未使用）なら対象外。
+        match val.as_array() {
+            Some(a) if a.len() == 2 && !a[0].is_null() => {}
+            _ => continue,
+        }
+        let sub = d.join(comp);
+        if !sub.is_dir() {
+            return false;
+        }
+        let mut has_weight = false;
+        let mut shard_idxs: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&sub) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.ends_with(".index.json") {
+                    shard_idxs.push(e.path());
+                } else if n.ends_with(".safetensors") || n.ends_with(".bin") {
+                    has_weight = true;
+                }
+            }
+        }
+        if !shard_idxs.is_empty() {
+            for ix in shard_idxs {
+                let v: serde_json::Value = match std::fs::read_to_string(&ix)
+                    .ok()
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                {
+                    Some(v) => v,
+                    None => return false,
+                };
+                if let Some(wm) = v.get("weight_map").and_then(|w| w.as_object()) {
+                    for sh in wm.values().filter_map(|s| s.as_str()) {
+                        if !sub.join(sh).is_file() {
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else if !has_weight {
+            return false;
+        }
+    }
+    true
+}
+
+/// フォルダ d が単一ファイルモデル（model_index.json 無し・チェックポイント1つ）か。
+fn t2i_dir_has_single_checkpoint(d: &Path) -> bool {
+    if d.join("model_index.json").is_file() {
+        return false;
+    }
+    let mut count = 0;
+    if let Ok(rd) = std::fs::read_dir(d) {
+        for e in rd.flatten() {
+            if let Some(n) = e.file_name().to_str() {
+                if n.ends_with(".safetensors") || n.ends_with(".ckpt") {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count == 1
+}
+
+/// 取得済み（ロード可能）モデル名。完全な diffusers / 単一ファイル（直置き or フォルダ内）。
+/// daemon の list_available と一致させる（部分DLは含めない＝再取得ボタンが出る）。
+fn list_t2i_models(app_data: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(t2i_models_dir(app_data)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if t2i_dir_complete(&p) || t2i_dir_has_single_checkpoint(&p) {
+                    out.push(name);
+                }
+            } else if name.ends_with(".safetensors") || name.ends_with(".ckpt") {
+                // 直置き単一ファイル: 名前＝拡張子抜き
+                out.push(name.rsplitn(2, '.').nth(1).unwrap_or(&name).to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 部分ダウンロード（中断/失敗）のモデル名: フォルダに model_index.json はあるが不完全。
+/// 「不完全（続きから再取得）」を UI に出すため。
+fn t2i_partial_models(app_data: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(t2i_models_dir(app_data)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() && p.join("model_index.json").is_file() && !t2i_dir_complete(&p) {
+                out.push(e.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// torch/diffusers が使える Python を探す。戻り値 (実行ファイルパス, 依存が揃っているか, CUDA可否)。
+/// 「システム Python 優先」: PATH の python / py / python3 を順に試し、sys.executable を得る。
+/// 依存チェックと同時に torch.cuda.is_available() も取得（サーバー未起動でも GPU 判定できる）。
+fn detect_python() -> (Option<String>, bool, bool) {
+    use std::process::Command;
+    for cand in ["python", "py", "python3"] {
+        let mut c = Command::new(cand);
+        c.args(["-c", "import sys; sys.stdout.write(sys.executable)"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000);
+        }
+        let out = match c.output() {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let mut d = Command::new(&path);
+        d.args([
+            "-c",
+            "import torch,diffusers,transformers,safetensors,PIL,huggingface_hub; \
+             import sys; sys.stdout.write('1' if torch.cuda.is_available() else '0')",
+        ]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            d.creation_flags(0x0800_0000);
+        }
+        match d.output() {
+            Ok(o) if o.status.success() => {
+                let cuda = String::from_utf8_lossy(&o.stdout).trim() == "1";
+                return (Some(path), true, cuda);
+            }
+            // Python はあるが依存が無い
+            _ => return (Some(path), false, false),
+        }
+    }
+    (None, false, false)
+}
+
+/// デーモンへ GET（tokio 文脈外スレッドで blocking 実行）。
+fn t2i_http_get(path: &str, timeout_ms: u64) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "http://127.0.0.1:{}/{}",
+        flow::T2I_PORT,
+        path.trim_start_matches('/')
+    );
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let c = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(timeout_ms))
+                .build()
+                .map_err(|e| e.to_string())?;
+            c.get(&url)
+                .send()
+                .map_err(|e| e.to_string())?
+                .json::<serde_json::Value>()
+                .map_err(|e| e.to_string())
+        })
+        .join()
+        .map_err(|_| "HTTPスレッドが異常終了".to_string())?
+    })
+}
+
+fn t2i_running() -> bool {
+    t2i_http_get("health", 800).is_ok()
+}
+
+/// 稼働中デーモンが報告する版（取得できなければ空）。古い版の検出に使う。
+fn t2i_daemon_version() -> String {
+    t2i_http_get("health", 1000)
+        .ok()
+        .and_then(|v| v["version"].as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// 稼働中デーモンが「取得済み」と認識しているモデル名。取得できなければ空。
+fn t2i_daemon_models() -> Vec<String> {
+    t2i_http_get("models", 2000)
+        .ok()
+        .and_then(|v| {
+            v.get("available").and_then(|a| a.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// T2I_PORT を Listen しているプロセスを止める（孤児デーモンや古いデーモンの掃除）。
+/// 自分の子だけでなく、前セッションの取り残しも確実に終わらせるため port 基準で kill。
+#[cfg(windows)]
+fn t2i_kill_on_port() {
+    use std::os::windows::process::CommandExt;
+    let ps = format!(
+        "Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | \
+         ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}",
+        flow::T2I_PORT
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(0x0800_0000)
+        .status();
+}
+#[cfg(not(windows))]
+fn t2i_kill_on_port() {}
+
+/// デーモンを起動して health が立つまで待つ。
+/// 既に稼働中でも、ディスク上の取得済みモデルをすべて認識していなければ「古いデーモン」と
+/// 見なして再起動する（モデルをDLしたのにデーモンが見ない不一致の自己修復）。
+/// 子プロセスは state.t2i_server に保持して停止できるようにする。
+fn t2i_ensure_server(app_data: &Path, state: &AppState) -> Result<(), String> {
+    // 稼働中/新規どちらでも、デーモンが読むトークンファイルを最新化しておく
+    // （pull のたびに読む方式なので、これだけで再起動なしにトークンが効く）。
+    sync_t2i_token_file(app_data);
+    if t2i_running() {
+        // 版が一致し、ディスクの取得済みモデルを全部認識していれば、そのまま使う。
+        let disk = list_t2i_models(app_data);
+        let seen = t2i_daemon_models();
+        let version_ok = t2i_daemon_version() == T2I_SERVER_VERSION;
+        if version_ok && disk.iter().all(|m| seen.contains(m)) {
+            return Ok(());
+        }
+        // 古い版／取得済みを見ていない → 止めて最新スクリプトで起動し直す。
+        {
+            let mut g = state.t2i_server.lock().unwrap();
+            if let Some(mut old) = g.take() {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
+        }
+        t2i_kill_on_port();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+    }
+    let (py, deps_ok, _cuda) = detect_python();
+    let py = py.ok_or(
+        "Python が見つかりません。システムに Python（+torch/diffusers）を導入してください",
+    )?;
+    if !deps_ok {
+        return Err(
+            "Python に torch / diffusers が見つかりません。`pip install torch diffusers transformers accelerate safetensors` を導入してください"
+                .into(),
+        );
+    }
+    let root = t2i_root(app_data);
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let script = t2i_server_script(app_data);
+    std::fs::write(&script, T2I_SERVER_PY).map_err(|e| format!("サーバースクリプトの書き出しに失敗: {e}"))?;
+
+    let log = std::fs::File::create(root.join("server.log")).ok();
+    let mut c = std::process::Command::new(&py);
+    c.arg(&script)
+        .args(["--port", &flow::T2I_PORT.to_string()])
+        .args(["--home", &root.to_string_lossy()]);
+    // ゲート付き FLUX 公式モデル用の HF トークンを環境変数で渡す（設定されていれば）。
+    if let Some(tok) = read_config(app_data).t2i_hf_token.filter(|t| !t.trim().is_empty()) {
+        c.env("HF_TOKEN", tok);
+    }
+    if let Some(f) = log {
+        c.stderr(std::process::Stdio::from(f));
+    }
+    c.stdout(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let child = c.spawn().map_err(|e| format!("画像生成サーバーの起動に失敗: {e}"))?;
+    // 旧プロセスがいれば置換（先に殺す）。
+    {
+        let mut g = state.t2i_server.lock().unwrap();
+        if let Some(mut old) = g.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+        *g = Some(child);
+    }
+    // health を最大 ~30 秒待つ（torch の import に時間がかかる）。
+    for _ in 0..60 {
+        if t2i_running() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err("画像生成サーバーが起動しませんでした（t2i/server.log を確認してください）".into())
+}
+
+#[derive(Serialize, Clone)]
+struct T2iKnownModel {
+    name: String,
+    label: String,
+    /// HF 認証（HF_TOKEN）が必要なゲート付きモデルか
+    gated: bool,
+    /// ライセンス承諾ページ URL（gated のときに UI でコピー提示する）
+    hf_url: String,
+}
+
+#[derive(Serialize, Clone)]
+struct T2iStatus {
+    /// 使える Python が見つかったか
+    python_ok: bool,
+    /// その Python の絶対パス
+    python_path: String,
+    /// torch/diffusers 等が揃っているか
+    deps_ok: bool,
+    /// デーモンが応答するか（=すぐ生成できる）
+    server_running: bool,
+    /// CUDA(GPU) が使えるか（デーモン稼働時のみ判明）
+    gpu: bool,
+    /// 取得済みモデル名
+    models: Vec<String>,
+    /// 既知モデル（DL候補）
+    known: Vec<T2iKnownModel>,
+    /// 現在選択中のモデル（既定 sd1.5）
+    current_model: String,
+    /// HF トークンが設定済みか（ゲート付きモデル取得の可否）
+    hf_token_set: bool,
+    /// 部分DL（中断/失敗）のモデル名。「不完全（続きから再取得）」表示用。
+    partial: Vec<String>,
+}
+
+#[tauri::command(async)]
+fn t2i_status(state: State<AppState>) -> T2iStatus {
+    let app_data = state.app_data.clone();
+    let (py, deps_ok, cuda) = detect_python();
+    let running = t2i_running();
+    // GPU: サーバー稼働中は health の cuda を、未起動なら Python 直問い合わせの結果を使う。
+    let gpu = if running {
+        t2i_http_get("health", 1500)
+            .ok()
+            .and_then(|v| v["cuda"].as_bool())
+            .unwrap_or(cuda)
+    } else {
+        cuda
+    };
+    let current = read_config(&app_data)
+        .t2i_model
+        .unwrap_or_else(|| "sd1.5".to_string());
+    T2iStatus {
+        python_ok: py.is_some(),
+        python_path: py.unwrap_or_default(),
+        deps_ok,
+        server_running: running,
+        gpu,
+        models: list_t2i_models(&app_data),
+        known: T2I_KNOWN_MODELS
+            .iter()
+            .map(|(n, l, gated, url)| T2iKnownModel {
+                name: n.to_string(),
+                label: l.to_string(),
+                gated: *gated,
+                hf_url: url.to_string(),
+            })
+            .collect(),
+        current_model: current,
+        hf_token_set: read_config(&app_data)
+            .t2i_hf_token
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false),
+        partial: t2i_partial_models(&app_data),
+    }
+}
+
+/// デーモンを起動する（モデルのロードはまだしない＝最初の生成で読む）。
+#[tauri::command(async)]
+fn t2i_start_server(state: State<AppState>) -> Result<(), String> {
+    let app_data = state.app_data.clone();
+    t2i_ensure_server(&app_data, state.inner())
+}
+
+/// デーモンを停止する（VRAM を解放）。
+#[tauri::command(async)]
+fn t2i_stop_server(state: State<AppState>) -> Result<(), String> {
+    let mut g = state.t2i_server.lock().unwrap();
+    if let Some(mut child) = g.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok(())
+}
+
+/// モデルを取得（共有 app-data へ DL）。進捗は "t2i-model"（{model,status,percent}）で配信。
+/// デーモンが diffusers/huggingface_hub でダウンロードするので、先にサーバーを起動する。
+#[tauri::command(async)]
+fn t2i_download_model(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+    model: String,
+) -> Result<(), String> {
+    let app_data = state.app_data.clone();
+    let model = if model.trim().is_empty() {
+        "sd1.5".to_string()
+    } else {
+        model.trim().to_string()
+    };
+    t2i_ensure_server(&app_data, state.inner())?;
+    let app = window.app_handle().clone();
+    let url = format!("http://127.0.0.1:{}/pull", flow::T2I_PORT);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            use std::io::BufRead;
+            let client = reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| format!("HTTPクライアント生成に失敗: {e}"))?;
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "name": model }))
+                .send()
+                .map_err(|e| format!("ダウンロードを開始できません: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("モデル取得に失敗 ({})", resp.status()));
+            }
+            for line in std::io::BufReader::new(resp).lines() {
+                let line = line.map_err(|e| format!("進捗の読み取りに失敗: {e}"))?;
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(err) = v["error"].as_str() {
+                        return Err(err.to_string());
+                    }
+                    if v["done"].as_bool().unwrap_or(false) {
+                        break;
+                    }
+                    let _ = app.emit(
+                        "t2i-model",
+                        serde_json::json!({
+                            "model": model,
+                            "status": v["status"].as_str().unwrap_or(""),
+                            "percent": v["percent"].as_u64().unwrap_or(0),
+                        }),
+                    );
+                }
+            }
+            // 既定モデルとして記録。
+            let mut cfg = read_config(&app_data);
+            cfg.t2i_model = Some(model.clone());
+            write_config(&app_data, &cfg);
+            let _ = app.emit(
+                "t2i-model",
+                serde_json::json!({ "model": model, "status": "完了", "percent": 100 }),
+            );
+            Ok::<(), String>(())
+        })
+        .join()
+        .map_err(|_| "ダウンロードスレッドが異常終了しました".to_string())?
+    })
+}
+
+/// 既定モデルを切り替え、デーモンに warm ロードさせる（取得済みのものから）。
+#[tauri::command(async)]
+fn t2i_set_model(state: State<AppState>, model: String) -> Result<(), String> {
+    let app_data = state.app_data.clone();
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("モデル名が空です".into());
+    }
+    let mut cfg = read_config(&app_data);
+    cfg.t2i_model = Some(model.clone());
+    write_config(&app_data, &cfg);
+    // サーバーが動いていれば warm ロード（重いので best-effort・失敗は致命ではない）。
+    if t2i_running() {
+        let url = format!("http://127.0.0.1:{}/load", flow::T2I_PORT);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let c = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(120))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let r = c
+                    .post(&url)
+                    .json(&serde_json::json!({ "name": model }))
+                    .send()
+                    .map_err(|e| e.to_string())?;
+                if !r.status().is_success() {
+                    return Err(format!("モデルのロードに失敗 ({})", r.status()));
+                }
+                Ok::<(), String>(())
+            })
+            .join()
+            .map_err(|_| "ロードスレッドが異常終了".to_string())?
+        })?;
+    }
+    Ok(())
+}
+
+/// HF トークンを保存（ゲート付き FLUX 公式モデル用）。空文字でクリア。
+/// デーモンは pull のたびに <home>/hf_token を読むので、ファイルを書くだけで再起動不要で効く。
+#[tauri::command(async)]
+fn t2i_set_hf_token(state: State<AppState>, token: String) -> Result<(), String> {
+    let app_data = state.app_data.clone();
+    let mut cfg = read_config(&app_data);
+    let t = token.trim().to_string();
+    cfg.t2i_hf_token = if t.is_empty() { None } else { Some(t) };
+    write_config(&app_data, &cfg);
+    sync_t2i_token_file(&app_data); // デーモンが読むファイルへ反映（再起動不要）
+    Ok(())
+}
+
+/// 手動配置用: モデルの配置先フォルダ <models>/<model>/ を作って Explorer で開く。
+/// ユーザーが HF から diffusers 構造（model_index.json＋各サブフォルダ）を手で置けるようにする
+/// （自動DLが失敗するゲートモデルの保険）。デーモンは完全性チェックで自動検出する。
+#[tauri::command(async)]
+fn t2i_reveal_model_dir(state: State<AppState>, model: String) -> Result<String, String> {
+    let app_data = state.app_data.clone();
+    let m = model.trim();
+    let dir = if m.is_empty() {
+        t2i_models_dir(&app_data)
+    } else {
+        t2i_models_dir(&app_data).join(m)
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let p = dir.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(&p).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&p).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+    }
+    Ok(p)
+}
+
+/// モデルのローカルデータを削除（部分DL/壊れたモデルを破棄して取り直す用）。
+/// フォルダ <models>/<model>/ と直置き <models>/<model>.safetensors|.ckpt の両方を消す。
+#[tauri::command(async)]
+fn t2i_delete_model(state: State<AppState>, model: String) -> Result<(), String> {
+    let app_data = state.app_data.clone();
+    let m = model.trim();
+    if m.is_empty() {
+        return Err("モデル名が空です".into());
+    }
+    let base = t2i_models_dir(&app_data);
+    let dir = base.join(m);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("削除に失敗: {e}"))?;
+    }
+    for ext in ["safetensors", "ckpt"] {
+        let f = base.join(format!("{m}.{ext}"));
+        if f.is_file() {
+            let _ = std::fs::remove_file(&f);
+        }
+    }
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::new().build())
@@ -5748,6 +6447,7 @@ pub fn run() {
                 chat_cancel: std::sync::atomic::AtomicBool::new(false),
                 rec_stdin: std::sync::Mutex::new(None),
                 flow_running: std::sync::atomic::AtomicBool::new(false),
+                t2i_server: std::sync::Mutex::new(None),
             });
             Ok(())
         })
@@ -5837,6 +6537,14 @@ pub fn run() {
             whisper_install,
             whisper_download_model,
             whisper_set_model,
+            t2i_status,
+            t2i_start_server,
+            t2i_stop_server,
+            t2i_download_model,
+            t2i_set_model,
+            t2i_set_hf_token,
+            t2i_reveal_model_dir,
+            t2i_delete_model,
             flow_send_stdin,
             list_audio_devices,
             check_filter_program,

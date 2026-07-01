@@ -91,6 +91,28 @@ pub struct FilterSpec {
     /// 録音は自分で終わらない（-t 不要）ので「停止」で 'q' を送って正常終了させ WAV を確定する。
     #[serde(default)]
     pub record: bool,
+    // --- v1.5 Text-To-Image（builtin:"t2i"）。AIフィルタと同系統の「データ変換子」。
+    //     入力テキスト = プロンプト → diffusers 常駐デーモン（t2i_server.py）→ PNG。
+    //     `model` は AI と共用（ここでは SD モデルの friendly name = "sd1.5" 等）。
+    //     `width` は img_resize と共用（画像幅）。以下は t2i 専用の追加パラメータ。---
+    /// 負プロンプト（除外したい要素）。
+    #[serde(default)]
+    pub negative: Option<String>,
+    /// 推論ステップ数（未指定は 25）。
+    #[serde(default)]
+    pub steps: Option<u32>,
+    /// ガイダンススケール（CFG。未指定は 7.5）。
+    #[serde(default)]
+    pub guidance: Option<f64>,
+    /// 画像の高さ（未指定は 512。幅は既存の `width` を共用）。
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// 乱数シード（未指定/空＝毎回ランダム）。再現したいとき固定する。
+    #[serde(default)]
+    pub seed: Option<i64>,
+    /// img2img の変化度（0=元画像のまま〜1=大きく変える。未指定は 0.6）。元画像入力時のみ有効。
+    #[serde(default)]
+    pub strength: Option<f64>,
 }
 
 /// v1.4.10 リファクタリング（§4.2 ノード種別の体系化）: いままで eval_filter / run_flow に
@@ -109,6 +131,8 @@ pub enum NodeKind {
     Generator,
     /// builtin:"ai" — ネットワーク経由の LLM 変換（同期 blocking・別経路）。
     Ai,
+    /// builtin:"t2i" — 常駐 diffusers デーモン経由の画像生成（テキスト→PNG・別経路）。
+    T2i,
     /// その他の内蔵フィルタ（text_grep / text_replace / img_* / md_codeblock …）。
     Builtin,
     /// 外部コマンド／プログラム（{in}/{out} 展開）。集約か個別かは is_aggregate() で。
@@ -125,7 +149,11 @@ impl FilterSpec {
             return NodeKind::Generator;
         }
         if let Some(b) = self.builtin.as_deref() {
-            return if b == "ai" { NodeKind::Ai } else { NodeKind::Builtin };
+            return match b {
+                "ai" => NodeKind::Ai,
+                "t2i" => NodeKind::T2i,
+                _ => NodeKind::Builtin,
+            };
         }
         if self.name.is_some() || self.cmd.is_some() {
             return NodeKind::External;
@@ -472,6 +500,131 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
     };
 
     Ok((content.into_bytes(), "md".into(), "text/markdown".into()))
+}
+
+/// v1.5 Text-To-Image デーモン（t2i_server.py）の待受ポート。TexoS が system Python で
+/// 起動・管理する（Ollama 相当の常駐サーバー）。固定ポート＝接続先は環境非依存。
+pub const T2I_PORT: u16 = 8765;
+
+/// 画像生成の既定タイムアウト（初回はモデルロードを含むため AI より長め）。
+const T2I_DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// 実行中の生成をデーモンに中断させる（best-effort・短時間）。タイムアウトや中断ボタンで使う。
+/// tokio 文脈から呼ばれても安全なよう素の OS スレッドで実行する。
+pub fn t2i_post_cancel() {
+    let url = format!("http://127.0.0.1:{T2I_PORT}/cancel");
+    let _ = std::thread::scope(|s| {
+        s.spawn(|| {
+            if let Ok(c) = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+            {
+                let _ = c.post(&url).send();
+            }
+        })
+        .join()
+    });
+}
+
+/// builtin:"t2i": 入力テキストをプロンプトとして diffusers 常駐デーモンに送り、PNG を得る。
+/// `init_image` を渡すと img2img（元画像を部分修正）になる。
+/// run_ai と同じ理由で reqwest::blocking を tokio 文脈外の素の OS スレッドで実行する
+/// （内部ランタイム drop パニック → DB Mutex poison → 全体クラッシュ を避ける）。
+pub fn run_t2i(
+    spec: &FilterSpec,
+    prompt_bytes: &[u8],
+    init_image: Option<&[u8]>,
+) -> Result<(Vec<u8>, String, String), String> {
+    std::thread::scope(|s| {
+        s.spawn(|| run_t2i_blocking(spec, prompt_bytes, init_image))
+            .join()
+            .map_err(|_| "画像生成スレッドが異常終了しました".to_string())?
+    })
+}
+
+fn run_t2i_blocking(
+    spec: &FilterSpec,
+    prompt_bytes: &[u8],
+    init_image: Option<&[u8]>,
+) -> Result<(Vec<u8>, String, String), String> {
+    let prompt = String::from_utf8_lossy(prompt_bytes).trim().to_string();
+    if prompt.is_empty() {
+        return Err("入力テキスト（プロンプト）が空です".into());
+    }
+    // タイムアウト: Some(0)=無制限 / 未指定=300秒。
+    let timeout = match spec.timeout_secs {
+        Some(0) => None,
+        Some(s) => Some(std::time::Duration::from_secs(s)),
+        None => Some(std::time::Duration::from_secs(T2I_DEFAULT_TIMEOUT_SECS)),
+    };
+    let mut cb = reqwest::blocking::Client::builder();
+    if let Some(t) = timeout {
+        cb = cb.timeout(t);
+    }
+    let client = cb
+        .build()
+        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
+
+    let mut body = serde_json::json!({ "prompt": prompt });
+    if let Some(m) = spec.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["model"] = serde_json::json!(m);
+    }
+    if let Some(n) = spec.negative.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["negative_prompt"] = serde_json::json!(n);
+    }
+    if let Some(v) = spec.steps {
+        body["steps"] = serde_json::json!(v);
+    }
+    if let Some(v) = spec.guidance {
+        body["guidance"] = serde_json::json!(v);
+    }
+    if let Some(v) = spec.width {
+        body["width"] = serde_json::json!(v);
+    }
+    if let Some(v) = spec.height {
+        body["height"] = serde_json::json!(v);
+    }
+    if let Some(v) = spec.seed {
+        body["seed"] = serde_json::json!(v);
+    }
+    // img2img: 元画像を base64 で送る（あれば）。strength は変化度。
+    if let Some(img) = init_image {
+        use base64::Engine as _;
+        body["init_image"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(img));
+        if let Some(s) = spec.strength {
+            body["strength"] = serde_json::json!(s);
+        }
+    }
+
+    let url = format!("http://127.0.0.1:{T2I_PORT}/generate");
+    let resp = client.post(&url).json(&body).send().map_err(|e| {
+        if e.is_connect() {
+            "画像生成サーバーに接続できません。設定（T2Iセットアップ）でモデルを取得してサーバーを起動してください"
+                .to_string()
+        } else if e.is_timeout() {
+            // タイムアウトしてもデーモン側の生成はまだ走っている（GPU を握り続ける）。
+            // /cancel を投げて次ステップ境界で止めさせる（GPU を解放）。
+            t2i_post_cancel();
+            "画像生成がタイムアウトしました。ステップ数を減らすか制限時間を延ばしてください（生成は中断しました）".to_string()
+        } else {
+            format!("画像生成リクエストに失敗: {e}")
+        }
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        // サーバーは失敗を {"error": "..."} で返す
+        let v: serde_json::Value = resp.json().unwrap_or_else(|_| serde_json::json!({}));
+        let msg = v["error"].as_str().unwrap_or("不明なエラー");
+        return Err(format!("画像生成エラー ({status}): {msg}"));
+    }
+    let bytes = resp
+        .bytes()
+        .map_err(|e| format!("画像の受信に失敗: {e}"))?
+        .to_vec();
+    if bytes.is_empty() {
+        return Err("画像生成サーバーが空の応答を返しました".into());
+    }
+    Ok((bytes, "png".into(), "image/png".into()))
 }
 
 /// v1.4.1 チャット: ストリーミング応答。messages は system を含む会話履歴全体。
@@ -1320,6 +1473,7 @@ mod tests {
     fn node_kind_classification() {
         assert_eq!(spec(r#"{"type":"generator","name":"rec.exe"}"#).node_kind(), NodeKind::Generator);
         assert_eq!(spec(r#"{"builtin":"ai","model":"x"}"#).node_kind(), NodeKind::Ai);
+        assert_eq!(spec(r#"{"builtin":"t2i","model":"sd1.5"}"#).node_kind(), NodeKind::T2i);
         assert_eq!(spec(r#"{"builtin":"text_grep"}"#).node_kind(), NodeKind::Builtin);
         assert_eq!(spec(r#"{"name":"sp2tab.exe"}"#).node_kind(), NodeKind::External);
         assert_eq!(spec(r#"{"cmd":"sort < {in} > {out}"}"#).node_kind(), NodeKind::External);

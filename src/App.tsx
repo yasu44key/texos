@@ -14,6 +14,8 @@ import { PromptDialog } from "./ui/PromptDialog";
 import { FilterDialog } from "./ui/FilterDialog";
 import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
+import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
+import { T2iSetupDialog, type T2iStatus } from "./ui/T2iSetupDialog";
 
 // v1.4.8 ①: Whisper 文字起こしカードの spec（外部コマンドフィルタ）。
 // whisper-cli は app_data 共有・絶対パス参照。-of {out_noext} が <base>.txt を書き {out} と一致。
@@ -134,6 +136,21 @@ function App() {
   } | null>(null);
   // v1.4.8 ①: Whisper セットアップダイアログ（未導入時に開く。作成位置を保持）。
   const [whisperDlg, setWhisperDlg] = useState<{
+    x: number;
+    y: number;
+    linkFrom?: string;
+  } | null>(null);
+  // v1.5 Text-To-Image: パラメータ設定ダイアログ（新規作成 create / 既存編集 id）。
+  const [t2iDlg, setT2iDlg] = useState<{
+    id: string | null;
+    label: string;
+    spec: string;
+    models: string[];
+    known: string[];
+    create?: { x: number; y: number; linkFrom?: string };
+  } | null>(null);
+  // v1.5 Text-To-Image: セットアップ（依存確認・モデルDL・サーバー起動）。完了で設定へ。
+  const [t2iSetup, setT2iSetup] = useState<{
     x: number;
     y: number;
     linkFrom?: string;
@@ -652,6 +669,7 @@ function App() {
             { label: "AI: 対話（チャットパネル）...", onClick: () => la.filter("ai_dialog", cp.x, cp.y, fromId) },
             { label: "AI: 変換（一発・MD出力）...", onClick: () => la.filter("ai_chat", cp.x, cp.y, fromId) },
             { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => la.filter("md_codeblock", cp.x, cp.y, fromId) },
+            { label: "画像生成: Text-To-Image（テキスト→画像）...", onClick: () => la.filter("t2i", cp.x, cp.y, fromId) },
             { label: "テキスト: grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
             { label: "テキスト: 置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
             { label: "画像: リサイズ（幅指定）...", onClick: () => la.filter("img_resize", cp.x, cp.y, fromId) },
@@ -796,6 +814,39 @@ function App() {
           spec: JSON.stringify(spec),
           create: { x: canvasX, y: canvasY, linkFrom },
         });
+        return;
+      }
+      if (builtin === "t2i") {
+        // v1.5 Text-To-Image: 依存＋モデルが揃っていれば設定ダイアログ、未整備ならセットアップへ。
+        void (async () => {
+          try {
+            const s = await invoke<T2iStatus>("t2i_status");
+            if (s.deps_ok && s.models.length > 0) {
+              setT2iDlg({
+                id: null,
+                label: "画像生成",
+                spec: JSON.stringify({
+                  builtin: "t2i",
+                  model: s.current_model || s.models[0],
+                  steps: 25,
+                  guidance: 7.5,
+                  width: 512,
+                  height: 512,
+                  accept_mime: "*/*",
+                  output_ext: "png",
+                }),
+                models: s.models,
+                known: s.known.map((k) => k.name),
+                create: { x: canvasX, y: canvasY, linkFrom },
+              });
+            } else {
+              setT2iSetup({ x: canvasX, y: canvasY, linkFrom });
+            }
+          } catch (e) {
+            console.error("t2i_status failed", e);
+            setT2iSetup({ x: canvasX, y: canvasY, linkFrom });
+          }
+        })();
         return;
       }
       if (builtin === "md_codeblock") {
@@ -1216,6 +1267,22 @@ function App() {
       // v1.4.1 AIカードは専用設定ダイアログ。
       if (builtin === "ai") {
         setAiDlg({ id, label, spec: current });
+        return;
+      }
+      // v1.5 Text-To-Image カードも専用設定ダイアログ（取得済みモデル一覧を添えて開く）。
+      if (builtin === "t2i") {
+        void (async () => {
+          let models: string[] = [];
+          let known: string[] = [];
+          try {
+            const s = await invoke<T2iStatus>("t2i_status");
+            models = s.models;
+            known = s.known.map((k) => k.name);
+          } catch {
+            /* status 取得不可でも編集は開く */
+          }
+          setT2iDlg({ id, label, spec: current, models, known });
+        })();
         return;
       }
       if (!builtin) {
@@ -3967,6 +4034,75 @@ function App() {
               console.error("create whisper card failed", e);
               setConfirm({
                 title: "Whisperカードを作成できませんでした",
+                message: String(e),
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              });
+            }
+          }}
+        />
+      )}
+      {t2iSetup && (
+        <T2iSetupDialog
+          onCancel={() => setT2iSetup(null)}
+          onReady={(s) => {
+            const dlg = t2iSetup;
+            setT2iSetup(null);
+            // 準備完了 → 設定ダイアログでパラメータを決めてカード作成。
+            setT2iDlg({
+              id: null,
+              label: "画像生成",
+              spec: JSON.stringify({
+                builtin: "t2i",
+                model: s.current_model || s.models[0],
+                steps: 25,
+                guidance: 7.5,
+                width: 512,
+                height: 512,
+                accept_mime: "*/*",
+                output_ext: "png",
+              }),
+              models: s.models,
+              known: s.known.map((k) => k.name),
+              create: { x: dlg.x, y: dlg.y, linkFrom: dlg.linkFrom },
+            });
+          }}
+        />
+      )}
+      {t2iDlg && (
+        <T2iSettingsDialog
+          initialLabel={t2iDlg.label}
+          initialSpec={t2iDlg.spec}
+          models={t2iDlg.models}
+          known={t2iDlg.known}
+          onCancel={() => setT2iDlg(null)}
+          onOpenSetup={() => {
+            const d = t2iDlg;
+            setT2iDlg(null);
+            setT2iSetup({ x: d.create?.x ?? 100, y: d.create?.y ?? 100, linkFrom: d.create?.linkFrom });
+          }}
+          onSave={async (label, spec) => {
+            const dlg = t2iDlg;
+            setT2iDlg(null);
+            try {
+              if (dlg.id) {
+                await invoke("update_filter", { id: dlg.id, spec });
+                if (label !== dlg.label) await invoke("rename_object", { id: dlg.id, label });
+              } else if (dlg.create) {
+                const vid = await invoke<string>("create_filter", {
+                  label,
+                  spec,
+                  x: dlg.create.x,
+                  y: dlg.create.y,
+                });
+                pushUndo([{ kind: "delete", ids: [vid] }]);
+                if (dlg.create.linkFrom) await linkNewNode(dlg.create.linkFrom, vid);
+              }
+              await refresh();
+            } catch (e) {
+              console.error("t2i settings save failed", e);
+              setConfirm({
+                title: "画像生成カードを保存できませんでした",
                 message: String(e),
                 okLabel: "OK",
                 onConfirm: () => setConfirm(null),

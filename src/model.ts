@@ -157,6 +157,7 @@ export function filterOutputMime(filterRef: string | null): string | null {
     const s = JSON.parse(filterRef ?? "{}");
     if (s.builtin === "text_grep" || s.builtin === "text_replace") return "text/plain";
     if (s.builtin === "ai") return "text/markdown"; // v1.4.0 AIフィルタは常にMDを吐く
+    if (s.builtin === "t2i") return "image/png"; // v1.5 Text-To-Image は常にPNGを吐く
     if (s.builtin === "md_codeblock") return "text/plain"; // v1.4.0 コード抽出（→gcc等）
     if (s.builtin === "img_resize") return "image/png";
     if (s.builtin === "img_convert") {

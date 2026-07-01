@@ -749,6 +749,7 @@ export function buildCanvasMenu(
           { label: "AI: 対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog", pos.canvasX, pos.canvasY) },
           { label: "AI: 変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat", pos.canvasX, pos.canvasY) },
           { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => a.addFilter("md_codeblock", pos.canvasX, pos.canvasY) },
+          { label: "画像生成: Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i", pos.canvasX, pos.canvasY) },
           { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
           { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
           { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },

@@ -25,3 +25,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# 放棄した旧BlockProgプロジェクトのコピー（無関係・コミットしない）
+/BlockProg/
+
+# Python
+__pycache__/
+*.pyc
