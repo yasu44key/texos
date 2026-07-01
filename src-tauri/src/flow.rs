@@ -113,6 +113,19 @@ pub struct FilterSpec {
     /// img2img の変化度（0=元画像のまま〜1=大きく変える。未指定は 0.6）。元画像入力時のみ有効。
     #[serde(default)]
     pub strength: Option<f64>,
+    // --- v1.5.x モディファイア（SD/SDXL 中心）。デーモンが要求状態へリコンサイルする。---
+    /// LoRA 指定。"name:weight, name2" の自由記述（重み省略は 1.0）。ファイルは home/loras に配置。
+    #[serde(default)]
+    pub lora: Option<String>,
+    /// VAE 名（home/vae に置いたファイル/フォルダ名。空＝モデル既定 VAE）。
+    #[serde(default)]
+    pub vae: Option<String>,
+    /// サンプラー名（dpm++_2m / dpm++_2m_karras / euler_a / unipc / ddim 等。空＝既定 DPM++）。
+    #[serde(default)]
+    pub sampler: Option<String>,
+    /// Clip skip（A1111 流。1=スキップなし・2=penultimate。SD/SDXL のみ有効）。
+    #[serde(default)]
+    pub clip_skip: Option<u32>,
 }
 
 /// v1.4.10 リファクタリング（§4.2 ノード種別の体系化）: いままで eval_filter / run_flow に
@@ -586,6 +599,19 @@ fn run_t2i_blocking(
     }
     if let Some(v) = spec.seed {
         body["seed"] = serde_json::json!(v);
+    }
+    // モディファイア（SD/SDXL 中心）。空/未指定は送らない＝デーモン側は既定のまま。
+    if let Some(s) = spec.lora.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["lora"] = serde_json::json!(s);
+    }
+    if let Some(s) = spec.vae.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["vae"] = serde_json::json!(s);
+    }
+    if let Some(s) = spec.sampler.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["sampler"] = serde_json::json!(s);
+    }
+    if let Some(v) = spec.clip_skip {
+        body["clip_skip"] = serde_json::json!(v);
     }
     // img2img: 元画像を base64 で送る（あれば）。strength は変化度。
     if let Some(img) = init_image {

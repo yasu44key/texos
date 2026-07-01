@@ -157,6 +157,8 @@ function App() {
     spec: string;
     models: string[];
     known: string[];
+    // モディファイア用アセット（LoRA/埋め込み/VAE のセレクト候補）。
+    assets: { loras: string[]; embeddings: string[]; vae: string[] };
     create?: { x: number; y: number; linkFrom?: string };
   } | null>(null);
   // v1.5 Text-To-Image: セットアップ（依存確認・モデルDL・サーバー起動）。完了で設定へ。
@@ -881,6 +883,7 @@ function App() {
                 }),
                 models: s.models,
                 known: s.known.map((k) => k.name),
+                assets: { loras: s.loras, embeddings: s.embeddings, vae: s.vae },
                 create: { x: canvasX, y: canvasY, linkFrom },
               });
             } else {
@@ -1318,14 +1321,16 @@ function App() {
         void (async () => {
           let models: string[] = [];
           let known: string[] = [];
+          let assets = { loras: [] as string[], embeddings: [] as string[], vae: [] as string[] };
           try {
             const s = await invoke<T2iStatus>("t2i_status");
             models = s.models;
             known = s.known.map((k) => k.name);
+            assets = { loras: s.loras, embeddings: s.embeddings, vae: s.vae };
           } catch {
             /* status 取得不可でも編集は開く */
           }
-          setT2iDlg({ id, label, spec: current, models, known });
+          setT2iDlg({ id, label, spec: current, models, known, assets });
         })();
         return;
       }
@@ -4367,6 +4372,7 @@ function App() {
               }),
               models: s.models,
               known: s.known.map((k) => k.name),
+              assets: { loras: s.loras, embeddings: s.embeddings, vae: s.vae },
               create: { x: dlg.x, y: dlg.y, linkFrom: dlg.linkFrom },
             });
           }}
@@ -4378,6 +4384,7 @@ function App() {
           initialSpec={t2iDlg.spec}
           models={t2iDlg.models}
           known={t2iDlg.known}
+          assets={t2iDlg.assets}
           onCancel={() => setT2iDlg(null)}
           onOpenSetup={() => {
             const d = t2iDlg;

@@ -15,10 +15,21 @@ export interface T2iSpec {
   height?: number;
   seed?: number | null;
   strength?: number;
+  // モディファイア（SD/SDXL 中心）。空は送らない＝モデル既定のまま。
+  lora?: string;
+  vae?: string;
+  sampler?: string;
+  clip_skip?: number;
   timeout_secs?: number;
   accept_mime?: string;
   output_ext?: string;
 }
+
+// サンプラー選択肢（t2i_server.py の SAMPLERS と対応）。空＝モデル既定(DPM++)。
+const SAMPLERS = [
+  "dpm++_2m", "dpm++_2m_karras", "dpm++_sde_karras",
+  "euler_a", "euler", "unipc", "ddim", "heun", "lms",
+];
 
 interface Props {
   initialLabel: string;
@@ -27,13 +38,15 @@ interface Props {
   models: string[];
   /** 既知モデル名（DL候補。取得済みでなくても選択肢に出す）。 */
   known?: string[];
+  /** モディファイア用アセット（home/loras・embeddings・vae の名前）。セレクトの候補。 */
+  assets?: { loras: string[]; embeddings: string[]; vae: string[] };
   onCancel: () => void;
   onSave: (label: string, spec: string) => void;
   /** モデル取得などのセットアップを開く（未取得時の導線）。 */
   onOpenSetup?: () => void;
 }
 
-export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [], onCancel, onSave, onOpenSetup }: Props) {
+export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [], assets = { loras: [], embeddings: [], vae: [] }, onCancel, onSave, onOpenSetup }: Props) {
   const init: T2iSpec = (() => {
     try {
       return { ...(JSON.parse(initialSpec) as T2iSpec) };
@@ -51,8 +64,26 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
   const [height, setHeight] = useState(String(init.height ?? 512));
   const [seed, setSeed] = useState(init.seed === null || init.seed === undefined ? "" : String(init.seed));
   const [strength, setStrength] = useState(String(init.strength ?? 0.6));
+  // モディファイア（SD/SDXL 中心）。フィルタ流儀＝手持ちアセットから「選ぶ」。埋め込みは自動ロード。
+  // LoRA は "name:weight" の先頭1件を UI では「選択＋強度」に分解（複数指定はデーモンが受理可＝将来）。
+  const initLora = (() => {
+    const first = (init.lora ?? "").split(",")[0].trim();
+    if (!first) return { name: "", weight: "0.8" };
+    const i = first.lastIndexOf(":");
+    if (i > 0) return { name: first.slice(0, i).trim(), weight: first.slice(i + 1).trim() || "0.8" };
+    return { name: first, weight: "1.0" };
+  })();
+  const [loraName, setLoraName] = useState(initLora.name);
+  const [loraWeight, setLoraWeight] = useState(initLora.weight);
+  const [vae, setVae] = useState(init.vae ?? "");
+  const [sampler, setSampler] = useState(init.sampler ?? "");
+  const [clipSkip, setClipSkip] = useState(String(init.clip_skip ?? 1));
   // 制限時間（秒）。FLUX は初回モデルロードで数分かかることがあるので既定を長めに。
   const [timeoutSecs, setTimeoutSecs] = useState(String(init.timeout_secs ?? 600));
+
+  // セレクト候補＝実在アセット ∪ 現在値（アセットが消えても保存済みの選択は選択肢に残す）。
+  const loraOptions = Array.from(new Set([...assets.loras, ...(loraName ? [loraName] : [])]));
+  const vaeOptions = Array.from(new Set([...assets.vae, ...(vae ? [vae] : [])]));
 
   const save = () => {
     const to = parseInt(timeoutSecs, 10);
@@ -66,6 +97,15 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
       height: parseInt(height, 10) || 512,
       seed: seed.trim() === "" ? null : parseInt(seed, 10),
       strength: parseFloat(strength) || 0.6,
+      // LoRA は「選択 → name:weight」で送る（未選択なら送らない）。
+      lora: loraName ? `${loraName}:${parseFloat(loraWeight) || 1.0}` : undefined,
+      vae: vae.trim() || undefined,
+      sampler: sampler || undefined,
+      // Clip skip は A1111 流。1（スキップなし）は既定なので送らない。
+      clip_skip: (() => {
+        const n = parseInt(clipSkip, 10);
+        return !n || n <= 1 ? undefined : n;
+      })(),
       timeout_secs: isNaN(to) ? undefined : to,
       // */* ＝ テキスト（プロンプト）に加えて画像（img2img の元画像）も接続できる。
       accept_mime: "*/*",
@@ -168,6 +208,73 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
         </div>
         <div style={{ ...note, marginBottom: 4 }}>
           画像カードも接続すると img2img（元画像を変化度ぶん変える）。0=元画像のまま〜1=大きく変える。
+        </div>
+
+        {/* --- モディファイア（SD/SDXL 中心）。フィルタ流儀＝手持ちアセットから「選ぶ」。--- */}
+        <div style={{ fontSize: 12, color: "#8a93a8", margin: "12px 0 6px", borderTop: "1px solid #2a3145", paddingTop: 10 }}>
+          拡張（SD/SDXL）
+        </div>
+
+        {/* LoRA は「選択（何を）＋強度（どれだけ）」のセット。候補は home/loras の実在ファイル。 */}
+        <div style={cellRow}>
+          <label style={{ ...cell, flex: 2 }}>
+            <span style={cellLab}>LoRA</span>
+            <select style={cellInp} value={loraName} onChange={(e) => setLoraName(e.target.value)}>
+              <option value="">なし</option>
+              {loraOptions.map((n) => (
+                <option key={n} value={n}>
+                  {assets.loras.includes(n) ? "✓ " : "　"}
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label style={cell}>
+            <span style={cellLab}>強度</span>
+            <input
+              style={cellInp}
+              value={loraWeight}
+              placeholder="0.8"
+              disabled={!loraName}
+              onChange={(e) => setLoraWeight(e.target.value)}
+            />
+          </label>
+        </div>
+
+        <div style={cellRow}>
+          <label style={cell}>
+            <span style={cellLab}>サンプラー</span>
+            <select style={cellInp} value={sampler} onChange={(e) => setSampler(e.target.value)}>
+              <option value="">既定(DPM++)</option>
+              {SAMPLERS.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label style={cell}>
+            <span style={cellLab}>Clip skip</span>
+            <input style={cellInp} value={clipSkip} placeholder="1" onChange={(e) => setClipSkip(e.target.value)} />
+          </label>
+          <label style={cell}>
+            <span style={cellLab}>VAE</span>
+            <select style={cellInp} value={vae} onChange={(e) => setVae(e.target.value)}>
+              <option value="">既定</option>
+              {vaeOptions.map((n) => (
+                <option key={n} value={n}>
+                  {assets.vae.includes(n) ? "✓ " : "　"}
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div style={{ ...note, marginBottom: 4 }}>
+          LoRA/VAE は home/loras・home/vae に置いたファイルから選択（無ければ空）。ネガ埋め込み(Textual Inversion)は
+          home/embeddings に置けば、その名前をプロンプト/負プロンプトに書くだけで有効
+          {assets.embeddings.length > 0 && <>（利用可: {assets.embeddings.join(", ")}）</>}。
+          Clip skip はアニメ系 SD1.5 で 2 が定番。※SD/SDXL 向け。
         </div>
 
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>

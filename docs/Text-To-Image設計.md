@@ -90,12 +90,49 @@ ControlNet 等）は `Backend` を継承して `BACKENDS` + `PATTERNS_BY_KIND` �
 - 既知の留意点: FLUX は初回ロード ~26GB（オフロード）で重い。`is_available` は model_index.json だけ見るので
   **DL 途中でも available に出る**（全シャード揃う前にロードすると失敗）— 改善候補。
 
+## Phase 3（2026-07-01 実装）: モディファイア層（SD/SDXL 中心の拡張点）
+
+**SERVER_VERSION "7"→"8"（モディファイア層）→"9"（不一致 LoRA ガード）。v1.4.16 に同梱。**
+よく使われる SD/SDXL 拡張を、モデル種別(kind)とは**直交する修飾**として
+`t2i_server.py` に追加。いずれも常駐 pipe を書き換えるので **毎生成、要求状態へリコンサイル**（差しっぱなし
+＝次生成へのリークを防ぐ）。ロード済みアセットは名前でキャッシュ＝繰り返しは再読込なし。新しい修飾は
+`Backend` にメソッド1本＋能力フラグ（`supports_*`）を足すだけ＝拡張点。
+
+- **対応**（SD/SDXL）: **LoRA**（複数・強度／PEFT アダプタ API で有効化・切替）／**Textual Inversion 埋め込み**
+  （`home/embeddings` 全自動ロード＝名前をプロンプトに書けば効く／A1111 流）／**VAE 差し替え**（`home/vae`・
+  単一ファイル or diffusers フォルダ）／**サンプラー選択**（`SAMPLERS` レジストリ・既定 DPM++）／**Clip skip**
+  （A1111 流。diffusers の値は A1111-1）。FLUX は LoRA/VAE のみ（`supports_*` で無効化）。
+- **アセット置き場**: `home/loras` `home/embeddings` `home/vae`（`models/` とは分離＝モデル一覧を汚さない）。
+  `GET /assets` で一覧（loras/embeddings/vae/samplers）。名前は「拡張子なしファイル名」で指定可。
+- **配線**: `/generate` に `lora`（"name:weight, .." 自由記述・デーモンは複数受理可）/`vae`/`sampler`/`clip_skip`。
+  Rust `FilterSpec`＋`run_t2i_blocking` で素通し。
+- **UI＝フィルタ流儀「手持ちから選ぶ」（セレクト）**: 「生成＝画像変換の手段」というコンセプトに沿い、モディファイアも
+  フリーテキストでなく**実在アセットからの select**。Rust `list_t2i_assets`（`home/loras・embeddings・vae` を直接走査＝
+  **daemon 非依存**・モデル一覧と同じ流儀）を `t2i_status` の `loras/embeddings/vae` に載せ、`App.tsx`→`T2iSettingsDialog`
+  へ。**LoRA=選択＋強度**（何を・どれだけ／複数は将来）、**VAE=選択**、**サンプラー=選択**、Clip skip=数値。埋め込みは
+  自動ロードなので UI 欄なし（利用可能名をヒント表示）。保存済みでアセットが消えても現在値は選択肢に残す。
+- **依存＆不一致ガード**: LoRA は **`peft`** が要る（この開発PCは導入済み: peft 0.19.1 / diffusers 0.33.1）。
+  **落とし穴＝LoRA とベースモデルの系(SD1.5/SDXL/FLUX/DiT)が不一致だと、`load_lora_weights` は例外を投げず通るが
+  アダプタが0層で未登録→直後の `set_adapters` が「present adapters: set()」で 500**。対策として `apply_loras` が
+  `get_list_adapters()` で実登録を確認し、未登録なら `delete_adapters` して**明示 ValueError**（「現在のモデル(kind)に
+  適合しません＝SD/SDXL 用でない可能性」）＋キャッシュに誤登録しない（実機で krea2/DiT 系 LoRA を SD/SDXL に入れて
+  遭遇→"9" で対策）。
+- **次リビジョン**: **LoRA 複数掛け UI**（比較的簡単・下の「次リビジョン候補」参照）→ ControlNet（別バックエンド・
+  複雑ゆえ次へ＝ユーザー合意）→ compel（`(word:1.3)`）→ Hires fix・アップスケール。
+- 検証: `python -m py_compile` / `cargo check` / `cargo test --lib`(30 passed) / `tsc --noEmit` 通過。純粋ヘルパ
+  （LoRA 指定パース・アダプタ名・アセット解決/一覧）は実データで単体確認済み。**実機で SD/SDXL 用 LoRA を選択→生成成功を
+  確認**（緑髪キャラで作風反映を目視）。不一致 LoRA は上記ガードで明示エラー。
+
 ---
 
-## 現状（v1.4.14・2026-07-01・origin/main = de1391c push済み・インストーラ `I:\texos_1.4.14_x64-setup.exe`）＝続きの入口
+## 現状（v1.4.16・2026-07-01・**モディファイア層まで実装済み**）＝続きの入口
 
-**このスレッドで t2i フィルタを一通り作り切った。実機で AI対話→grep→生成、img2img、手持ちモデル、
-中断まで確認済み。以下は別スレッドで続きを始めるための引き継ぎ。**
+> **build & push はユーザーのフロー**。本節を書いた時点では **未ビルド/未 push ＝この作業ツリーが最新**。
+> ビルド/push 後に「v1.4.16・新コミットハッシュ・`I:\texos_1.4.16_x64-setup.exe`」へ更新すること。
+> （直前の確定リリースは v1.4.14 = de1391c・`I:\texos_1.4.14_x64-setup.exe`）
+
+**t2i フィルタは一通り完成（AI対話→grep→生成・img2img・手持ちモデル・中断）＋モディファイア層（LoRA/VAE/
+サンプラー/Clip skip/埋め込み）まで実機動作。以下は別スレッドで続きを始めるための引き継ぎ。**
 
 ### 実装済み（すべて実機検証済み）
 - `builtin:"t2i"`＝Ollama 流の常駐 diffusers デーモン。TexoS が起動・管理。テキスト→PNG 実身。
@@ -109,7 +146,11 @@ ControlNet 等）は `Backend` を継承して `BACKENDS` + `PATTERNS_BY_KIND` �
   **HF トークン（ファイル方式）**・手動配置導線（📁配置先を開く/🔄更新）・サーバー停止・**設定に常駐リンク**。
 - **中断＆制限時間**: 制限時間欄（既定600・0=無制限）／`/cancel`＝生成を次ステップで止め **GPU 即解放**
   （run_t2i タイムアウト時＋フロー中断ボタンから）／**自己修復**＝版照合で古いデーモンを入替。
-- デーモンは `include_str!` で埋め込み（**SERVER_VERSION "7"**）。
+- **モディファイア層（v1.4.16・SD/SDXL 中心）**: LoRA（選択＋強度）／VAE（選択）／サンプラー（選択）／Clip skip／
+  Textual Inversion（`home/embeddings` 自動ロード＝名前をプロンプトに書くだけ）。アセットは `home/{loras,embeddings,vae}`
+  に置く（`models/` と分離）、Rust `list_t2i_assets`→`t2i_status`→`T2iSettingsDialog` のセレクトへ。**不一致 LoRA ガード**あり。
+  詳細は上の「Phase 3（実装）」節。FLUX は LoRA/VAE のみ。
+- デーモンは `include_str!` で埋め込み（**SERVER_VERSION "9"**）。
 
 ### ファイルマップ
 - `python/t2i_server.py` — デーモン本体（Engine/Backend/HTTP）。**Rust に include_str! で埋め込み**。
@@ -127,8 +168,17 @@ ControlNet 等）は `Backend` を継承して `BACKENDS` + `PATTERNS_BY_KIND` �
   （埋め込みはビルド時）。版照合で稼働中の古いデーモンが自動で入れ替わる。
 - 検証時は**同一ポート(8765)に手動デーモンを乱立させない**（混在で切り分けが困難になった実績あり）。
 
-### Phase 3 候補（未実装・`docs/気づき.txt` 由来）
-1. **t2i インライン編集パネル**（ChatPanel 風＝ポジ欄/ネガ欄（やや小）/実行ボタン。追加プロンプトを編集しつつ生成）。★次の本命候補。
+### 次リビジョン候補（未実装・`docs/気づき.txt` 由来。※旧「Phase 3 候補」を改称＝Phase 3 は実装済のため）
+
+**★t2i モディファイアの次の一手＝LoRA 複数掛け（比較的簡単・UI 据え置き方針でも入る）**:
+デーモン/配線は**既に複数受理済み**（`_parse_lora_specs` が `"a:0.8, b:0.6"`・リスト・dict を `[(name,weight)]` に正規化し、
+`apply_loras` が PEFT `set_adapters` で複数アダプタを同時有効化＝リコンサイルも対応）。**残るは UI のみ**＝
+`T2iSettingsDialog` の LoRA を「行を追加できる複数選択＋各行の強度」にして、保存時に `"name:weight, .."` へ連結するだけ
+（`lora` フィールドは文字列のまま）。**前提＝全 LoRA がベースモデルの系(SD/SDXL)と一致**（不一致は "9" ガードが弾く）。
+ControlNet より軽い＝先に入れて良い。
+
+その他（t2i / UX 一般）:
+1. **t2i インライン編集パネル**（ChatPanel 風＝ポジ欄/ネガ欄（やや小）/実行ボタン。追加プロンプトを編集しつつ生成）。★本命候補。
 2. **ワークフローの部分を別プロジェクトへコピー/移動**（つながり選択→右クリック→**仮身化コピー**(CAS依存)／
    **実身化移動**(元から分離)）。`docs/共有とモジュール設計.md` のデータ2レーンと直結。
 3. AI チャット欄の Ctrl+C コピーが不安定（できる時とできない時がある）。

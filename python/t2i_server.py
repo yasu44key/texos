@@ -10,13 +10,22 @@ FastAPI 等の追加依存は要求しない）。この開発 PC には一式�
 "kind" で BACKENDS の実装にディスパッチする＝拡張点。img2img は AutoPipelineForImage2Image で
 コンポーネントを共有して実現（種別非依存）。
 
+モディファイア層（SD/SDXL 中心の拡張点）: LoRA / Textual Inversion 埋め込み / VAE 差し替え /
+サンプラー選択 / Clip skip を「モデル種別（kind）とは直交する修飾」として持つ。いずれも常駐 pipe を
+書き換えるので **毎生成、要求状態へリコンサイル**（差しっぱなしの次生成へのリークを防ぐ）。ロード済み
+アセットは名前でキャッシュ＝繰り返しは再読み込みなし。アセット置き場は home 直下の loras/ embeddings/
+vae/（models/ とは分離＝モデル一覧を汚さない）。新しい修飾は Backend にメソッド1本＋能力フラグを足すだけ。
+
 エンドポイント:
   GET  /health            -> {"ok":true,"device":..,"cuda":bool,"current_model":str|null,"loaded":bool,...}
   GET  /models            -> {"available":[name..],"known":[name..],"current":name|null}
+  GET  /assets            -> {"loras":[..],"embeddings":[..],"vae":[..]}   モディファイア用アセット一覧
   POST /load   {name}     -> {"ok":true,"model":name}               モデルをVRAMへ（無ければエラー）
   POST /pull   {name}     -> NDJSON 進捗ストリーム（{"status","percent"} / 末尾 {"done":true}）
   POST /generate {...}    -> image/png バイト列。prompt 必須。任意: negative_prompt / steps / guidance /
-                            width / height / seed / model / init_image(base64=img2img) / strength
+                            width / height / seed / model / init_image(base64=img2img) / strength /
+                            lora("name:weight, .."/リスト) / vae(name) / sampler(name) / clip_skip(A1111流) /
+                            embeddings(既定=embeddings/ 全自動ロード。名前をプロンプトに書けば効く)
 引数: --port <n>（既定 8765） --home <dir>（モデル/HFキャッシュの置き場＝共有 app-data 配下）
 gated モデル（FLUX 公式）は環境変数 HF_TOKEN（or huggingface-cli login）が要る。
 """
@@ -36,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # スクリプトの版（変更ごとに上げる）。TexoS はこれを /health で照合し、古いデーモンが
 # 残っていれば停止して最新スクリプトで起動し直す（再ビルド後に確実に反映するため）。
 # Rust 側 T2I_SERVER_VERSION と一致させること。
-SERVER_VERSION = "7"
+SERVER_VERSION = "9"
 
 # --- モデルレジストリ（Ollama 流の名前付きモデル）+ 種別ごとの取得パターン -------------
 # 各モデルは "kind"（バックエンド種別）を持つ。新しい種別（sdxl / controlnet 等）は
@@ -78,6 +87,82 @@ FLUX_PATTERNS = [
 PATTERNS_BY_KIND = {"sd": SD_PATTERNS, "flux": FLUX_PATTERNS}
 
 
+# --- サンプラー（スケジューラ）レジストリ。名前 → (diffusers クラス名, from_config kwargs) -----
+# 「名前付きモデル」(MODELS) と同じ流儀で名前付きサンプラーを持つ＝拡張は1行足すだけ。
+# クラスは遅延 import（起動を軽く）。既定は現行 _finalize_sd と同じ DPM++（karras なし）。
+SAMPLERS: dict[str, tuple[str, dict]] = {
+    "dpm++_2m":         ("DPMSolverMultistepScheduler", {"algorithm_type": "dpmsolver++"}),
+    "dpm++_2m_karras":  ("DPMSolverMultistepScheduler", {"algorithm_type": "dpmsolver++", "use_karras_sigmas": True}),
+    "dpm++_sde_karras": ("DPMSolverSDEScheduler",        {"use_karras_sigmas": True}),
+    "euler":            ("EulerDiscreteScheduler",        {}),
+    "euler_a":          ("EulerAncestralDiscreteScheduler", {}),
+    "unipc":            ("UniPCMultistepScheduler",       {}),
+    "ddim":             ("DDIMScheduler",                 {}),
+    "heun":             ("HeunDiscreteScheduler",         {}),
+    "lms":              ("LMSDiscreteScheduler",          {}),
+}
+DEFAULT_SAMPLER = "dpm++_2m"
+
+
+def _adapter_name(name: str) -> str:
+    """LoRA 名 → PEFT アダプタ名（英数字と _ のみ）。空なら 'lora'。"""
+    return "".join(c if c.isalnum() else "_" for c in name) or "lora"
+
+
+def _parse_lora_specs(val) -> list[tuple[str, float]]:
+    """LoRA 指定を [(name, weight), ..] へ正規化。受理: 文字列 "a:0.8, b" / dict{name:weight} /
+    リスト[str|dict{name,weight}|[name,weight]]。重み省略は 1.0。"""
+    out: list[tuple[str, float]] = []
+    if not val:
+        return out
+    if isinstance(val, str):
+        for part in val.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                n, _, w = part.rpartition(":")
+                try:
+                    out.append((n.strip(), float(w)))
+                    continue
+                except ValueError:
+                    pass
+            out.append((part, 1.0))
+    elif isinstance(val, dict):
+        for n, w in val.items():
+            try:
+                out.append((str(n), float(w)))
+            except (TypeError, ValueError):
+                out.append((str(n), 1.0))
+    elif isinstance(val, (list, tuple)):
+        for it in val:
+            if isinstance(it, str):
+                out.extend(_parse_lora_specs(it))
+            elif isinstance(it, dict):
+                try:
+                    out.append((str(it.get("name", "")), float(it.get("weight", 1.0))))
+                except (TypeError, ValueError):
+                    out.append((str(it.get("name", "")), 1.0))
+            elif isinstance(it, (list, tuple)) and it:
+                w = 1.0
+                if len(it) > 1:
+                    try:
+                        w = float(it[1])
+                    except (TypeError, ValueError):
+                        w = 1.0
+                out.append((str(it[0]), w))
+    return [(n, w) for (n, w) in out if n]
+
+
+def _as_name_list(v) -> list[str]:
+    """埋め込み指定を名前リストへ。文字列はカンマ区切り、リストはそのまま。"""
+    if isinstance(v, str):
+        return [s.strip() for s in v.split(",") if s.strip()]
+    if isinstance(v, (list, tuple)):
+        return [str(s).strip() for s in v if str(s).strip()]
+    return []
+
+
 # --- バックエンド（モデル種別ごとの読み込み＋生成）。★拡張点 ------------------------
 # 新しいモデル一族や機能（SDXL / FLUX / 将来の ControlNet 等）は Backend を継承して
 # BACKENDS に登録するだけで載る。Engine はこの抽象だけに依存する＝種別非依存。
@@ -85,6 +170,13 @@ PATTERNS_BY_KIND = {"sd": SD_PATTERNS, "flux": FLUX_PATTERNS}
 # 引き継ぐので、どの種別でも追加の VRAM を食わずに txt2img と共存できる。
 class Backend:
     kind = "base"
+    # モディファイア対応（種別ごとに上書き）。base 既定＝LoRA/VAE のみ（FLUX 相当）。
+    # SD/SDXL は TI・サンプラー・Clip skip も対応（SDBackend で有効化）。
+    supports_lora = True
+    supports_vae = True
+    supports_ti = False
+    supports_scheduler = False
+    supports_clip_skip = False
 
     def __init__(self, name, pipe, device, torch):
         self.name = name
@@ -92,6 +184,134 @@ class Backend:
         self.device = device
         self.torch = torch
         self._i2i = None  # img2img パイプ（遅延生成・コンポーネント共有）
+        # --- モディファイアの適用状態（pipe に紐づく。リコンサイル用にキャッシュ）---
+        self._loaded_loras: dict[str, str] = {}   # LoRA名 → PEFT アダプタ名（ロード済み）
+        self._active_loras = None                 # 直近に有効化した集合（None=無効）
+        self._loaded_tis: set[str] = set()         # ロード済み埋め込み名（解除不要）
+        self._orig_vae = None                      # モデル既定 VAE（差し替えから戻す用）
+        self._cur_vae = ""                         # 現在適用中の VAE 名（""=既定）
+        self._base_sched_cfg = getattr(getattr(pipe, "scheduler", None), "config", None)
+        self._cur_sampler = DEFAULT_SAMPLER if self.supports_scheduler else None
+
+    # --- モディファイア（LoRA / TI / VAE / サンプラー）。SD/SDXL 中心の拡張点 ---------------
+    # いずれも常駐 pipe を書き換えるので「毎生成、要求状態へリコンサイル」する。ロード済みアセットは
+    # 名前でキャッシュ＝繰り返しは再読み込みなし。img2img パイプ(_i2i)は UNet 等を共有するので、
+    # LoRA/埋め込みはそのまま効く。scheduler/vae は参照差し替えなので _i2i にも反映する。
+    def set_sampler(self, name: str) -> None:
+        if not self.supports_scheduler:
+            return
+        name = name or DEFAULT_SAMPLER
+        if name == self._cur_sampler:
+            return
+        entry = SAMPLERS.get(name)
+        if entry is None:
+            return  # 未知名は無視（現状維持）
+        import diffusers
+        cls = getattr(diffusers, entry[0], None)
+        cfg = self._base_sched_cfg or self.pipe.scheduler.config
+        if cls is None:
+            return
+        self.pipe.scheduler = cls.from_config(cfg, **entry[1])
+        if self._i2i is not None:
+            self._i2i.scheduler = self.pipe.scheduler
+        self._cur_sampler = name
+
+    def apply_vae(self, name: str, resolved) -> None:
+        # resolved: (path, is_single_file) or None。name="" は既定 VAE へ戻す。
+        if not self.supports_vae:
+            return
+        name = name or ""
+        if name == self._cur_vae:
+            return
+        if self._orig_vae is None:
+            self._orig_vae = self.pipe.vae
+        if not name:
+            self.pipe.vae = self._orig_vae
+        else:
+            if resolved is None:
+                raise ValueError(f"VAE '{name}' が見つかりません（home/vae に置いてください）")
+            from diffusers import AutoencoderKL
+            path, single = resolved
+            dtype = self.torch.float16 if self.device == "cuda" else self.torch.float32
+            if single:
+                vae = AutoencoderKL.from_single_file(path, torch_dtype=dtype)
+            else:
+                vae = AutoencoderKL.from_pretrained(path, torch_dtype=dtype)
+            self.pipe.vae = vae.to(self.device)
+        if self._i2i is not None:
+            self._i2i.vae = self.pipe.vae
+        self._cur_vae = name
+
+    def apply_embeddings(self, names, resolve) -> None:
+        # names: ロードしておく埋め込み名。トリガ語＝名前（プロンプトにその語を書けば効く／A1111 流）。
+        # 一度ロードすればトークンが tokenizer に残る＝解除不要（未使用なら無影響）。
+        if not self.supports_ti:
+            return
+        for n in names:
+            if not n or n in self._loaded_tis:
+                continue
+            path = resolve(n)
+            if path is None:
+                continue
+            try:
+                self.pipe.load_textual_inversion(path, token=n)
+            except Exception:
+                # 二重ロード・形式不一致・種別不一致(SD↔SDXL)は握りつぶす
+                # （1つの不良埋め込みで生成全体を止めない）。
+                pass
+            self._loaded_tis.add(n)  # 失敗も記録＝毎回リトライしない
+
+    def _adapter_registered(self, adapter: str) -> bool:
+        """adapter が実際に pipe のどこかの層に登録されたか。get_list_adapters は
+        {"unet":[..],"text_encoder":[..]} 形。判定不能（API 無し）なら True（従来動作）。"""
+        try:
+            listed = self.pipe.get_list_adapters()
+        except Exception:
+            return True
+        return any(adapter in names for names in listed.values())
+
+    def apply_loras(self, specs, resolve) -> None:
+        # specs: [(name, weight), ..]。PEFT アダプタ API で毎回リコンサイル（要求集合だけ有効化）。
+        if not self.supports_lora:
+            return
+        want = list(specs)
+        for n, _ in want:
+            if n in self._loaded_loras:
+                continue
+            path = resolve(n)
+            if path is None:
+                raise ValueError(f"LoRA '{n}' が見つかりません（home/loras に置いてください）")
+            adapter = _adapter_name(n)
+            try:
+                self.pipe.load_lora_weights(path, adapter_name=adapter)
+            except Exception as ex:
+                raise RuntimeError(
+                    f"LoRA '{n}' の適用に失敗しました（peft 未導入なら『pip install peft』が要ります）: {ex}"
+                ) from ex
+            # load は通っても、キーがどの層にも一致しないと**アダプタが0層＝未登録**になる
+            # （例: SD/SDXL のパイプに DiT/FLUX 用 LoRA を入れた）。この場合そのまま進むと
+            # set_adapters が「present adapters: set()」で落ちる＝分かりにくいので、ここで明示的に弾く。
+            if not self._adapter_registered(adapter):
+                try:
+                    self.pipe.delete_adapters(adapter)
+                except Exception:
+                    pass
+                raise ValueError(
+                    f"LoRA '{n}' は現在のモデル（{self.kind}）に適合しません＝対応する層が無く未適用でした。"
+                    f"SD/SDXL 用でない可能性（DiT/FLUX 等の別アーキ向け）。モデルと LoRA の種別を合わせてください"
+                )
+            self._loaded_loras[n] = adapter
+        if want:
+            self.pipe.set_adapters(
+                [self._loaded_loras[n] for n, _ in want],
+                adapter_weights=[float(w) for _, w in want],
+            )
+        elif self._active_loras:
+            try:
+                self.pipe.disable_lora()
+            except Exception:
+                pass
+        self._active_loras = want or None
 
     @classmethod
     def load(cls, name, model_path, device, torch):
@@ -146,9 +366,13 @@ def _finalize_sd(pipe, device, torch):
 
 
 class SDBackend(Backend):
-    """Stable Diffusion 1.x 系。負プロンプト対応・DPM++・fp16。diffusers/単一ファイル両対応。"""
+    """Stable Diffusion 1.x 系。負プロンプト対応・DPM++・fp16。diffusers/単一ファイル両対応。
+    モディファイア（LoRA/TI/VAE/サンプラー/Clip skip）フル対応＝SD/SDXL の拡張はここに乗る。"""
     kind = "sd"
     default_size = 512
+    supports_ti = True
+    supports_scheduler = True
+    supports_clip_skip = True
 
     @staticmethod
     def _pipe_cls():
@@ -189,6 +413,14 @@ class SDBackend(Backend):
             generator=self._gen(params),
             callback_on_step_end=params.get("_callback"),
         )
+        # Clip skip（A1111 流: 1=スキップなし・2=penultimate）。diffusers の clip_skip は
+        # 「末尾から飛ばす層数」で A1111 の値-1 に相当。1 以下は指定しない（＝スキップなし）。
+        try:
+            cs = int(params.get("clip_skip") or 0)
+        except (TypeError, ValueError):
+            cs = 0
+        if cs > 1:
+            common["clip_skip"] = cs - 1
         with self.torch.inference_mode():
             if init_image is not None:
                 return self._img2img()(
@@ -257,6 +489,12 @@ class Engine:
         self.home = os.path.abspath(home)
         self.models_dir = os.path.join(self.home, "models")
         os.makedirs(self.models_dir, exist_ok=True)
+        # モディファイア用アセット置き場（models/ とは分離＝モデル一覧を汚さない）。
+        self.loras_dir = os.path.join(self.home, "loras")
+        self.embeddings_dir = os.path.join(self.home, "embeddings")
+        self.vae_dir = os.path.join(self.home, "vae")
+        for _d in (self.loras_dir, self.embeddings_dir, self.vae_dir):
+            os.makedirs(_d, exist_ok=True)
         # HF のキャッシュも共有 app-data 配下へ（小さい起動ドライブを埋めない）。
         os.environ.setdefault("HF_HOME", os.path.join(self.home, "hf"))
         os.makedirs(os.environ["HF_HOME"], exist_ok=True)
@@ -445,6 +683,85 @@ class Engine:
                     out.add(base)  # 直置きの単一ファイル（名前=拡張子抜き）
         return sorted(out)
 
+    # --- モディファイア用アセット（LoRA / 埋め込み / VAE）の解決と一覧。★拡張点 ----------
+    # 置き場は home 直下の loras/ embeddings/ vae/。名前は「拡張子なしのファイル名」で指定でき、
+    # 完全一致 → 拡張子補完の順に解く（VAE は diffusers フォルダも許可）。
+    _LORA_EXTS = (".safetensors", ".pt", ".ckpt")
+    _EMB_EXTS = (".safetensors", ".pt", ".bin")
+    _VAE_EXTS = (".safetensors", ".ckpt", ".pt", ".bin")
+
+    @staticmethod
+    def _resolve_file(d, name, exts):
+        if not name:
+            return None
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+        for ext in exts:
+            f = os.path.join(d, name + ext)
+            if os.path.isfile(f):
+                return f
+        return None
+
+    def resolve_lora(self, name):
+        return self._resolve_file(self.loras_dir, name, self._LORA_EXTS)
+
+    def resolve_embedding(self, name):
+        return self._resolve_file(self.embeddings_dir, name, self._EMB_EXTS)
+
+    def resolve_vae(self, name):
+        """VAE 名 → (path, is_single_file) or None。diffusers フォルダ or 単一ファイル両対応。"""
+        if not name:
+            return None
+        d = os.path.join(self.vae_dir, name)
+        if os.path.isdir(d):
+            return (d, False)
+        f = self._resolve_file(self.vae_dir, name, self._VAE_EXTS)
+        return (f, True) if f else None
+
+    @staticmethod
+    def _list_assets(d, exts, dirs=False):
+        out = set()
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            return []
+        for n in entries:
+            full = os.path.join(d, n)
+            if os.path.isdir(full):
+                if dirs:
+                    out.add(n)
+            else:
+                base, ext = os.path.splitext(n)
+                if ext.lower() in exts:
+                    out.add(base)
+        return sorted(out)
+
+    def list_loras(self):
+        return self._list_assets(self.loras_dir, self._LORA_EXTS)
+
+    def list_embeddings(self):
+        return self._list_assets(self.embeddings_dir, self._EMB_EXTS)
+
+    def list_vae(self):
+        return self._list_assets(self.vae_dir, self._VAE_EXTS, dirs=True)
+
+    def _apply_modifiers(self, params: dict) -> None:
+        """生成直前に、要求されたモディファイアを現在の backend/pipe へリコンサイルする。
+        呼び出しは generate 内のロック下（pipe を1度に1つだけ触る）。"""
+        b = self.backend
+        if b is None:
+            return
+        b.set_sampler((params.get("sampler") or "").strip().lower())
+        vname = (params.get("vae") or "").strip()
+        b.apply_vae(vname, self.resolve_vae(vname))
+        if b.supports_ti:
+            emb = params.get("embeddings")
+            # 既定（未指定/"auto"）は embeddings/ を全自動ロード（A1111 流）。プロンプトに名前を書けば効く。
+            names = self.list_embeddings() if emb in (None, "", "auto") else _as_name_list(emb)
+            b.apply_embeddings(names, self.resolve_embedding)
+        b.apply_loras(_parse_lora_specs(params.get("lora")), self.resolve_lora)
+
     # --- ダウンロード（pull）。種別ごとの取得パターン。進捗を on_line(dict) で流す ----------
     def pull(self, name: str, on_line) -> None:
         spec = MODELS.get(name)
@@ -565,6 +882,7 @@ class Engine:
 
         self.cancel_event.clear()  # 新しい生成の開始 = 前のキャンセルをリセット
         with self.lock:
+            self._apply_modifiers(params)  # LoRA/TI/VAE/サンプラー/Clip skip を要求状態へ
             image = self.backend.generate(params, init_image=init)
         buf = io.BytesIO()
         image.save(buf, format="PNG")
@@ -615,6 +933,15 @@ class Handler(BaseHTTPRequestHandler):
                     "available": e.list_available(),
                     "known": sorted(MODELS.keys()),
                     "current": e.current_model,
+                })
+            elif self.path == "/assets":
+                # モディファイア用アセット一覧（loras/embeddings/vae）。UI のドロップダウン等に。
+                e = ENGINE
+                self._json(200, {
+                    "loras": e.list_loras(),
+                    "embeddings": e.list_embeddings(),
+                    "vae": e.list_vae(),
+                    "samplers": sorted(SAMPLERS.keys()),
                 })
             else:
                 self._json(404, {"error": "not found"})

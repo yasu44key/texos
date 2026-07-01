@@ -24,6 +24,10 @@ export interface T2iStatus {
   current_model: string;
   hf_token_set: boolean;
   partial: string[];
+  // モディファイア用アセット（home/loras・embeddings・vae の名前一覧）。設定UIのセレクト用。
+  loras: string[];
+  embeddings: string[];
+  vae: string[];
 }
 
 interface Props {

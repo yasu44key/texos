@@ -6309,7 +6309,7 @@ const T2I_SERVER_PY: &str = include_str!("../../python/t2i_server.py");
 
 /// 期待するデーモンの版（t2i_server.py の SERVER_VERSION と一致させること）。
 /// 稼働中デーモンの版がこれと違えば「古い」と見なして起動し直す（再ビルド反映）。
-const T2I_SERVER_VERSION: &str = "7";
+const T2I_SERVER_VERSION: &str = "9";
 
 /// 既知モデル（friendly name → 表示名）。t2i_server.py の MODELS と対応させること。
 /// (name, label, gated, hf_url)。gated=true は HF 認証（HF_TOKEN）が必要。
@@ -6479,6 +6479,32 @@ fn list_t2i_models(app_data: &Path) -> Vec<String> {
             } else if name.ends_with(".safetensors") || name.ends_with(".ckpt") {
                 // 直置き単一ファイル: 名前＝拡張子抜き
                 out.push(name.rsplitn(2, '.').nth(1).unwrap_or(&name).to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// モディファイア用アセット（loras/embeddings/vae）を home/<sub> から列挙。拡張子なしの名前。
+/// daemon の Engine._list_assets と一致させる（daemon 非依存＝サーバー未起動でも UI セレクトに出せる）。
+/// vae は diffusers フォルダ（単一ファイルでない VAE）も許可するので dirs=true。
+fn list_t2i_assets(app_data: &Path, sub: &str, exts: &[&str], dirs: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(t2i_root(app_data).join(sub)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if dirs {
+                    out.push(name);
+                }
+            } else if let Some(dot) = name.rfind('.') {
+                let ext = name[dot..].to_ascii_lowercase();
+                if exts.contains(&ext.as_str()) {
+                    out.push(name[..dot].to_string());
+                }
             }
         }
     }
@@ -6728,6 +6754,10 @@ struct T2iStatus {
     hf_token_set: bool,
     /// 部分DL（中断/失敗）のモデル名。「不完全（続きから再取得）」表示用。
     partial: Vec<String>,
+    /// モディファイア用アセット（home/loras・embeddings・vae の名前一覧）。設定UIのセレクト用。
+    loras: Vec<String>,
+    embeddings: Vec<String>,
+    vae: Vec<String>,
 }
 
 #[tauri::command(async)]
@@ -6769,6 +6799,9 @@ fn t2i_status(state: State<AppState>) -> T2iStatus {
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false),
         partial: t2i_partial_models(&app_data),
+        loras: list_t2i_assets(&app_data, "loras", &[".safetensors", ".pt", ".ckpt"], false),
+        embeddings: list_t2i_assets(&app_data, "embeddings", &[".safetensors", ".pt", ".bin"], false),
+        vae: list_t2i_assets(&app_data, "vae", &[".safetensors", ".ckpt", ".pt", ".bin"], true),
     }
 }
 
