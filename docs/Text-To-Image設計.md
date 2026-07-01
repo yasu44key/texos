@@ -90,11 +90,51 @@ ControlNet 等）は `Backend` を継承して `BACKENDS` + `PATTERNS_BY_KIND` �
 - 既知の留意点: FLUX は初回ロード ~26GB（オフロード）で重い。`is_available` は model_index.json だけ見るので
   **DL 途中でも available に出る**（全シャード揃う前にロードすると失敗）— 改善候補。
 
-## 既知の留意点 / Phase 3 以降
+---
 
-- **img2img（部分修正の元画像入力）**: デーモンは `init_image`(base64)+`strength` を既に受けられる。
-  Rust/フロントから画像入力（2本目の接続＝image）を渡す配線が Phase 2。要件「入力＝テキスト＋画像」。
-- **対話パネル**: ChatPanel 風の T2i パネル（プロンプト入力＋プレビュー＋画像添付）は Phase 2。
-- **デーモンの停止**: 現状 TexoS 終了時に自動 kill していない（`t2i_stop_server` で明示停止）。
-  起動時自動起動（モデルがあれば health だけ立てる）も将来の改善候補。
-- **バージョン**: 版数 bump と main へのコミットはユーザーのフロー（未実施）。
+## 現状（v1.4.14・2026-07-01・origin/main = de1391c push済み・インストーラ `I:\texos_1.4.14_x64-setup.exe`）＝続きの入口
+
+**このスレッドで t2i フィルタを一通り作り切った。実機で AI対話→grep→生成、img2img、手持ちモデル、
+中断まで確認済み。以下は別スレッドで続きを始めるための引き継ぎ。**
+
+### 実装済み（すべて実機検証済み）
+- `builtin:"t2i"`＝Ollama 流の常駐 diffusers デーモン。TexoS が起動・管理。テキスト→PNG 実身。
+- **バックエンド抽象化**（`python/t2i_server.py` の `Backend`／`SDBackend`・`SDXLBackend`・`FluxBackend`・
+  `BACKENDS` レジストリ）。`MODELS[kind]` でディスパッチ＝**種別非依存の拡張点**（ControlNet 等はここに1件足す）。
+- **txt2img / img2img**（t2i カードは集約ノード＝テキスト入力→プロンプト・画像入力→元画像。`strength`）。
+- **モデル**: `sd1.5`/`dreamshaper`/`flux-lite`（オープン）＋公式 `flux-schnell`/`flux-dev`（HF 認証）。
+- **手持ちモデル**: ①diffusers フォルダ手動配置 ②**単一ファイル(.safetensors/.ckpt)**＝safetensors ヘッダの
+  キーから SD/SDXL/FLUX を自動判別（`_detect_kind_file`）。SDXL は既定 1024。**FLUX 単一ファイルは非対応**（T5 別）。
+- **セットアップ**（`T2iSetupDialog`）: Python 検出・モデルDL（進捗/**レジューム**/**完全性チェック**）・
+  **HF トークン（ファイル方式）**・手動配置導線（📁配置先を開く/🔄更新）・サーバー停止・**設定に常駐リンク**。
+- **中断＆制限時間**: 制限時間欄（既定600・0=無制限）／`/cancel`＝生成を次ステップで止め **GPU 即解放**
+  （run_t2i タイムアウト時＋フロー中断ボタンから）／**自己修復**＝版照合で古いデーモンを入替。
+- デーモンは `include_str!` で埋め込み（**SERVER_VERSION "7"**）。
+
+### ファイルマップ
+- `python/t2i_server.py` — デーモン本体（Engine/Backend/HTTP）。**Rust に include_str! で埋め込み**。
+- `src-tauri/src/flow.rs` — `FilterSpec` の t2i フィールド／`NodeKind::T2i`／`run_t2i`／`t2i_post_cancel`／`T2I_PORT=8765`。
+- `src-tauri/src/lib.rs` — `execute_node` の T2i／デーモン管理コマンド群（status/start/stop/download_model/
+  set_model/set_hf_token/reveal_model_dir/delete_model）／完全性チェック（`t2i_dir_complete` 等）／`T2I_SERVER_VERSION`。
+- `src/model.ts`（t2i→image/png）／`src/ui/T2iSetupDialog.tsx`・`T2iSettingsDialog.tsx`／`src/App.tsx`・`menuBuilder.ts`（配線）。
+
+### 運用の要点（他PC / 他スレッド）
+- **画像生成エンジンは本体に同梱していない**。各PCに system Python＋`torch diffusers transformers accelerate
+  safetensors`（NVIDIA なら CUDA torch）が要る。無ければセットアップの「Python＋生成ライブラリ」が✗。
+- モデルは `%APPDATA%\com.yoshi.texos\t2i\models\`。HF キャッシュ・トークン・スクリプトも `…\t2i\` 配下。
+- **HF トークン**は `config.json` の `t2i_hf_token`（TexoS が `…\t2i\hf_token` へ同期）→ デーモンが pull ごとに読む＝再起動不要。
+- **デーモンを変えたら** python `SERVER_VERSION` と Rust `T2I_SERVER_VERSION` を**両方**上げる＋**再ビルド**
+  （埋め込みはビルド時）。版照合で稼働中の古いデーモンが自動で入れ替わる。
+- 検証時は**同一ポート(8765)に手動デーモンを乱立させない**（混在で切り分けが困難になった実績あり）。
+
+### Phase 3 候補（未実装・`docs/気づき.txt` 由来）
+1. **t2i インライン編集パネル**（ChatPanel 風＝ポジ欄/ネガ欄（やや小）/実行ボタン。追加プロンプトを編集しつつ生成）。★次の本命候補。
+2. **ワークフローの部分を別プロジェクトへコピー/移動**（つながり選択→右クリック→**仮身化コピー**(CAS依存)／
+   **実身化移動**(元から分離)）。`docs/共有とモジュール設計.md` のデータ2レーンと直結。
+3. AI チャット欄の Ctrl+C コピーが不安定（できる時とできない時がある）。
+4. 終了時デーモン自動 kill／起動時自動起動（VRAM 常駐の後始末）。
+5. DL 進捗の粒度（現状は file-count バーで粗い）／ControlNet 等のバックエンド追加。
+
+### 参考
+- 詳細な実装知見・ハマり所の履歴は**メモリ `[[project_texos_t2i]]`** に集約（本ドキュメントの補完）。
+- AI フィルタ設計は `[[project_texos_ai_card]]`、共有/モジュールは `docs/共有とモジュール設計.md`。
