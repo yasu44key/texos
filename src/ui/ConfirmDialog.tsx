@@ -31,17 +31,18 @@ export function ConfirmDialog({
       }}
       onMouseDown={onCancel}
     >
+      {/* v1.4.18: 4モーダルのテーマ追従 — 構造色は --panel-*（ビュワー系と同じ変数体系）。 */}
       <div
         onMouseDown={(e) => e.stopPropagation()}
         style={{
-          background: "#1c2130",
-          border: "1px solid #38445e",
+          background: "var(--panel-bg, #1c2130)",
+          border: "1px solid var(--panel-border, #38445e)",
           borderRadius: 10,
           padding: 20,
           maxWidth: 380,
           boxShadow: "0 8px 32px #000000aa",
           fontFamily: "sans-serif",
-          color: "#d6dded",
+          color: "var(--panel-text, #d6dded)",
         }}
       >
         <div style={{ fontSize: 15, fontWeight: 600, marginBottom: message ? 8 : 16 }}>
@@ -51,7 +52,7 @@ export function ConfirmDialog({
           <div style={{
             fontSize: 13,
             lineHeight: 1.6,
-            color: "#aeb8cc",
+            color: "var(--panel-muted, #aeb8cc)",
             marginBottom: warning ? 10 : 16,
             whiteSpace: "pre-wrap",
             wordBreak: "break-all",
@@ -63,7 +64,7 @@ export function ConfirmDialog({
           <div style={{
             fontSize: 13,
             lineHeight: 1.6,
-            color: "#e06060",
+            color: "var(--panel-danger, #e06060)",
             background: "#3a1c1c55",
             border: "1px solid #6e2e2e",
             borderRadius: 6,
@@ -78,7 +79,10 @@ export function ConfirmDialog({
           </div>
         )}
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <button onClick={onCancel} style={btn("#2a3346", "#aeb8cc")}>
+          <button
+            onClick={onCancel}
+            style={btn("var(--panel-btn-bg, #2a3346)", "var(--panel-text, #aeb8cc)")}
+          >
             {cancelLabel}
           </button>
           <button onClick={onConfirm} style={btn("#3a6fb0", "#ffffff")}>

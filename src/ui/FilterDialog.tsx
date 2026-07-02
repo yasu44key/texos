@@ -241,11 +241,12 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
       }}
       onMouseDown={onCancel}
     >
+      {/* v1.4.18: 4モーダルのテーマ追従 — 構造色は --panel-*（ビュワー系と同じ変数体系）。 */}
       <div
         onMouseDown={(e) => e.stopPropagation()}
         style={{
-          background: "#1c2130",
-          border: "1px solid #38445e",
+          background: "var(--panel-bg, #1c2130)",
+          border: "1px solid var(--panel-border, #38445e)",
           borderRadius: 10,
           padding: 20,
           width: 560,
@@ -253,7 +254,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
           overflowY: "auto",
           boxShadow: "0 8px 32px #000000aa",
           fontFamily: "sans-serif",
-          color: "#d6dded",
+          color: "var(--panel-text, #d6dded)",
           fontSize: 13,
         }}
       >
@@ -433,7 +434,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
                 </option>
               ))}
             </select>
-            <span style={{ fontSize: 12, color: "#8a93a8", flex: "none" }}>拡張子</span>
+            <span style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", flex: "none" }}>拡張子</span>
             <input
               style={{ ...inputStyle(), flex: 1 }}
               value={inExts}
@@ -478,7 +479,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
               onChange={(e) => setPrefix(e.target.value)}
               placeholder="空欄=入力名_フィルタ名"
             />
-            <span style={{ fontSize: 12, color: "#8a93a8", flex: "none" }}>連番</span>
+            <span style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", flex: "none" }}>連番</span>
             <input
               style={{ ...inputStyle(), width: 80 }}
               type="number"
@@ -488,7 +489,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
               placeholder="固定名"
               onChange={(e) => setSeq(e.target.value)}
             />
-            <span style={{ fontSize: 11, color: "#8a93a8" }}>
+            <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
               →{" "}
               {prefix.trim()
                 ? seq.trim() === ""
@@ -519,7 +520,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
               value={timeoutSecs}
               onChange={(e) => setTimeoutSecs(Math.max(0, parseInt(e.target.value, 10) || 0))}
             />
-            <span style={{ fontSize: 12, color: "#8a93a8" }}>
+            <span style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)" }}>
               {timeoutSecs === 0 ? "秒（0=無制限・中断ボタンで停止）" : "秒で強制終了（暴走対策・0=無制限）"}
             </span>
           </div>
@@ -539,7 +540,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
             </label>
             {stdinStop && (
               <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                <span style={{ fontSize: 12, color: "#8a93a8" }}>送る文字</span>
+                <span style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)" }}>送る文字</span>
                 <input
                   style={{ ...inputStyle(), width: 70 }}
                   value={stopCmd}
@@ -551,7 +552,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
           </div>
         )}
         {stdinStop && (
-          <div style={{ fontSize: 11, color: "#8a93a8", margin: "-4px 0 10px 92px" }}>
+          <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", margin: "-4px 0 10px 92px" }}>
             実行中パネルに「停止」が出ます。停止＝この文字を stdin に送って正常終了（ffmpeg 録音は "q"）。
             届かない場合は「中断」で強制終了します。
           </div>
@@ -573,7 +574,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
 function row(label: string, field: React.ReactNode) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-      <div style={{ width: 82, flex: "none", textAlign: "right", color: "#aeb8cc", fontSize: 12 }}>
+      <div style={{ width: 82, flex: "none", textAlign: "right", color: "var(--panel-muted, #aeb8cc)", fontSize: 12 }}>
         {label}
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>{field}</div>
@@ -585,10 +586,10 @@ function inputStyle(): React.CSSProperties {
   return {
     width: "100%",
     padding: "6px 8px",
-    background: "#0e121c",
-    border: "1px solid #38445e",
+    background: "var(--panel-input-bg, #0e121c)",
+    border: "1px solid var(--panel-border, #38445e)",
     borderRadius: 6,
-    color: "#eef2f9",
+    color: "var(--panel-text, #eef2f9)",
     fontSize: 13,
     outline: "none",
     boxSizing: "border-box",
@@ -598,9 +599,9 @@ function inputStyle(): React.CSSProperties {
 function smallBtn(): React.CSSProperties {
   return {
     padding: "6px 10px",
-    background: "#2a3346",
-    color: "#aeb8cc",
-    border: "1px solid #38445e",
+    background: "var(--panel-btn-bg, #2a3346)",
+    color: "var(--panel-text, #aeb8cc)",
+    border: "1px solid var(--panel-border, #38445e)",
     borderRadius: 6,
     cursor: "pointer",
     fontSize: 12,

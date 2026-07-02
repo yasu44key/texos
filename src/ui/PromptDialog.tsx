@@ -40,17 +40,18 @@ export function PromptDialog({ title, initial, allowEmpty, onConfirm, onCancel }
       }}
       onMouseDown={onCancel}
     >
+      {/* v1.4.18: 4モーダルのテーマ追従 — 構造色は --panel-*（ビュワー系と同じ変数体系）。 */}
       <div
         onMouseDown={(e) => e.stopPropagation()}
         style={{
-          background: "#1c2130",
-          border: "1px solid #38445e",
+          background: "var(--panel-bg, #1c2130)",
+          border: "1px solid var(--panel-border, #38445e)",
           borderRadius: 10,
           padding: 20,
           minWidth: 320,
           boxShadow: "0 8px 32px #000000aa",
           fontFamily: "sans-serif",
-          color: "#d6dded",
+          color: "var(--panel-text, #d6dded)",
         }}
       >
         <div style={{ fontSize: 14, marginBottom: 12 }}>{title}</div>
@@ -65,17 +66,20 @@ export function PromptDialog({ title, initial, allowEmpty, onConfirm, onCancel }
           style={{
             width: "100%",
             padding: "8px 10px",
-            background: "#0e121c",
-            border: "1px solid #38445e",
+            background: "var(--panel-input-bg, #0e121c)",
+            border: "1px solid var(--panel-border, #38445e)",
             borderRadius: 6,
-            color: "#eef2f9",
+            color: "var(--panel-text, #eef2f9)",
             fontSize: 14,
             outline: "none",
             boxSizing: "border-box",
           }}
         />
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
-          <button onClick={onCancel} style={btnStyle("#2a3346", "#aeb8cc")}>
+          <button
+            onClick={onCancel}
+            style={btnStyle("var(--panel-btn-bg, #2a3346)", "var(--panel-text, #aeb8cc)")}
+          >
             キャンセル
           </button>
           <button onClick={confirm} style={btnStyle("#3a6fb0", "#ffffff")}>

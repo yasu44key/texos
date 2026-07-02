@@ -55,24 +55,25 @@ export function ProjectChooser({ onChosen, onCancel }: Props) {
   };
 
   return (
+    // v1.4.18: テーマ追従 — 全面はキャンバス色、行/ボタンは --panel-*（ビュワー系と同じ変数体系）。
     <div
       style={{
         position: "fixed",
         inset: 0,
-        background: "#12121e",
+        background: "var(--canvas-bg, #12121e)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         zIndex: 3000,
         fontFamily: "sans-serif",
-        color: "#d6dded",
+        color: "var(--panel-text, #d6dded)",
       }}
     >
       <div style={{ width: 420, maxWidth: "90vw" }}>
         <div style={{ fontSize: 26, fontWeight: 700, marginBottom: 4, letterSpacing: 1 }}>
           TexoS
         </div>
-        <div style={{ fontSize: 12, color: "#7a8aa6", marginBottom: 24 }}>
+        <div style={{ fontSize: 12, color: "var(--panel-muted, #7a8aa6)", marginBottom: 24 }}>
           織り紡ぐ者たち — プロジェクトを選択
         </div>
 
@@ -87,21 +88,21 @@ export function ProjectChooser({ onChosen, onCancel }: Props) {
 
         {recent.length > 0 && (
           <div>
-            <div style={{ fontSize: 11, color: "#7a8aa6", marginBottom: 8 }}>最近使ったプロジェクト</div>
+            <div style={{ fontSize: 11, color: "var(--panel-muted, #7a8aa6)", marginBottom: 8 }}>最近使ったプロジェクト</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: "40vh", overflowY: "auto" }}>
               {buildTree(recent).map(({ info, depth }) => (
                 <div
                   key={info.path}
                   onClick={() => openRecent(info.path)}
                   style={{ ...recentRow, marginLeft: depth * 18 }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = "#222a3c")}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = "#1a2030")}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "var(--panel-btn-bg, #222a3c)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "var(--panel-input-bg, #1a2030)")}
                 >
                   <div style={{ fontSize: 14 }}>
-                    {depth > 0 && <span style={{ color: "#5a6478" }}>↳ </span>}
+                    {depth > 0 && <span style={{ color: "var(--panel-muted, #5a6478)" }}>↳ </span>}
                     {info.name}
                   </div>
-                  <div style={{ fontSize: 10, color: "#6a7488" }}>{info.path}</div>
+                  <div style={{ fontSize: 10, color: "var(--panel-muted, #6a7488)" }}>{info.path}</div>
                 </div>
               ))}
             </div>
@@ -138,9 +139,9 @@ const primaryBtn: React.CSSProperties = {
 
 const secondaryBtn: React.CSSProperties = {
   padding: "12px 16px",
-  background: "#2a3346",
-  color: "#cdd6e6",
-  border: "none",
+  background: "var(--panel-btn-bg, #2a3346)",
+  color: "var(--panel-text, #cdd6e6)",
+  border: "1px solid var(--panel-border, transparent)",
   borderRadius: 8,
   cursor: "pointer",
   fontSize: 14,
@@ -189,8 +190,8 @@ function buildTree(items: ProjectInfo[]): { info: ProjectInfo; depth: number }[]
 }
 
 const recentRow: React.CSSProperties = {
-  background: "#1a2030",
-  border: "1px solid #2a3346",
+  background: "var(--panel-input-bg, #1a2030)",
+  border: "1px solid var(--panel-border, #2a3346)",
   borderRadius: 6,
   padding: "8px 12px",
   cursor: "pointer",
