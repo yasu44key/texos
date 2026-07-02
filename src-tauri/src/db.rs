@@ -4,8 +4,41 @@ use std::path::Path;
 pub fn open(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // v1.4.17 カード統一 §1: 付箋(notes)→virtual_bodies(kind='note') の一括変換を行う前に、
+    // 変換対象がある DB だけ丸ごとバックアップ（.texos/backup/）。コストほぼゼロの保険。
+    backup_before_note_unify(&conn, db_path);
     migrate(&conn)?;
     Ok(conn)
+}
+
+/// notes テーブルに行が残っている（＝これから一括変換が走る）場合のみ、texos.db を
+/// `.texos/backup/texos_pre_note_unify_<ts>.db` へスナップショットする。失敗しても開く
+/// のは止めない（best-effort）が、変換自体は migrate 側で走る。
+fn backup_before_note_unify(conn: &Connection, db_path: &Path) {
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='notes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if pending == 0 {
+        return;
+    }
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+        .unwrap_or(0);
+    if rows == 0 {
+        return;
+    }
+    let Some(parent) = db_path.parent() else { return };
+    let dir = parent.join("backup");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let dest = dir.join(format!("texos_pre_note_unify_{}.db", now_ms()));
+    // VACUUM INTO は WAL 中でも一貫したスナップショットを書く。
+    let _ = conn.execute("VACUUM INTO ?1", params![dest.to_string_lossy()]);
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -79,17 +112,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             value TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS notes (
-            id          TEXT PRIMARY KEY,
-            text        TEXT NOT NULL DEFAULT '',
-            pos_x       REAL NOT NULL DEFAULT 0,
-            pos_y       REAL NOT NULL DEFAULT 0,
-            created_at  INTEGER NOT NULL,
-            width       REAL NOT NULL DEFAULT 220,
-            font_size   REAL NOT NULL DEFAULT 13,
-            bold        INTEGER NOT NULL DEFAULT 0,
-            file_ref    TEXT          -- if set, note mirrors this text file
-        );
+        -- notes テーブルは v1.4.17 で廃止（カード統一 §1）。既存 DB の行は migrate() 末尾で
+        -- virtual_bodies(kind='note') へ一括変換してから DROP する。新規 DB には作らない。
 
         -- v1.3-②③: simple background shapes (角丸四角/楕円/太矢印).
         -- Shapes sit BEHIND cards and act as visual thought-groups: dragging a
@@ -195,6 +219,122 @@ fn migrate(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute("UPDATE virtual_bodies SET kind='file' WHERE kind IS NULL", []);
 
+    // v1.4.17 カード統一 §1 — 付箋のカード派生化。
+    // 本文は note_text、スタイル（width/font_size/bold/color/title_size/file_ref）は
+    // style_ref(JSON)。実身は共有センチネル（url:sentinel の前例）＝CAS に載せない不変テキスト。
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN note_text TEXT", []);
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN style_ref TEXT", []);
+    conn.execute(
+        "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+         VALUES ('note:sentinel', 'text/vnd.texos.note', 0, ?1)",
+        params![now_ms()],
+    )?;
+    migrate_notes_to_cards(conn)?;
+
+    Ok(())
+}
+
+/// v1.4.17: 旧 notes テーブルの全行（ソフト削除中も含む）を virtual_bodies(kind='note') へ
+/// 移し、テーブルを DROP する。notes.id を vid としてそのまま使うので relations の端点は
+/// 無変更で生き残る（カード統一モデル検討結果.md §1）。旧 note 系 UNDO オペは再生不能に
+/// なるため、変換が起きたときだけ UNDO スタックをクリアする。
+fn migrate_notes_to_cards(conn: &Connection) -> Result<()> {
+    let has_notes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='notes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if has_notes == 0 {
+        return Ok(());
+    }
+    struct OldNote {
+        id: String,
+        text: String,
+        x: f64,
+        y: f64,
+        created_at: i64,
+        width: f64,
+        font_size: f64,
+        bold: bool,
+        file_ref: Option<String>,
+        color: Option<String>,
+        title_size: Option<f64>,
+        deleted_at: Option<i64>,
+    }
+    let rows: Vec<OldNote> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, text, pos_x, pos_y, created_at, width, font_size, bold,
+                    file_ref, color, title_size, deleted_at
+             FROM notes",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            Ok(OldNote {
+                id: r.get(0)?,
+                text: r.get(1)?,
+                x: r.get(2)?,
+                y: r.get(3)?,
+                created_at: r.get(4)?,
+                width: r.get(5)?,
+                font_size: r.get(6)?,
+                bold: r.get::<_, i64>(7)? != 0,
+                file_ref: r.get(8)?,
+                color: r.get(9)?,
+                title_size: r.get(10)?,
+                deleted_at: r.get(11)?,
+            })
+        })?;
+        mapped.collect::<Result<Vec<_>>>()?
+    };
+    let migrated = rows.len();
+    for n in rows {
+        let label: String = n
+            .text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(40)
+            .collect();
+        let mut style = serde_json::Map::new();
+        style.insert("width".into(), serde_json::json!(n.width));
+        style.insert("font_size".into(), serde_json::json!(n.font_size));
+        if n.bold {
+            style.insert("bold".into(), serde_json::json!(true));
+        }
+        if let Some(c) = n.color {
+            style.insert("color".into(), serde_json::json!(c));
+        }
+        if let Some(t) = n.title_size {
+            style.insert("title_size".into(), serde_json::json!(t));
+        }
+        if let Some(f) = n.file_ref {
+            style.insert("file_ref".into(), serde_json::json!(f));
+        }
+        conn.execute(
+            "INSERT INTO virtual_bodies
+                (id, real_id, label, pos_x, pos_y, created_at, kind, note_text, style_ref, deleted_at)
+             VALUES (?1, 'note:sentinel', ?2, ?3, ?4, ?5, 'note', ?6, ?7, ?8)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                n.id,
+                label,
+                n.x,
+                n.y,
+                n.created_at,
+                n.text,
+                serde_json::Value::Object(style).to_string(),
+                n.deleted_at
+            ],
+        )?;
+    }
+    if migrated > 0 {
+        // 旧 note オペ（create/move/delete note）は新モデルで再生できないためクリア。
+        let _ = conn.execute("DELETE FROM meta WHERE key = 'ui_undo_stack'", []);
+    }
+    conn.execute("DROP TABLE notes", [])?;
     Ok(())
 }
 
@@ -272,6 +412,73 @@ mod tests {
             assert!((opacity - 0.2).abs() < 1e-9);
         }
         let _ = open(&db_path).expect("re-open (idempotent migrate)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1.4.17 カード統一: 旧 notes テーブルの行が virtual_bodies(kind='note') へ移り、
+    /// id は不変（relations の端点が生き残る）・スタイルは style_ref(JSON)・notes は DROP
+    /// され、変換前バックアップが backup/ に作られること。
+    #[test]
+    fn migrate_notes_table_to_cards() {
+        let dir = std::env::temp_dir().join(format!("texos_note_mig_test_{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("texos.db");
+        {
+            let conn = open(&db_path).expect("first open");
+            // 旧形式の notes テーブルを再現（v1.4.16 までのフルカラム）
+            conn.execute_batch(
+                "CREATE TABLE notes (
+                    id TEXT PRIMARY KEY, text TEXT NOT NULL DEFAULT '',
+                    pos_x REAL NOT NULL DEFAULT 0, pos_y REAL NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL, width REAL NOT NULL DEFAULT 220,
+                    font_size REAL NOT NULL DEFAULT 13, bold INTEGER NOT NULL DEFAULT 0,
+                    file_ref TEXT, color TEXT, title_size REAL, deleted_at INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO notes (id,text,pos_x,pos_y,created_at,bold,color)
+                 VALUES ('n1', '見出し' || char(10) || '本文', 10.0, 20.0, ?1, 1, '#ffcc00')",
+                params![now_ms()],
+            )
+            .unwrap();
+        }
+        {
+            let conn = open(&db_path).expect("re-open runs migration");
+            let (kind, text, label): (String, String, String) = conn
+                .query_row(
+                    "SELECT kind, note_text, label FROM virtual_bodies WHERE id='n1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .expect("migrated note row");
+            assert_eq!(kind, "note");
+            assert_eq!(text, "見出し\n本文");
+            assert_eq!(label, "見出し");
+            let style: String = conn
+                .query_row(
+                    "SELECT style_ref FROM virtual_bodies WHERE id='n1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(style.contains("#ffcc00"));
+            assert!(style.contains("\"bold\":true"));
+            let notes_left: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='notes'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(notes_left, 0);
+            assert!(
+                std::fs::read_dir(dir.join("backup"))
+                    .map(|d| d.count() > 0)
+                    .unwrap_or(false),
+                "変換前バックアップが無い"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

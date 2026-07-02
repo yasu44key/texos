@@ -5,7 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { Canvas, screenToCanvas, type Transform, type CanvasApi } from "./canvas/Canvas";
-import { LinkLayer, type RelationInfo } from "./canvas/LinkLayer";
+import { LinkLayer, center as nodeCenter, edgePoint as nodeEdgePoint, type NodeBox, type RelationInfo } from "./canvas/LinkLayer";
 import { ObjectCard, CARD_W, CARD_H } from "./objects/ObjectCard";
 import { NoteCard } from "./objects/NoteCard";
 import { ShapeCard, type ShapeInfo } from "./objects/ShapeCard";
@@ -1607,10 +1607,11 @@ function App() {
         return;
       }
       // v1.4.1 AI対話カード: 覗く＝チャットパネルをトグル（設定は右クリックメニュー）。
+      // v1.4.17 画像生成カードも同じ流儀＝ダブルクリックでインライン生成パネルをトグル。
       if (obj?.filter_ref) {
         try {
           const s = JSON.parse(obj.filter_ref);
-          if (s.builtin === "ai" && s.mode === "chat") {
+          if ((s.builtin === "ai" && s.mode === "chat") || s.builtin === "t2i") {
             const isOpen = expandedRef.current.has(id);
             invoke("set_expanded", { id, expanded: !isOpen }).catch(() => {});
             setExpanded((prev) => {
@@ -2378,16 +2379,19 @@ function App() {
   // v1.4.14 プロジェクト間ワークフロー共有: 選択した部分グラフ（カード＋コメント＋内部の
   // 関係矢印）を別プロジェクトへ送る。mode="copy"=仮身化してコピー（元に依存・元は残る）/
   // "move"=実身化して移動（送り先に独立実身・元はソフトデリート＝Ctrl+Z 復活可）。
+  // v1.4.17: 選択中の図形（コンテナとして使う枠）も一緒に運ぶ。
   const handleSendSelectionToProject = useCallback(
     async (mode: "copy" | "move", targetPath: string, targetName: string) => {
       const cardIds = [...selectedRef.current];
       const noteIds = [...selectedNotesRef.current];
-      if (!cardIds.length && !noteIds.length) return;
+      const shapeIds = [...selectedShapesRef.current];
+      if (!cardIds.length && !noteIds.length && !shapeIds.length) return;
       const run = async () => {
         try {
           const n = await invoke<number>("send_selection_to_project", {
             cardIds,
             noteIds,
+            shapeIds,
             targetPath,
             moveOut: mode === "move",
           });
@@ -2418,7 +2422,7 @@ function App() {
         }
       };
       if (mode === "move") {
-        const total = cardIds.length + noteIds.length;
+        const total = cardIds.length + noteIds.length + shapeIds.length;
         setConfirm({
           title: "別プロジェクトへ移動",
           message: `${total}件を「${targetName}」へ移動します。実体が送り先へ移るため、元プロジェクトからは削除され、Ctrl+Z では復活できません。よろしいですか？（元にも残したい場合は「仮身化してコピー」を使ってください）`,
@@ -2615,6 +2619,54 @@ function App() {
 
   // Drag one selected card/note → move the whole selection together
   // (cards AND notes — v1.3.1 unified).
+  // v1.4.17: ドラッグ中の矢印追従。カード/付箋と同じ命令的DOM更新で、動いているノードに
+  // 接続された矢印の端点を再計算して <line data-rel-id> に直接書く。状態ベースで再描画すると
+  // ドラッグ中の transform（DOM直接更新）と React の再レンダーが競合するため、この方式にする。
+  // 確定描画は従来どおりドラッグ終了後の move 永続化＋再レンダーが担う。
+  const redrawArrowsFor = useCallback(
+    (moved: Map<string, { x: number; y: number }>) => {
+      if (!moved.size) return;
+      let cardById: Map<string, (typeof objectsRef.current)[number]> | null = null;
+      let noteById: Map<string, (typeof notesRef.current)[number]> | null = null;
+      const boxOf = (nid: string): NodeBox | null => {
+        const m = moved.get(nid);
+        cardById ??= new Map(objectsRef.current.map((o) => [o.id, o]));
+        const o = cardById.get(nid);
+        if (o) return { id: nid, x: m?.x ?? o.pos_x, y: m?.y ?? o.pos_y, w: CARD_W, h: CARD_H };
+        noteById ??= new Map(notesRef.current.map((n) => [n.id, n]));
+        const n = noteById.get(nid);
+        if (n) {
+          const s = measuredNoteSize(n);
+          return { id: nid, x: m?.x ?? n.pos_x, y: m?.y ?? n.pos_y, w: s.w, h: s.h };
+        }
+        return null;
+      };
+      for (const r of relationsRef.current) {
+        if (!moved.has(r.from_id) && !moved.has(r.to_id)) continue;
+        const from = boxOf(r.from_id);
+        const to = boxOf(r.to_id);
+        if (!from || !to) continue;
+        const p1 = nodeEdgePoint(from, nodeCenter(to));
+        const p2 = nodeEdgePoint(to, nodeCenter(from));
+        document
+          .querySelectorAll<SVGLineElement>(`line[data-rel-id="${r.id}"]`)
+          .forEach((ln) => {
+            ln.setAttribute("x1", String(p1.x));
+            ln.setAttribute("y1", String(p1.y));
+            ln.setAttribute("x2", String(p2.x));
+            ln.setAttribute("y2", String(p2.y));
+          });
+      }
+    },
+    [measuredNoteSize]
+  );
+
+  // 単体ドラッグ（ObjectCard/NoteCard 内部のDOM移動）用の矢印追従。
+  const handleDragLive = useCallback(
+    (id: string, x: number, y: number) => redrawArrowsFor(new Map([[id, { x, y }]])),
+    [redrawArrowsFor]
+  );
+
   const handleGroupDragStart = useCallback((id: string, clientX: number, clientY: number) => {
     if (!selectedRef.current.size && !selectedNotesRef.current.size) return;
     const scale = transformRef.current.scale || 1;
@@ -2644,6 +2696,11 @@ function App() {
         const el = elOf("data-note-id", nid);
         if (el) el.style.transform = `translate(${s.x + dx}px, ${s.y + dy}px)`;
       });
+      // 矢印も同時に追従（v1.4.17）。
+      const moved = new Map<string, { x: number; y: number }>();
+      cardStarts.forEach((s, oid) => moved.set(oid, { x: s.x + dx, y: s.y + dy }));
+      noteStarts.forEach((s, nid) => moved.set(nid, { x: s.x + dx, y: s.y + dy }));
+      redrawArrowsFor(moved);
     };
     const onUp = async () => {
       window.removeEventListener("mousemove", onMove);
@@ -2685,7 +2742,7 @@ function App() {
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-  }, [pushUndo, applyObjectMoves, applyNoteMoves]);
+  }, [pushUndo, applyObjectMoves, applyNoteMoves, redrawArrowsFor]);
 
   // --- Clipboard paste (v1.3-④) ---------------------------------------------
 
@@ -2832,6 +2889,10 @@ function App() {
       if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "c") return;
       const ae = document.activeElement as HTMLElement | null;
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      // キャンバスは userSelect:none のため、非折りたたみのテキスト選択が残っているのは
+      // チャット応答などパネル内で意図的に選択した状態。カードが選択中でも奪わず標準コピーに任せる。
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.toString()) return;
       const ids = [...selectedRef.current];
       if (!ids.length) return; // 選択がなければブラウザ標準コピーに任せる
       e.preventDefault();
@@ -2969,6 +3030,11 @@ function App() {
         const el = document.querySelector<HTMLElement>(`[data-shape-id="${CSS.escape(sid)}"]`);
         if (el) el.style.transform = `translate(${st.x + dx}px, ${st.y + dy}px) rotate(${st.rot}deg)`;
       });
+      // 図形に乗ったカード/付箋の矢印も同時に追従（v1.4.17）。
+      const movedNodes = new Map<string, { x: number; y: number }>();
+      drag.cardStarts.forEach((st, oid) => movedNodes.set(oid, { x: st.x + dx, y: st.y + dy }));
+      drag.noteStarts.forEach((st, nid) => movedNodes.set(nid, { x: st.x + dx, y: st.y + dy }));
+      redrawArrowsFor(movedNodes);
       if (done) {
         const moves = [...drag.cardStarts.entries()].map(([oid, st]) => ({
           id: oid,
@@ -3010,7 +3076,7 @@ function App() {
         })();
       }
     },
-    [cardsOnShape, notesOnShape, pushUndo, applyObjectMoves, applyNoteMoves, applyShapeGeoms]
+    [cardsOnShape, notesOnShape, pushUndo, applyObjectMoves, applyNoteMoves, applyShapeGeoms, redrawArrowsFor]
   );
 
   const handleShapeDelete = useCallback(
@@ -4089,6 +4155,7 @@ function App() {
             onSelect={handleCardSelectOnly}
             onGroupDragStart={handleGroupDragStart}
             onMoveEnd={handleMoveEnd}
+            onDragLive={handleDragLive}
             onStartLink={handleStartLink}
             onOpen={handleOpenObject}
             onRenameTitle={handleRenameTitle}
@@ -4120,6 +4187,7 @@ function App() {
             onStartLink={handleStartLink}
             onMeasure={handleNoteMeasure}
             onMoveEnd={handleNoteMove}
+            onDragLive={handleDragLive}
             onSave={handleNoteSave}
             onResize={handleNoteResize}
           />

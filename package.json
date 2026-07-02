@@ -1,13 +1,14 @@
 {
   "name": "texos",
   "private": true,
-  "version": "1.4.16",
+  "version": "1.4.17",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

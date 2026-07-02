@@ -126,6 +126,10 @@ pub struct FilterSpec {
     /// Clip skip（A1111 流。1=スキップなし・2=penultimate。SD/SDXL のみ有効）。
     #[serde(default)]
     pub clip_skip: Option<u32>,
+    /// v1.4.17 インラインパネルの追加プロンプト。接続テキスト入力の後ろに ", " で連結される。
+    /// 入力が無ければこれ単独がプロンプトになる（パネルだけで生成できる）。
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 /// v1.4.10 リファクタリング（§4.2 ノード種別の体系化）: いままで eval_filter / run_flow に
@@ -193,6 +197,11 @@ impl FilterSpec {
     pub fn is_self_contained(&self) -> bool {
         matches!(self.node_kind(), NodeKind::Generator | NodeKind::External)
             && !self.cmd.as_deref().unwrap_or("").contains("{out")
+    }
+
+    /// v1.4.17 t2i インラインパネルの追加プロンプト（空白のみは無いのと同じ）。
+    pub fn own_prompt(&self) -> Option<&str> {
+        self.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
 }
 

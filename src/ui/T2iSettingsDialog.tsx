@@ -23,6 +23,8 @@ export interface T2iSpec {
   timeout_secs?: number;
   accept_mime?: string;
   output_ext?: string;
+  /** v1.4.17 インラインパネルの追加プロンプト。編集はパネル側（ここではパススルー保持のみ）。 */
+  prompt?: string;
 }
 
 // サンプラー選択肢（t2i_server.py の SAMPLERS と対応）。空＝モデル既定(DPM++)。
@@ -110,6 +112,8 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
       // */* ＝ テキスト（プロンプト）に加えて画像（img2img の元画像）も接続できる。
       accept_mime: "*/*",
       output_ext: "png",
+      // インラインパネルが保存した追加プロンプトを消さない（編集はパネル側）。
+      prompt: init.prompt || undefined,
     };
     onSave(label.trim() || "画像生成", JSON.stringify(spec));
   };

@@ -63,6 +63,8 @@ interface Props {
   /** Reports the ACTUAL rendered size (canvas px) so arrows attach exactly. */
   onMeasure?: (id: string, w: number, h: number) => void;
   onMoveEnd?: (id: string, x: number, y: number) => void;
+  /** v1.4.17: 単体ドラッグ中の生位置（矢印の同時追従用。永続化はしない）。 */
+  onDragLive?: (id: string, x: number, y: number) => void;
   onSave?: (id: string, text: string) => void;
   onResize?: (id: string, width: number) => void;
 }
@@ -71,7 +73,7 @@ export function NoteCard({
   id, text, x, y,
   width = 220, fontSize = 13, bold = false, color = null, titleSize = null, fileRef = null,
   startEditing, zIndex = 0, selected = false,
-  onToggleSelect, onSelect, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onSave, onResize,
+  onToggleSelect, onSelect, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onDragLive, onSave, onResize,
 }: Props) {
   const c = noteColors(color, fileRef);
   const posRef = useRef({ x, y });
@@ -163,6 +165,7 @@ export function NoteCard({
         curX = startX + (me.clientX - startMouseX) / scale;
         curY = startY + (me.clientY - startMouseY) / scale;
         card.style.transform = `translate(${curX}px, ${curY}px)`;
+        onDragLive?.(id, curX, curY); // 矢印も同時に追従（v1.4.17）
       } else {
         curW = Math.max(120, startW + (me.clientX - startMouseX) / scale);
         card.style.width = `${curW}px`;

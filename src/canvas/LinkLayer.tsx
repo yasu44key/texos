@@ -24,12 +24,13 @@ interface LinkLayerProps {
   invalidIds?: Set<number>;
 }
 
-function center(n: NodeBox) {
+// v1.4.17: ドラッグ中の矢印追従（App.redrawArrowsFor）が同じ端点計算を使うため export。
+export function center(n: NodeBox) {
   return { x: n.x + n.w / 2, y: n.y + n.h / 2 };
 }
 
 /** Point on the node rect edge (centered at c) along the direction toward `toward`. */
-function edgePoint(n: NodeBox, toward: { x: number; y: number }) {
+export function edgePoint(n: NodeBox, toward: { x: number; y: number }) {
   const c = center(n);
   const dx = toward.x - c.x;
   const dy = toward.y - c.y;
@@ -115,7 +116,9 @@ export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation, invali
         return (
           <g key={r.id}>
             {/* invisible fat line for easier click-to-delete */}
+            {/* data-rel-id: ドラッグ中はカードと同じ命令的DOM更新で端点を追従させる（v1.4.17） */}
             <line
+              data-rel-id={r.id}
               x1={p1.x}
               y1={p1.y}
               x2={p2.x}
@@ -126,6 +129,7 @@ export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation, invali
               onClick={() => onDeleteRelation?.(r.id)}
             />
             <line
+              data-rel-id={r.id}
               x1={p1.x}
               y1={p1.y}
               x2={p2.x}

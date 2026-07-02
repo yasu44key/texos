@@ -2,6 +2,7 @@ import { useRef, useState, useEffect, lazy, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { InlineTextEditor } from "./InlineTextEditor";
 import { ChatPanel } from "./ChatPanel";
+import { T2iPanel } from "./T2iPanel";
 import { ImagePreview } from "./ImagePreview";
 import { AudioPlayer } from "./AudioPlayer";
 import { MediaPreview } from "./MediaPreview";
@@ -80,6 +81,8 @@ interface Props {
   /** v1.3.9: フィルタ/コマンド/ジェネレータの ▶実行 ボタン（ダブルクリックは設定に変更）。 */
   onRunFlow?: (id: string) => void;
   onMoveEnd?: (id: string, x: number, y: number) => void;
+  /** v1.4.17: 単体ドラッグ中の生位置（矢印の同時追従用。永続化はしない）。 */
+  onDragLive?: (id: string, x: number, y: number) => void;
   /** Begin dragging a link from this card. (fromId, clientX, clientY) */
   onStartLink?: (fromId: string, clientX: number, clientY: number) => void;
   /** Double-click to open/edit this object. */
@@ -201,6 +204,16 @@ function aiModeOf(ref: string | null | undefined): "chat" | "transform" | null {
   return null;
 }
 
+// v1.4.17: t2i（画像生成）カード判定。ダブルクリック＝インライン生成パネル（AIチャットと同じ流儀）。
+function isT2iOf(ref: string | null | undefined): boolean {
+  if (!ref) return false;
+  try {
+    return JSON.parse(ref).builtin === "t2i";
+  } catch {
+    return false;
+  }
+}
+
 // v1.4.6: AIカードの provider/endpoint（ChatPanel の Ollama セットアップ案内に渡す）。
 function aiConnOf(ref: string | null | undefined): { provider?: string; endpoint?: string } {
   if (!ref) return {};
@@ -221,10 +234,11 @@ export function ObjectCard({
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onCtrlClone, onSelectConnected, onSelect, onGroupDragStart,
-  onMoveEnd, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
+  onMoveEnd, onDragLive, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
 }: Props) {
   const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
   const isAiChat = aiModeOf(filterRef) === "chat"; // v1.4.1 対話パネルを持つAIカード
+  const isT2i = isT2iOf(filterRef); // v1.4.17 インライン生成パネルを持つ画像生成カード
   const posRef = useRef({ x, y });
   posRef.current = { x, y };
   const [thumbnail, setThumbnail] = useState<string | null>(null);
@@ -337,6 +351,7 @@ export function ObjectCard({
       curX = startX + (me.clientX - startMouseX) / scale;
       curY = startY + (me.clientY - startMouseY) / scale;
       el.style.transform = `translate(${curX}px, ${curY}px)`;
+      onDragLive?.(id, curX, curY); // 矢印も同時に追従（v1.4.17）
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
@@ -453,6 +468,8 @@ export function ObjectCard({
       title={
         isAiChat
           ? `🤖 AI対話\nダブルクリック / 💬チャット: パネルを開く\n右クリック → 設定: モデル・システム変更${memo ? `\n\n${memo}` : ""}`
+          : isT2i
+          ? `🎨 画像生成\nダブルクリック: 生成パネル（プロンプト編集＋実行） ／ ボタン: フローを実行\n右クリック → 設定: モデル・パラメータ変更${memo ? `\n\n${memo}` : ""}`
           : isFilter
           ? `${fstyle.badge}\nダブルクリック: 設定を開く ／ ボタン: ${fstyle.run}\n右クリック: メニュー${memo ? `\n\n${memo}` : ""}`
           : isDrop
@@ -681,6 +698,18 @@ export function ObjectCard({
           onClose={() => onCollapse?.(id)}
           provider={aiConnOf(filterRef).provider}
           endpoint={aiConnOf(filterRef).endpoint}
+        />
+      )}
+      {/* v1.4.17: 画像生成のインラインパネル（ダブルクリックでトグル・AIチャットと同じ流儀）。 */}
+      {expanded && isT2i && (
+        <T2iPanel
+          objId={id}
+          label={label}
+          top={CARD_H + 8}
+          filterRef={filterRef}
+          onClose={() => onCollapse?.(id)}
+          onRun={onRunFlow}
+          onSaved={onAfterSave}
         />
       )}
       {expanded && !isAiChat && isImage && (

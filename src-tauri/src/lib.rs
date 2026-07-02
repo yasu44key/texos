@@ -346,10 +346,11 @@ fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), String> {
              INSERT INTO fork.virtual_bodies
                (id,real_id,label,pos_x,pos_y,desktop_id,created_at,etag,last_modified,
                 committed_path,committed_mtime,project_ref,expanded,url_ref,memo,
-                z_order,folder_ref,origin_path,kind,filter_ref,ext,mime_type)
+                z_order,folder_ref,origin_path,kind,filter_ref,ext,mime_type,note_text,style_ref)
                SELECT id,real_id,label,pos_x,pos_y,desktop_id,created_at,etag,last_modified,
                 NULL,NULL,project_ref,expanded,url_ref,memo,
-                z_order,folder_ref,origin_path,kind,filter_ref,ext,mime_type FROM main.virtual_bodies
+                z_order,folder_ref,origin_path,kind,filter_ref,ext,mime_type,note_text,style_ref
+               FROM main.virtual_bodies
                WHERE deleted_at IS NULL;
              INSERT INTO fork.relations (id,from_id,to_id,kind,created_at)
                SELECT id,from_id,to_id,kind,created_at FROM main.relations rel
@@ -357,14 +358,7 @@ fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), String> {
                  AND NOT EXISTS (
                    SELECT 1 FROM main.virtual_bodies d
                    WHERE d.deleted_at IS NOT NULL AND (d.id = rel.from_id OR d.id = rel.to_id)
-                 )
-                 AND NOT EXISTS (
-                   SELECT 1 FROM main.notes dn
-                   WHERE dn.deleted_at IS NOT NULL AND (dn.id = rel.from_id OR dn.id = rel.to_id)
                  );
-             INSERT INTO fork.notes (id,text,pos_x,pos_y,created_at,width,font_size,bold,file_ref,color,title_size)
-               SELECT id,text,pos_x,pos_y,created_at,width,font_size,bold,NULL,color,title_size FROM main.notes
-               WHERE deleted_at IS NULL;
              INSERT INTO fork.shapes
                (id,kind,pos_x,pos_y,width,height,rotation,fill,opacity,z_order,label,created_at)
                SELECT id,kind,pos_x,pos_y,width,height,rotation,fill,opacity,z_order,label,created_at
@@ -378,6 +372,31 @@ fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), String> {
             "INSERT OR REPLACE INTO fork.meta (key,value) VALUES ('fork_source_cas', ?1)",
             rusqlite::params![source_cas],
         )?;
+        // v1.4.17: 付箋(kind='note')の file_ref は親のコミット先を指すので外す
+        //（旧 fork.notes の file_ref=NULL と同じ扱い。style_ref JSON から該当キーだけ除去）。
+        {
+            let rows: Vec<(String, String)> = {
+                let mut stmt = src.conn.prepare(
+                    "SELECT id, style_ref FROM fork.virtual_bodies
+                     WHERE kind = 'note' AND style_ref IS NOT NULL",
+                )?;
+                let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                mapped.flatten().collect()
+            };
+            for (id, style) in rows {
+                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&style) {
+                    if v.get("file_ref").is_some() {
+                        if let Some(o) = v.as_object_mut() {
+                            o.remove("file_ref");
+                        }
+                        src.conn.execute(
+                            "UPDATE fork.virtual_bodies SET style_ref = ?1 WHERE id = ?2",
+                            rusqlite::params![v.to_string(), id],
+                        )?;
+                    }
+                }
+            }
+        }
         // v1.3.11: フォークの仮身化を「外部ファイルの取り込み」と同じ形にする（ユーザー指摘の
         // “ぬけ”の修正）。従来は committed_path を NULL にして origin をコピーするだけで、親で
         // origin/window_of を持たないカード（内部実身・仮身の複製）が**指し先ゼロの孤児**になり、
@@ -1033,6 +1052,7 @@ fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo>, String> 
              FROM virtual_bodies v
              JOIN real_bodies r ON r.id = v.real_id
              WHERE v.desktop_id IS NULL AND v.deleted_at IS NULL
+               AND (v.kind IS NULL OR v.kind <> 'note') -- 付箋は list_notes（NoteCard ビュー）が担う
              ORDER BY v.created_at",
         )
         .map_err(|e| e.to_string())?;
@@ -1698,11 +1718,14 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
 ///   - `move_out=true` ＝実身化して移動: 送り先ルートにコミット済みの独立した実身として置き、
 ///     元プロジェクトからはソフトデリート（Ctrl+Zで復活可・実ファイルは .texos/trash へ退避）。
 /// フィルタ／ランチャー等の設定（filter_ref/kind/url_ref…）も継承する。プロジェクト境界を
-/// またぐ矢印は張らない（両端が選択内の relations だけ運ぶ）。戻り値＝運んだカード＋コメント数。
+/// またぐ矢印は張らない（両端が選択内の relations だけ運ぶ）。
+/// v1.4.17: 選択中の図形（コンテナ枠）も一緒に運ぶ（移動なら元をソフトデリート）。
+/// 戻り値＝運んだカード＋コメント＋図形数。
 #[tauri::command]
 fn send_selection_to_project(
     card_ids: Vec<String>,
     note_ids: Vec<String>,
+    shape_ids: Vec<String>,
     target_path: String,
     move_out: bool,
     state: State<AppState>,
@@ -1751,6 +1774,9 @@ fn send_selection_to_project(
         mime_type: Option<String>,
         window_of: Option<String>,
         mime: String,
+        // v1.4.17 カード統一: 付箋(kind='note')も同じ経路で運ぶ。
+        note_text: Option<String>,
+        style_ref: Option<String>,
     }
 
     p.conn
@@ -1760,17 +1786,30 @@ fn send_selection_to_project(
         )
         .map_err(|e| e.to_string())?;
 
+    // 送り先がまだ旧バージョンでしか開かれていなくても受け取れるよう、この関数の INSERT が
+    // 使う新列だけ best-effort で足しておく（送り先を開けば正規の migrate が走る）。
+    let _ = p
+        .conn
+        .execute("ALTER TABLE dst.virtual_bodies ADD COLUMN note_text TEXT", []);
+    let _ = p
+        .conn
+        .execute("ALTER TABLE dst.virtual_bodies ADD COLUMN style_ref TEXT", []);
+    let _ = p
+        .conn
+        .execute("ALTER TABLE dst.shapes ADD COLUMN deleted_at INTEGER", []);
+
     let result = (|| -> Result<usize, String> {
         let mut moved = 0usize;
 
-        for old_id in &card_ids {
+        // v1.4.17 カード統一: 付箋(note_ids)もカードと同じ経路で運ぶ（旧・専用セクションは廃止）。
+        for old_id in card_ids.iter().chain(note_ids.iter()) {
             let row: Option<CardRow> = p
                 .conn
                 .query_row(
                     "SELECT v.real_id, v.label, v.pos_x, v.pos_y, v.kind, v.filter_ref,
                             v.url_ref, v.folder_ref, v.project_ref, v.memo, v.z_order,
                             v.ext, v.mime_type, v.window_of,
-                            COALESCE(v.mime_type, r.mime_type)
+                            COALESCE(v.mime_type, r.mime_type), v.note_text, v.style_ref
                      FROM main.virtual_bodies v JOIN main.real_bodies r ON r.id = v.real_id
                      WHERE v.id = ?1 AND v.deleted_at IS NULL",
                     rusqlite::params![old_id],
@@ -1791,6 +1830,8 @@ fn send_selection_to_project(
                             mime_type: r.get(12)?,
                             window_of: r.get(13)?,
                             mime: r.get(14)?,
+                            note_text: r.get(15)?,
+                            style_ref: r.get(16)?,
                         })
                     },
                 )
@@ -1813,14 +1854,28 @@ fn send_selection_to_project(
                 )
                 .map_err(|e| e.to_string())?;
 
+            // 付箋の file_ref は元プロジェクトのコミット先を指すので運ばない（fork と同じ扱い）。
+            let style_out: Option<String> = if c.kind.as_deref() == Some("note") {
+                c.style_ref.as_deref().and_then(|s| {
+                    serde_json::from_str::<serde_json::Value>(s).ok().map(|mut v| {
+                        if let Some(o) = v.as_object_mut() {
+                            o.remove("file_ref");
+                        }
+                        v.to_string()
+                    })
+                })
+            } else {
+                c.style_ref.clone()
+            };
+
             // カード本体を新IDで挿入。committed_path/mtime は一旦 NULL、project_ref は
             // 持ち出さない（プロジェクト参照は跨がない）。
             p.conn
                 .execute(
                     "INSERT INTO dst.virtual_bodies
                         (id,real_id,label,pos_x,pos_y,created_at,kind,filter_ref,url_ref,
-                         folder_ref,memo,z_order,ext,mime_type,window_of)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                         folder_ref,memo,z_order,ext,mime_type,window_of,note_text,style_ref)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     rusqlite::params![
                         new_id,
                         c.real_id,
@@ -1837,6 +1892,8 @@ fn send_selection_to_project(
                         c.ext,
                         c.mime_type,
                         new_window,
+                        c.note_text,
+                        style_out,
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -1908,46 +1965,6 @@ fn send_selection_to_project(
             moved += 1;
         }
 
-        // コメント（付箋）。file_ref は元のコミット先を指すので NULL にリセット（fork と同様）。
-        for old_id in &note_ids {
-            let new_id = id_map.get(old_id).unwrap().clone();
-            let n: Option<(String, f64, f64, f64, f64, i64, Option<String>, Option<f64>)> = p
-                .conn
-                .query_row(
-                    "SELECT text,pos_x,pos_y,width,font_size,bold,color,title_size FROM main.notes
-                     WHERE id = ?1 AND deleted_at IS NULL",
-                    rusqlite::params![old_id],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                            r.get(7)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            let Some((text, x, y, width, font_size, bold, color, title_size)) = n else {
-                continue;
-            };
-            p.conn
-                .execute(
-                    "INSERT INTO dst.notes
-                        (id,text,pos_x,pos_y,created_at,width,font_size,bold,file_ref,color,title_size)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9,?10)",
-                    rusqlite::params![
-                        new_id, text, x, y, db::now_ms(), width, font_size, bold, color, title_size
-                    ],
-                )
-                .map_err(|e| e.to_string())?;
-            moved += 1;
-        }
-
         // 関係矢印: 両端が選択内のものだけ、新IDへ貼り替えて運ぶ。先に Vec へ集めてから挿入
         // （prepared statement と execute の借用が重ならないように）。
         let edges: Vec<(String, String, String)> = {
@@ -1974,6 +1991,46 @@ fn send_selection_to_project(
             }
         }
 
+        // v1.4.17: 選択中の図形（コンテナとして使う枠）も一緒に運ぶ。図形は関係の端点に
+        // ならず ID 参照もされないため、新規採番で挿入するだけでよい。
+        for old_id in &shape_ids {
+            let s: Option<(String, f64, f64, f64, f64, f64, String, f64, i64, String)> = p
+                .conn
+                .query_row(
+                    "SELECT kind,pos_x,pos_y,width,height,rotation,fill,opacity,z_order,label
+                     FROM main.shapes WHERE id = ?1 AND deleted_at IS NULL",
+                    rusqlite::params![old_id],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let Some((kind, x, y, w, h, rot, fill, opacity, z, label)) = s else {
+                continue;
+            };
+            p.conn
+                .execute(
+                    "INSERT INTO dst.shapes
+                        (id,kind,pos_x,pos_y,width,height,rotation,fill,opacity,z_order,label,created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    rusqlite::params![uuid(), kind, x, y, w, h, rot, fill, opacity, z, label, db::now_ms()],
+                )
+                .map_err(|e| e.to_string())?;
+            moved += 1;
+        }
+
         Ok(moved)
     })();
 
@@ -1984,7 +2041,8 @@ fn send_selection_to_project(
     // Ctrl+Z で復活可）。コミット済み実ファイルは .texos/trash へ退避（delete_object と同じ
     // 共有ガード付き＝同じ実体を指す別の生きたカードがいれば退避しない）。
     if move_out {
-        for old_id in &card_ids {
+        // v1.4.17 カード統一: 付箋も同じソフトデリート経路（committed_path 無し＝退避なし）。
+        for old_id in card_ids.iter().chain(note_ids.iter()) {
             let committed: Option<String> = p
                 .conn
                 .query_row(
@@ -2024,12 +2082,6 @@ fn send_selection_to_project(
                 rusqlite::params![db::now_ms(), old_id],
             );
         }
-        for old_id in &note_ids {
-            let _ = p.conn.execute(
-                "UPDATE notes SET deleted_at = ?1 WHERE id = ?2",
-                rusqlite::params![db::now_ms(), old_id],
-            );
-        }
         // 端点が選択（カード or コメント）に触れる矢印もソフトデリート。復活の呪文で戻る。
         let all_ids: Vec<&String> = card_ids.iter().chain(note_ids.iter()).collect();
         for id in all_ids {
@@ -2037,6 +2089,13 @@ fn send_selection_to_project(
                 "UPDATE relations SET deleted_at = ?1
                  WHERE deleted_at IS NULL AND (from_id = ?2 OR to_id = ?2)",
                 rusqlite::params![db::now_ms(), id],
+            );
+        }
+        // v1.4.17: 選択図形も移動なら元からソフトデリート。
+        for old_id in &shape_ids {
+            let _ = p.conn.execute(
+                "UPDATE shapes SET deleted_at = ?1 WHERE id = ?2",
+                rusqlite::params![db::now_ms(), old_id],
             );
         }
     }
@@ -2184,19 +2243,15 @@ fn list_relations(state: State<AppState>) -> Result<Vec<RelationInfo>, String> {
     };
     let mut stmt = p
         .conn
-        // Soft-deleted cards/notes keep their relation rows (for restore); hide
+        // Soft-deleted cards keep their relation rows (for restore); hide
         // arrows that are deleted themselves or whose endpoint is currently
-        // deleted. Endpoints can be cards or notes → anti-join both tables.
+        // deleted. v1.4.17: 付箋も virtual_bodies に統一されたので anti-join は1本。
         .prepare(
             "SELECT id, from_id, to_id, kind FROM relations rel
              WHERE rel.deleted_at IS NULL
                AND NOT EXISTS (
                  SELECT 1 FROM virtual_bodies d
                  WHERE d.deleted_at IS NOT NULL AND (d.id = rel.from_id OR d.id = rel.to_id)
-               )
-               AND NOT EXISTS (
-                 SELECT 1 FROM notes dn
-                 WHERE dn.deleted_at IS NOT NULL AND (dn.id = rel.from_id OR dn.id = rel.to_id)
                )
              ORDER BY created_at",
         )
@@ -2457,6 +2512,10 @@ fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Result<CommitAll
         errors: vec![],
     };
     for r in rows {
+        // v1.4.17: 付箋はキャンバスの注釈＝従来どおり持ち出し対象外（警告も出さない）。
+        if r.kind.as_deref() == Some("note") {
+            continue;
+        }
         // v1.4: フィルタ・ドロップポイントはTexoS内の道具であり持ち出し対象ではない
         if matches!(r.kind.as_deref(), Some("filter") | Some("drop") | Some("launcher")) {
             report.warnings.push(CommitAllWarning {
@@ -2946,11 +3005,65 @@ fn create_note(text: String, x: f64, y: f64, state: State<AppState>) -> Result<S
     let id = uuid();
     p.conn
         .execute(
-            "INSERT INTO notes (id, text, pos_x, pos_y, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![id, text, x, y, db::now_ms()],
+            "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, note_text)
+             VALUES (?1, 'note:sentinel', ?2, ?3, ?4, ?5, 'note', ?6)",
+            rusqlite::params![id, note_label(&text), x, y, db::now_ms(), text],
         )
         .map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+// --- v1.4.17 カード統一 §1: 付箋は kind='note' の仮身（実身は共有センチネル・CAS 非依存）。
+//     本文は note_text、変種固有の属性は style_ref(JSON) に寄せる。NoteInfo の形は不変＝
+//     フロントは無改修。フロー矢印で繋ぐと本文を text/plain として供給する「定数カード」になる。
+
+/// kind='note' のスタイル置き場（style_ref JSON）。
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct NoteStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    font_size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bold: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title_size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_ref: Option<String>,
+}
+
+fn note_style_of(s: Option<&str>) -> NoteStyle {
+    s.and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default()
+}
+
+fn read_note_style(p: &Project, id: &str) -> Result<NoteStyle, String> {
+    let s: Option<String> = p
+        .conn
+        .query_row(
+            "SELECT style_ref FROM virtual_bodies WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .map_err(|_| "コメントが見つかりません".to_string())?;
+    Ok(note_style_of(s.as_deref()))
+}
+
+fn write_note_style(p: &Project, id: &str, st: &NoteStyle) -> Result<(), String> {
+    let json = serde_json::to_string(st).map_err(|e| e.to_string())?;
+    p.conn
+        .execute(
+            "UPDATE virtual_bodies SET style_ref = ?1 WHERE id = ?2 AND kind = 'note'",
+            rusqlite::params![json, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 付箋のラベル＝先頭行（一括メニュー・ツールチップ用の短い名前）。
+fn note_label(text: &str) -> String {
+    text.lines().next().unwrap_or("").trim().chars().take(40).collect()
 }
 
 #[tauri::command]
@@ -2963,23 +3076,25 @@ fn list_notes(state: State<AppState>) -> Result<Vec<NoteInfo>, String> {
     let mut stmt = p
         .conn
         .prepare(
-            "SELECT id, text, pos_x, pos_y, width, font_size, bold, file_ref, color, title_size
-             FROM notes WHERE deleted_at IS NULL ORDER BY created_at",
+            "SELECT id, note_text, pos_x, pos_y, style_ref
+             FROM virtual_bodies WHERE kind = 'note' AND deleted_at IS NULL ORDER BY created_at",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
+            let style: Option<String> = row.get(4)?;
+            let st = note_style_of(style.as_deref());
             Ok(NoteInfo {
                 id: row.get(0)?,
-                text: row.get(1)?,
+                text: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 pos_x: row.get(2)?,
                 pos_y: row.get(3)?,
-                width: row.get(4)?,
-                font_size: row.get(5)?,
-                bold: row.get::<_, i64>(6)? != 0,
-                file_ref: row.get(7)?,
-                color: row.get(8)?,
-                title_size: row.get(9)?,
+                width: st.width.unwrap_or(220.0),
+                font_size: st.font_size.unwrap_or(13.0),
+                bold: st.bold.unwrap_or(false),
+                file_ref: st.file_ref,
+                color: st.color,
+                title_size: st.title_size,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -2993,8 +3108,8 @@ fn update_note(id: String, text: String, state: State<AppState>) -> Result<(), S
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     p.conn
         .execute(
-            "UPDATE notes SET text = ?1 WHERE id = ?2",
-            rusqlite::params![text, id],
+            "UPDATE virtual_bodies SET note_text = ?1, label = ?2 WHERE id = ?3 AND kind = 'note'",
+            rusqlite::params![text, note_label(&text), id],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -3006,7 +3121,7 @@ fn move_note(id: String, x: f64, y: f64, state: State<AppState>) -> Result<(), S
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     p.conn
         .execute(
-            "UPDATE notes SET pos_x = ?1, pos_y = ?2 WHERE id = ?3",
+            "UPDATE virtual_bodies SET pos_x = ?1, pos_y = ?2 WHERE id = ?3 AND kind = 'note'",
             rusqlite::params![x, y, id],
         )
         .map_err(|e| e.to_string())?;
@@ -3021,7 +3136,7 @@ fn delete_note(id: String, state: State<AppState>) -> Result<(), String> {
     // 表示は list_relations 側で隠す）。
     p.conn
         .execute(
-            "UPDATE notes SET deleted_at = ?1 WHERE id = ?2",
+            "UPDATE virtual_bodies SET deleted_at = ?1 WHERE id = ?2 AND kind = 'note'",
             rusqlite::params![db::now_ms(), id],
         )
         .map_err(|e| e.to_string())?;
@@ -3035,7 +3150,7 @@ fn restore_note(id: String, state: State<AppState>) -> Result<(), String> {
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     p.conn
         .execute(
-            "UPDATE notes SET deleted_at = NULL WHERE id = ?1",
+            "UPDATE virtual_bodies SET deleted_at = NULL WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id],
         )
         .map_err(|e| e.to_string())?;
@@ -3067,13 +3182,11 @@ fn set_note_style(
 ) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-    p.conn
-        .execute(
-            "UPDATE notes SET width = ?1, font_size = ?2, bold = ?3 WHERE id = ?4",
-            rusqlite::params![width, font_size, bold as i64, id],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    let mut st = read_note_style(p, &id)?;
+    st.width = Some(width);
+    st.font_size = Some(font_size);
+    st.bold = if bold { Some(true) } else { None };
+    write_note_style(p, &id, &st)
 }
 
 /// v1.4.16 付箋の充実: 付箋の色を設定（`color=None` で既定＝テーマの黄に戻す）。
@@ -3081,13 +3194,9 @@ fn set_note_style(
 fn set_note_color(id: String, color: Option<String>, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-    p.conn
-        .execute(
-            "UPDATE notes SET color = ?1 WHERE id = ?2",
-            rusqlite::params![color, id],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    let mut st = read_note_style(p, &id)?;
+    st.color = color;
+    write_note_style(p, &id, &st)
 }
 
 /// v1.4.16 付箋の充実: 先頭行を見出しにするフォントサイズを設定（`title_size=None` で
@@ -3100,13 +3209,9 @@ fn set_note_title(
 ) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-    p.conn
-        .execute(
-            "UPDATE notes SET title_size = ?1 WHERE id = ?2",
-            rusqlite::params![title_size, id],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    let mut st = read_note_style(p, &id)?;
+    st.title_size = title_size;
+    write_note_style(p, &id, &st)
 }
 
 /// Create a note linked to a text file; its content is loaded from the file.
@@ -3121,11 +3226,26 @@ fn create_note_linked(
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     let id = uuid();
+    let st = NoteStyle {
+        width: Some(320.0),
+        font_size: Some(13.0),
+        file_ref: Some(path),
+        ..Default::default()
+    };
     p.conn
         .execute(
-            "INSERT INTO notes (id, text, pos_x, pos_y, created_at, width, font_size, bold, file_ref)
-             VALUES (?1, ?2, ?3, ?4, ?5, 320, 13, 0, ?6)",
-            rusqlite::params![id, text, x, y, db::now_ms(), path],
+            "INSERT INTO virtual_bodies
+                (id, real_id, label, pos_x, pos_y, created_at, kind, note_text, style_ref)
+             VALUES (?1, 'note:sentinel', ?2, ?3, ?4, ?5, 'note', ?6, ?7)",
+            rusqlite::params![
+                id,
+                note_label(&text),
+                x,
+                y,
+                db::now_ms(),
+                text,
+                serde_json::to_string(&st).map_err(|e| e.to_string())?
+            ],
         )
         .map_err(|e| e.to_string())?;
     Ok(id)
@@ -3137,15 +3257,16 @@ fn create_note_linked(
 fn commit_note_to_file(id: String, state: State<AppState>) -> Result<String, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-    let (text, file_ref): (String, Option<String>) = p
+    let text: String = p
         .conn
         .query_row(
-            "SELECT text, file_ref FROM notes WHERE id = ?1",
+            "SELECT note_text FROM virtual_bodies WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default()),
         )
         .map_err(|e| e.to_string())?;
-    if let Some(f) = file_ref {
+    let mut st = read_note_style(p, &id)?;
+    if let Some(f) = st.file_ref {
         return Ok(f); // already a file-linked note
     }
     // Filename from the first line of the comment (sanitized).
@@ -3163,12 +3284,8 @@ fn commit_note_to_file(id: String, state: State<AppState>) -> Result<String, Str
     let dest = unique_path(&p.root, &format!("{}.txt", stem));
     std::fs::write(&dest, &text).map_err(|e| e.to_string())?;
     let dest_str = dest.to_string_lossy().to_string();
-    p.conn
-        .execute(
-            "UPDATE notes SET file_ref = ?1 WHERE id = ?2",
-            rusqlite::params![dest_str, id],
-        )
-        .map_err(|e| e.to_string())?;
+    st.file_ref = Some(dest_str.clone());
+    write_note_style(p, &id, &st)?;
     Ok(dest_str)
 }
 
@@ -3779,7 +3896,23 @@ fn execute_node(
                     prompt = Some(*bytes); // テキスト等はプロンプト扱い（最初の1本）
                 }
             }
-            let prompt = prompt.ok_or("プロンプト（テキスト入力）が接続されていません")?;
+            // v1.4.17 インラインパネルの追加プロンプトを合成: 接続テキストの後ろに ", " で
+            // 連結（SD は前方トークンほど効くため接続入力＝主・パネル＝追加）。入力が無ければ
+            // パネル単独で生成できる。両方無いときだけエラー。
+            let combined: Vec<u8>;
+            let prompt: &[u8] = match (prompt, spec.own_prompt()) {
+                (Some(p), Some(x)) => {
+                    combined = [p, b", ", x.as_bytes()].concat();
+                    &combined
+                }
+                (Some(p), None) => p,
+                (None, Some(x)) => x.as_bytes(),
+                (None, None) => {
+                    return Err(
+                        "プロンプトがありません。テキストカードを接続するか、パネル（ダブルクリック）に入力してください".into(),
+                    )
+                }
+            };
             let (bytes, ext, mime) = flow::run_t2i(spec, prompt, init)?;
             Ok(plain(bytes, ext, mime))
         }
@@ -3936,6 +4069,35 @@ fn eval_filter(
                 .skipped
                 .push(format!("{vlabel}（まだファイルが投入されていません）"));
             continue;
+        } else if kind.as_deref() == Some("note") {
+            // v1.4.17 カード統一＝定数カード: 付箋は本文をそのまま text/plain として供給する
+            //（実体・CAS 非依存の読み出し専用テキスト。付箋→AI/t2i/grep がそのまま繋がる）。
+            let text = match with_db(state, |p| {
+                p.conn
+                    .query_row(
+                        "SELECT note_text FROM virtual_bodies WHERE id = ?1",
+                        rusqlite::params![vid],
+                        |r| Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default()),
+                    )
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok(t) => t,
+                Err(e) => {
+                    report.errors.push(format!("{vlabel}: {e}"));
+                    continue;
+                }
+            };
+            let stem = if vlabel.trim().is_empty() {
+                "コメント".to_string()
+            } else {
+                vlabel.clone()
+            };
+            vec![FlowPayload {
+                bytes: text.into_bytes(),
+                ext: "txt".into(),
+                mime: "text/plain".into(),
+                stem,
+            }]
         } else {
             // 短ロック: 窓の今を解決（snapshot 更新＋ビューパス）。ファイル読みはロック外。
             let path = match with_db(state, |p| {
@@ -3995,19 +4157,26 @@ fn eval_filter(
         }
         if !bad.is_empty() {
             report.errors.extend(bad);
-        } else if !collected.is_empty() {
+        } else if !collected.is_empty()
+            // v1.4.17: t2i はパネルの追加プロンプトだけでも生成できる（入力ゼロで実行可）。
+            || (kind == flow::NodeKind::T2i && spec.own_prompt().is_some())
+        {
             let ins: Vec<(&[u8], &str, &str)> = collected
                 .iter()
                 .map(|pl| (pl.bytes.as_slice(), pl.ext.as_str(), pl.mime.as_str()))
                 .collect();
+            // 入力ゼロ（t2i パネル単独生成）でも落ちないよう stem はフォールバック付き。
+            let stem0 = collected
+                .first()
+                .map(|pl| pl.stem.clone())
+                .unwrap_or_else(|| "output".to_string());
             match execute_node(root, &spec, kind, &ins, cancel, stdin_slot) {
                 Ok(run) => {
-                    let stem = collected[0].stem.clone();
                     for (bytes, ext, mime) in run.outputs {
-                        produced.push(FlowPayload { bytes, ext, mime, stem: stem.clone() });
+                        produced.push(FlowPayload { bytes, ext, mime, stem: stem0.clone() });
                     }
                 }
-                Err(e) => report.errors.push(format!("{}: {e}", collected[0].stem)),
+                Err(e) => report.errors.push(format!("{stem0}: {e}")),
             }
         }
     } else {
