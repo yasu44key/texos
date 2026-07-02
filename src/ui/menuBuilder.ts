@@ -40,6 +40,10 @@ export interface MenuActions {
   linkProject: (x: number, y: number) => void;
   autoLayout: () => void;
   commitAll: () => void;
+  // v1.4.19 カードを検索: ライブ検索→フォーカス（Ctrl+F）。
+  openSearch: () => void;
+  // v1.4.19 ゴミ箱を開く: 削除済みの一覧・復活・完全削除（空にする）。
+  openTrash: () => void;
   // v1.4.15 データの掃除A: UNDO/REDO履歴＋サムネイル・一時プレビューのキャッシュを掃除。
   cleanCaches: () => void;
   // v1.4.15 データの掃除B（正規化）: どのカードからも参照されない孤立CASデータを削除。
@@ -1025,6 +1029,12 @@ export function buildCanvasMenu(
     DIV,
     // ── 整理・出力系 ──
     {
+      label: "カードを検索 ...",
+      shortcut: "Ctrl+F",
+      hint: "ラベル・コメント本文・メモ・拡張子でカードを検索し、クリックでフォーカスします（複数一致はまとめて選択も可）。",
+      onClick: () => a.openSearch(),
+    },
+    {
       label: "自動レイアウト（重なり解消）",
       onClick: () => a.autoLayout(),
     },
@@ -1034,13 +1044,18 @@ export function buildCanvasMenu(
       onClick: () => a.commitAll(),
     },
     {
+      label: "ゴミ箱を開く ...",
+      hint: "削除したカード・コメント・図形を一覧して、復活または完全削除します。UNDO履歴を掃除した後でも、ここからならいつでも復活できます。",
+      onClick: () => a.openTrash(),
+    },
+    {
       label: "履歴・キャッシュを掃除...",
-      hint: "UNDO/REDO履歴と、サムネイル・一時プレビューのキャッシュを掃除します。キャッシュは必要時に自動再生成されます（ゴミ箱＝削除の復活は残ります）。",
+      hint: "UNDO/REDO履歴と、サムネイル・一時プレビューのキャッシュを掃除します。キャッシュは必要時に自動再生成されます（ゴミ箱の中身は残り、「ゴミ箱を開く」から復活できます）。",
       onClick: () => a.cleanCaches(),
     },
     {
       label: "孤立データを削除（正規化）...",
-      hint: "どのカードからも参照されなくなった実身データ（CAS）を削除して容量を回収します。まず件数・サイズを確認してから実行します（生きたカード・ゴミ箱・履歴は残ります）。",
+      hint: "どのカードからも参照されなくなった実身データ（CAS）を削除して容量を回収します。まず件数・サイズを確認してから実行します（生きたカード・ゴミ箱・履歴は残ります）。先に「ゴミ箱を空にする」と回収量が増えます。",
       onClick: () => a.gcCas(),
     },
     DIV,

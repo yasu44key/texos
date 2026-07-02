@@ -34,6 +34,8 @@ function whisperSpec(st: WhisperStatus) {
 }
 import { AppPicker } from "./ui/AppPicker";
 import { ConfirmDialog } from "./ui/ConfirmDialog";
+import { TrashDialog } from "./ui/TrashDialog";
+import { SearchDialog } from "./ui/SearchDialog";
 import { ShortcutHelp } from "./ui/ShortcutHelp";
 import { ProjectChooser, type ProjectInfo } from "./ui/ProjectChooser";
 import {
@@ -209,6 +211,10 @@ function App() {
   const [appPicker, setAppPicker] = useState<{ x: number; y: number; linkFrom?: string } | null>(null);
   // v1.4.12: キーボードショートカットのヘルプ・オーバーレイ（? / F1 で開閉）。
   const [helpOpen, setHelpOpen] = useState(false);
+  // v1.4.19: ゴミ箱を開く（削除済みの一覧・復活・完全削除）。
+  const [trashOpen, setTrashOpen] = useState(false);
+  // v1.4.19: カードを検索（Ctrl+F・右側フローティング）。
+  const [searchOpen, setSearchOpen] = useState(false);
   const [confirm, setConfirm] = useState<{
     title: string;
     message?: string;
@@ -2446,7 +2452,7 @@ function App() {
       title: "履歴・キャッシュを掃除",
       message:
         "UNDO/REDO履歴と、サムネイル・一時プレビューのキャッシュを掃除します。\n\n" +
-        "・UNDO履歴は消え、Ctrl+Z / Ctrl+Y で戻せなくなります（削除の「復活の呪文」＝ゴミ箱は残ります）。\n" +
+        "・UNDO履歴は消え、Ctrl+Z / Ctrl+Y で戻せなくなります（削除したものは「ゴミ箱を開く」からいつでも復活できます）。\n" +
         "・キャッシュは必要時に自動で再生成されます。",
       okLabel: "掃除する",
       onConfirm: async () => {
@@ -2882,6 +2888,19 @@ function App() {
     },
     [refresh]
   );
+
+  // v1.4.19 Ctrl+F → カードを検索（テキスト編集中は奪わない・再押下でトグル）。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "f") return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      e.preventDefault();
+      setSearchOpen((v) => !v);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Ctrl+C → 選択カードをファイルとしてコピー（テキスト編集中は奪わない）。
   useEffect(() => {
@@ -3465,6 +3484,55 @@ function App() {
     canvasApi.current?.fitTo(getSelectionBounds());
   }, [getSelectionBounds]);
 
+  // v1.4.19 検索・ゴミ箱復活から「IDを指定してフォーカス」する版。選択も置き換える。
+  // setSelected 直後は selectedRef が古いので、bounds は引数の ID から直接計算する。
+  const focusCards = useCallback(
+    (cardIds: string[], noteIds: string[]) => {
+      setSelected(new Set(cardIds));
+      setSelectedNotes(new Set(noteIds));
+      const cs = new Set(cardIds);
+      const ns = new Set(noteIds);
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const o of objectsRef.current) {
+        if (!cs.has(o.id)) continue;
+        const s = layoutSize(o);
+        minX = Math.min(minX, o.pos_x);
+        minY = Math.min(minY, o.pos_y);
+        maxX = Math.max(maxX, o.pos_x + s.w);
+        maxY = Math.max(maxY, o.pos_y + s.h);
+      }
+      for (const n of notesRef.current) {
+        if (!ns.has(n.id)) continue;
+        const s = measuredNoteSize(n);
+        minX = Math.min(minX, n.pos_x);
+        minY = Math.min(minY, n.pos_y);
+        maxX = Math.max(maxX, n.pos_x + s.w);
+        maxY = Math.max(maxY, n.pos_y + s.h);
+      }
+      if (minX === Infinity) return;
+      canvasApi.current?.fitTo({ x: minX, y: minY, w: maxX - minX, h: maxY - minY });
+    },
+    [layoutSize, measuredNoteSize, setSelected, setSelectedNotes]
+  );
+
+  // ゴミ箱からの復活後: refresh のコミットを待ってから該当カードへフォーカス
+  //（図形は選択対象外なので図形矩形へ直接 fitTo）。
+  const handleTrashRestored = useCallback(
+    async (id: string, kind: "card" | "note" | "shape") => {
+      await refresh();
+      // setObjects のコミット後に objectsRef が新しくなるのを待つ（setTimeout(0) の既存イディオム）。
+      setTimeout(() => {
+        if (kind === "shape") {
+          const s = shapesRef.current.find((sh) => sh.id === id);
+          if (s) canvasApi.current?.fitTo({ x: s.pos_x, y: s.pos_y, w: s.width, h: s.height });
+          return;
+        }
+        focusCards(kind === "card" ? [id] : [], kind === "note" ? [id] : []);
+      }, 0);
+    },
+    [refresh, focusCards]
+  );
+
   // Notes (free text annotations)
   const handleAddNote = useCallback(async (canvasX: number, canvasY: number, linkFrom?: string) => {
     try {
@@ -3686,6 +3754,8 @@ function App() {
         linkProject: handleLinkProject,
         autoLayout: handleAutoLayout,
         commitAll: handleCommitAll,
+        openSearch: () => setSearchOpen(true),
+        openTrash: () => setTrashOpen(true),
         cleanCaches: handleCleanCaches,
         gcCas: handleGcCas,
         setTheme,
@@ -4572,6 +4642,21 @@ function App() {
           okLabel={confirm.okLabel}
           onConfirm={confirm.onConfirm}
           onCancel={() => setConfirm(null)}
+        />
+      )}
+      {trashOpen && (
+        <TrashDialog
+          onClose={() => setTrashOpen(false)}
+          onChanged={refresh}
+          onRestored={handleTrashRestored}
+        />
+      )}
+      {searchOpen && (
+        <SearchDialog
+          objects={objects}
+          notes={notes}
+          onFocus={focusCards}
+          onClose={() => setSearchOpen(false)}
         />
       )}
       {chooserVisible && (

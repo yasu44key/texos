@@ -1630,6 +1630,176 @@ struct GcCasReport {
     total_count: u64,
 }
 
+// ---------------------------------------------------------------------------
+// v1.4.19 ゴミ箱を開く — 削除済み（ソフトデリート）の一覧・復活・完全削除。
+// 復活の呪文（Ctrl+Z）は UNDO スタックの寿命に縛られるが、こちらは deleted_at 行を
+// 直接読むので履歴を掃除した後でも復活できる。「空にする」で行と trash ファイルを
+// 物理削除し、以後は正規化（GC）が実身 CAS を回収できるようになる（＝出口の完成）。
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct DeletedItem {
+    id: String,
+    /// "card" | "note" | "shape"
+    kind: String,
+    label: String,
+    /// カード=拡張子または種別（filter/url/launcher…）、図形=形（rect/ellipse/arrow）
+    detail: Option<String>,
+    deleted_at: i64,
+}
+
+#[tauri::command]
+fn list_deleted(state: State<AppState>) -> Result<Vec<DeletedItem>, String> {
+    let guard = state.current.lock().unwrap();
+    let p = match guard.as_ref() {
+        Some(p) => p,
+        None => return Ok(vec![]),
+    };
+    let mut items: Vec<DeletedItem> = Vec::new();
+    {
+        let mut stmt = p
+            .conn
+            .prepare(
+                "SELECT id, COALESCE(kind,'file'), label, ext, deleted_at
+                 FROM virtual_bodies WHERE deleted_at IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                let kind: String = r.get(1)?;
+                let ext: Option<String> = r.get(3)?;
+                Ok(DeletedItem {
+                    id: r.get(0)?,
+                    kind: if kind == "note" { "note".into() } else { "card".into() },
+                    label: r.get(2)?,
+                    detail: if kind != "file" && kind != "note" { Some(kind) } else { ext },
+                    deleted_at: r.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        items.extend(rows.flatten());
+    }
+    {
+        let mut stmt = p
+            .conn
+            .prepare("SELECT id, kind, label, deleted_at FROM shapes WHERE deleted_at IS NOT NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DeletedItem {
+                    id: r.get(0)?,
+                    kind: "shape".into(),
+                    label: r.get(2)?,
+                    detail: Some(r.get::<_, String>(1)?),
+                    deleted_at: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        items.extend(rows.flatten());
+    }
+    items.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+    Ok(items)
+}
+
+#[derive(Serialize, Default)]
+struct PurgeReport {
+    cards: u64,
+    shapes: u64,
+    relations: u64,
+    files: u64,
+    bytes: u64,
+}
+
+/// ゴミ箱の完全削除（**元に戻せない**）。`ids=None` は全部＝「ゴミ箱を空にする」
+/// （そのときは単独で削除された矢印の行も一緒に掃く）。行の削除に伴い、対応する
+/// `.texos/trash/<vid>__*` ファイルと、端点を失う relations 行も物理削除する。
+#[tauri::command]
+fn purge_deleted(ids: Option<Vec<String>>, state: State<AppState>) -> Result<PurgeReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let filter: Option<std::collections::HashSet<String>> =
+        ids.map(|v| v.into_iter().collect());
+    let wanted = |id: &str| filter.as_ref().map(|s| s.contains(id)).unwrap_or(true);
+    let mut report = PurgeReport::default();
+
+    let cards: Vec<String> = {
+        let mut stmt = p
+            .conn
+            .prepare("SELECT id FROM virtual_bodies WHERE deleted_at IS NOT NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.flatten().filter(|id| wanted(id)).collect()
+    };
+    let trash_dir = texos_dir(&p.root).join("trash");
+    for id in &cards {
+        // 退避された実ファイル（<vid>__名前）を削除
+        if let Ok(rd) = std::fs::read_dir(&trash_dir) {
+            let prefix = format!("{}__", id);
+            for f in rd.flatten() {
+                if f.file_name().to_string_lossy().starts_with(&prefix) {
+                    if let Ok(m) = f.metadata() {
+                        report.bytes += m.len();
+                    }
+                    if std::fs::remove_file(f.path()).is_ok() {
+                        report.files += 1;
+                    }
+                }
+            }
+        }
+        // 端点を失う矢印は行ごと削除（復活先が消えるため）
+        report.relations += p
+            .conn
+            .execute(
+                "DELETE FROM relations WHERE from_id = ?1 OR to_id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(|e| e.to_string())? as u64;
+        // 旧スキーマの diff_stack FK の保険（現行は未使用テーブル）
+        let _ = p.conn.execute(
+            "DELETE FROM diff_stack WHERE virtual_id = ?1",
+            rusqlite::params![id],
+        );
+        report.cards += p
+            .conn
+            .execute(
+                "DELETE FROM virtual_bodies WHERE id = ?1 AND deleted_at IS NOT NULL",
+                rusqlite::params![id],
+            )
+            .map_err(|e| e.to_string())? as u64;
+    }
+
+    let shapes: Vec<String> = {
+        let mut stmt = p
+            .conn
+            .prepare("SELECT id FROM shapes WHERE deleted_at IS NOT NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.flatten().filter(|id| wanted(id)).collect()
+    };
+    for id in &shapes {
+        report.shapes += p
+            .conn
+            .execute(
+                "DELETE FROM shapes WHERE id = ?1 AND deleted_at IS NOT NULL",
+                rusqlite::params![id],
+            )
+            .map_err(|e| e.to_string())? as u64;
+    }
+
+    // 空にする（全部）のときは、単独で削除された矢印も掃く
+    if filter.is_none() {
+        report.relations += p
+            .conn
+            .execute("DELETE FROM relations WHERE deleted_at IS NOT NULL", [])
+            .map_err(|e| e.to_string())? as u64;
+    }
+    Ok(report)
+}
+
 /// B: 孤立CASの dry-run（削除せずに件数・サイズだけ返す。確認ダイアログ用）。
 #[tauri::command]
 fn gc_cas_scan(state: State<AppState>) -> Result<GcCasReport, String> {
@@ -7252,6 +7422,8 @@ pub fn run() {
             clean_caches,
             gc_cas_scan,
             gc_cas_clean,
+            list_deleted,
+            purge_deleted,
             commit_object,
             commit_all,
             relink_object,

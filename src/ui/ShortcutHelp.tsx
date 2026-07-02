@@ -46,6 +46,12 @@ const SECTIONS: Section[] = [
       ["Ctrl + G", "整列メニュー"],
     ],
   },
+  {
+    title: "探す",
+    rows: [
+      ["Ctrl + F", "カードを検索（クリック＝フォーカス）"],
+    ],
+  },
 ];
 
 function Keys({ combo }: { combo: string }) {
