@@ -185,6 +185,15 @@ impl FilterSpec {
         self.node_kind() == NodeKind::External
             && cmd_is_aggregate(self.cmd.as_deref().unwrap_or(""))
     }
+
+    /// 出力ファイル（`{out}` / `{out_noext}`）を書かない外部コマンドか。カメラ起動
+    /// （`start microsoft.windows.camera:`）や読み上げのような「呼ぶだけ」で完結する
+    /// fire-and-forget コマンドで、成功しても取り込む出力が無い（＝生成カードを作らず、
+    /// 「出力がありません」をエラーにしない）。CMD に `{out` を書けば従来どおり出力必須。
+    pub fn is_self_contained(&self) -> bool {
+        matches!(self.node_kind(), NodeKind::Generator | NodeKind::External)
+            && !self.cmd.as_deref().unwrap_or("").contains("{out")
+    }
 }
 
 /// 外部プログラムの解決: 絶対パス → <project>/.texos/filters → 環境変数PATH の順
@@ -1518,6 +1527,21 @@ mod tests {
         assert!(spec(r#"{"name":"convert","cmd":"\"{in1}\" \"{in2}\" {out}"}"#).is_aggregate());
         assert!(!spec(r#"{"cmd":"\"{in}\" {out}"}"#).is_aggregate());
         assert!(!spec(r#"{"builtin":"text_grep","cmd":"{in*}"}"#).is_aggregate());
+    }
+
+    /// 自己完結コマンド判定: {out}/{out_noext} を書かない外部・ジェネレータは fire-and-forget
+    /// （カメラ起動・読み上げ）。{out} を書けば従来どおり出力必須。
+    #[test]
+    fn is_self_contained_detection() {
+        // {out} なし → 自己完結（カメラ起動・読み上げ）
+        assert!(spec(r#"{"type":"generator","cmd":"start microsoft.windows.camera:"}"#).is_self_contained());
+        assert!(spec(r#"{"cmd":"start microsoft.windows.camera:"}"#).is_self_contained());
+        // {out}/{out_noext} を書くなら出力必須（従来どおり）
+        assert!(!spec(r#"{"type":"generator","cmd":"> \"{out}\""}"#).is_self_contained());
+        assert!(!spec(r#"{"cmd":"whisper {in} -o \"{out_noext}\""}"#).is_self_contained());
+        // builtin/ai/t2i/invalid は外部コマンドではないので対象外
+        assert!(!spec(r#"{"builtin":"text_grep"}"#).is_self_contained());
+        assert!(!spec(r#"{}"#).is_self_contained());
     }
 
     /// shell 判定（run_flow 終端の対話シェル）。

@@ -189,9 +189,13 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
 
   const save = () => {
     const spec: Record<string, unknown> = {};
+    // type は NAME の有無に依存せず必ず保存する。CMD だけのカード（NAME 空。
+    // カメラ起動のようなコマンドや `> "{out}"` のジェネレータ）でも type を落とすと
+    // backend の node_kind が generator を判定できず External 扱い＝入力必須になり
+    // 「入力を設定しないとエラー」になっていた（旧バグ）。
+    spec.type = ftype;
     if (name.trim()) {
       spec.name = name.trim();
-      spec.type = ftype;
       if (path.trim()) spec.path = path.trim();
     }
     if (cmd.trim()) spec.cmd = cmd.trim();

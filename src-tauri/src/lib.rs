@@ -3812,9 +3812,20 @@ fn execute_node(
             )?;
             let exit_code = o.exit_code;
             let stderr = o.stderr.clone();
-            let bytes = o.into_bytes()?; // 非0終了/出力なしは従来どおりエラー（挙動不変）
+            // {out} を書かない自己完結コマンド（カメラ起動・読み上げ等の fire-and-forget）は
+            // 取り込む出力が無い。成功＝完了とみなし出力カードを作らない。非0終了は従来どおり
+            // エラーにする（stderr 付きの文面を再利用）。{out} を書くコマンドは従来のまま
+            // 「出力なし→エラー」で挙動不変。
+            let outputs = if spec.is_self_contained() {
+                if !o.success() {
+                    return Err(o.into_bytes().unwrap_err());
+                }
+                Vec::new()
+            } else {
+                vec![(o.into_bytes()?, out_ext, out_mime)]
+            };
             Ok(NodeRun {
-                outputs: vec![(bytes, out_ext, out_mime)],
+                outputs,
                 exit_code,
                 stderr,
             })
@@ -4176,7 +4187,11 @@ fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
         &state.rec_stdin,
     )?;
     if payloads.is_empty() && report.skipped.is_empty() && report.errors.is_empty() {
-        return Err("入力がありません。データカードからフィルタへ矢印を引いてください".into());
+        // 自己完結コマンド（{out} を書かないカメラ起動・読み上げ等）は出力ゼロで正常終了する
+        // のが正しい。それ以外で空なら入力の繋ぎ忘れとして案内する。
+        if !term_spec.is_self_contained() {
+            return Err("入力がありません。データカードからフィルタへ矢印を引いてください".into());
+        }
     }
 
     // 出力ファイル名に使えるラベル（Windowsの禁止文字を逃がす）
