@@ -45,6 +45,12 @@ interface CanvasProps {
 export interface CanvasApi {
   /** Pan/zoom so the given canvas-coords rect fills the viewport (padded). */
   fitTo: (b: { x: number; y: number; w: number; h: number } | null) => void;
+  /** v1.4.20 ナビゲーションショートカット用: 全体を表示（Home）。 */
+  fitAll: () => void;
+  /** 選択範囲にフォーカス（F）。 */
+  fitSelection: () => void;
+  /** ズーム%を直接指定（Ctrl+0 = 100%）。 */
+  zoomTo: (pct: number) => void;
 }
 
 export function screenToCanvas(transform: Transform, sx: number, sy: number) {
@@ -84,6 +90,11 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
   // Apply saved view when the project (viewKey) changes.
   useEffect(() => {
     if (viewKey !== undefined) {
+      // 進行中のカメラアニメーションは破棄（前プロジェクトの座標を書き続けないように）
+      if (animRef.current != null) {
+        cancelAnimationFrame(animRef.current);
+        animRef.current = null;
+      }
       setTransform(initialTransform ?? { x: 0, y: 0, scale: 1 });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -169,6 +180,11 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
     // （Alt+LMB パンは廃止。手のひらカーソルは onMouseMove でドラッグ開始後に出す。）
     if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
       e.preventDefault();
+      // アニメーション中のパン開始は即座に主導権を渡す（v1.4.20）
+      if (animRef.current != null) {
+        cancelAnimationFrame(animRef.current);
+        animRef.current = null;
+      }
       panDragging.current = true;
       lastPanPos.current = { x: e.clientX, y: e.clientY };
       return;
@@ -239,6 +255,11 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
 
   const onWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
+    // アニメーション中のホイールは即座に主導権を渡す（v1.4.20）
+    if (animRef.current != null) {
+      cancelAnimationFrame(animRef.current);
+      animRef.current = null;
+    }
     const factor = e.deltaY < 0 ? 1.1 : 0.9;
     const rect = containerRef.current!.getBoundingClientRect();
     const cx = e.clientX - rect.left;
@@ -258,39 +279,93 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
     return () => el.removeEventListener("wheel", handler);
   }, []);
 
+  // --- v1.4.20 カメラアニメーション（プレゼン向け）--------------------------------
+  // fitTo / zoomTo をイージング付きで滑らかに移動する。補間は「ビュー中心（キャンバス
+  // 座標）＝線形」「スケール＝対数（等比）」— ズームを伴う移動が自然に見える定石。
+  // ユーザーのパン/ホイール操作で即キャンセル（操作を奪わない）。時間は右下ズーム
+  // メニューで選択（即時/高速/中速/低速）・localStorage 永続。
+  const animRef = useRef<number | null>(null);
+  const cancelAnim = useCallback(() => {
+    if (animRef.current != null) {
+      cancelAnimationFrame(animRef.current);
+      animRef.current = null;
+    }
+  }, []);
+  const [navDuration, setNavDuration] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem("texos-nav-anim") ?? "500", 10);
+    return isNaN(v) ? 500 : v;
+  });
+  const navDurationRef = useRef(navDuration);
+  navDurationRef.current = navDuration;
+  const setNavAnim = useCallback((ms: number) => {
+    setNavDuration(ms);
+    localStorage.setItem("texos-nav-anim", String(ms));
+  }, []);
+
+  const animateTo = useCallback(
+    (target: Transform) => {
+      cancelAnim();
+      const dur = navDurationRef.current;
+      if (dur <= 0) {
+        setTransform(target);
+        return;
+      }
+      const from = transformRef.current;
+      const rect = containerRef.current!.getBoundingClientRect();
+      const vw = rect.width / 2;
+      const vh = rect.height / 2;
+      // ビュー中心のキャンバス座標（from / target それぞれ）
+      const c0 = { x: (vw - from.x) / from.scale, y: (vh - from.y) / from.scale };
+      const c1 = { x: (vw - target.x) / target.scale, y: (vh - target.y) / target.scale };
+      const s0 = from.scale;
+      const s1 = target.scale;
+      const t0 = performance.now();
+      // easeInOutCubic: 加速→巡航→減速
+      const ease = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+      const step = (now: number) => {
+        const k = Math.min(1, (now - t0) / dur);
+        const e = ease(k);
+        const s = s0 * Math.pow(s1 / s0, e);
+        const cx = c0.x + (c1.x - c0.x) * e;
+        const cy = c0.y + (c1.y - c0.y) * e;
+        setTransform({ scale: s, x: vw - cx * s, y: vh - cy * s });
+        if (k < 1) animRef.current = requestAnimationFrame(step);
+        else animRef.current = null;
+      };
+      animRef.current = requestAnimationFrame(step);
+    },
+    [cancelAnim]
+  );
+  useEffect(() => cancelAnim, [cancelAnim]); // アンマウント時に停止
+
   // Set an exact zoom ratio, keeping the viewport center fixed.
   const applyZoom = useCallback((pct: number) => {
     const s = Math.min(Math.max(pct, 5), 2000) / 100;
     const rect = containerRef.current!.getBoundingClientRect();
     const cx = rect.width / 2;
     const cy = rect.height / 2;
-    setTransform((t) => {
-      const ratio = s / t.scale;
-      return { scale: s, x: cx - ratio * (cx - t.x), y: cy - ratio * (cy - t.y) };
-    });
+    const t = transformRef.current;
+    const ratio = s / t.scale;
+    animateTo({ scale: s, x: cx - ratio * (cx - t.x), y: cy - ratio * (cy - t.y) });
     setZoomMenu(false);
-  }, []);
+  }, [animateTo]);
 
   // Fit a canvas-coords rect into the viewport (centered, padded).
-  const fitTo = useCallback((b: { x: number; y: number; w: number; h: number } | null) => {
-    if (!b || b.w <= 0 || b.h <= 0) return;
-    const rect = containerRef.current!.getBoundingClientRect();
-    const pad = 60;
-    const raw = Math.min((rect.width - pad * 2) / b.w, (rect.height - pad * 2) / b.h);
-    const s = Math.min(Math.max(raw, 0.05), 1.5); // don't zoom in absurdly for tiny content
-    setTransform({
-      scale: s,
-      x: (rect.width - b.w * s) / 2 - b.x * s,
-      y: (rect.height - b.h * s) / 2 - b.y * s,
-    });
-  }, []);
-
-  // Expose the imperative API to the parent (選択範囲にフォーカス etc.).
-  useEffect(() => {
-    if (!apiRef) return;
-    apiRef.current = { fitTo };
-    return () => { apiRef.current = null; };
-  }, [apiRef, fitTo]);
+  const fitTo = useCallback(
+    (b: { x: number; y: number; w: number; h: number } | null) => {
+      if (!b || b.w <= 0 || b.h <= 0) return;
+      const rect = containerRef.current!.getBoundingClientRect();
+      const pad = 60;
+      const raw = Math.min((rect.width - pad * 2) / b.w, (rect.height - pad * 2) / b.h);
+      const s = Math.min(Math.max(raw, 0.05), 1.5); // don't zoom in absurdly for tiny content
+      animateTo({
+        scale: s,
+        x: (rect.width - b.w * s) / 2 - b.x * s,
+        y: (rect.height - b.h * s) / 2 - b.y * s,
+      });
+    },
+    [animateTo]
+  );
 
   // 全体を表示: fit every card/note into the viewport.
   const fitAll = useCallback(() => {
@@ -303,6 +378,13 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
     setZoomMenu(false);
     fitTo(getSelectionBoundsRef.current?.() ?? null);
   }, [fitTo]);
+
+  // Expose the imperative API to the parent (選択範囲にフォーカス・ナビゲーションキー等).
+  useEffect(() => {
+    if (!apiRef) return;
+    apiRef.current = { fitTo, fitAll, fitSelection, zoomTo: applyZoom };
+    return () => { apiRef.current = null; };
+  }, [apiRef, fitTo, fitAll, fitSelection, applyZoom]);
 
   // Close the zoom menu on outside click.
   useEffect(() => {
@@ -391,7 +473,7 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
             onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = "#2a3346")}
             onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
           >
-            全体を表示
+            全体を表示<span style={{ color: "#6c7587", fontSize: 10, marginLeft: 8 }}>Home</span>
           </div>
           {getSelectionBoundsRef.current?.() && (
             <div
@@ -400,7 +482,7 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
               onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = "#2a3346")}
               onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "transparent")}
             >
-              選択範囲にフォーカス
+              選択範囲にフォーカス<span style={{ color: "#6c7587", fontSize: 10, marginLeft: 8 }}>F</span>
             </div>
           )}
           <div style={{ height: 1, background: "#38445e", margin: "2px 4px" }} />
@@ -444,6 +526,38 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
               適用
             </button>
           </form>
+          {/* v1.4.20 フォーカス移動の速度（プレゼン向けカメラアニメーション）。 */}
+          <div style={{ height: 1, background: "#38445e", margin: "6px 4px 4px" }} />
+          <div style={{ fontSize: 10, color: "#6c7587", padding: "0 4px 3px" }}>フォーカス移動</div>
+          <div style={{ display: "flex", gap: 3 }}>
+            {([["即時", 0], ["高速", 250], ["中速", 500], ["低速", 900]] as [string, number][]).map(
+              ([label, ms]) => (
+                <div
+                  key={ms}
+                  onClick={() => setNavAnim(ms)}
+                  title="F・Home・検索フォーカスなどの画面移動をこの速さでアニメーションします"
+                  style={{
+                    flex: 1,
+                    padding: "3px 0",
+                    borderRadius: 5,
+                    cursor: "pointer",
+                    textAlign: "center",
+                    fontSize: 11,
+                    background: navDuration === ms ? "#3a6fb0" : "transparent",
+                    color: navDuration === ms ? "#fff" : "#d6dded",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (navDuration !== ms) (e.currentTarget as HTMLElement).style.background = "#2a3346";
+                  }}
+                  onMouseLeave={(e) => {
+                    if (navDuration !== ms) (e.currentTarget as HTMLElement).style.background = "transparent";
+                  }}
+                >
+                  {label}
+                </div>
+              )
+            )}
+          </div>
         </div>
       )}
       {marquee && (

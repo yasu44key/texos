@@ -2889,6 +2889,37 @@ function App() {
     [refresh]
   );
 
+  // v1.4.20 ナビゲーションキー（テキスト編集中は奪わない）:
+  //   F      = 選択にフォーカス（選択が無ければ全体を表示）— Unity/Maya/Godot の Frame Selected 流
+  //   Home   = 全体を表示 — Blender の View All 流
+  //   Ctrl+0 = ズーム100% — Adobe/Figma/ブラウザ流
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      if (e.key.toLowerCase() === "f" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        if (selectedRef.current.size || selectedNotesRef.current.size) {
+          canvasApi.current?.fitSelection();
+        } else {
+          canvasApi.current?.fitAll();
+        }
+        return;
+      }
+      if (e.key === "Home" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        canvasApi.current?.fitAll();
+        return;
+      }
+      if (e.key === "0" && (e.ctrlKey || e.metaKey) && !e.altKey) {
+        e.preventDefault();
+        canvasApi.current?.zoomTo(100);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   // v1.4.19 Ctrl+F → カードを検索（テキスト編集中は奪わない・再押下でトグル）。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
