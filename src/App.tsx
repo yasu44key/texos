@@ -86,6 +86,11 @@ interface LinkDrag {
   y2: number;
 }
 
+// v1.4.25 ⑤: 図形グリッドスナップの格子（px）。カード(150×115)がほぼ正確に
+// 「横4×縦3単位」に収まる正方グリッド（150/4=37.5, 115/3≈38.3 → 38）。
+// 図形の対角（左上・右下）をこの格子に吸着させる。カードの配置は自由なまま。
+export const SHAPE_GRID = 38;
+
 function App() {
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const currentProjectRef = useRef<ProjectInfo | null>(null);
@@ -111,6 +116,11 @@ function App() {
   // v1.3.4: メニュー項目の説明ツールチップを出すか（既定オン、設定で切替・永続化）。
   const [showMenuHints, setShowMenuHints] = useState<boolean>(
     () => localStorage.getItem("texos-menu-hints") !== "0"
+  );
+  // v1.4.25 ⑤: 図形のグリッドスナップ（既定オフ、切替・永続化）。オンの間、図形の
+  // 作成・移動・リサイズが SHAPE_GRID の見えない格子に吸着する（カードは対象外＝自由）。
+  const [shapeSnap, setShapeSnap] = useState<boolean>(
+    () => localStorage.getItem("texos-shape-snap") === "1"
   );
   const [newNoteId, setNewNoteId] = useState<string | null>(null);
   const [relations, setRelations] = useState<RelationInfo[]>([]);
@@ -220,6 +230,7 @@ function App() {
     message?: string;
     warning?: string;
     okLabel?: string;
+    cancelLabel?: string;
     onConfirm: () => void;
   } | null>(null);
   // Objects newly committed / changed during this session (緑シグナル).
@@ -267,6 +278,14 @@ function App() {
   const mtimeBaseRef = useRef<Map<string, number>>(new Map());
   // Canvas imperative API (fitTo) — 選択範囲にフォーカス等で使う。
   const canvasApi = useRef<CanvasApi | null>(null);
+  // v1.4.22 ②: プロジェクト間コピー/移動の控え。送り先で新規採番されたIDを覚えておき、
+  // このセッション中に送り先プロジェクトを開いたら選択状態で迎える（重なりの分離が容易に）。
+  const pendingSelectRef = useRef<{
+    path: string;
+    cards: string[];
+    notes: string[];
+    shapes: string[];
+  } | null>(null);
   // v1.4 ドロップポイント: 先に定義される handleDropFiles から、後方で定義される
   // パイプライン実行関数を呼ぶための間接参照（TDZ回避。refミラーの既存イディオム）。
   const runDownstreamFlowsRef = useRef<(startId: string) => Promise<void>>(async () => {});
@@ -289,7 +308,7 @@ function App() {
     handleClearSelection,
     handleCardSelectOnly,
     handleNoteSelectOnly,
-  } = useSelection({ objectsRef, notesRef, measuredNoteSize });
+  } = useSelection({ objectsRef, notesRef, shapesRef, measuredNoteSize });
 
   const refresh = useCallback(async () => {
     try {
@@ -399,6 +418,39 @@ function App() {
       setView(null);
     }
   }, [project, refresh, resetStacks, loadStacks]);
+
+  // v1.4.22 ②: プロジェクト間コピー/移動の後、送り先プロジェクトを開いたら送った物を
+  // 選択状態で迎えてビューを寄せる。元の座標のまま既存カードと重なっていても、選択
+  // ドラッグ（まとめ移動）でそのまま空きキャンバスへ分離できる。
+  // 保存ビューの復元（view）とデータ読込（objects等）の両方が揃ってから発火する。
+  useEffect(() => {
+    const pend = pendingSelectRef.current;
+    if (!pend || !project || !view || view.key !== project.path) return;
+    const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase();
+    if (norm(pend.path) !== norm(project.path)) return;
+    const cards = objects.filter((o) => pend.cards.includes(o.id));
+    const noteHits = notes.filter((n) => pend.notes.includes(n.id));
+    const shapeHits = shapes.filter((s) => pend.shapes.includes(s.id));
+    if (!cards.length && !noteHits.length && !shapeHits.length) return; // データ読込前
+    pendingSelectRef.current = null;
+    setSelected(new Set(cards.map((o) => o.id)));
+    setSelectedNotes(new Set(noteHits.map((n) => n.id)));
+    setSelectedShapes(new Set(shapeHits.map((s) => s.id)));
+    // 送った物の外接矩形へビューを寄せる（fitTo が余白を付ける）。
+    const boxes = [
+      ...cards.map((o) => ({ x: o.pos_x, y: o.pos_y, w: CARD_W, h: CARD_H })),
+      ...noteHits.map((n) => {
+        const sz = measuredNoteSize(n);
+        return { x: n.pos_x, y: n.pos_y, w: sz.w, h: sz.h };
+      }),
+      ...shapeHits.map((s) => ({ x: s.pos_x, y: s.pos_y, w: s.width, h: s.height })),
+    ];
+    const minX = Math.min(...boxes.map((b) => b.x));
+    const minY = Math.min(...boxes.map((b) => b.y));
+    const maxX = Math.max(...boxes.map((b) => b.x + b.w));
+    const maxY = Math.max(...boxes.map((b) => b.y + b.h));
+    canvasApi.current?.fitTo({ x: minX, y: minY, w: maxX - minX, h: maxY - minY });
+  }, [project, view, objects, notes, shapes, measuredNoteSize, setSelected, setSelectedNotes, setSelectedShapes]);
 
   // v1.3-①: apply / persist the UI color preset.
   useEffect(() => {
@@ -2394,27 +2446,53 @@ function App() {
       if (!cardIds.length && !noteIds.length && !shapeIds.length) return;
       const run = async () => {
         try {
-          const n = await invoke<number>("send_selection_to_project", {
+          const res = await invoke<{
+            moved: number;
+            new_card_ids: string[];
+            new_note_ids: string[];
+            new_shape_ids: string[];
+          }>("send_selection_to_project", {
             cardIds,
             noteIds,
             shapeIds,
             targetPath,
             moveOut: mode === "move",
           });
+          // v1.4.22 ②: 送り先で新規採番されたIDを控える。送り先を開いたとき（下の
+          // 「送り先を開く」でも、後で手動で開いても）選択状態で迎える。
+          pendingSelectRef.current = {
+            path: targetPath,
+            cards: res.new_card_ids,
+            notes: res.new_note_ids,
+            shapes: res.new_shape_ids,
+          };
+          const openTarget = () => {
+            setConfirm(null);
+            void (async () => {
+              try {
+                const info = await invoke<ProjectInfo>("open_project", { path: targetPath });
+                setProject(info);
+              } catch (err) {
+                console.error("open_project failed", err);
+              }
+            })();
+          };
           if (mode === "move") {
             await refresh();
             setConfirm({
               title: "移動しました",
-              message: `${n}件を「${targetName}」へ移動しました。実体が送り先へ移り、元プロジェクトからは削除されました（Ctrl+Z では復活できません）。送り先を開くと反映されます。`,
-              okLabel: "OK",
-              onConfirm: () => setConfirm(null),
+              message: `${res.moved}件を「${targetName}」へ移動しました。実体が送り先へ移り、元プロジェクトからは削除されました（Ctrl+Z では復活できません）。「送り先を開く」で、移動した物が選択された状態で開きます。`,
+              okLabel: "送り先を開く",
+              cancelLabel: "閉じる",
+              onConfirm: openTarget,
             });
           } else {
             setConfirm({
               title: "コピーしました",
-              message: `${n}件を「${targetName}」へ仮身としてコピーしました。送り先プロジェクトを開くと反映されます。`,
-              okLabel: "OK",
-              onConfirm: () => setConfirm(null),
+              message: `${res.moved}件を「${targetName}」へ仮身としてコピーしました。「送り先を開く」で、コピーした物が選択された状態で開きます。`,
+              okLabel: "送り先を開く",
+              cancelLabel: "閉じる",
+              onConfirm: openTarget,
             });
           }
         } catch (e) {
@@ -2972,20 +3050,118 @@ function App() {
     });
   }, []);
 
+  // 従う図形を推移的に集める（子の上の孫も動く）。クリック選択とドラッグ追従で共用
+  // することで「クリックで選択される集合＝ドラッグで動く集合」を一致させる（v1.4.21 ①）。
+  const growShapeGroup = useCallback((base: ShapeInfo[]) => {
+    const moving = new Map<string, ShapeInfo>(base.map((sh) => [sh.id, sh]));
+    let grown = true;
+    while (grown) {
+      grown = false;
+      for (const sh of shapesRef.current) {
+        if (moving.has(sh.id)) continue;
+        for (const parent of moving.values()) {
+          if (sh.z_order > parent.z_order && shapeCenterOn(sh, parent)) {
+            moving.set(sh.id, sh);
+            grown = true;
+            break;
+          }
+        }
+      }
+    }
+    return moving;
+  }, []);
+
   const handleShapeAdd = useCallback(
     async (kind: string, canvasX: number, canvasY: number) => {
       const size =
         kind === "arrow" ? { width: 280, height: 110 } : { width: 360, height: 250 };
+      let x = canvasX, y = canvasY, w = size.width, h = size.height;
+      // v1.4.25 ⑤: スナップ中は対角（左上・右下）を格子に乗せて生む。
+      if (shapeSnap) {
+        const g = SHAPE_GRID;
+        x = Math.round(x / g) * g;
+        y = Math.round(y / g) * g;
+        w = Math.max(g, Math.round((x + w) / g) * g - x);
+        h = Math.max(g, Math.round((y + h) / g) * g - y);
+      }
       try {
-        const vid = await invoke<string>("create_shape", { kind, x: canvasX, y: canvasY, ...size });
+        const vid = await invoke<string>("create_shape", { kind, x, y, width: w, height: h });
         pushUndo([{ kind: "deleteShapes", ids: [vid] }]);
         await refresh();
       } catch (e) {
         console.error("create_shape failed", e);
       }
     },
-    [refresh, pushUndo]
+    [refresh, pushUndo, shapeSnap]
   );
+
+  // v1.4.25 ⑤: 全図形の対角をグリッドへ強制スナップ（オプションのオン/オフに関わらず
+  // 使える明示コマンド）。UNDO一手で全部戻せる。
+  const handleSnapAllShapes = useCallback(async () => {
+    const g = SHAPE_GRID;
+    const olds: { id: string; x: number; y: number; w: number; h: number; rot: number }[] = [];
+    const geoms: { id: string; x: number; y: number; w: number; h: number; rot: number }[] = [];
+    for (const s of shapesRef.current) {
+      const x = Math.round(s.pos_x / g) * g;
+      const y = Math.round(s.pos_y / g) * g;
+      const w = Math.max(g, Math.round((s.pos_x + s.width) / g) * g - x);
+      const h = Math.max(g, Math.round((s.pos_y + s.height) / g) * g - y);
+      if (x !== s.pos_x || y !== s.pos_y || w !== s.width || h !== s.height) {
+        olds.push({ id: s.id, x: s.pos_x, y: s.pos_y, w: s.width, h: s.height, rot: s.rotation });
+        geoms.push({ id: s.id, x, y, w, h, rot: s.rotation });
+      }
+    }
+    if (!geoms.length) return;
+    pushUndo([{ kind: "shapes", geoms: olds }]);
+    try {
+      await applyShapeGeoms(geoms);
+    } catch (e) {
+      console.error("snap all shapes failed", e);
+    }
+  }, [pushUndo, applyShapeGeoms]);
+
+  // v1.4.23 ③: 選択部（カード＋コメント）を囲む角丸四角を新規作成し、図形を選択状態に
+  // する（カード側の選択は維持）。ステップ①の分離モードと組み合わせて、混在した密集地でも
+  // 「選択 → 囲む → 図形ドラッグ」で選択だけを新グループとして引き出せる。
+  const handleShapeAroundSelection = useCallback(async () => {
+    const selCards = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
+    const selNs = notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
+    if (!selCards.length && !selNs.length) return;
+    const boxes = [
+      ...selCards.map((o) => ({ x: o.pos_x, y: o.pos_y, w: CARD_W, h: CARD_H })),
+      ...selNs.map((n) => {
+        const sz = measuredNoteSize(n);
+        return { x: n.pos_x, y: n.pos_y, w: sz.w, h: sz.h };
+      }),
+    ];
+    const pad = 28;
+    let minX = Math.min(...boxes.map((b) => b.x)) - pad;
+    let minY = Math.min(...boxes.map((b) => b.y)) - pad;
+    let maxX = Math.max(...boxes.map((b) => b.x + b.w)) + pad;
+    let maxY = Math.max(...boxes.map((b) => b.y + b.h)) + pad;
+    // v1.4.25 ⑤: スナップ中は外側方向へ丸めて格子に乗せる（選択部を必ず包含したまま）。
+    if (shapeSnap) {
+      const g = SHAPE_GRID;
+      minX = Math.floor(minX / g) * g;
+      minY = Math.floor(minY / g) * g;
+      maxX = Math.ceil(maxX / g) * g;
+      maxY = Math.ceil(maxY / g) * g;
+    }
+    try {
+      const vid = await invoke<string>("create_shape", {
+        kind: "rect",
+        x: Math.round(minX),
+        y: Math.round(minY),
+        width: Math.round(maxX - minX),
+        height: Math.round(maxY - minY),
+      });
+      pushUndo([{ kind: "deleteShapes", ids: [vid] }]);
+      await refresh();
+      setSelectedShapes(new Set([vid])); // カード・コメントの選択はそのまま維持
+    } catch (e) {
+      console.error("create_shape (around selection) failed", e);
+    }
+  }, [measuredNoteSize, pushUndo, refresh, setSelectedShapes, shapeSnap]);
 
   const handleShapeGeomEnd = useCallback(
     async (id: string, x: number, y: number, w: number, h: number) => {
@@ -3005,15 +3181,24 @@ function App() {
   );
 
   // クリック（ドラッグなし）= 図形上のカード・コメントをまとめて選択（思考のグループ）。
+  // v1.4.21 ①: 推移的な子図形も選択に含める。ドラッグ時の追従集合と一致するので、
+  // Ctrl+クリックで不要なカード・子図形を外してから図形ドラッグ＝選択だけ分離、が成立する。
   const handleShapeClickSelect = useCallback(
     (id: string) => {
       const s = shapesRef.current.find((sh) => sh.id === id);
       if (!s) return;
-      setSelectedShapes(new Set([id]));
-      setSelected(new Set(cardsOnShape(s).map((c) => c.id)));
-      setSelectedNotes(new Set(notesOnShape(s).map((n) => n.id)));
+      const group = growShapeGroup([s]);
+      const cards = new Set<string>();
+      const notes = new Set<string>();
+      for (const sh of group.values()) {
+        cardsOnShape(sh).forEach((c) => cards.add(c.id));
+        notesOnShape(sh).forEach((n) => notes.add(n.id));
+      }
+      setSelectedShapes(new Set(group.keys()));
+      setSelected(cards);
+      setSelectedNotes(notes);
     },
-    [cardsOnShape, notesOnShape]
+    [cardsOnShape, notesOnShape, growShapeGroup]
   );
 
   // 図形をドラッグ → 上に乗っているカード・コメントも一緒に動かす（グループ移動）。
@@ -3035,26 +3220,40 @@ function App() {
           ? shapesRef.current.filter((sh) => sel.has(sh.id))
           : [s];
         // 従う図形を推移的に集める（子の上の孫も動く）。
-        const moving = new Map<string, ShapeInfo>(base.map((sh) => [sh.id, sh]));
-        let grown = true;
-        while (grown) {
-          grown = false;
-          for (const sh of shapesRef.current) {
-            if (moving.has(sh.id)) continue;
-            for (const parent of moving.values()) {
-              if (sh.z_order > parent.z_order && shapeCenterOn(sh, parent)) {
-                moving.set(sh.id, sh);
-                grown = true;
-                break;
-              }
-            }
+        const moving = growShapeGroup(base);
+        // v1.4.21 ①「分離モード」: 図形群の上のカード/コメントが選択中なら、選択された
+        // ものだけが追従し非選択は置いていく（選択＝分離の意図）。図形と無関係な選択
+        //（上に乗っていない）の場合は従来通り全員追従。Shift+ドラッグ（図形のみ）は
+        // ShapeCard 側で onDragCards 自体が呼ばれないので従来通り。
+        const selCards = selectedRef.current;
+        const selNotes = selectedNotesRef.current;
+        let separating = false;
+        for (const sh of moving.values()) {
+          if (
+            cardsOnShape(sh).some((c) => selCards.has(c.id)) ||
+            notesOnShape(sh).some((n) => selNotes.has(n.id))
+          ) {
+            separating = true;
+            break;
+          }
+        }
+        if (separating) {
+          // 分離モードでは推移的に拾った子図形のうち、明示選択されていないものは外す
+          //（Ctrl+クリックで子図形を選択から外す＝置いていく、を可能にする）。
+          const baseIds = new Set(base.map((b) => b.id));
+          for (const sid of [...moving.keys()]) {
+            if (!baseIds.has(sid) && !sel.has(sid)) moving.delete(sid);
           }
         }
         const cardStarts = new Map<string, { x: number; y: number }>();
         const noteStarts = new Map<string, { x: number; y: number }>();
         for (const sh of moving.values()) {
-          cardsOnShape(sh).forEach((c) => cardStarts.set(c.id, { x: c.pos_x, y: c.pos_y }));
-          notesOnShape(sh).forEach((n) => noteStarts.set(n.id, { x: n.pos_x, y: n.pos_y }));
+          cardsOnShape(sh).forEach((c) => {
+            if (!separating || selCards.has(c.id)) cardStarts.set(c.id, { x: c.pos_x, y: c.pos_y });
+          });
+          notesOnShape(sh).forEach((n) => {
+            if (!separating || selNotes.has(n.id)) noteStarts.set(n.id, { x: n.pos_x, y: n.pos_y });
+          });
         }
         drag = {
           cardStarts,
@@ -3126,7 +3325,7 @@ function App() {
         })();
       }
     },
-    [cardsOnShape, notesOnShape, pushUndo, applyObjectMoves, applyNoteMoves, applyShapeGeoms, redrawArrowsFor]
+    [cardsOnShape, notesOnShape, growShapeGroup, pushUndo, applyObjectMoves, applyNoteMoves, applyShapeGeoms, redrawArrowsFor]
   );
 
   const handleShapeDelete = useCallback(
@@ -3797,6 +3996,13 @@ function App() {
             localStorage.setItem("texos-menu-hints", nv ? "1" : "0");
             return nv;
           }),
+        toggleShapeSnap: () =>
+          setShapeSnap((v) => {
+            const nv = !v;
+            localStorage.setItem("texos-shape-snap", nv ? "1" : "0");
+            return nv;
+          }),
+        snapAllShapes: handleSnapAllShapes,
         switchProject: () => setShowChooser(true),
         showHelp: () => setHelpOpen(true),
         focusSelection: handleFocusSelection,
@@ -3863,6 +4069,7 @@ function App() {
         noteToTextCard: handleNoteToTextCard,
         deleteNote: handleDeleteNote,
         shapeClickSelect: handleShapeClickSelect,
+        shapeAroundSelection: handleShapeAroundSelection,
         shapeStyle: handleShapeStyle,
         shapeRotate: handleShapeRotate,
         shapeScale: handleShapeScale,
@@ -3947,6 +4154,7 @@ function App() {
             launcherLibrary: launcherLibrary.map((e) => e.name),
             audioDevices: audioDevicesRef.current,
             menuHints: showMenuHints,
+            shapeSnap,
           },
           actions
         );
@@ -3996,6 +4204,8 @@ function App() {
       handleFocusSelection,
       handlePaste,
       handleShapeAdd,
+      handleShapeAroundSelection,
+      handleSnapAllShapes,
       handleShapeClickSelect,
       handleShapeStyle,
       handleShapeRotate,
@@ -4024,6 +4234,7 @@ function App() {
       runDownstreamFlows,
       theme,
       showMenuHints,
+      shapeSnap,
       expanded,
       notes,
       filterLibrary,
@@ -4207,6 +4418,7 @@ function App() {
               onClickSelect={handleShapeClickSelect}
               onToggleSelect={handleShapeToggleSelect}
               onDragCards={handleShapeDragCards}
+              snapGrid={shapeSnap ? SHAPE_GRID : undefined}
             />
           ))}
         <LinkLayer
@@ -4671,6 +4883,7 @@ function App() {
           message={confirm.message}
           warning={confirm.warning}
           okLabel={confirm.okLabel}
+          cancelLabel={confirm.cancelLabel}
           onConfirm={confirm.onConfirm}
           onCancel={() => setConfirm(null)}
         />

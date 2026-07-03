@@ -28,6 +28,8 @@ interface Props {
   onToggleSelect?: (id: string) => void;
   /** Live-move the cards riding on the shape. (id, dx, dy, done) */
   onDragCards?: (id: string, dx: number, dy: number, done: boolean) => void;
+  /** v1.4.25 ⑤: グリッドスナップ格子(px)。指定時、移動・リサイズの対角がライブで吸着。 */
+  snapGrid?: number;
 }
 
 export function hexToRgba(hex: string, alpha: number): string {
@@ -37,7 +39,7 @@ export function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 }
 
-export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, onToggleSelect, onDragCards }: Props) {
+export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, onToggleSelect, onDragCards, snapGrid }: Props) {
   const s = shape;
   const ref = useRef<HTMLDivElement>(null);
 
@@ -62,24 +64,46 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
     let moved = false;
 
     const onMove = (me: globalThis.MouseEvent) => {
-      dx = (me.clientX - startMouseX) / scale;
-      dy = (me.clientY - startMouseY) / scale;
-      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
+      const rawDx = (me.clientX - startMouseX) / scale;
+      const rawDy = (me.clientY - startMouseY) / scale;
+      // moved 判定は生の移動量で（スナップで dx=0 に丸まってもドラッグはドラッグ）。
+      if (Math.abs(rawDx) > 2 || Math.abs(rawDy) > 2) moved = true;
+      dx = rawDx;
+      dy = rawDy;
+      // v1.4.25 ⑤: スナップ中は対角（左上・右下）を格子へライブ吸着。移動は左上基準の
+      // 絶対スナップ（元が格子から外れていても、動かせば格子に乗る）。
+      const g = snapGrid;
       if (mode === "move") {
+        if (g) {
+          dx = Math.round((start.x + rawDx) / g) * g - start.x;
+          dy = Math.round((start.y + rawDy) / g) * g - start.y;
+        }
         el.style.transform = `translate(${start.x + dx}px, ${start.y + dy}px) rotate(${s.rotation}deg)`;
         if (!solo) onDragCards?.(s.id, dx, dy, false);
       } else if (mode === "resize-tl") {
         // 左上ハンドル: 右下角を固定したまま左上方向へ拡縮（pos と size を同時に動かす）。
-        curW = Math.max(60, start.w - dx);
-        curH = Math.max(40, start.h - dy);
+        if (g) {
+          const left = Math.round((start.x + rawDx) / g) * g;
+          const top = Math.round((start.y + rawDy) / g) * g;
+          curW = Math.max(60, start.x + start.w - left);
+          curH = Math.max(40, start.y + start.h - top);
+        } else {
+          curW = Math.max(60, start.w - rawDx);
+          curH = Math.max(40, start.h - rawDy);
+        }
         curX = start.x + start.w - curW;
         curY = start.y + start.h - curH;
         el.style.width = `${curW}px`;
         el.style.height = `${curH}px`;
         el.style.transform = `translate(${curX}px, ${curY}px) rotate(${s.rotation}deg)`;
       } else {
-        curW = Math.max(60, start.w + dx);
-        curH = Math.max(40, start.h + dy);
+        if (g) {
+          curW = Math.max(60, Math.round((start.x + start.w + rawDx) / g) * g - start.x);
+          curH = Math.max(40, Math.round((start.y + start.h + rawDy) / g) * g - start.y);
+        } else {
+          curW = Math.max(60, start.w + rawDx);
+          curH = Math.max(40, start.h + rawDy);
+        }
         el.style.width = `${curW}px`;
         el.style.height = `${curH}px`;
       }

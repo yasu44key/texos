@@ -116,6 +116,11 @@ export interface MenuActions {
   deleteNote: (id: string) => void;
   // 図形
   shapeClickSelect: (id: string) => void;
+  // v1.4.23 ③: 選択部（カード＋コメント）を囲む図形を新規作成して選択状態にする。
+  shapeAroundSelection: () => void;
+  // v1.4.25 ⑤: 図形グリッドスナップのオン/オフ切替と、全図形の強制スナップ。
+  toggleShapeSnap: () => void;
+  snapAllShapes: () => void;
   shapeStyle: (id: string, fill: string, opacity: number) => void;
   shapeRotate: (id: string, deg: number) => void;
   shapeScale: (id: string, factor: number) => void;
@@ -821,6 +826,8 @@ interface CanvasMenuCtx {
   audioDevices: string[];
   /// v1.3.4: メニュー説明ツールチップの現在のオン/オフ（トグル表示用）。
   menuHints: boolean;
+  /// v1.4.25 ⑤: 図形グリッドスナップの現在のオン/オフ（トグル表示用）。
+  shapeSnap: boolean;
 }
 
 // v1.4.16: UIカラーの連続比較用サブメニュー。選んでもメニューは閉じず（keepOpen）、
@@ -962,6 +969,11 @@ export function buildCanvasMenu(
     ...(selTotal
       ? [{ label: "選択範囲にフォーカス", onClick: () => a.focusSelection() }]
       : []),
+    // v1.4.23 ③: 選択部を囲む図形（角丸四角）を作って選択状態で渡す。囲んでから
+    // 図形ドラッグ＝分離モードで、混在する密集地から選択だけを新グループにできる。
+    ...(selTotal
+      ? [{ label: "選択を図形で囲む", onClick: () => a.shapeAroundSelection() }]
+      : []),
     ...(selTotal >= 2
       ? [{ label: "選択を整列 ...", onClick: () => a.openSubmenu(ctx.alignItems) }]
       : []),
@@ -997,6 +1009,19 @@ export function buildCanvasMenu(
           { label: "角丸四角", onClick: () => a.shapeAdd("rect", pos.canvasX, pos.canvasY) },
           { label: "楕円", onClick: () => a.shapeAdd("ellipse", pos.canvasX, pos.canvasY) },
           { label: "太矢印", onClick: () => a.shapeAdd("arrow", pos.canvasX, pos.canvasY) },
+          DIV,
+          // v1.4.25 ⑤: 見えない格子（カード≒横4×縦3単位の38px正方）への吸着。
+          // オンの間、図形の作成・移動・リサイズの対角が格子に乗る（カードは自由なまま）。
+          {
+            label: (ctx.shapeSnap ? "✓ " : "　") + "グリッドにスナップ",
+            hint: "オンの間、図形の作成・移動・サイズ変更が見えない格子（38px）に吸着します。カードの配置は自由なままです。",
+            onClick: () => a.toggleShapeSnap(),
+          },
+          {
+            label: "全図形を今すぐグリッドへ",
+            hint: "このプロジェクトの全図形の位置とサイズを格子に揃えます（Ctrl+Z で一括で戻せます）。スナップがオフでも使えます。",
+            onClick: () => a.snapAllShapes(),
+          },
         ]),
     },
     {

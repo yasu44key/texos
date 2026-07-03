@@ -1890,7 +1890,16 @@ fn duplicate_virtual(id: String, state: State<AppState>) -> Result<String, Strin
 /// フィルタ／ランチャー等の設定（filter_ref/kind/url_ref…）も継承する。プロジェクト境界を
 /// またぐ矢印は張らない（両端が選択内の relations だけ運ぶ）。
 /// v1.4.17: 選択中の図形（コンテナ枠）も一緒に運ぶ（移動なら元をソフトデリート）。
-/// 戻り値＝運んだカード＋コメント＋図形数。
+/// 戻り値＝運んだ数＋送り先で新規採番されたID群（v1.4.22 ②: フロントが送り先を開いた
+/// ときに選択状態で迎え、重なったカード類をドラッグで分離できるようにする）。
+#[derive(Serialize)]
+pub struct SendSelectionResult {
+    pub moved: usize,
+    pub new_card_ids: Vec<String>,
+    pub new_note_ids: Vec<String>,
+    pub new_shape_ids: Vec<String>,
+}
+
 #[tauri::command]
 fn send_selection_to_project(
     card_ids: Vec<String>,
@@ -1899,7 +1908,7 @@ fn send_selection_to_project(
     target_path: String,
     move_out: bool,
     state: State<AppState>,
-) -> Result<usize, String> {
+) -> Result<SendSelectionResult, String> {
     ensure_no_flow_running(state.inner())?;
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
@@ -1968,8 +1977,12 @@ fn send_selection_to_project(
         .conn
         .execute("ALTER TABLE dst.shapes ADD COLUMN deleted_at INTEGER", []);
 
-    let result = (|| -> Result<usize, String> {
+    let result = (|| -> Result<SendSelectionResult, String> {
         let mut moved = 0usize;
+        let mut new_card_ids: Vec<String> = Vec::new();
+        let mut new_note_ids: Vec<String> = Vec::new();
+        let mut new_shape_ids: Vec<String> = Vec::new();
+        let note_set: std::collections::HashSet<&String> = note_ids.iter().collect();
 
         // v1.4.17 カード統一: 付箋(note_ids)もカードと同じ経路で運ぶ（旧・専用セクションは廃止）。
         for old_id in card_ids.iter().chain(note_ids.iter()) {
@@ -2133,6 +2146,11 @@ fn send_selection_to_project(
                 }
             }
             moved += 1;
+            if note_set.contains(old_id) {
+                new_note_ids.push(new_id);
+            } else {
+                new_card_ids.push(new_id);
+            }
         }
 
         // 関係矢印: 両端が選択内のものだけ、新IDへ貼り替えて運ぶ。先に Vec へ集めてから挿入
@@ -2190,22 +2208,29 @@ fn send_selection_to_project(
             let Some((kind, x, y, w, h, rot, fill, opacity, z, label)) = s else {
                 continue;
             };
+            let new_sid = uuid();
             p.conn
                 .execute(
                     "INSERT INTO dst.shapes
                         (id,kind,pos_x,pos_y,width,height,rotation,fill,opacity,z_order,label,created_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                    rusqlite::params![uuid(), kind, x, y, w, h, rot, fill, opacity, z, label, db::now_ms()],
+                    rusqlite::params![new_sid, kind, x, y, w, h, rot, fill, opacity, z, label, db::now_ms()],
                 )
                 .map_err(|e| e.to_string())?;
             moved += 1;
+            new_shape_ids.push(new_sid);
         }
 
-        Ok(moved)
+        Ok(SendSelectionResult {
+            moved,
+            new_card_ids,
+            new_note_ids,
+            new_shape_ids,
+        })
     })();
 
     let _ = p.conn.execute("DETACH DATABASE dst", []);
-    let moved = result?;
+    let res = result?;
 
     // 移動: 元プロジェクトからソフトデリート（既存の削除フローと同じ deleted_at 方式・
     // Ctrl+Z で復活可）。コミット済み実ファイルは .texos/trash へ退避（delete_object と同じ
@@ -2270,7 +2295,7 @@ fn send_selection_to_project(
         }
     }
 
-    Ok(moved)
+    Ok(res)
 }
 
 #[tauri::command]

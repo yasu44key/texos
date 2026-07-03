@@ -5,15 +5,17 @@ import { useCallback, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
 import { CARD_W, CARD_H } from "../objects/ObjectCard";
 import type { NoteInfo, VirtualBodyInfo } from "../model";
+import type { ShapeInfo } from "../objects/ShapeCard";
 
 interface UseSelectionDeps {
   objectsRef: MutableRefObject<VirtualBodyInfo[]>;
   notesRef: MutableRefObject<NoteInfo[]>;
+  shapesRef: MutableRefObject<ShapeInfo[]>;
   // 実測サイズ（ResizeObserver）優先のコメント寸法。
   measuredNoteSize: (n: NoteInfo) => { w: number; h: number };
 }
 
-export function useSelection({ objectsRef, notesRef, measuredNoteSize }: UseSelectionDeps) {
+export function useSelection({ objectsRef, notesRef, shapesRef, measuredNoteSize }: UseSelectionDeps) {
   // Rubber-band selection (group move).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const selectedRef = useRef<Set<string>>(selected);
@@ -51,6 +53,19 @@ export function useSelection({ objectsRef, notesRef, measuredNoteSize }: UseSele
           );
         })
         .map((n) => n.id);
+      // v1.4.24 ④: 矩形に「完全に収まっている」図形だけ選択に含める。図形は背景の
+      // 大物なので、カードと同じ交差判定にすると大図形の上でラバーバンドを引くたびに
+      // 選択されてしまう。丸ごと囲んだ図形＝グループの一部として運ぶ意図、はみ出す
+      // 図形＝背景、の区別。回転図形は無回転バウンディングボックスで近似判定。
+      const hitShapes = shapesRef.current
+        .filter(
+          (s) =>
+            s.pos_x >= rect.x &&
+            s.pos_y >= rect.y &&
+            s.pos_x + s.width <= rect.x + rect.w &&
+            s.pos_y + s.height <= rect.y + rect.h
+        )
+        .map((s) => s.id);
       const apply = (prev: Set<string>, hits: string[]) => {
         if (mode === "replace") return new Set(hits);
         if (mode === "add") return new Set([...prev, ...hits]);
@@ -63,8 +78,9 @@ export function useSelection({ objectsRef, notesRef, measuredNoteSize }: UseSele
       };
       setSelected((prev) => apply(prev, hit));
       setSelectedNotes((prev) => apply(prev, hitNotes));
+      setSelectedShapes((prev) => apply(prev, hitShapes));
     },
-    [objectsRef, notesRef, measuredNoteSize]
+    [objectsRef, notesRef, shapesRef, measuredNoteSize]
   );
 
   // v1.3 メモ２追加: Ctrl+クリックで選択を個別にトグル（追加／解除）。
