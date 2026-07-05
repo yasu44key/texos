@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { MenuItem } from "./ContextMenu";
 import type { ShapeInfo } from "../objects/ShapeCard";
 import type { NoteInfo, VirtualBodyInfo } from "../model";
-import { SHAPE_COLORS, THEMES, isTextMime, lostOf, lostRealOf, isInternalReal } from "../model";
+import { SHAPE_COLORS, THEME_GROUPS, isTextMime, lostOf, lostRealOf, isInternalReal } from "../model";
 
 // App のハンドラ群。メニュー項目はすべてこの窓口経由で実行する。
 export interface MenuActions {
@@ -161,7 +161,7 @@ export function buildAlignItems(a: MenuActions): MenuItem[] {
 
 // v1.3 メモ２追加④: 選択カードへの一括操作（対象件数つき）。
 export function buildBulkItems(
-  counts: { commitable: number; uncommitable: number; total: number; ids: string[] },
+  counts: { commitable: number; uncommitable: number; total: number; notes: number; ids: string[] },
   a: MenuActions
 ): MenuItem[] {
   return [
@@ -203,7 +203,8 @@ export function buildBulkItems(
         ]),
     },
     {
-      label: `まとめて削除（${counts.total}件）`,
+      // v1.4.30: 選択コメントも一緒に消えるようになったため件数に含める。
+      label: `まとめて削除（${counts.total + counts.notes}件）`,
       danger: true,
       shortcut: "Delete",
       onClick: () => a.bulkDelete(),
@@ -834,15 +835,19 @@ interface CanvasMenuCtx {
 // v1.4.16: UIカラーの連続比較用サブメニュー。選んでもメニューは閉じず（keepOpen）、
 // ✓ を選択中テーマへ付け替えて開き直す。末尾の OK で閉じる。
 function themeSubmenu(a: MenuActions, sel: string): MenuItem[] {
+  // v1.4.30: グループごとに区切り線を入れて段落表示（基本/中間/配色/パステル/季節/アクセント）。
   return [
-    ...THEMES.map(([key, name]) => ({
-      label: (sel === key ? "✓ " : "　") + name,
-      keepOpen: true,
-      onClick: () => {
-        a.setTheme(key);
-        a.openSubmenu(themeSubmenu(a, key));
-      },
-    })),
+    ...THEME_GROUPS.flatMap((group, gi) => [
+      ...(gi > 0 ? [DIV] : []),
+      ...group.map(([key, name]) => ({
+        label: (sel === key ? "✓ " : "　") + name,
+        keepOpen: true,
+        onClick: () => {
+          a.setTheme(key);
+          a.openSubmenu(themeSubmenu(a, key));
+        },
+      })),
+    ]),
     DIV,
     { label: "OK（閉じる）", onClick: () => {} },
   ];

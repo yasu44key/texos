@@ -110,23 +110,45 @@ export function isInternalReal(o: VirtualBodyInfo): boolean {
   return o.origin_path === o.committed_path;
 }
 
-// v1.3-①: UIカラープリセット（App.cssの[data-texos-theme]と対応）
-export const THEMES: [string, string][] = [
-  ["midnight", "ミッドナイト（標準）"],
-  ["light", "視認性重視（ライト）"],
-  ["dim", "中間・明るめ（フォグ）"],
-  ["slate", "中間・暗め（スレート）"],
-  ["warm", "色調重視（セピア）"],
-  ["calm", "疲労防止（低刺激）"],
-  // v1.4.16 遊び心: カラフルなプリセット（明るい系5＋暗い系2）。
-  ["pastel-cool", "パステル（クール）"],
-  ["pastel-warm", "パステル（ウォーム）"],
-  ["spring", "スプリング（春）"],
-  ["summer", "サマー（夏）"],
-  ["winter", "ウィンター（冬）"],
-  ["vivid", "ビビッド"],
-  ["autumn", "オータム（秋）"],
+// v1.3-①: UIカラープリセット（App.cssの[data-texos-theme]と対応）。
+// v1.4.30: グループ化（テーマメニューは区切り線で段落表示）＋中間トーンの配色シリーズ8色を追加。
+// 並び = 基本 → 中間（実用）→ 中間（配色）→ パステル → 季節（春夏秋冬を連続に）→ アクセント。
+// ※ 従来はビビッドが季節の間（冬と秋の間）に挟まっていた違和感を解消。
+export const THEME_GROUPS: [string, string][][] = [
+  [
+    ["midnight", "ミッドナイト（標準）"],
+    ["light", "視認性重視（ライト）"],
+  ],
+  [
+    ["dim", "中間・明るめ（フォグ）"],
+    ["slate", "中間・暗め（スレート）"],
+    ["warm", "色調重視（セピア）"],
+    ["calm", "疲労防止（低刺激）"],
+  ],
+  // v1.4.30 中間トーンの配色シリーズ（まぶしくなく・暗くなく・華やか）
+  [
+    ["modern", "モダン（グレージュ×シグナルレッド）"],
+    ["britone", "ブライトーン（オートミール×クリアオレンジ）"],
+    ["nordic", "ノルディック（白樺×ダスティブルー）"],
+    ["japonisme", "ジャポニズム（藍×朱）"],
+    ["roman", "ローマン（大理石×テラコッタ）"],
+    ["mediterranean", "地中海（白壁×コバルト）"],
+    ["venice", "ベニス（漆喰×緑青）"],
+    ["cafe", "カフェ（ラテ×エスプレッソ）"],
+  ],
+  [
+    ["pastel-cool", "パステル（クール）"],
+    ["pastel-warm", "パステル（ウォーム）"],
+  ],
+  [
+    ["spring", "スプリング（春）"],
+    ["summer", "サマー（夏）"],
+    ["autumn", "オータム（秋）"],
+    ["winter", "ウィンター（冬）"],
+  ],
+  [["vivid", "ビビッド"]],
 ];
+export const THEMES: [string, string][] = THEME_GROUPS.flat();
 
 // v1.3-②: 図形のカラーパレット
 export const SHAPE_COLORS: [string, string][] = [

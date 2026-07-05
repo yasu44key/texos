@@ -2351,14 +2351,20 @@ function App() {
   }, [refresh]);
 
   // まとめて削除: 件数とコミット済み（実ファイルも消える）件数を出して確認。
+  // v1.4.30: 選択コメント（付箋）も一緒に削除する（Delキーがコメントに効かない問題の本丸）。
   const handleBulkDelete = useCallback(() => {
     const targets = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
-    if (!targets.length) return;
+    const noteTargets = notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
+    if (!targets.length && !noteTargets.length) return;
     const committedCount = targets.filter((o) => o.committed_path).length;
+    const parts = [
+      ...(targets.length ? [`${targets.length} 件のカード`] : []),
+      ...(noteTargets.length ? [`${noteTargets.length} 件のコメント`] : []),
+    ];
     setConfirm({
-      title: "選択カードをまとめて削除",
+      title: "選択をまとめて削除",
       message:
-        `${targets.length} 件のカードを削除します。` +
+        `${parts.join("と")}を削除します。` +
         (committedCount
           ? `\nうち ${committedCount} 件は実身化済みで、プロジェクトフォルダ内の実身ファイルも削除されます。\n（CAS内の元データは保持されます）`
           : ""),
@@ -2374,11 +2380,22 @@ function App() {
             console.error("delete_object failed", o.id, e);
           }
         }
-        // 復活の呪文: まとめて削除も1回のCtrl+Zで全員戻ってくる。
-        if (ids.length) {
-          pushUndo([{ kind: "restore", ids }]);
+        const noteIds: string[] = [];
+        for (const n of noteTargets) {
+          try {
+            await invoke("delete_note", { id: n.id });
+            noteIds.push(n.id);
+          } catch (e) {
+            console.error("delete_note failed", n.id, e);
+          }
         }
+        // 復活の呪文: まとめて削除も1回のCtrl+Zで全員（カード＋コメント）戻ってくる。
+        const undo: UndoAction[] = [];
+        if (ids.length) undo.push({ kind: "restore", ids });
+        if (noteIds.length) undo.push({ kind: "restoreNotes", ids: noteIds });
+        if (undo.length) pushUndo(undo);
         setSelected(new Set());
+        setSelectedNotes(new Set());
         await refresh();
       },
     });
@@ -4133,6 +4150,7 @@ function App() {
             (o) => !!o.committed_path && !!o.origin_path && o.origin_path !== o.committed_path
           ).length,
           total: selObjs.length,
+          notes: notesRef.current.filter((n) => selectedNotesRef.current.has(n.id)).length,
           ids: selObjs.map((o) => o.id),
         },
         actions
@@ -4353,8 +4371,8 @@ function App() {
     setSelectedNotes,
   ]);
 
-  // Delete キー = 選択カードを削除（確認・一括Undoは既存の削除フローに乗せる）。
-  // テキスト入力中・ダイアログ/メニュー表示中は奪わない。
+  // Delete キー = 選択カード＋選択コメントを削除（確認・一括Undoは既存の削除フローに乗せる）。
+  // テキスト入力中・ダイアログ/メニュー表示中は奪わない。v1.4.30: コメント（付箋）にも効く。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Delete") return;
@@ -4363,14 +4381,18 @@ function App() {
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable))
         return;
       const ids = objectsRef.current.filter((o) => selectedRef.current.has(o.id)).map((o) => o.id);
-      if (!ids.length) return;
+      const noteIds = notesRef.current
+        .filter((n) => selectedNotesRef.current.has(n.id))
+        .map((n) => n.id);
+      if (!ids.length && !noteIds.length) return;
       e.preventDefault();
-      if (ids.length >= 2) handleBulkDelete();
-      else handleRequestDelete(ids[0]);
+      if (ids.length + noteIds.length >= 2) handleBulkDelete();
+      else if (ids.length === 1) handleRequestDelete(ids[0]);
+      else handleDeleteNote(noteIds[0]); // 単独コメント: メニューの削除と同じ（確認なし・Ctrl+Zで復活）
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prompt, confirm, filterDlg, builtinDlg, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete]);
+  }, [prompt, confirm, filterDlg, builtinDlg, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete, handleDeleteNote]);
 
   const handleChosen = useCallback((info: ProjectInfo) => {
     setShowChooser(false);

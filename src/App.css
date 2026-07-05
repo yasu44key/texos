@@ -563,6 +563,289 @@
   --tip-text: #d8c4a8;
 }
 
+/* ===== v1.4.30 中間トーンの配色シリーズ ==================================
+   「明るい系と暗い系に分かれている」の中間を埋める8色。キャンバスは中明度
+   （まぶしくなく・暗くなく）、カードはひと回り明るく浮かせ、テーマごとに
+   世界観のある2色（矢印×アクセント）を効かせる。 */
+
+/* 中間クール系の共通クローム（モダン/ノルディック/地中海） */
+[data-texos-theme="modern"],
+[data-texos-theme="nordic"],
+[data-texos-theme="mediterranean"] {
+  --card-text: #262c2c;
+  --card-label-bg: #ffffffb8;
+  --card-bg-filter: #d6e6dc;
+  --card-bg-filter-cmd: #d2e2e2;
+  --card-bg-filter-gen: #e8dfc6;
+  --card-bg-drop: #d8e2ee;
+  --card-bg-launcher: #d6e6dc;
+  --card-filter-text: #1f6b4a;
+  --card-filter-cmd-text: #1d6a6a;
+  --card-filter-gen-text: #8a5e1a;
+  --card-drop-text: #1f5fa0;
+  --card-launcher-text: #1f6b4a;
+  --panel-bg: #e8eae6;
+  --panel-header-bg: #d9ded9;
+  --panel-header-text: #2c3634;
+  --panel-text: #242c2a;
+  --panel-muted: #5c6662;
+  --panel-border: #b6c0ba;
+  --panel-input-bg: #f0f2ee;
+  --panel-btn-bg: #68746e;
+  --panel-checker-a: #d4d8d2;
+  --panel-checker-b: #e2e6e0;
+  --panel-danger: #b5342a;
+  --chat-bubble-user-bg: #d2e2f2;
+  --chat-bubble-user-text: #16365c;
+  --chat-bubble-user-border: #a8c4e2;
+  --chat-bubble-ai-bg: #d8e8dc;
+  --chat-bubble-ai-text: #173a2c;
+  --chat-bubble-ai-border: #a0c8ac;
+  --menu-bg: #eceeea;
+  --menu-border: #b6c0ba;
+  --menu-text: #242c2a;
+  --menu-dim: #8a948e;
+  --menu-hover: #dce2dc;
+  --menu-danger: #b5342a;
+  --menu-danger-bg: #f3ddd9;
+  --tip-bg: #2e3834;
+  --tip-text: #e8ede8;
+  --card-shadow: 0 2px 12px #00000028;
+  --arrow-width: 2.1;
+}
+
+/* 中間ウォーム系の共通クローム（ブライトーン/ジャポニズム/ローマン/ベニス/カフェ） */
+[data-texos-theme="britone"],
+[data-texos-theme="japonisme"],
+[data-texos-theme="roman"],
+[data-texos-theme="venice"],
+[data-texos-theme="cafe"] {
+  --card-text: #322b20;
+  --card-label-bg: #fffdf2b8;
+  --card-bg-filter: #dce8cc;
+  --card-bg-filter-cmd: #d4e4de;
+  --card-bg-filter-gen: #ecdfba;
+  --card-bg-drop: #dee2ea;
+  --card-bg-launcher: #dce8cc;
+  --card-filter-text: #2a6a42;
+  --card-filter-cmd-text: #1d6a62;
+  --card-filter-gen-text: #8a5e1a;
+  --card-drop-text: #2a5a8a;
+  --card-launcher-text: #2a6a42;
+  --panel-bg: #f0e9da;
+  --panel-header-bg: #e2d9c4;
+  --panel-header-text: #3c342a;
+  --panel-text: #322b20;
+  --panel-muted: #6e6250;
+  --panel-border: #c8bba2;
+  --panel-input-bg: #f7f2e6;
+  --panel-btn-bg: #7a6c54;
+  --panel-checker-a: #e0d8c4;
+  --panel-checker-b: #ece4d2;
+  --panel-danger: #b5342a;
+  --chat-bubble-user-bg: #d8e4ee;
+  --chat-bubble-user-text: #1c3a58;
+  --chat-bubble-user-border: #a8c2da;
+  --chat-bubble-ai-bg: #dee8d2;
+  --chat-bubble-ai-text: #2c3c1e;
+  --chat-bubble-ai-border: #b2c896;
+  --menu-bg: #f2ecdd;
+  --menu-border: #c8bba2;
+  --menu-text: #322b20;
+  --menu-dim: #948870;
+  --menu-hover: #e6decc;
+  --menu-danger: #b5342a;
+  --menu-danger-bg: #f0ddd4;
+  --tip-bg: #3a332a;
+  --tip-text: #ece5d4;
+  --card-shadow: 0 2px 12px #00000028;
+  --arrow-width: 2.1;
+}
+
+/* モダン＝グレージュの無彩色ベースに、シグナルレッド1色だけを効かせる（バウハウス） */
+[data-texos-theme="modern"] {
+  --canvas-bg: #aeaba3;
+  --canvas-bg-drag: #a09d94;
+  --card-bg: #ebe9e4;
+  --card-bg-url: #e0e5e8;
+  --card-bg-project: #e6e2ea;
+  --card-bg-folder: #e8e4d8;
+  --note-bg: #f0e9c9;
+  --note-border: #c2b370;
+  --note-text: #3a3418;
+  --note-edit-bg: #f5efd6;
+  --linked-note-bg: #dce8e2;
+  --linked-note-border: #8ab8a4;
+  --linked-note-text: #1f3a30;
+  --arrow-color: #d0432e;
+  --arrow-temp: #e07a62;
+  --accent: #d0432e;
+  --chrome-bg: #e7e6e2d9;
+  --chrome-border: #bcb9b0;
+  --chrome-text: #3a3830;
+}
+
+/* ブライトーン＝オートミールの生成りに、クリアオレンジの明るい中間 */
+[data-texos-theme="britone"] {
+  --canvas-bg: #cfc9b8;
+  --canvas-bg-drag: #c2bba6;
+  --card-bg: #fbf8ee;
+  --card-bg-url: #e6f0f6;
+  --card-bg-project: #f0e8f4;
+  --card-bg-folder: #f4ecd6;
+  --note-bg: #ffe9a8;
+  --note-border: #d8b84a;
+  --note-text: #4a3a08;
+  --note-edit-bg: #fff3c6;
+  --linked-note-bg: #d8eed8;
+  --linked-note-border: #86c286;
+  --linked-note-text: #1e3c1e;
+  --arrow-color: #e8853a;
+  --arrow-temp: #f4a866;
+  --accent: #e8853a;
+  --chrome-bg: #f4f0e4d9;
+  --chrome-border: #d0c8b0;
+  --chrome-text: #4a4230;
+}
+
+/* ノルディック＝白樺のグレーグリーンに、ダスティブルー（ヒュッゲ） */
+[data-texos-theme="nordic"] {
+  --canvas-bg: #b4bab6;
+  --canvas-bg-drag: #a6ada8;
+  --card-bg: #eef0ec;
+  --card-bg-url: #e4ecee;
+  --card-bg-project: #e8e8ee;
+  --card-bg-folder: #ecead8;
+  --note-bg: #e8e2cc;
+  --note-border: #b0a880;
+  --note-text: #3a3620;
+  --note-edit-bg: #f0ecda;
+  --linked-note-bg: #d8e6e2;
+  --linked-note-border: #8ab0a8;
+  --linked-note-text: #22403a;
+  --arrow-color: #5a7a8c;
+  --arrow-temp: #82a2b2;
+  --accent: #5a7a8c;
+  --chrome-bg: #e9ebe8d9;
+  --chrome-border: #b8beba;
+  --chrome-text: #363e3a;
+}
+
+/* ジャポニズム＝利休鼠に生成りのカード、矢印は藍・アクセントは朱（二色使い） */
+[data-texos-theme="japonisme"] {
+  --canvas-bg: #a3a894;
+  --canvas-bg-drag: #969b86;
+  --card-bg: #f2ecda;
+  --card-bg-url: #e4ecea;
+  --card-bg-project: #eae4ee;
+  --card-bg-folder: #ece6c8;
+  --note-bg: #f0dc96;
+  --note-border: #c0a444;
+  --note-text: #3e3208;
+  --note-edit-bg: #f6e6ac;
+  --linked-note-bg: #d8e4d0;
+  --linked-note-border: #86ae7e;
+  --linked-note-text: #223a1c;
+  --arrow-color: #2f4d7a;
+  --arrow-temp: #5a7aa6;
+  --accent: #c04a32;
+  --chrome-bg: #ede7d6d9;
+  --chrome-border: #c2bba2;
+  --chrome-text: #3c382a;
+}
+
+/* ローマン＝トラバーチンと大理石に、テラコッタとブロンズ */
+[data-texos-theme="roman"] {
+  --canvas-bg: #bfae92;
+  --canvas-bg-drag: #b2a081;
+  --card-bg: #f2ead8;
+  --card-bg-url: #e8e6da;
+  --card-bg-project: #ece2d4;
+  --card-bg-folder: #eee2c2;
+  --note-bg: #e8d6a2;
+  --note-border: #bc9c50;
+  --note-text: #3c3010;
+  --note-edit-bg: #f0e0b6;
+  --linked-note-bg: #dde6d2;
+  --linked-note-border: #9ab080;
+  --linked-note-text: #2a3a1c;
+  --arrow-color: #8a5a2e;
+  --arrow-temp: #ac7c50;
+  --accent: #b5573a;
+  --chrome-bg: #ece2ccd9;
+  --chrome-border: #c4b494;
+  --chrome-text: #443826;
+}
+
+/* 地中海＝エーゲ海の靄に白壁のカード、コバルトとレモンとオリーブ */
+[data-texos-theme="mediterranean"] {
+  --canvas-bg: #9fb6bc;
+  --canvas-bg-drag: #90a9b0;
+  --card-bg: #f6f3e8;
+  --card-bg-url: #e2eef2;
+  --card-bg-project: #e8e8f2;
+  --card-bg-folder: #f2ecd2;
+  --note-bg: #f6e8a4;
+  --note-border: #ccb050;
+  --note-text: #423608;
+  --note-edit-bg: #faf0be;
+  --linked-note-bg: #dcead6;
+  --linked-note-border: #94b478;
+  --linked-note-text: #26401a;
+  --arrow-color: #2a5fa8;
+  --arrow-temp: #5a88c8;
+  --accent: #2a5fa8;
+  --chrome-bg: #eef0e8d9;
+  --chrome-border: #b8c4c0;
+  --chrome-text: #2e4046;
+}
+
+/* ベニス＝色褪せた漆喰のローズに、ベネチアンレッドの矢印と緑青のアクセント */
+[data-texos-theme="venice"] {
+  --canvas-bg: #b3988d;
+  --canvas-bg-drag: #a68a7e;
+  --card-bg: #f2e9dc;
+  --card-bg-url: #e6e6e0;
+  --card-bg-project: #ece0dc;
+  --card-bg-folder: #eee4ca;
+  --note-bg: #ecd9a6;
+  --note-border: #c0a054;
+  --note-text: #3c3010;
+  --note-edit-bg: #f4e3ba;
+  --linked-note-bg: #d4e4dc;
+  --linked-note-border: #7eae9e;
+  --linked-note-text: #1e3a32;
+  --arrow-color: #9e3a30;
+  --arrow-temp: #c06a5e;
+  --accent: #46857a;
+  --chrome-bg: #eee5d8d9;
+  --chrome-border: #c6b3a4;
+  --chrome-text: #443328;
+}
+
+/* カフェ＝ラテのキャンバスにスチームミルクのカード、エスプレッソの矢印 */
+[data-texos-theme="cafe"] {
+  --canvas-bg: #a89484;
+  --canvas-bg-drag: #9a8574;
+  --card-bg: #f0e8dc;
+  --card-bg-url: #e6e4da;
+  --card-bg-project: #eae0d8;
+  --card-bg-folder: #ece2ca;
+  --note-bg: #ecd8b0;
+  --note-border: #c0a068;
+  --note-text: #3c2e14;
+  --note-edit-bg: #f4e2c2;
+  --linked-note-bg: #dce6d4;
+  --linked-note-border: #92b284;
+  --linked-note-text: #263c1e;
+  --arrow-color: #6a4a32;
+  --arrow-temp: #8e6c50;
+  --accent: #c07840;
+  --chrome-bg: #ece4d6d9;
+  --chrome-border: #c4b6a2;
+  --chrome-text: #44362a;
+}
+
 body {
   overflow: hidden;
   background: var(--canvas-bg);
