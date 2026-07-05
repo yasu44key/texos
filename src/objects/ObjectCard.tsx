@@ -89,6 +89,8 @@ interface Props {
   onOpen?: (id: string) => void;
   /** v1.3.10: ラベルのダブルクリックでリネーム（実身=実ファイル改名／仮身=表示名）。 */
   onRenameTitle?: (id: string) => void;
+  /** v1.4.29: カードの説明ツールチップ（ホバー時のmime/メモ/使い方・状態）を出すか。既定オン。 */
+  showHints?: boolean;
 }
 
 // Icon by file extension (covers types with no specific MIME).
@@ -235,6 +237,7 @@ export function ObjectCard({
   panelW = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onCtrlClone, onSelectConnected, onSelect, onGroupDragStart,
   onMoveEnd, onDragLive, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
+  showHints = true,
 }: Props) {
   const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
   const isAiChat = aiModeOf(filterRef) === "chat"; // v1.4.1 対話パネルを持つAIカード
@@ -299,17 +302,50 @@ export function ObjectCard({
     if (e.ctrlKey || e.metaKey) {
       const sx = e.clientX;
       const sy = e.clientY;
+      // v1.4.29 ①: ドラッグ中は半透明のカードゴーストをポインタに追従表示する（「この場に
+      // コピーしている」実感）。実カードを cloneNode して見た目そのままのゴーストにし、掴んだ
+      // 相対位置（grab）とキャンバス倍率（scale）を保って画面上のサイズ・位置を一致させる。
+      const cardEl = e.currentTarget as HTMLElement;
+      const rect = cardEl.getBoundingClientRect();
+      const grabX = sx - rect.left;
+      const grabY = sy - rect.top;
+      const layer = cardEl.closest<HTMLElement>("[data-canvas-layer]");
+      const scale = parseFloat(layer?.style.getPropertyValue("--canvas-scale") || "1") || 1;
       let dragged = false;
+      let ghost: HTMLElement | null = null;
+      const moveGhost = (mx: number, my: number) => {
+        if (ghost) ghost.style.transform = `translate(${mx - grabX}px, ${my - grabY}px) scale(${scale})`;
+      };
+      const removeGhost = () => {
+        ghost?.remove();
+        ghost = null;
+      };
       const onCtrlMove = (me: globalThis.MouseEvent) => {
         if (!dragged && Math.hypot(me.clientX - sx, me.clientY - sy) > 4) {
           dragged = true;
           document.body.style.cursor = "copy";
+          const g = cardEl.cloneNode(true) as HTMLElement;
+          g.style.position = "fixed";
+          g.style.left = "0";
+          g.style.top = "0";
+          g.style.margin = "0";
+          g.style.transformOrigin = "0 0";
+          g.style.opacity = "0.55";
+          g.style.pointerEvents = "none";
+          g.style.transition = "none";
+          g.style.zIndex = "2147483647";
+          document.body.appendChild(g);
+          ghost = g;
+          moveGhost(me.clientX, me.clientY);
+        } else if (dragged) {
+          moveGhost(me.clientX, me.clientY);
         }
       };
       const onCtrlUp = (me: globalThis.MouseEvent) => {
         window.removeEventListener("mousemove", onCtrlMove);
         window.removeEventListener("mouseup", onCtrlUp);
         document.body.style.cursor = "";
+        removeGhost();
         if (dragged && onCtrlClone) onCtrlClone(id, me.clientX, me.clientY);
         else onToggleSelect?.(id);
       };
@@ -466,7 +502,10 @@ export function ObjectCard({
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       title={
-        isAiChat
+        // v1.4.29: 「カードのツールチップを表示」がオフのときは説明を出さない。
+        !showHints
+          ? undefined
+          : isAiChat
           ? `🤖 AI対話\nダブルクリック / 💬チャット: パネルを開く\n右クリック → 設定: モデル・システム変更${memo ? `\n\n${memo}` : ""}`
           : isT2i
           ? `🎨 画像生成\nダブルクリック: 生成パネル（プロンプト編集＋実行） ／ ボタン: フローを実行\n右クリック → 設定: モデル・パラメータ変更${memo ? `\n\n${memo}` : ""}`
@@ -650,7 +689,7 @@ export function ObjectCard({
           リンク切れ（lost==="real"）のときだけ赤シグナルを表示する。 */}
       {((!isProject && !isUrl && !isFolder && !isFilter && !isLauncher) || lost === "real") && (
       <div
-        title={status.title}
+        title={showHints ? status.title : undefined}
         style={{
           position: "absolute",
           left: 7,

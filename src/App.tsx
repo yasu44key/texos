@@ -12,6 +12,7 @@ import { ShapeCard, type ShapeInfo } from "./objects/ShapeCard";
 import { ContextMenu, type MenuItem } from "./ui/ContextMenu";
 import { PromptDialog } from "./ui/PromptDialog";
 import { FilterDialog } from "./ui/FilterDialog";
+import { BuiltinFilterDialog, hasBuiltinSchema } from "./ui/BuiltinFilterDialog";
 import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
 import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
@@ -117,6 +118,10 @@ function App() {
   const [showMenuHints, setShowMenuHints] = useState<boolean>(
     () => localStorage.getItem("texos-menu-hints") !== "0"
   );
+  // v1.4.29: カードのホバー説明ツールチップ（mime/メモ/使い方・状態）を出すか（既定オン・永続化）。
+  const [showCardHints, setShowCardHints] = useState<boolean>(
+    () => localStorage.getItem("texos-card-hints") !== "0"
+  );
   // v1.4.25 ⑤: 図形のグリッドスナップ（既定オフ、切替・永続化）。オンの間、図形の
   // 作成・移動・リサイズが SHAPE_GRID の見えない格子に吸着する（カードは対象外＝自由）。
   const [shapeSnap, setShapeSnap] = useState<boolean>(
@@ -147,6 +152,15 @@ function App() {
     x: number;
     y: number;
     edit?: { id: string; label: string; spec: string };
+  } | null>(null);
+  // v1.4.29 ⑤: ビルトインフィルタ専用の設定ダイアログ（生JSON編集の置き換え）。
+  // 種別ごとのスキーマからフォームを自動生成する（text_grep / text_replace /
+  // img_resize / img_convert / md_codeblock）。id あり=既存編集。
+  const [builtinDlg, setBuiltinDlg] = useState<{
+    id: string;
+    builtin: string;
+    label: string;
+    spec: string;
   } | null>(null);
   // v1.4.1 AIカード専用の設定ダイアログ（生JSON編集の置き換え／新規作成も兼ねる）。
   // id あり=既存編集 / create あり=新規作成（保存時に create_filter＋矢印接続）。
@@ -1396,6 +1410,12 @@ function App() {
         setFilterDlg({ x: 0, y: 0, edit: { id, label, spec: current } });
         return;
       }
+      // v1.4.29 ⑤: スキーマのあるビルトインは種別別のフォームダイアログで編集。
+      if (hasBuiltinSchema(builtin)) {
+        setBuiltinDlg({ id, builtin, label, spec: current });
+        return;
+      }
+      // スキーマ未定義の builtin（将来追加分）は従来の JSON 直編集にフォールバック。
       setPrompt({
         title: "フィルタ定義（JSON）",
         initial: current,
@@ -3374,30 +3394,18 @@ function App() {
     }
   }, [pushUndo, applyShapeGeoms]);
 
-  // v1.3 メモ⑥: ハンドルがカードの下に隠れて掴めない問題への対策。
-  // メニューから一定倍率で拡縮（中心を保つ）するか、上のカード全体に合わせる。
-  const handleShapeScale = useCallback(async (id: string, factor: number) => {
-    const s = shapesRef.current.find((sh) => sh.id === id);
-    if (!s) return;
-    const w = Math.max(60, Math.round(s.width * factor));
-    const h = Math.max(40, Math.round(s.height * factor));
-    const x = Math.round(s.pos_x + (s.width - w) / 2);
-    const y = Math.round(s.pos_y + (s.height - h) / 2);
-    pushUndo([
-      { kind: "shapes", geoms: [{ id, x: s.pos_x, y: s.pos_y, w: s.width, h: s.height, rot: s.rotation }] },
-    ]);
-    try {
-      await applyShapeGeoms([{ id, x, y, w, h, rot: s.rotation }]);
-    } catch (e) {
-      console.error("scale shape failed", e);
-    }
-  }, [pushUndo, applyShapeGeoms]);
-
+  // v1.4.29 ③: 「図形の拡縮（拡大/縮小）」は廃止し、「選択範囲にフィット」へ一本化。
+  // 選択中のカード・コメントを囲む大きさに図形を合わせる（「選択を図形で囲む」＝
+  // handleShapeAroundSelection と同じ範囲計算）。選択が空なら図形の上のカードに
+  // フォールバックするので、ハンドルが隠れて掴めない旧来の用途もそのまま満たす。
   const handleShapeFitToCards = useCallback(async (id: string) => {
     const s = shapesRef.current.find((sh) => sh.id === id);
     if (!s) return;
-    const cards = cardsOnShape(s);
-    const ns = notesOnShape(s);
+    const selCards = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
+    const selNs = notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
+    const useSel = selCards.length > 0 || selNs.length > 0;
+    const cards = useSel ? selCards : cardsOnShape(s);
+    const ns = useSel ? selNs : notesOnShape(s);
     if (!cards.length && !ns.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const c of cards) {
@@ -3415,22 +3423,34 @@ function App() {
     }
     const PAD = 28;
     const labelPad = s.label ? 22 : 0; // ラベルの居場所を上に確保
+    let x = minX - PAD, y = minY - PAD - labelPad;
+    let w = maxX - minX + PAD * 2, h = maxY - minY + PAD * 2 + labelPad;
+    // v1.4.25 ⑤ と同じく、スナップ中は外側方向へ丸めて格子に乗せる（選択部を必ず包含）。
+    if (shapeSnap) {
+      const g = SHAPE_GRID;
+      const x2 = Math.ceil((x + w) / g) * g;
+      const y2 = Math.ceil((y + h) / g) * g;
+      x = Math.floor(x / g) * g;
+      y = Math.floor(y / g) * g;
+      w = x2 - x;
+      h = y2 - y;
+    }
     pushUndo([
       { kind: "shapes", geoms: [{ id, x: s.pos_x, y: s.pos_y, w: s.width, h: s.height, rot: s.rotation }] },
     ]);
     try {
       await applyShapeGeoms([{
         id,
-        x: Math.round(minX - PAD),
-        y: Math.round(minY - PAD - labelPad),
-        w: Math.round(maxX - minX + PAD * 2),
-        h: Math.round(maxY - minY + PAD * 2 + labelPad),
+        x: Math.round(x),
+        y: Math.round(y),
+        w: Math.round(w),
+        h: Math.round(h),
         rot: s.rotation,
       }]);
     } catch (e) {
       console.error("fit shape failed", e);
     }
-  }, [cardsOnShape, notesOnShape, pushUndo, applyShapeGeoms]);
+  }, [cardsOnShape, notesOnShape, measuredNoteSize, pushUndo, applyShapeGeoms, shapeSnap]);
 
   const handleShapeLabel = useCallback(
     (id: string, current: string) => {
@@ -3996,6 +4016,12 @@ function App() {
             localStorage.setItem("texos-menu-hints", nv ? "1" : "0");
             return nv;
           }),
+        toggleCardHints: () =>
+          setShowCardHints((v) => {
+            const nv = !v;
+            localStorage.setItem("texos-card-hints", nv ? "1" : "0");
+            return nv;
+          }),
         toggleShapeSnap: () =>
           setShapeSnap((v) => {
             const nv = !v;
@@ -4072,7 +4098,6 @@ function App() {
         shapeAroundSelection: handleShapeAroundSelection,
         shapeStyle: handleShapeStyle,
         shapeRotate: handleShapeRotate,
-        shapeScale: handleShapeScale,
         shapeFitToCards: handleShapeFitToCards,
         shapeAlignGrid: handleShapeAlignGrid,
         shapeLabel: handleShapeLabel,
@@ -4154,6 +4179,7 @@ function App() {
             launcherLibrary: launcherLibrary.map((e) => e.name),
             audioDevices: audioDevicesRef.current,
             menuHints: showMenuHints,
+            cardHints: showCardHints,
             shapeSnap,
           },
           actions
@@ -4209,7 +4235,6 @@ function App() {
       handleShapeClickSelect,
       handleShapeStyle,
       handleShapeRotate,
-      handleShapeScale,
       handleShapeFitToCards,
       handleShapeLabel,
       handleShapeZ,
@@ -4234,6 +4259,7 @@ function App() {
       runDownstreamFlows,
       theme,
       showMenuHints,
+      showCardHints,
       shapeSnap,
       expanded,
       notes,
@@ -4278,7 +4304,7 @@ function App() {
         return;
       }
       if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || typing) return;
-      if (prompt || confirm || filterDlg || aiDlg || whisperDlg || menu || appPicker) return;
+      if (prompt || confirm || filterDlg || builtinDlg || aiDlg || whisperDlg || menu || appPicker) return;
       const k = e.key.toLowerCase();
       if (k === "a") {
         e.preventDefault();
@@ -4316,6 +4342,7 @@ function App() {
     prompt,
     confirm,
     filterDlg,
+    builtinDlg,
     aiDlg,
     whisperDlg,
     menu,
@@ -4331,7 +4358,7 @@ function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Delete") return;
-      if (prompt || confirm || filterDlg || aiDlg || whisperDlg || menu) return;
+      if (prompt || confirm || filterDlg || builtinDlg || aiDlg || whisperDlg || menu) return;
       const ae = document.activeElement as HTMLElement | null;
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable))
         return;
@@ -4343,7 +4370,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prompt, confirm, filterDlg, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete]);
+  }, [prompt, confirm, filterDlg, builtinDlg, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete]);
 
   const handleChosen = useCallback((info: ProjectInfo) => {
     setShowChooser(false);
@@ -4441,6 +4468,7 @@ function App() {
             realId={obj.real_id}
             label={obj.label}
             mimeType={obj.mime_type}
+            showHints={showCardHints}
             x={obj.pos_x}
             y={obj.pos_y}
             committed={!!obj.committed_path}
@@ -4649,6 +4677,33 @@ function App() {
               await refresh();
             } catch (e) {
               console.error("filter save failed", e);
+              setConfirm({
+                title: "フィルタを保存できませんでした",
+                message: String(e),
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              });
+            }
+          }}
+        />
+      )}
+      {builtinDlg && (
+        <BuiltinFilterDialog
+          builtin={builtinDlg.builtin}
+          initialLabel={builtinDlg.label}
+          initialSpec={builtinDlg.spec}
+          onCancel={() => setBuiltinDlg(null)}
+          onSave={async (label, spec) => {
+            const dlg = builtinDlg;
+            setBuiltinDlg(null);
+            try {
+              await invoke("update_filter", { id: dlg.id, spec });
+              if (label !== dlg.label) {
+                await invoke("rename_object", { id: dlg.id, label });
+              }
+              await refresh();
+            } catch (e) {
+              console.error("builtin filter save failed", e);
               setConfirm({
                 title: "フィルタを保存できませんでした",
                 message: String(e),

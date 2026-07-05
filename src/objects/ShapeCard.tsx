@@ -78,7 +78,7 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
           dx = Math.round((start.x + rawDx) / g) * g - start.x;
           dy = Math.round((start.y + rawDy) / g) * g - start.y;
         }
-        el.style.transform = `translate(${start.x + dx}px, ${start.y + dy}px) rotate(${s.rotation}deg)`;
+        el.style.transform = `translate(${start.x + dx}px, ${start.y + dy}px)`;
         if (!solo) onDragCards?.(s.id, dx, dy, false);
       } else if (mode === "resize-tl") {
         // 左上ハンドル: 右下角を固定したまま左上方向へ拡縮（pos と size を同時に動かす）。
@@ -95,7 +95,7 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
         curY = start.y + start.h - curH;
         el.style.width = `${curW}px`;
         el.style.height = `${curH}px`;
-        el.style.transform = `translate(${curX}px, ${curY}px) rotate(${s.rotation}deg)`;
+        el.style.transform = `translate(${curX}px, ${curY}px)`;
       } else {
         if (g) {
           curW = Math.max(60, Math.round((start.x + start.w + rawDx) / g) * g - start.x);
@@ -141,8 +141,11 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
         position: "absolute",
         left: 0,
         top: 0,
-        transform: `translate(${s.pos_x}px, ${s.pos_y}px) rotate(${s.rotation}deg)`,
-        transformOrigin: "center center",
+        // v1.4.29 ④: 外枠（＋リサイズハンドル）は常に軸並行に保つ。回転は矢印グラフィック
+        // （下の polygon）側だけに適用する。これでハンドルが画面上の実際の角に一致し、
+        // 拡縮が直観的になる（旧: 枠ごと rotate してハンドルも回っていた）。ヒットテスト
+        // （cardsOnShape）も pos/width/height の AABB なので、描画と判定域が一致する。
+        transform: `translate(${s.pos_x}px, ${s.pos_y}px)`,
         width: s.width,
         height: s.height,
         zIndex: 0,
@@ -159,13 +162,16 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
           preserveAspectRatio="none"
           style={{ display: "block", overflow: "visible" }}
         >
-          {/* 面積のある矢印 (右向き; rotationで方向を変える) */}
+          {/* 面積のある矢印 (右向き; rotation で方向を変える)。v1.4.29 ④: 回転は枠では
+              なく viewBox 内でポリゴンだけに掛ける（中心 50,50 まわり）。枠は軸並行のまま
+              なので、縦長の箱＝縦矢印と自然にフィットし、リサイズハンドルも直観的。 */}
           <polygon
             points="0,28 62,28 62,6 100,50 62,94 62,72 0,72"
             fill={bg}
             stroke={borderColor}
             strokeWidth={selected ? 2 : 1}
             vectorEffect="non-scaling-stroke"
+            transform={`rotate(${s.rotation} 50 50)`}
           />
         </svg>
       ) : (

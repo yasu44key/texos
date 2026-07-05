@@ -1,0 +1,420 @@
+import { useState } from "react";
+
+// v1.4.29 ⑤: ビルトインフィルタの設定ダイアログ。
+// 従来の JSON 直編集（小さなプロンプト窓）を廃し、builtin 種別ごとのパラメータスキーマから
+// フォームを自動生成する。backend の run_builtin（flow.rs）が読むキーと一致させること。
+// 既存カードの JSON は「元の spec を土台に、既知フィールドだけ上書き」で後方互換を保つ
+// （builtin / accept_mime 等は落とさず、知らないキーもそのまま残す）。
+
+type FieldType = "text" | "number" | "select";
+
+interface FieldSchema {
+  key: string;
+  label: string;
+  type: FieldType;
+  /** number の既定値／text・select の初期候補。 */
+  default?: string | number;
+  placeholder?: string;
+  hint?: string;
+  /** 空欄を許す（保存時にキーごと省く）。既定は必須（空でも空文字で保存）。 */
+  optional?: boolean;
+  /** select の選択肢。 */
+  options?: { value: string; label: string }[];
+  /** number の最小値。 */
+  min?: number;
+}
+
+interface BuiltinSchema {
+  /** 人間向けの種別名（ダイアログ見出し）。 */
+  title: string;
+  /** この builtin が常に持つ固定キー（accept_mime 等）。保存時に必ず付与する。 */
+  fixed: Record<string, unknown>;
+  fields: FieldSchema[];
+}
+
+// 対象は run_builtin の match アームと一致する5種のみ（ai / t2i は各専用ダイアログ）。
+export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
+  text_grep: {
+    title: "grep（正規表現で行を抽出）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "pattern",
+        label: "正規表現",
+        type: "text",
+        placeholder: "抽出する行にマッチする正規表現（例: ^ERROR）",
+        hint: "この正規表現にマッチした行だけを残します（Rust の regex 構文）。",
+      },
+    ],
+  },
+  text_replace: {
+    title: "置換（正規表現）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      { key: "pattern", label: "検索", type: "text", placeholder: "置換対象の正規表現（例: \\s+）" },
+      {
+        key: "replacement",
+        label: "置換後",
+        type: "text",
+        optional: true,
+        placeholder: "置き換える文字列（空欄=削除・$1 で後方参照）",
+        hint: "マッチ部分をこの文字列に置き換えます。$1, $2 で正規表現のグループを参照できます。",
+      },
+    ],
+  },
+  img_resize: {
+    title: "画像リサイズ（幅指定）",
+    fixed: { accept_mime: "image/*" },
+    fields: [
+      {
+        key: "width",
+        label: "幅 (px)",
+        type: "number",
+        default: 800,
+        min: 1,
+        hint: "指定した幅に合わせ、高さはアスペクト比を保って自動。出力は PNG。",
+      },
+    ],
+  },
+  img_convert: {
+    title: "画像 形式変換",
+    fixed: { accept_mime: "image/*" },
+    fields: [
+      {
+        key: "format",
+        label: "出力形式",
+        type: "select",
+        default: "png",
+        options: [
+          { value: "png", label: "PNG" },
+          { value: "jpeg", label: "JPEG" },
+          { value: "webp", label: "WebP" },
+          { value: "bmp", label: "BMP" },
+          { value: "gif", label: "GIF" },
+        ],
+      },
+    ],
+  },
+  md_codeblock: {
+    title: "コードブロック抽出（Markdown → ソース）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "lang",
+        label: "言語",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=最初のブロック（例: c / py / rust）",
+        hint: "指定した言語のコードフェンス(```lang)を取り出します。空欄なら最初のブロック。",
+      },
+      {
+        key: "output_ext",
+        label: "出力拡張子",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=言語から自動推定（c→.c 等）",
+        hint: "出力ファイルの拡張子を明示します。空欄なら言語トークンから推定。",
+      },
+    ],
+  },
+};
+
+/** この builtin がダイアログ対応か（未対応なら呼び出し側で従来の JSON 編集へフォールバック）。 */
+export function hasBuiltinSchema(builtin: string): boolean {
+  return builtin in BUILTIN_SCHEMAS;
+}
+
+interface Props {
+  builtin: string;
+  /** 編集時はカードの現在の表示名、作成時は既定名。 */
+  initialLabel?: string;
+  /** 編集時は filter_ref の JSON、作成時は undefined。 */
+  initialSpec?: string;
+  onSave: (label: string, specJson: string) => void;
+  onCancel: () => void;
+}
+
+/** スキーマ＋spec から各フィールドの初期文字列値を作る（JSON⇄フォーム往復でも共用）。 */
+function initVals(schema: BuiltinSchema | undefined, base: Record<string, unknown>): Record<string, string> {
+  const v: Record<string, string> = {};
+  for (const f of schema?.fields ?? []) {
+    const cur = base[f.key];
+    if (typeof cur === "string" || typeof cur === "number") v[f.key] = String(cur);
+    else if (f.default !== undefined) v[f.key] = String(f.default);
+    else v[f.key] = "";
+  }
+  return v;
+}
+
+export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave, onCancel }: Props) {
+  const schema = BUILTIN_SCHEMAS[builtin];
+
+  const parseSpec = (s?: string): Record<string, unknown> => {
+    try {
+      return s ? (JSON.parse(s) as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  };
+
+  const [title, setTitle] = useState(initialLabel ?? "");
+  // 元 spec を土台に保持（未知キーの後方互換）。JSON編集で書き換わり得るので state。
+  const [base, setBase] = useState<Record<string, unknown>>(() => parseSpec(initialSpec));
+  const [vals, setVals] = useState<Record<string, string>>(() => initVals(schema, parseSpec(initialSpec)));
+  // v1.4.29 ⑤+: 「JSONで編集」モード。フォームでは届かない機微な設定を生JSONで直接編集できる。
+  const [jsonMode, setJsonMode] = useState(false);
+  const [jsonText, setJsonText] = useState("");
+  const [jsonErr, setJsonErr] = useState<string | null>(null);
+
+  if (!schema) return null;
+
+  const setVal = (k: string, val: string) => setVals((prev) => ({ ...prev, [k]: val }));
+
+  // 元 spec を土台に、builtin・固定キー・既知フィールドを上書き（未知キーは温存）。
+  const buildSpec = (): Record<string, unknown> => {
+    const spec: Record<string, unknown> = { ...base, builtin, ...schema.fixed };
+    for (const f of schema.fields) {
+      const raw = (vals[f.key] ?? "").trim();
+      if (f.type === "number") {
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n)) spec[f.key] = Math.max(f.min ?? 0, n);
+        else if (f.default !== undefined) spec[f.key] = f.default;
+        else delete spec[f.key];
+      } else if (f.optional && raw === "") {
+        delete spec[f.key]; // 空欄は「未指定」＝キーごと省く
+      } else {
+        spec[f.key] = raw;
+      }
+    }
+    return spec;
+  };
+
+  // フォーム → JSON。現在のフォーム値を整形JSONにして編集モードへ。
+  const enterJson = () => {
+    setJsonText(JSON.stringify(buildSpec(), null, 2));
+    setJsonErr(null);
+    setJsonMode(true);
+  };
+
+  // JSON → フォーム。パースできたら base とフォーム値へ取り込む（未知キーも base に残る）。
+  const exitJson = () => {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    } catch (e) {
+      setJsonErr(jsonMessage(e));
+      return;
+    }
+    setBase(parsed);
+    setVals(initVals(schema, parsed));
+    setJsonErr(null);
+    setJsonMode(false);
+  };
+
+  const onJsonChange = (t: string) => {
+    setJsonText(t);
+    try {
+      JSON.parse(t);
+      setJsonErr(null);
+    } catch (e) {
+      setJsonErr(jsonMessage(e));
+    }
+  };
+
+  const save = () => {
+    const label = title.trim() || initialLabel || schema.title;
+    if (jsonMode) {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(jsonText) as Record<string, unknown>;
+      } catch (e) {
+        setJsonErr(jsonMessage(e));
+        return;
+      }
+      onSave(label, JSON.stringify(parsed));
+      return;
+    }
+    onSave(label, JSON.stringify(buildSpec()));
+  };
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "#00000066",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 2000,
+      }}
+      onMouseDown={onCancel}
+    >
+      <div
+        onMouseDown={(e) => e.stopPropagation()}
+        style={{
+          background: "var(--panel-bg, #1c2130)",
+          border: "1px solid var(--panel-border, #38445e)",
+          borderRadius: 10,
+          padding: 20,
+          width: 480,
+          maxHeight: "85vh",
+          overflowY: "auto",
+          boxShadow: "0 8px 32px #000000aa",
+          fontFamily: "sans-serif",
+          color: "var(--panel-text, #d6dded)",
+          fontSize: 13,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
+          <div style={{ fontSize: 15 }}>ビルトインフィルタの設定</div>
+          {/* v1.4.29 ⑤+: フォーム⇄JSON の切替。JSON は機微な設定（フォーム外のキー）用。 */}
+          <button
+            style={{ ...smallBtn(), fontSize: 11 }}
+            title={jsonMode ? "編集内容をフォームに取り込みます（不正な JSON のときは戻れません）" : "現在の設定を生 JSON で直接編集します（フォームにない項目も設定できます）"}
+            onClick={jsonMode ? exitJson : enterJson}
+          >
+            {jsonMode ? "フォームに戻す ⤴" : "JSONで編集 ⤵"}
+          </button>
+        </div>
+        <div style={{ fontSize: 12, marginBottom: 16, color: "var(--panel-muted, #8a93a8)" }}>
+          {schema.title}
+        </div>
+
+        {row(
+          "カード名",
+          <input
+            style={inputStyle()}
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder={schema.title}
+          />
+        )}
+
+        {jsonMode ? (
+          <div>
+            <textarea
+              style={{
+                ...inputStyle(),
+                width: "100%",
+                minHeight: 160,
+                resize: "vertical",
+                fontFamily: "Consolas, monospace",
+                lineHeight: 1.5,
+                whiteSpace: "pre",
+                overflowWrap: "normal",
+              }}
+              spellCheck={false}
+              value={jsonText}
+              onChange={(e) => onJsonChange(e.target.value)}
+            />
+            <div style={{ fontSize: 11, margin: "4px 2px 0", color: jsonErr ? "#d96a6a" : "var(--panel-muted, #8a93a8)" }}>
+              {jsonErr ? `✗ JSON エラー: ${jsonErr}` : "フォーム外のキーも設定できます（builtin キーは変更しないでください）。"}
+            </div>
+          </div>
+        ) : (
+          schema.fields.map((f) => (
+            <div key={f.key}>
+              {row(
+                f.label,
+                f.type === "select" ? (
+                  <select style={inputStyle()} value={vals[f.key] ?? ""} onChange={(e) => setVal(f.key, e.target.value)}>
+                    {f.options?.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    style={f.type === "number" ? { ...inputStyle(), width: 120 } : inputStyle()}
+                    type={f.type === "number" ? "number" : "text"}
+                    min={f.min}
+                    value={vals[f.key] ?? ""}
+                    onChange={(e) => setVal(f.key, e.target.value)}
+                    placeholder={f.placeholder}
+                  />
+                )
+              )}
+              {f.hint && (
+                <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", margin: "-4px 0 10px 92px" }}>
+                  {f.hint}
+                </div>
+              )}
+            </div>
+          ))
+        )}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+          <button onClick={onCancel} style={btnStyle("#2a3346", "#aeb8cc")}>
+            キャンセル
+          </button>
+          <button
+            onClick={save}
+            disabled={jsonMode && !!jsonErr}
+            style={btnStyle(jsonMode && jsonErr ? "#2a3346" : "#3a6fb0", "#ffffff")}
+          >
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function row(label: string, field: React.ReactNode) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+      <div style={{ width: 82, flex: "none", textAlign: "right", color: "var(--panel-muted, #aeb8cc)", fontSize: 12 }}>
+        {label}
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>{field}</div>
+    </div>
+  );
+}
+
+function inputStyle(): React.CSSProperties {
+  return {
+    width: "100%",
+    padding: "6px 8px",
+    background: "var(--panel-input-bg, #0e121c)",
+    border: "1px solid var(--panel-border, #38445e)",
+    borderRadius: 6,
+    color: "var(--panel-text, #eef2f9)",
+    fontSize: 13,
+    outline: "none",
+    boxSizing: "border-box",
+  };
+}
+
+function smallBtn(): React.CSSProperties {
+  return {
+    padding: "5px 10px",
+    background: "var(--panel-btn-bg, #2a3346)",
+    color: "var(--panel-text, #aeb8cc)",
+    border: "1px solid var(--panel-border, #38445e)",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontSize: 12,
+    fontFamily: "sans-serif",
+    flex: "none",
+  };
+}
+
+/** JSON.parse の例外を短い日本語向けメッセージに（SyntaxError の message をそのまま出す）。 */
+function jsonMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function btnStyle(bg: string, color: string): React.CSSProperties {
+  return {
+    padding: "7px 16px",
+    background: bg,
+    color,
+    border: "none",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontSize: 13,
+    fontFamily: "sans-serif",
+  };
+}

@@ -53,6 +53,8 @@ export interface MenuActions {
   uiAdjust: (kind: "brighter" | "darker" | "contrastUp" | "contrastDown" | "reset") => void;
   // v1.3.4: メニューの説明ツールチップ表示のオン/オフ。
   toggleMenuHints: () => void;
+  // v1.4.29: カードの説明ツールチップ表示のオン/オフ（メニューとは別系統）。
+  toggleCardHints: () => void;
   switchProject: () => void;
   // v1.4.12: キーボードショートカット一覧（? / F1 でも開閉）。
   showHelp: () => void;
@@ -123,7 +125,6 @@ export interface MenuActions {
   snapAllShapes: () => void;
   shapeStyle: (id: string, fill: string, opacity: number) => void;
   shapeRotate: (id: string, deg: number) => void;
-  shapeScale: (id: string, factor: number) => void;
   shapeFitToCards: (id: string) => void;
   shapeAlignGrid: (id: string) => void;
   shapeLabel: (id: string, current: string) => void;
@@ -374,7 +375,7 @@ export function buildObjectMenu(
       },
       { label: "URLを変更...", onClick: () => a.changeUrl(targetId, obj.url_ref!) },
       ...zItems,
-      { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
+      { label: obj.memo ? "コメントを編集..." : "コメントを追加...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
       ...deleteItems({ label: "削除", danger: true, onClick: () => a.deleteObject(targetId) }),
     ];
@@ -451,7 +452,7 @@ export function buildObjectMenu(
         onClick: () => a.relinkFolder(targetId, obj.folder_ref!),
       },
       ...zItems,
-      { label: "コメントを編集...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
+      { label: obj.memo ? "コメントを編集..." : "コメントを追加...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
       ...deleteItems({
         label: "削除（参照のみ・フォルダは残る）",
@@ -794,15 +795,13 @@ export function buildShapeMenu(
           },
         ]
       : []),
-    // v1.3 メモ⑥: ハンドルが隠れていてもメニューから拡縮できる。
+    // v1.4.29 ③: 拡縮コマンド（拡大/縮小）は廃止し、「選択範囲にフィット」に一本化。
+    // 選択中のカード・コメントを囲む大きさに図形を合わせる（「選択を図形で囲む」と同じ
+    // 範囲計算）。ハンドルがカードの下に隠れて掴めなくても、メニューから畳み直せる。
     {
-      label: "図形の拡縮 ...",
-      onClick: () =>
-        a.openSubmenu([
-          { label: "上のカードを含む大きさに", onClick: () => a.shapeFitToCards(shapeId) },
-          { label: "拡大（1.25倍）", onClick: () => a.shapeScale(shapeId, 1.25) },
-          { label: "縮小（0.8倍）", onClick: () => a.shapeScale(shapeId, 0.8) },
-        ]),
+      label: "選択範囲にフィット",
+      hint: "選択中のカード・コメントを囲む大きさに図形を合わせます（選択が無ければ図形の上のカードに合わせます）。",
+      onClick: () => a.shapeFitToCards(shapeId),
     },
     { label: "名前を変更...", onClick: () => a.shapeLabel(shapeId, sh?.label ?? "") },
     { label: "最前面へ（図形内）", onClick: () => a.shapeZ(shapeId, true) },
@@ -826,6 +825,8 @@ interface CanvasMenuCtx {
   audioDevices: string[];
   /// v1.3.4: メニュー説明ツールチップの現在のオン/オフ（トグル表示用）。
   menuHints: boolean;
+  /// v1.4.29: カード説明ツールチップの現在のオン/オフ（トグル表示用）。
+  cardHints: boolean;
   /// v1.4.25 ⑤: 図形グリッドスナップの現在のオン/オフ（トグル表示用）。
   shapeSnap: boolean;
 }
@@ -964,105 +965,11 @@ export function buildCanvasMenu(
         ]
       : []),
   ];
-  return compact([
-    // ── 選択系（選択があるときだけ）──
-    ...(selTotal
-      ? [{ label: "選択範囲にフォーカス", onClick: () => a.focusSelection() }]
-      : []),
-    // v1.4.23 ③: 選択部を囲む図形（角丸四角）を作って選択状態で渡す。囲んでから
-    // 図形ドラッグ＝分離モードで、混在する密集地から選択だけを新グループにできる。
-    ...(selTotal
-      ? [{ label: "選択を図形で囲む", onClick: () => a.shapeAroundSelection() }]
-      : []),
-    ...(selTotal >= 2
-      ? [{ label: "選択を整列 ...", onClick: () => a.openSubmenu(ctx.alignItems) }]
-      : []),
-    ...(ctx.selectionCount >= 2
-      ? [{ label: "選択カードをまとめて ...", onClick: () => a.openSubmenu(ctx.bulkItems) }]
-      : []),
-    DIV,
-    // ── 配置・追加系 ──
-    {
-      // v1.3.11 #8/#9: プロジェクトフォルダに新規ファイルを作って実身として置く。
-      label: "新規ファイルを作成...",
-      hint: "プロジェクトフォルダに新しいファイル（拡張子つき）を作り、実身としてキャンバスに置きます。開くアプリはOSの関連付けに従います。",
-      onClick: () => a.newFile(pos.canvasX, pos.canvasY),
-    },
-    {
-      label: "ファイルを配置...",
-      onClick: () => a.contextPlace(pos.canvasX, pos.canvasY),
-    },
-    {
-      label: "コメントを追加...",
-      onClick: () => a.addNote(pos.canvasX, pos.canvasY),
-    },
-    {
-      label: "クリップボードから貼り付け",
-      hint: "OSのクリップボードの内容（画像・テキスト・URL）をカードとして取り込みます。",
-      shortcut: "Ctrl+V",
-      onClick: () => a.paste(pos.canvasX, pos.canvasY),
-    },
-    {
-      label: "図形を追加 ...",
-      onClick: () =>
-        a.openSubmenu([
-          { label: "角丸四角", onClick: () => a.shapeAdd("rect", pos.canvasX, pos.canvasY) },
-          { label: "楕円", onClick: () => a.shapeAdd("ellipse", pos.canvasX, pos.canvasY) },
-          { label: "太矢印", onClick: () => a.shapeAdd("arrow", pos.canvasX, pos.canvasY) },
-          DIV,
-          // v1.4.25 ⑤: 見えない格子（カード≒横4×縦3単位の38px正方）への吸着。
-          // オンの間、図形の作成・移動・リサイズの対角が格子に乗る（カードは自由なまま）。
-          {
-            label: (ctx.shapeSnap ? "✓ " : "　") + "グリッドにスナップ",
-            hint: "オンの間、図形の作成・移動・サイズ変更が見えない格子（38px）に吸着します。カードの配置は自由なままです。",
-            onClick: () => a.toggleShapeSnap(),
-          },
-          {
-            label: "全図形を今すぐグリッドへ",
-            hint: "このプロジェクトの全図形の位置とサイズを格子に揃えます（Ctrl+Z で一括で戻せます）。スナップがオフでも使えます。",
-            onClick: () => a.snapAllShapes(),
-          },
-        ]),
-    },
-    {
-      label: "URLリンクを追加...",
-      onClick: () => a.addUrl(pos.canvasX, pos.canvasY),
-    },
-    // v1.4.x ③: 自動化系（ランチャー／フィルタ／ユーザーのカード）を一つのトップ項目に
-    // 集約し、サブメニューは1段階のフラットなリスト（セクション見出し付き）にする。
-    {
-      label: "自動化カードを追加 ...",
-      hint: "プログラムを起動するランチャーカードや、データを処理するフィルタカードを追加します。",
-      onClick: () => a.openSubmenu(automationAddSub),
-    },
-    DIV,
-    // ── プロジェクト系 ──
-    {
-      label: "新規プロジェクトを内包...",
-      hint: "新しいサブプロジェクトを作成し、このプロジェクトの中に実身として内包します。",
-      onClick: () => a.newSubproject(false, pos.canvasX, pos.canvasY),
-    },
-    {
-      label: "新規プロジェクトを分岐（フォーク）...",
-      hint: "新しいプロジェクトを兄弟（フォーク）として分岐作成します。",
-      onClick: () => a.newSubproject(true, pos.canvasX, pos.canvasY),
-    },
-    {
-      label: "既存プロジェクトへのリンクを配置...",
-      onClick: () => a.linkProject(pos.canvasX, pos.canvasY),
-    },
-    DIV,
-    // ── 整理・出力系 ──
-    {
-      label: "カードを検索 ...",
-      shortcut: "Ctrl+F",
-      hint: "ラベル・コメント本文・メモ・拡張子でカードを検索し、クリックでフォーカスします（複数一致はまとめて選択も可）。",
-      onClick: () => a.openSearch(),
-    },
-    {
-      label: "自動レイアウト（重なり解消）",
-      onClick: () => a.autoLayout(),
-    },
+  // v1.4.29 ②: メニュー再整理。トップは「よく使う作成・配置＋探す・並べる」に絞り、低頻度の
+  // 保守系（実身化・ゴミ箱・掃除）／プロジェクト作成／表示・設定を各1段のサブメニューへ畳む。
+  // openSubmenu は「戻る」導線の無いその場差し替えなので、既に深い項目（自動化＝フィルタは
+  // 2〜3段）はトップに残し、畳むのは中身が浅い（1段のリーフ）グループに限る。
+  const cleanupSub: MenuItem[] = [
     {
       label: "すべて実身化（持ち出し）...",
       hint: "プロジェクト内のすべての仮身を実身化し、データをプロジェクトフォルダに書き出します。",
@@ -1083,12 +990,29 @@ export function buildCanvasMenu(
       hint: "どのカードからも参照されなくなった実身データ（CAS）を削除して容量を回収します。まず件数・サイズを確認してから実行します（生きたカード・ゴミ箱・履歴は残ります）。先に「ゴミ箱を空にする」と回収量が増えます。",
       onClick: () => a.gcCas(),
     },
-    DIV,
-    // ── 設定系 ──
+  ];
+  const newProjectSub: MenuItem[] = [
+    {
+      label: "新規プロジェクトを内包...",
+      hint: "新しいサブプロジェクトを作成し、このプロジェクトの中に実身として内包します。",
+      onClick: () => a.newSubproject(false, pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "新規プロジェクトを分岐（フォーク）...",
+      hint: "このプロジェクトをフォーク（複製）して、兄弟プロジェクトを新規作成します。元のプロジェクトはそのまま残ります。",
+      onClick: () => a.newSubproject(true, pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "既存プロジェクトへのリンクを配置...",
+      hint: "既にあるTexoSプロジェクトのフォルダを選び、そこへ移動できるリンクカードをこの場所に置きます。",
+      onClick: () => a.linkProject(pos.canvasX, pos.canvasY),
+    },
+  ];
+  const settingsSub: MenuItem[] = [
     {
       label: "UIカラー ...",
+      hint: "配色テーマを選びます。選ぶたびにその場でプレビューされ、OKで確定します。",
       // v1.4.16: 連続で見比べられるよう、選んでもメニューは開いたまま（keepOpen）。
-      // 選ぶたびに ✓ が付いた状態で開き直し、OK で閉じる。
       onClick: () => a.openSubmenu(themeSubmenu(a, ctx.theme)),
     },
     {
@@ -1098,18 +1022,148 @@ export function buildCanvasMenu(
     },
     {
       // v1.3.4: メニュー項目の説明ツールチップを出すか。慣れたらオフにできる。
-      label: (ctx.menuHints ? "✓ " : "　") + "メニューの説明を表示",
+      label: (ctx.menuHints ? "✓ " : "　") + "メニューのツールチップを表示",
       hint: "各メニュー項目にカーソルを合わせたとき、このような説明を表示します。オフにすると非表示になります。",
       onClick: () => a.toggleMenuHints(),
     },
     {
-      label: "プロジェクトを切り替え...",
-      onClick: () => a.switchProject(),
+      // v1.4.29: カードのホバー説明（種別・メモ・使い方・状態）を出すか。メニューとは別系統。
+      label: (ctx.cardHints ? "✓ " : "　") + "カードのツールチップを表示",
+      hint: "カードにカーソルを合わせたときの説明（種別・メモ・使い方や仮身/実身の状態）を表示します。オフにすると非表示になります。",
+      onClick: () => a.toggleCardHints(),
     },
     {
       label: "ショートカット一覧（?）",
       hint: "キーボードショートカットの一覧を表示します（? または F1 キーでも開閉できます）。",
       onClick: () => a.showHelp(),
+    },
+  ];
+  return compact([
+    // ── 選択系（選択があるときだけ）──
+    ...(selTotal
+      ? [{
+          label: "選択範囲にフォーカス",
+          shortcut: "F",
+          hint: "選択したカード・コメントが画面いっぱいに収まるよう、ズームと位置を合わせます（キーボードの F でも実行できます）。",
+          onClick: () => a.focusSelection(),
+        }]
+      : []),
+    // v1.4.23 ③: 選択部を囲む図形（角丸四角）を作って選択状態で渡す。囲んでから
+    // 図形ドラッグ＝分離モードで、混在する密集地から選択だけを新グループにできる。
+    ...(selTotal
+      ? [{
+          label: "選択を図形で囲む",
+          hint: "選択したカード・コメントを囲む角丸四角の図形を作り、選択状態のまま渡します。図形をドラッグすると中身ごと動くので、密集した場所から思考のまとまりを切り出せます。",
+          onClick: () => a.shapeAroundSelection(),
+        }]
+      : []),
+    ...(selTotal >= 2
+      ? [{
+          label: "選択を整列 ...",
+          hint: "選択したカード・コメントを、横一列／縦一列／格子状／均等配置に並べ替えます。",
+          onClick: () => a.openSubmenu(ctx.alignItems),
+        }]
+      : []),
+    ...(ctx.selectionCount >= 2
+      ? [{
+          label: "選択カードをまとめて ...",
+          hint: "選択したカードをまとめて実身化・仮身化・クリップボードにコピー・別プロジェクトへ送付・削除します。",
+          onClick: () => a.openSubmenu(ctx.bulkItems),
+        }]
+      : []),
+    DIV,
+    // ── 作成・配置系（よく使う。トップに残す）──
+    {
+      label: "クリップボードから貼り付け",
+      hint: "OSのクリップボードの内容（画像・テキスト・URL）をカードとして取り込みます。",
+      shortcut: "Ctrl+V",
+      onClick: () => a.paste(pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "ファイルを配置...",
+      hint: "PC上のファイルを選び、仮身（元ファイルを指す参照カード）としてこの場所に置きます。ドラッグ＆ドロップでも配置できます。",
+      onClick: () => a.contextPlace(pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "コメントを追加...",
+      hint: "自由に書ける付箋（コメントカード）をこの場所に作ります。色・文字サイズ・見出し行は右クリックから変えられます。",
+      onClick: () => a.addNote(pos.canvasX, pos.canvasY),
+    },
+    {
+      // v1.3.11 #8/#9: プロジェクトフォルダに新規ファイルを作って実身として置く。
+      label: "新規ファイルを作成...",
+      hint: "プロジェクトフォルダに新しいファイル（拡張子つき）を作り、実身としてキャンバスに置きます。開くアプリはOSの関連付けに従います。",
+      onClick: () => a.newFile(pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "URLリンクを追加...",
+      hint: "Webページなどのアドレス（URL）を開けるリンクカードをこの場所に作ります。",
+      onClick: () => a.addUrl(pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "図形を追加 ...",
+      hint: "角丸四角・楕円・太矢印の図形をカードの背面に置きます。思考のグループ分けや、選択範囲を囲む土台に使います。",
+      onClick: () =>
+        a.openSubmenu([
+          { label: "角丸四角", hint: "角丸四角の図形を背面に追加します（思考のまとまりを囲む土台に）。", onClick: () => a.shapeAdd("rect", pos.canvasX, pos.canvasY) },
+          { label: "楕円", hint: "楕円の図形を背面に追加します。", onClick: () => a.shapeAdd("ellipse", pos.canvasX, pos.canvasY) },
+          { label: "太矢印", hint: "面のある太い矢印を背面に追加します（向きは追加後、右クリック→向きを変更）。", onClick: () => a.shapeAdd("arrow", pos.canvasX, pos.canvasY) },
+          DIV,
+          // v1.4.25 ⑤: 見えない格子（カード≒横4×縦3単位の38px正方）への吸着。
+          // オンの間、図形の作成・移動・リサイズの対角が格子に乗る（カードは自由なまま）。
+          {
+            label: (ctx.shapeSnap ? "✓ " : "　") + "グリッドにスナップ",
+            hint: "オンの間、図形の作成・移動・サイズ変更が見えない格子（38px）に吸着します。カードの配置は自由なままです。",
+            onClick: () => a.toggleShapeSnap(),
+          },
+          {
+            label: "全図形を今すぐグリッドへ",
+            hint: "このプロジェクトの全図形の位置とサイズを格子に揃えます（Ctrl+Z で一括で戻せます）。スナップがオフでも使えます。",
+            onClick: () => a.snapAllShapes(),
+          },
+        ]),
+    },
+    // v1.4.x ③: 自動化系（ランチャー／フィルタ／ユーザーのカード）は既に2〜3段深いので
+    // トップに残す（追加サブへ畳むと最悪パスが4段になり「戻る」不在では使いにくい）。
+    {
+      label: "自動化カードを追加 ...",
+      hint: "プログラムを起動するランチャーカードや、データを処理するフィルタカードを追加します。",
+      onClick: () => a.openSubmenu(automationAddSub),
+    },
+    DIV,
+    // ── 探す・並べる（よく使う）＋畳んだ低頻度グループ ──
+    {
+      label: "カードを検索 ...",
+      shortcut: "Ctrl+F",
+      hint: "ラベル・コメント本文・メモ・拡張子でカードを検索し、クリックでフォーカスします（複数一致はまとめて選択も可）。",
+      onClick: () => a.openSearch(),
+    },
+    {
+      label: "自動レイアウト（重なり解消）",
+      hint: "重なり合ったカードを自動でずらして、重なりを解消します（Ctrl+Z で元に戻せます）。",
+      onClick: () => a.autoLayout(),
+    },
+    {
+      label: "整理・書き出し ...",
+      hint: "すべて実身化（持ち出し）、ゴミ箱、履歴・キャッシュの掃除、孤立データの削除などの保守操作。",
+      onClick: () => a.openSubmenu(cleanupSub),
+    },
+    {
+      label: "プロジェクトを作成 ...",
+      hint: "サブプロジェクトの内包・分岐（フォーク）や、既存プロジェクトへのリンク配置。",
+      onClick: () => a.openSubmenu(newProjectSub),
+    },
+    {
+      label: "プロジェクトを切り替え...",
+      hint: "別のTexoSプロジェクトを開きます（現在のプロジェクトは自動で保存されます）。",
+      onClick: () => a.switchProject(),
+    },
+    DIV,
+    // ── 表示・設定（低頻度・畳む）──
+    {
+      label: "表示・設定 ...",
+      hint: "UIカラー、明るさ・コントラスト、メニューの説明表示、ショートカット一覧。",
+      onClick: () => a.openSubmenu(settingsSub),
     },
   ]);
 }
