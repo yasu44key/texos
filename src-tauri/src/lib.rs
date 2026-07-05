@@ -335,6 +335,7 @@ pub fn run() {
             t2i_delete_model,
             python_build_env,
             python_set_env_mode,
+            detect_spec,
             flow_send_stdin,
             list_audio_devices,
             check_filter_program,

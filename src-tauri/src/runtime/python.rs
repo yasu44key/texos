@@ -434,7 +434,7 @@ pub(crate) fn python_build_env(
         }
     }
     // spec.rs の推奨に従って torch の取得先を選ぶ（GPU なし／VRAM 少は cpu ＝確実に動く）。
-    let torch_index: String = if std::process::Command::new(NVIDIA_SMI_CMD).arg("-L").output().map(|o| o.status.success()).unwrap_or(false) { TORCH_INDEX_CU124.to_string() } else { TORCH_INDEX_CPU.to_string() };
+    let torch_index = gather_spec().torch_index;
     std::thread::scope(|s| {
         s.spawn(|| ensure_env(&app, &app_data, &name, &torch_index))
             .join()

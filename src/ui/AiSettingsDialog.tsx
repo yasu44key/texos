@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { SpecInfo } from "./T2iSetupDialog";
 
 // v1.4.1 AIカード（builtin:"ai"）専用の設定ダイアログ。生JSON編集の置き換え。
 // 既存 spec の未知フィールド（accept_mime/output_ext 等）は保持してマージする。
@@ -39,6 +40,14 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     base.mode === "chat" ? "chat" : "transform"
   );
   const [logName, setLogName] = useState(s("log_name")); // v1.4.5 ログ保存名（chat）
+
+  // v1.4.28 WS3: PCスペック検出。モデルサイズ選択の根拠として表示する。
+  const [spec, setSpec] = useState<SpecInfo | null>(null);
+  useEffect(() => {
+    invoke<SpecInfo>("detect_spec")
+      .then(setSpec)
+      .catch(() => setSpec(null));
+  }, []);
 
   // v1.4.2 モデル候補（/api/tags 等から取得）。手入力も併用可（datalist）。
   const [models, setModels] = useState<string[]>([]);
@@ -211,6 +220,20 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             </div>
           </div>
         )}
+
+        {spec &&
+          row(
+            "この PC",
+            <div style={{ fontSize: 11, color: "#8a93a8", lineHeight: 1.5 }}>
+              {spec.gpu
+                ? `GPU: ${spec.gpu.name}（VRAM ${(spec.gpu.vram_mb / 1024).toFixed(1)}GB）`
+                : "対応 GPU 未検出（CPU 動作）"}
+              {spec.ram_mb > 0 && ` ／ RAM: ${(spec.ram_mb / 1024).toFixed(1)}GB`}
+              {provider === "ollama" && spec.ollama_hint && (
+                <div style={{ color: "#8fb0ca", marginTop: 2 }}>💡 {spec.ollama_hint}</div>
+              )}
+            </div>
+          )}
 
         {row(
           "システム\nプロンプト",
