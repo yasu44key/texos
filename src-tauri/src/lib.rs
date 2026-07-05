@@ -91,6 +91,10 @@ struct Config {
     /// デーモン起動時に環境変数 HF_TOKEN として渡す。
     #[serde(default)]
     t2i_hf_token: Option<String>,
+    /// v1.4.27 WS2: Python 実行環境の明示切替（"managed"=TexoS 構築 env / "system"=
+    /// システム Python）。None は自動（管理 env → システムの順で解決）。
+    #[serde(default)]
+    python_env: Option<String>,
 }
 #[derive(Serialize)]
 pub struct ProjectInfo {
@@ -329,6 +333,8 @@ pub fn run() {
             t2i_set_hf_token,
             t2i_reveal_model_dir,
             t2i_delete_model,
+            python_build_env,
+            python_set_env_mode,
             flow_send_stdin,
             list_audio_devices,
             check_filter_program,

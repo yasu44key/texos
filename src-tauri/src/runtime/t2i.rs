@@ -237,49 +237,8 @@ pub(crate) fn t2i_partial_models(app_data: &Path) -> Vec<String> {
     out
 }
 
-/// torch/diffusers が使える Python を探す。戻り値 (実行ファイルパス, 依存が揃っているか, CUDA可否)。
-/// 「システム Python 優先」: PATH の python / py / python3 を順に試し、sys.executable を得る。
-/// 依存チェックと同時に torch.cuda.is_available() も取得（サーバー未起動でも GPU 判定できる）。
-pub(crate) fn detect_python() -> (Option<String>, bool, bool) {
-    use std::process::Command;
-    for cand in ["python", "py", "python3"] {
-        let mut c = Command::new(cand);
-        c.args(["-c", "import sys; sys.stdout.write(sys.executable)"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            c.creation_flags(0x0800_0000);
-        }
-        let out = match c.output() {
-            Ok(o) if o.status.success() => o,
-            _ => continue,
-        };
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if path.is_empty() {
-            continue;
-        }
-        let mut d = Command::new(&path);
-        d.args([
-            "-c",
-            "import torch,diffusers,transformers,safetensors,PIL,huggingface_hub; \
-             import sys; sys.stdout.write('1' if torch.cuda.is_available() else '0')",
-        ]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            d.creation_flags(0x0800_0000);
-        }
-        match d.output() {
-            Ok(o) if o.status.success() => {
-                let cuda = String::from_utf8_lossy(&o.stdout).trim() == "1";
-                return (Some(path), true, cuda);
-            }
-            // Python はあるが依存が無い
-            _ => return (Some(path), false, false),
-        }
-    }
-    (None, false, false)
-}
+// detect_python は WS2（v1.4.27）で runtime/python.rs へ移動し、解決順を
+// 「① TexoS 管理 env → ② システム Python」に変更した（config.python_env で明示切替も可）。
 
 /// デーモンへ GET（tokio 文脈外スレッドで blocking 実行）。
 pub(crate) fn t2i_http_get(path: &str, timeout_ms: u64) -> Result<serde_json::Value, String> {
@@ -376,13 +335,13 @@ pub(crate) fn t2i_ensure_server(app_data: &Path, state: &AppState) -> Result<(),
         t2i_kill_on_port();
         std::thread::sleep(std::time::Duration::from_millis(600));
     }
-    let (py, deps_ok, _cuda) = detect_python();
-    let py = py.ok_or(
-        "Python が見つかりません。システムに Python（+torch/diffusers）を導入してください",
+    let env = detect_python(app_data);
+    let py = env.path.ok_or(
+        "Python 環境がありません。画像生成の設定画面で「環境を構築する」を押すと自動構築されます",
     )?;
-    if !deps_ok {
+    if !env.deps_ok {
         return Err(
-            "Python に torch / diffusers が見つかりません。`pip install torch diffusers transformers accelerate safetensors` を導入してください"
+            "生成ライブラリ（torch / diffusers）が未導入です。画像生成の設定画面で「環境を構築する」を押すと自動構築されます"
                 .into(),
         );
     }
@@ -448,6 +407,10 @@ pub(crate) struct T2iStatus {
     python_path: String,
     /// torch/diffusers 等が揃っているか
     deps_ok: bool,
+    /// Python の解決元（WS2）: "managed"（TexoS 構築 env）| "system" | "none"
+    python_kind: String,
+    /// config の明示切替（WS2）: "auto" | "managed" | "system"
+    env_mode: String,
     /// デーモンが応答するか（=すぐ生成できる）
     server_running: bool,
     /// CUDA(GPU) が使えるか（デーモン稼働時のみ判明）
@@ -471,24 +434,28 @@ pub(crate) struct T2iStatus {
 #[tauri::command(async)]
 pub(crate) fn t2i_status(state: State<AppState>) -> T2iStatus {
     let app_data = state.app_data.clone();
-    let (py, deps_ok, cuda) = detect_python();
+    let env = detect_python(&app_data);
     let running = t2i_running();
     // GPU: サーバー稼働中は health の cuda を、未起動なら Python 直問い合わせの結果を使う。
     let gpu = if running {
         t2i_http_get("health", 1500)
             .ok()
             .and_then(|v| v["cuda"].as_bool())
-            .unwrap_or(cuda)
+            .unwrap_or(env.cuda)
     } else {
-        cuda
+        env.cuda
     };
     let current = read_config(&app_data)
         .t2i_model
         .unwrap_or_else(|| "sd1.5".to_string());
     T2iStatus {
-        python_ok: py.is_some(),
-        python_path: py.unwrap_or_default(),
-        deps_ok,
+        python_ok: env.path.is_some(),
+        python_path: env.path.unwrap_or_default(),
+        deps_ok: env.deps_ok,
+        python_kind: env.kind.to_string(),
+        env_mode: read_config(&app_data)
+            .python_env
+            .unwrap_or_else(|| "auto".to_string()),
         server_running: running,
         gpu,
         models: list_t2i_models(&app_data),
