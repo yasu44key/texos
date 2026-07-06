@@ -205,11 +205,18 @@ pub(crate) fn ai_pull_model(
 }
 
 /// ストリーミング中断（停止ボタン）。DB ロックを取らないので即座に効く。
+/// v1.5.1 WS-B: job_id 引数化（Job.cancel 経由）。job_id 未着（job:started 前の停止連打）の
+/// フォールバックとして None は Chat ジョブ全部に効く（Chat は現状どおり単一運用）。
 #[tauri::command(async)]
-pub(crate) fn ai_chat_cancel(state: State<AppState>) {
-    state
-        .chat_cancel
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn ai_chat_cancel(state: State<AppState>, job_id: Option<u64>) {
+    match job_id {
+        Some(id) => {
+            if let Some(job) = state.jobs.get(id) {
+                job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        None => state.jobs.cancel_chats(),
+    }
 }
 
 /// 会話をリセット（履歴ファイルを削除）。

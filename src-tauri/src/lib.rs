@@ -26,30 +26,154 @@ pub struct Project {
 pub struct AppState {
     pub current: Mutex<Option<Project>>,
     pub app_data: PathBuf,
-    /// フロー実行の中断フラグ（UIの中断ボタン → break_flow）。
-    /// run_flow が DB の Mutex を握っている間も break_flow はこれだけを触るので
-    /// 外部コマンドがストールしてもブレイクできる。
-    pub flow_cancel: std::sync::atomic::AtomicBool,
-    /// v1.4.1 チャット: ストリーミング応答の中断フラグ（停止ボタン → ai_chat_cancel）。
-    pub chat_cancel: std::sync::atomic::AtomicBool,
-    /// v1.4.9 子プロセス stdin チャネル: 実行中フィルタ（録音など record モード）の
-    /// stdin 書き込み端。flow_send_stdin が 'q' 等を書いて graceful 停止に使う。
-    pub rec_stdin: flow::StdinSlot,
-    /// v1.4.10 多重起動ガード: run_flow 実行中フラグ。録音など長時間フロー中に実行ボタンを
-    /// 再度押すと、2回目の run_flow が state.current ロック待ちで積み上がり、停止しても
-    /// 積まれた次の録音が走ってハングしたように見える（v1.4.9 バグ）。フローは単一スロット
-    /// 設計（flow_cancel/rec_stdin が各1個）＝同時実行は1つ前提なので、再入を即エラーで弾く。
-    pub flow_running: std::sync::atomic::AtomicBool,
+    /// v1.5.1 WS-B ジョブレジストリ（凍結仕様 §12.B）: 旧 singleton
+    /// （flow_cancel / chat_cancel / rec_stdin / flow_running）を JobId キーの台帳へ移送。
+    /// 中断フラグ・stdin 制御はジョブ別、多重起動判定は「台帳に Flow が居るか」。
+    pub jobs: Jobs,
     /// v1.5 Text-To-Image: TexoS が起動・管理する diffusers 常駐デーモン（t2i_server.py）の
     /// 子プロセスハンドル。t2i_stop_server で明示停止できるよう保持する。
     pub t2i_server: Mutex<Option<std::process::Child>>,
 }
-/// run_flow の多重起動ガード。drop で flow_running を false に戻す
-/// （早期 return / panic / `?` のどの離脱でも確実に解放する）。
-struct RunningGuard<'a>(&'a std::sync::atomic::AtomicBool);
-impl Drop for RunningGuard<'_> {
+// --- v1.5.1 WS-B ジョブレジストリ（凍結仕様 §12.B・実装指示書 WS-B）--------------------
+// singleton（同時1つを物理強制する AppState フィールド群）を JobId キーの台帳へ置き換える
+// ＝中央 kill スイッチ（cancel_all）の獲得・WS-C 並行解禁の土台。ジョブは揮発（凍結 §11.5・
+// 永続化しない）。WS-B の間の同時実行ルールは従来同等: Flow 同時1・Chat 単一・相互並行可。
+
+pub type JobId = u64;
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobKind {
+    Flow,
+    Chat,
+}
+
+pub struct Job {
+    pub id: JobId,
+    pub kind: JobKind,
+    /// 表示用ラベル。登録はカード読み出し前（ロック前拒否のため）なので後から確定する。
+    pub label: Mutex<String>,
+    pub started_at: i64,
+    /// 中断フラグ（UIの中断ボタン → break_flow / cancel_all）。run_flow が DB の Mutex を
+    /// 握っている間も break_flow はこれだけを触るので外部コマンドがストールしてもブレイクできる。
+    pub cancel: std::sync::atomic::AtomicBool,
+    /// 子プロセス stdin チャネル（v1.4.9 の rec_stdin のジョブ別版）: 実行中フィルタ
+    /// （録音など record モード）の stdin 書き込み端。flow_send_stdin が 'q' 等を書く。
+    pub control: flow::StdinSlot,
+    /// 起動元プロジェクト。WS-B では**束縛の形だけ**（記録のみ・検査/撤廃は WS-C）。
+    pub project_root: Mutex<String>,
+}
+
+/// list_jobs の返却行（WS-C 背景ジョブパネルの土台。WS-B の UI は未使用）。
+#[derive(Serialize)]
+pub struct JobInfo {
+    pub id: JobId,
+    pub kind: JobKind,
+    pub label: String,
+    pub started_at: i64,
+}
+
+pub struct Jobs {
+    next: std::sync::atomic::AtomicU64,
+    map: Mutex<std::collections::HashMap<JobId, std::sync::Arc<Job>>>,
+}
+
+impl Jobs {
+    pub fn new() -> Self {
+        Jobs {
+            next: std::sync::atomic::AtomicU64::new(1),
+            map: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+    fn make_job(&self, kind: JobKind, label: &str) -> std::sync::Arc<Job> {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::sync::Arc::new(Job {
+            id,
+            kind,
+            label: Mutex::new(label.to_string()),
+            started_at: db::now_ms(),
+            cancel: std::sync::atomic::AtomicBool::new(false),
+            control: Mutex::new(None),
+            project_root: Mutex::new(String::new()),
+        })
+    }
+    /// 登録（排他なし）。Chat 用 — 現状 UI はチャットを直列に使うため物理ガードは要らない。
+    pub fn register(&self, kind: JobKind, label: &str) -> std::sync::Arc<Job> {
+        let job = self.make_job(kind, label);
+        self.map.lock().unwrap().insert(job.id, job.clone());
+        job
+    }
+    /// Flow の登録（WS-B は従来同等＝同時1）。台帳に Flow ジョブが居れば登録せず従来文言で
+    /// 即拒否する。台帳ロックは短く、state.current（DB）をロックする**前**に弾くのが要点
+    /// — ここで待つと録音中フローの裏で実行が積み上がる（v1.4.10 の教訓）。
+    pub fn register_flow_exclusive(&self, label: &str) -> Result<std::sync::Arc<Job>, String> {
+        let mut map = self.map.lock().unwrap();
+        if map.values().any(|j| j.kind == JobKind::Flow) {
+            return Err(
+                "ほかのフローを実行中です。完了（録音は「停止」）してからもう一度実行してください"
+                    .into(),
+            );
+        }
+        let job = self.make_job(JobKind::Flow, label);
+        map.insert(job.id, job.clone());
+        Ok(job)
+    }
+    pub fn get(&self, id: JobId) -> Option<std::sync::Arc<Job>> {
+        self.map.lock().unwrap().get(&id).cloned()
+    }
+    pub fn remove(&self, id: JobId) {
+        self.map.lock().unwrap().remove(&id);
+    }
+    pub fn any_flow(&self) -> bool {
+        self.map.lock().unwrap().values().any(|j| j.kind == JobKind::Flow)
+    }
+    /// 中央 kill スイッチ（安全設計 §6.3）: 全ジョブの cancel を立てる。子プロセスの
+    /// 物理停止は各実行系の監視ループ（taskkill /T＝既存流用）が担う。
+    pub fn cancel_all(&self) {
+        for j in self.map.lock().unwrap().values() {
+            j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    /// Chat ジョブだけ cancel（job_id 未着の停止ボタンのフォールバック。Chat は単一運用）。
+    pub fn cancel_chats(&self) {
+        for j in self.map.lock().unwrap().values() {
+            if j.kind == JobKind::Chat {
+                j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    pub fn list(&self) -> Vec<JobInfo> {
+        let mut v: Vec<JobInfo> = self
+            .map
+            .lock()
+            .unwrap()
+            .values()
+            .map(|j| JobInfo {
+                id: j.id,
+                kind: j.kind,
+                label: j.label.lock().unwrap().clone(),
+                started_at: j.started_at,
+            })
+            .collect();
+        v.sort_by_key(|j| j.id);
+        v
+    }
+}
+
+/// ジョブの台帳からの確実な除去。drop で remove する（早期 return / panic / `?` の
+/// どの離脱でも解放する — 旧 RunningGuard と同じ役目のジョブ台帳版）。
+pub struct JobGuard<'a> {
+    jobs: &'a Jobs,
+    id: JobId,
+}
+impl<'a> JobGuard<'a> {
+    pub fn new(jobs: &'a Jobs, id: JobId) -> Self {
+        JobGuard { jobs, id }
+    }
+}
+impl Drop for JobGuard<'_> {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.jobs.remove(self.id);
     }
 }
 /// v1.4.11 非ブロッキング実行: current プロジェクトを**短時間だけ**ロックしてクロージャを
@@ -69,8 +193,10 @@ fn with_db<T>(
 /// v1.4.11: フロー実行中はプロジェクト切替を拒否する。非ブロッキング実行では run_flow が
 /// 実行中に DB ロックを手放すため、途中で current が別プロジェクトに差し替わると、評価や
 /// 結果の書き込みが別プロジェクトに当たって壊れる。切替系コマンドの入口でこれを弾く。
+/// v1.5.1 WS-B: 判定を「台帳に Flow ジョブが存在するか」に置換（呼び出し側の挙動不変。
+/// 撤廃＝ジョブの起動元プロジェクト束縛は WS-C）。
 fn ensure_no_flow_running(state: &AppState) -> Result<(), String> {
-    if state.flow_running.load(std::sync::atomic::Ordering::SeqCst) {
+    if state.jobs.any_flow() {
         return Err(
             "フロー実行中はプロジェクトを切り替えられません（完了／録音は「停止」してから）".into(),
         );
@@ -223,10 +349,7 @@ pub fn run() {
             app.manage(AppState {
                 current: Mutex::new(current),
                 app_data: app_dir,
-                flow_cancel: std::sync::atomic::AtomicBool::new(false),
-                chat_cancel: std::sync::atomic::AtomicBool::new(false),
-                rec_stdin: std::sync::Mutex::new(None),
-                flow_running: std::sync::atomic::AtomicBool::new(false),
+                jobs: Jobs::new(),
                 t2i_server: std::sync::Mutex::new(None),
             });
             Ok(())
@@ -310,6 +433,8 @@ pub fn run() {
             update_filter,
             run_flow,
             break_flow,
+            list_jobs,
+            cancel_all,
             ai_chat_send,
             ai_chat_history,
             ai_context_labels,

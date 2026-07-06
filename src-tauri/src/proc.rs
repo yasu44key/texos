@@ -13,10 +13,16 @@ use tauri::{Emitter, Manager, State};
 // 暴走プログラムの停止（CTRL_BREAK シグナル＋Job Object）は別チャネル＝#4 で実装予定。
 
 /// 実行中の子プロセスの stdin に文字列（+改行）を送る。録音の正常停止は text="q"。
+/// v1.5.1 WS-B: job_id 引数化（Job.control 経由）。ジョブ別 stdin なので、将来の並行実行でも
+/// 「どの録音を止めるか」が混線しない。
 #[tauri::command(async)]
-pub(crate) fn flow_send_stdin(state: State<AppState>, text: String) -> Result<(), String> {
+pub(crate) fn flow_send_stdin(state: State<AppState>, job_id: u64, text: String) -> Result<(), String> {
     use std::io::Write;
-    let mut guard = state.rec_stdin.lock().unwrap();
+    let job = state
+        .jobs
+        .get(job_id)
+        .ok_or("制御を受け付ける実行中プロセスがありません")?;
+    let mut guard = job.control.lock().unwrap();
     match guard.as_mut() {
         Some(si) => {
             si.write_all(text.as_bytes()).map_err(|e| e.to_string())?;

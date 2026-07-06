@@ -344,15 +344,21 @@ pub(crate) fn ai_chat_send(
         }
         Ok((spec, p.root.clone(), label))
     })?;
+
+    // v1.5.1 WS-B: チャットも Job 登録（Chat は単一運用のまま＝排他ガードなし）。中断は
+    // Job.cancel 経由。job:started の card=カードid で ChatPanel が自分の job_id を拾う。
+    let job = state.jobs.register(JobKind::Chat, &card_label);
+    let _guard = JobGuard::new(&state.jobs, job.id);
+    *job.project_root.lock().unwrap() = root.to_string_lossy().into_owned();
+    let app = window.app_handle().clone();
+    let _ = app.emit(
+        "job:started",
+        serde_json::json!({ "job_id": job.id, "kind": "chat", "label": card_label, "card": id }),
+    );
+
     // v1.4.4 マルチコンテキスト: 接続カードを毎ターン収集（編集が即反映）。v1.4.11: ロック外で
     // 評価する（上流にフィルタ連鎖があっても DB を握らない＝他操作が固まらない）。
-    let context = collect_context(
-        state.inner(),
-        &root,
-        &id,
-        &std::sync::atomic::AtomicBool::new(false),
-        &state.rec_stdin,
-    );
+    let context = collect_context(state.inner(), &root, &id, &job.cancel, &job.control);
 
     let user = message.trim().to_string();
     if user.is_empty() {
@@ -423,12 +429,8 @@ pub(crate) fn ai_chat_send(
         }
     }
 
-    state
-        .chat_cancel
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-
     // ストリーミングは tokio 文脈外の素のOSスレッドで（run_ai と同じ理由）。
-    let app = window.app_handle().clone();
+    // 中断フラグはこのジョブのもの（ジョブ別＝毎回新品なのでリセット不要）。
     let result = std::thread::scope(|s| {
         s.spawn(|| {
             let mut on_token = |tok: &str| {
@@ -440,7 +442,7 @@ pub(crate) fn ai_chat_send(
                     },
                 );
             };
-            flow::run_ai_chat_stream(&spec, &messages, &state.chat_cancel, &mut on_token)
+            flow::run_ai_chat_stream(&spec, &messages, &job.cancel, &mut on_token)
         })
         .join()
         .map_err(|_| "AI実行スレッドが異常終了しました".to_string())?
@@ -471,6 +473,7 @@ pub(crate) fn ai_chat_send(
                     error: None,
                 },
             );
+            let _ = app.emit("job:done", serde_json::json!({ "job_id": job.id }));
             Ok(answer)
         }
         Err(mut e) => {
@@ -486,6 +489,7 @@ pub(crate) fn ai_chat_send(
                     error: Some(e.clone()),
                 },
             );
+            let _ = app.emit("job:failed", serde_json::json!({ "job_id": job.id }));
             Err(e)
         }
     }

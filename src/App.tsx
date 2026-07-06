@@ -149,6 +149,9 @@ function App() {
   // （文字起こし等ふつうの実行で停止ボタンが出ると紛らわしいため）。stopCmdRun=送る文字（既定 q）。
   const [recordingRun, setRecordingRun] = useState(false);
   const [stopCmdRun, setStopCmdRun] = useState("q");
+  // v1.5.1 WS-B: 実行中フローの job_id（job:started で受領）。停止/中断コマンドに渡す。
+  // まだ届いていない瞬間の中断は cancel_all（中央 kill）へフォールバックする。
+  const flowJobIdRef = useRef<number | null>(null);
   // v1.5 外部プログラムフィルタの設定ダイアログ（作成 or 既存カードの編集）
   const [filterDlg, setFilterDlg] = useState<{
     x: number;
@@ -393,6 +396,23 @@ function App() {
       un?.();
     };
   }, [refresh]);
+
+  // v1.5.1 WS-B: job:started でフローの job_id を受領（停止/中断コマンドが対象を指せる）。
+  // WS-B はフロー同時1なので最後に受けた flow ジョブを保持すれば足りる（一覧パネルは WS-C）。
+  useEffect(() => {
+    let alive = true;
+    let un: (() => void) | undefined;
+    listen<{ job_id: number; kind: string; label: string }>("job:started", (e) => {
+      if (e.payload.kind === "flow") flowJobIdRef.current = e.payload.job_id;
+    }).then((u) => {
+      if (alive) un = u;
+      else u();
+    });
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, []);
 
   // v1.3 メモ② UNDO/REDO — useUndo に分離（v1.3.2 リファクタ）。
   // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y のキーバインドもフック内。
@@ -1396,6 +1416,7 @@ function App() {
         setFlowRunning(false);
         setRecordingRun(false);
         flowRunningRef.current = false;
+        flowJobIdRef.current = null;
       }
     },
     [refresh, pushUndo]
@@ -4993,7 +5014,11 @@ function App() {
           {recordingRun && (
             <button
               title={`stdin に "${stopCmdRun}" を送って正常終了させます（録音は WAV を確定）`}
-              onClick={() => void invoke("flow_send_stdin", { text: stopCmdRun }).catch(() => {})}
+              onClick={() => {
+                const jobId = flowJobIdRef.current;
+                if (jobId != null)
+                  void invoke("flow_send_stdin", { jobId, text: stopCmdRun }).catch(() => {});
+              }}
               style={{
                 padding: "6px 16px",
                 background: "#2f6f4f",
@@ -5010,7 +5035,12 @@ function App() {
           )}
           <button
             title="プロセスツリーを強制終了します（出力は破棄）"
-            onClick={() => void invoke("break_flow")}
+            onClick={() => {
+              // job_id 未着（job:started 前）の連打は中央 kill へフォールバック。
+              const jobId = flowJobIdRef.current;
+              if (jobId != null) void invoke("break_flow", { jobId }).catch(() => {});
+              else void invoke("cancel_all").catch(() => {});
+            }}
             style={{
               padding: "6px 16px",
               background: "#b03a3a",
@@ -5023,6 +5053,24 @@ function App() {
             }}
           >
             ■ 中断
+          </button>
+          {/* v1.5.1 WS-B: 中央 kill スイッチ。全ジョブ（フロー＋チャット＋t2i 生成）の cancel を
+              立てる。WS-B はフロー同時1なので中断とほぼ同義だが、並行チャットも一括で止まる。 */}
+          <button
+            title="実行中のすべてのジョブ（フロー・チャット・画像生成）を停止します"
+            onClick={() => void invoke("cancel_all").catch(() => {})}
+            style={{
+              padding: "6px 16px",
+              background: "#7a3a3a",
+              color: "#ffffff",
+              border: "1px solid #a05050",
+              borderRadius: 6,
+              cursor: "pointer",
+              fontSize: 13,
+              fontFamily: "sans-serif",
+            }}
+          >
+            ■ Stop-all
           </button>
         </div>
       )}

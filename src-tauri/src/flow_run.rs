@@ -105,6 +105,11 @@ pub(crate) fn execute_node(
         NodeKind::Ai => {
             // v1.4.0 AIフィルタは builtin だがネットワークを使う別経路（同期blocking）。
             let (bytes, ext, mime) = flow::run_ai(spec, inputs[0].0)?;
+            // v1.5.1 WS-B: 実行中に中断された場合は応答を破棄する（HTTP は途中で切れないため
+            // 完走後にここで判定。「中断＝出力は破棄」の既存契約に合わせる）。
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("中断されました".into());
+            }
             Ok(plain(bytes, ext, mime))
         }
         NodeKind::T2i => {
@@ -139,6 +144,13 @@ pub(crate) fn execute_node(
                 }
             };
             let (bytes, ext, mime) = flow::run_t2i(spec, prompt, init)?;
+            // v1.5.1 WS-B t2i 中断の実効化: 中断（break_flow/cancel_all → デーモン /cancel）
+            // されると diffusers は次ステップ境界で denoise を抜け**部分画像を返して完走**する。
+            // そのまま進むと中途半端な画像カードが生まれるので、ここで破棄してエラー化する
+            //（デーモンは既に解放済み＝次の生成を受けられる）。
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("中断されました".into());
+            }
             Ok(plain(bytes, ext, mime))
         }
         NodeKind::Generator | NodeKind::External => {
@@ -453,19 +465,33 @@ pub(crate) fn eval_filter(
 // (async) でスレッドプール実行にする — 同期コマンドはメインスレッドで走るため、
 // 外部コマンドがストールするとイベントループごと固まり中断ボタンが届かない。
 #[tauri::command(async)]
-pub(crate) fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport, String> {
-    // v1.4.10 多重起動ガード（録音ハングの修正）: 実行中なら state.current をロックする前に
-    // 即エラーで弾く。ロック前に弾くのが要点 — ここで待つと録音中フローの裏で積み上がる。
-    if state
-        .flow_running
-        .swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
-        return Err(
-            "ほかのフローを実行中です。完了（録音は「停止」）してからもう一度実行してください".into(),
-        );
-    }
-    let _running = RunningGuard(&state.flow_running);
+pub(crate) fn run_flow(
+    id: String,
+    app: tauri::AppHandle,
+    state: State<AppState>,
+) -> Result<FlowReport, String> {
+    // v1.5.1 WS-B 多重起動ガードの台帳版（v1.4.10 録音ハング修正の継承）: 台帳に Flow ジョブが
+    // 居れば state.current をロックする**前**に即エラーで弾く（ここで待つと録音中フローの裏で
+    // 積み上がる）。完了同期返しは維持＝この関数は従来どおり FlowReport を返す。
+    let job = state.jobs.register_flow_exclusive("フロー実行")?;
+    let _guard = JobGuard::new(&state.jobs, job.id);
+    let result = run_flow_inner(&id, &app, &state, &job);
+    // job:done / job:failed（WS-C 全規格の先行最小3種の後ろ2つ。progress は WS-C）。
+    // report 内のエラーは「完了した実行の報告」なので done 扱い＝Err はコマンド自体の失敗。
+    let _ = app.emit(
+        if result.is_ok() { "job:done" } else { "job:failed" },
+        serde_json::json!({ "job_id": job.id }),
+    );
+    result
+}
 
+fn run_flow_inner(
+    id: &str,
+    app: &tauri::AppHandle,
+    state: &State<AppState>,
+    job: &Job,
+) -> Result<FlowReport, String> {
+    let id = id.to_string();
     // 短ロック: 終端フィルタの位置・ラベル・spec と root を取得（実行中はロックを手放す）。
     let (fx, fy, flabel, fref, root): (f64, f64, String, Option<String>, PathBuf) =
         with_db(state.inner(), |p| {
@@ -482,6 +508,15 @@ pub(crate) fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport,
         })?;
     // 終端フィルタの設定が出力先と命名を決める（prefix連番 / 出力フォルダ）
     let term_spec = flow::parse_spec(fref.as_deref().unwrap_or("{}"))?;
+
+    // v1.5.1 WS-B: ラベル・起動元プロジェクト（記録のみ）を確定し job:started を通知。
+    // フロントはこの job_id を保持して break_flow / flow_send_stdin に渡す。
+    *job.label.lock().unwrap() = flabel.clone();
+    *job.project_root.lock().unwrap() = root.to_string_lossy().into_owned();
+    let _ = app.emit(
+        "job:started",
+        serde_json::json!({ "job_id": job.id, "kind": "flow", "label": flabel }),
+    );
 
     // v1.5 Text-To-Image: 終端が t2i カードなら生成デーモンを先に起こしておく（▶実行を
     // 「ただ押せば動く」に）。best-effort — 起動できなければ run_t2i が分かりやすく案内する。
@@ -529,16 +564,13 @@ pub(crate) fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport,
         };
         let window = term_spec.window.as_deref().unwrap_or("keep");
         let capture = if window == "hidden" {
-            // ウィンドウなし実行: 前回の中断フラグを下ろしてから走らせる（中断ボタン対応）。
-            state
-                .flow_cancel
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // ウィンドウなし実行: 中断フラグはジョブ別（毎回新品）なのでリセット不要。
             let out = run_shell_captured(
                 &shell,
                 &firstline,
                 &root,
                 term_spec.timeout_secs,
-                &state.flow_cancel,
+                &job.cancel,
             )?;
             // 出力はシェルウィンドウ相当のテキスト。エンコーディングは UTF-8 → 推定
             // （cmd 内蔵コマンドは CP932 を吐く）。パネル表示用に 64K 字で切り詰める。
@@ -600,21 +632,18 @@ pub(crate) fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport,
         errors: vec![],
         shell_capture: None,
     };
-    // 前回の中断フラグを下ろしてから評価を始める
-    state
-        .flow_cancel
-        .store(false, std::sync::atomic::Ordering::Relaxed);
     let mut visited = std::collections::HashSet::new();
     // 評価フェーズ: eval_filter が DB 接触ごとに短ロックを取り、実行（外部/AI/録音）は
     // ロック外で走る。録音/AI 中も他のコマンドが state.current を取れる＝UI が固まらない。
+    // 中断フラグ・stdin 制御はこのジョブのもの（ジョブ別＝毎回新品なのでリセット不要）。
     let payloads = eval_filter(
         state.inner(),
         &root,
         &id,
         &mut visited,
         &mut report,
-        &state.flow_cancel,
-        &state.rec_stdin,
+        &job.cancel,
+        &job.control,
     )?;
     if payloads.is_empty() && report.skipped.is_empty() && report.errors.is_empty() {
         // 自己完結コマンド（{out} を書かないカメラ起動・読み上げ等）は出力ゼロで正常終了する
@@ -798,14 +827,30 @@ pub(crate) fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport,
     Ok(report)
 }
 
-/// フロー実行の中断（UIの中断ボタン）。run_flow が外部コマンドでストールしていても
-/// このコマンドは DB の Mutex を取らないため即座に通り、監視ループがツリーごと kill する。
+/// フロー実行の中断（UIの中断ボタン・v1.5.1 WS-B で job_id 引数化）。run_flow が外部コマンドで
+/// ストールしていてもこのコマンドは DB の Mutex を取らないため即座に通り、監視ループがツリー
+/// ごと kill する。ジョブが既に終わっていれば黙って何もしない（連打・競合は無害）。
 #[tauri::command(async)]
-pub(crate) fn break_flow(state: State<AppState>) {
-    state
-        .flow_cancel
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn break_flow(job_id: u64, state: State<AppState>) {
+    if let Some(job) = state.jobs.get(job_id) {
+        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // 画像生成中ならデーモン側の生成も止める（GPU を握り続けないように）。best-effort。
+    flow::t2i_post_cancel();
+}
+
+/// v1.5.1 WS-B: 実行中ジョブの一覧（WS-C 背景ジョブパネルの土台。現 UI は未使用）。
+#[tauri::command]
+pub(crate) fn list_jobs(state: State<AppState>) -> Vec<JobInfo> {
+    state.jobs.list()
+}
+
+/// v1.5.1 WS-B: 中央 kill スイッチ（凍結仕様 §12.B・自律安全設計 §6.3 の「最後の物理停止」）。
+/// 全ジョブの cancel を立てる。子プロセスは各実行系の監視ループが taskkill /T でツリーごと
+/// 止め（既存流用）、画像生成はデーモンへ /cancel を送って次ステップ境界で止める。
+#[tauri::command(async)]
+pub(crate) fn cancel_all(state: State<AppState>) {
+    state.jobs.cancel_all();
     flow::t2i_post_cancel();
 }
 

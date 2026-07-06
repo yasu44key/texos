@@ -125,6 +125,9 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
     { label: string; kind: string }[]
   >([]); // v1.4.4 接続資料（kind: image|text|other）
   const scrollRef = useRef<HTMLDivElement>(null);
+  // v1.5.1 WS-B: 実行中ターンの job_id（job:started の card=このカードで受領）。
+  // 停止ボタンはこれを ai_chat_cancel に渡す（未着なら null＝Chat 全体キャンセルで代用）。
+  const jobIdRef = useRef<number | null>(null);
 
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -176,8 +179,15 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
       if (e.payload.id !== objId) return;
       setBusy(false);
       setStreaming(null);
+      jobIdRef.current = null;
       if (e.payload.error) setError(e.payload.error);
       reload();
+    }).then(keep);
+    // v1.5.1 WS-B: このカードのターンの job_id を受領（中断ボタンの job_id 化）。
+    listen<{ job_id: number; kind: string; card?: string }>("job:started", (e) => {
+      if (e.payload.kind === "chat" && e.payload.card === objId) {
+        jobIdRef.current = e.payload.job_id;
+      }
     }).then(keep);
     return () => {
       alive = false;
@@ -207,7 +217,8 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
   }, [input, busy, objId]);
 
   const stop = () => {
-    invoke("ai_chat_cancel").catch(() => {});
+    // job_id 未着（job:started 前の停止連打）は null＝バックエンドが Chat ジョブ全部に効かせる。
+    invoke("ai_chat_cancel", { jobId: jobIdRef.current }).catch(() => {});
   };
 
   const clear = () => {
