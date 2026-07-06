@@ -33,6 +33,21 @@ pub struct FlowReport {
     /// 型不一致などでスキップした入力（ラベル＋理由）
     pub skipped: Vec<String>,
     pub errors: Vec<String>,
+    /// シェルカード統合（2026-07-06）: window:"hidden" のシェル実行結果
+    /// （stdout/stderr 時系列マージ＋終了コード）。front は結果パネルで表示する。
+    /// シェル以外のフロー・ウィンドウあり実行では None。
+    pub shell_capture: Option<ShellCapture>,
+}
+
+/// window:"hidden" シェル実行の捕捉結果（結果パネル用）。
+#[derive(Serialize)]
+pub struct ShellCapture {
+    /// プロセス終了コード（シグナル等で取れなければ None）。
+    pub exit_code: Option<i32>,
+    /// stdout+stderr（2>&1 マージ・推定デコード済み）。長大出力は切り詰める。
+    pub output: String,
+    /// 出力を切り詰めたか（パネルに「以下省略」を出す）。
+    pub truncated: bool,
 }
 
 /// パイプラインの中間結果。中間ファイル・中間カードは作らず、メモリで次段へ渡す
@@ -474,8 +489,10 @@ pub(crate) fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport,
         let _ = t2i_ensure_server(&state.app_data, state.inner());
     }
 
-    // v1.3.11 対話シェル: cmd/PowerShell を detached で開いて一行目（cmd）を実行（捕捉しない）。
+    // v1.3.11 対話シェル: cmd/PowerShell で一行目（cmd）を実行。
     // 接続された最初の入力の生きた実ファイルを {in} に展開する。§4.2: 種別判定は is_shell() に集約。
+    // シェルカード統合（2026-07-06）: window="keep"（既定・開いたまま）/"close"（実行して閉じる）は
+    // detached ウィンドウ、"hidden" はウィンドウなしで捕捉して結果パネルへ返す。
     if term_spec.is_shell() {
         let shell = term_spec.shell.as_deref().unwrap_or("").to_string();
         // 短ロック: 接続された最初の入力の生きた実ファイルを解決（起動はロック外）。
@@ -510,13 +527,46 @@ pub(crate) fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport,
             Some(pb) => firstline.replace("{in}", &format!("\"{}\"", pb.display())),
             None => firstline.replace("{in}", ""),
         };
-        launch_interactive_shell(&shell, &firstline, &root)?;
+        let window = term_spec.window.as_deref().unwrap_or("keep");
+        let capture = if window == "hidden" {
+            // ウィンドウなし実行: 前回の中断フラグを下ろしてから走らせる（中断ボタン対応）。
+            state
+                .flow_cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let out = run_shell_captured(
+                &shell,
+                &firstline,
+                &root,
+                term_spec.timeout_secs,
+                &state.flow_cancel,
+            )?;
+            // 出力はシェルウィンドウ相当のテキスト。エンコーディングは UTF-8 → 推定
+            // （cmd 内蔵コマンドは CP932 を吐く）。パネル表示用に 64K 字で切り詰める。
+            let bytes = out.output.unwrap_or_default();
+            let (text, _enc) = notes::decode_text_bytes(&bytes);
+            const MAX_CHARS: usize = 65536;
+            let truncated = text.chars().count() > MAX_CHARS;
+            let text = if truncated {
+                text.chars().take(MAX_CHARS).collect()
+            } else {
+                text
+            };
+            Some(ShellCapture {
+                exit_code: out.exit_code,
+                output: text,
+                truncated,
+            })
+        } else {
+            launch_shell_window(&shell, &firstline, &root, window != "close")?;
+            None
+        };
         return Ok(FlowReport {
             created: vec![],
             updated: vec![],
             outputs: vec![],
             skipped: vec![],
             errors: vec![],
+            shell_capture: capture,
         });
     }
 
@@ -548,6 +598,7 @@ pub(crate) fn run_flow(id: String, state: State<AppState>) -> Result<FlowReport,
         outputs: vec![],
         skipped: vec![],
         errors: vec![],
+        shell_capture: None,
     };
     // 前回の中断フラグを下ろしてから評価を始める
     state

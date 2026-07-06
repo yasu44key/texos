@@ -886,8 +886,14 @@ export function buildCanvasMenu(
     { label: "── ランチャー ──", onClick: () => {}, disabled: true },
     { label: "インストール済みアプリから選択...", onClick: () => a.addLauncher("installed", pos.canvasX, pos.canvasY) },
     { label: "一般プログラム（.exe を選択）...", onClick: () => a.addLauncher("program", pos.canvasX, pos.canvasY) },
-    { label: "コマンドプロンプト", onClick: () => a.addLauncher("cmd", pos.canvasX, pos.canvasY) },
-    { label: "PowerShell", onClick: () => a.addLauncher("powershell", pos.canvasX, pos.canvasY) },
+    // シェルカード統合（2026-07-06）: 旧「コマンドプロンプト/PowerShell」ランチャー2項目と
+    // ビルトインフィルタ内の「対話: …」2項目をこの1項目に統合（入口はここと矢印引き出しの2か所）。
+    // シェル種別・コマンド・ウィンドウ（開いたまま/閉じる/出さない）は設定ダイアログで選ぶ。
+    {
+      label: "コマンドプロンプト / PowerShell ...",
+      hint: "シェルでコマンドを実行するカードを追加します。ウィンドウを開いたまま対話・実行して閉じる・ウィンドウなしで結果をパネル表示、を設定で選べます。",
+      onClick: () => a.addFilter("shell", pos.canvasX, pos.canvasY),
+    },
     // ── フィルタ・処理カード（データ→フィルタ→結果のパイプ）──
     { label: "── フィルタ・処理カード ──", onClick: () => {}, disabled: true },
     { label: "ドロップポイント（データ入口・自動実行）", onClick: () => a.addFilter("drop_point", pos.canvasX, pos.canvasY) },
@@ -931,9 +937,8 @@ export function buildCanvasMenu(
           { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => a.addFilter("to_wav16k", pos.canvasX, pos.canvasY) },
           { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => a.addFilter("whisper", pos.canvasX, pos.canvasY) },
           { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip", pos.canvasX, pos.canvasY) },
-          // v1.3.11 対話シェル（一行目設定可・{in}可・バッチ登録・時間無制限）
-          { label: "対話: コマンドプロンプト（一行目設定可）...", onClick: () => a.addFilter("shell_cmd", pos.canvasX, pos.canvasY) },
-          { label: "対話: PowerShell（一行目設定可）...", onClick: () => a.addFilter("shell_powershell", pos.canvasX, pos.canvasY) },
+          // シェルカード統合（2026-07-06）: 旧「対話: コマンドプロンプト/PowerShell」2項目は
+          // ランチャー節の「コマンドプロンプト / PowerShell ...」1項目に統合した。
         ]),
     },
     // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ

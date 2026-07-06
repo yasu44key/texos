@@ -253,20 +253,20 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
         <div style={{ fontSize: 15, marginBottom: 4, textAlign: "center" }}>
           画像生成（Text-To-Image）のセットアップ
         </div>
-        <div style={{ fontSize: 11, color: "#8a93a8", marginBottom: 14, textAlign: "center" }}>
+        <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginBottom: 14, textAlign: "center" }}>
           TexoS 管理の Python 環境（自動構築）の diffusers でローカル生成（Ollama 流の常駐デーモン）。
           モデルは PC に保存。
         </div>
 
         {/* この PC の構成と推奨（WS3）。推奨の根拠をユーザーが見られるように。 */}
         {spec && (
-          <div style={{ ...sec, background: "#141b16", borderColor: "#2b4034" }}>
+          <div style={{ ...sec, background: "#5fbf7714", borderColor: "#5fbf7750" }}>
             <div style={secTitle}>🖥️ この PC の構成 — {spec.tier}</div>
             <div style={note}>
               GPU: {spec.gpu ? `${spec.gpu.name}（VRAM ${(spec.gpu.vram_mb / 1024).toFixed(1)}GB）` : "対応 GPU 未検出（CPU 動作）"}
               {spec.ram_mb > 0 && <> ／ RAM: {(spec.ram_mb / 1024).toFixed(1)}GB</>}
             </div>
-            <div style={{ ...note, color: "#8fca9c", marginTop: 4 }}>
+            <div style={{ ...note, color: "#5fbf77", marginTop: 4 }}>
               推奨: {spec.cuda ? "GPU 版 torch（cu124）" : "CPU 版 torch"} ／ 既定モデル {spec.recommended_model}
             </div>
             <div style={{ ...note, marginTop: 4 }}>{spec.note}</div>
@@ -319,18 +319,18 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
                     <div
                       style={{
                         marginTop: 8,
-                        border: "1px solid #2f5a3e",
+                        border: "1px solid #5fbf7750",
                         borderRadius: 6,
                         padding: "8px 10px",
-                        background: "#16241a",
+                        background: "#5fbf7714",
                       }}
                     >
-                      <div style={{ ...note, color: "#8fca9c", marginBottom: 6, lineHeight: 1.6 }}>
+                      <div style={{ ...note, color: "#5fbf77", marginBottom: 6, lineHeight: 1.6 }}>
                         ✨ <b>GPU（{spec?.gpu?.name}）が使えるようになりました。</b>
                         <br />
                         今の環境は CPU 版で構築されているため、GPU 版に再構築すると画像生成が
                         大幅に速くなります。下のボタンで切り替えることをお勧めします
-                        <span style={{ color: "#d9b07a" }}>（再構築には時間がかかります：GPU 版 torch を数GB入れ直します）</span>。
+                        <span style={{ color: "#d9a06a" }}>（再構築には時間がかかります：GPU 版 torch を数GB入れ直します）</span>。
                       </div>
                       {st.python_kind === "system" && (
                         <div style={{ ...note, color: "#d9a06a", marginBottom: 6 }}>
@@ -446,8 +446,8 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
 
               {/* ゲート付きモデル: トークン入力（未設定で自動表示／設定済みでも「再設定」で開く・URLコピー可） */}
               {tokenPanelOpen && (
-                <div style={{ marginTop: 10, border: "1px solid #4a3a2a", borderRadius: 6, padding: "8px 10px", background: "#1d1812" }}>
-                  <div style={{ ...note, color: "#d9b07a", marginBottom: 6 }}>
+                <div style={{ marginTop: 10, border: "1px solid #d9a06a50", borderRadius: 6, padding: "8px 10px", background: "#d9a06a14" }}>
+                  <div style={{ ...note, color: "#d9a06a", marginBottom: 6 }}>
                     このモデルは Hugging Face の認証が必要です。①下記ページでライセンスに同意 →
                     ②アクセストークンを発行して貼り付けてください。
                   </div>
@@ -483,7 +483,7 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
               )}
 
               {/* 手動配置（保険）: HF から diffusers 構造を手で置く。デーモンが自動検出する。 */}
-              <div style={{ ...note, marginTop: 10, borderTop: "1px solid #2c3550", paddingTop: 8 }}>
+              <div style={{ ...note, marginTop: 10, borderTop: "1px solid var(--panel-border, #2c3550)", paddingTop: 8 }}>
                 <div style={{ marginBottom: 4 }}>
                   手動で置く場合: 下のフォルダに <b>diffusers 形式</b>（model_index.json ＋ transformer/
                   text_encoder/ vae/ などのサブフォルダ）を入れてください。
@@ -501,7 +501,7 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
                   <button style={btnGhost} disabled={busy !== null} onClick={() => void reload()}>
                     🔄 更新（再スキャン）
                   </button>
-                  <span style={{ color: "#6b7488" }}>置いたら「更新」で認識されます</span>
+                  <span style={{ color: "var(--panel-muted, #6b7488)" }}>置いたら「更新」で認識されます</span>
                 </div>
               </div>
             </div>
@@ -563,9 +563,11 @@ const overlay: React.CSSProperties = {
   justifyContent: "center",
   zIndex: 2000,
 };
+// 2026-07-06: テーマ追従（--panel-* 体系）。暗色固定（2026-06-26決定）は改訂。
+// 成功/警告の色付きボックスはアクセント色の半透明ティントにし、ライトテーマでも沈まない。
 const panel: React.CSSProperties = {
-  background: "#1c2130",
-  border: "1px solid #38445e",
+  background: "var(--panel-bg, #1c2130)",
+  border: "1px solid var(--panel-border, #38445e)",
   borderRadius: 10,
   padding: 20,
   width: 560,
@@ -573,19 +575,19 @@ const panel: React.CSSProperties = {
   overflowY: "auto",
   boxShadow: "0 8px 32px #000000aa",
   fontFamily: "sans-serif",
-  color: "#d6dded",
+  color: "var(--panel-text, #d6dded)",
   fontSize: 13,
   lineHeight: 1.6,
 };
 const sec: React.CSSProperties = {
-  border: "1px solid #2c3550",
+  border: "1px solid var(--panel-border, #2c3550)",
   borderRadius: 8,
   padding: "10px 12px",
   marginBottom: 10,
-  background: "#161b28",
+  background: "var(--panel-header-bg, #161b28)",
 };
 const secTitle: React.CSSProperties = { fontSize: 13, marginBottom: 6 };
-const note: React.CSSProperties = { fontSize: 11, color: "#9aa3b8" };
+const note: React.CSSProperties = { fontSize: 11, color: "var(--panel-muted, #9aa3b8)" };
 const btn: React.CSSProperties = {
   background: "#3a6ea5",
   color: "#fff",
@@ -605,9 +607,9 @@ const btnGhost: React.CSSProperties = {
   fontSize: 12,
 };
 const select: React.CSSProperties = {
-  background: "#0f1420",
-  color: "#d6dded",
-  border: "1px solid #38445e",
+  background: "var(--panel-input-bg, #0f1420)",
+  color: "var(--panel-text, #d6dded)",
+  border: "1px solid var(--panel-border, #38445e)",
   borderRadius: 6,
   padding: "6px 8px",
   fontSize: 12,

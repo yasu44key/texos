@@ -13,6 +13,8 @@ import { ContextMenu, type MenuItem } from "./ui/ContextMenu";
 import { PromptDialog } from "./ui/PromptDialog";
 import { FilterDialog } from "./ui/FilterDialog";
 import { BuiltinFilterDialog, hasBuiltinSchema } from "./ui/BuiltinFilterDialog";
+import { ShellSettingsDialog } from "./ui/ShellSettingsDialog";
+import { ShellOutputDialog } from "./ui/ShellOutputDialog";
 import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
 import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
@@ -161,6 +163,21 @@ function App() {
     builtin: string;
     label: string;
     spec: string;
+  } | null>(null);
+  // シェルカード統合（2026-07-06）: コマンドプロンプト/PowerShell カード専用の設定
+  // ダイアログ（作成・編集兼用）。id あり=既存編集 / create あり=新規作成。
+  const [shellDlg, setShellDlg] = useState<{
+    id: string | null;
+    label: string;
+    spec?: string;
+    create?: { x: number; y: number; linkFrom?: string };
+  } | null>(null);
+  // シェルカード統合: window:"hidden" 実行の結果パネル（stdout/stderr＋終了コード）。
+  const [shellOut, setShellOut] = useState<{
+    label: string;
+    exitCode: number | null;
+    output: string;
+    truncated: boolean;
   } | null>(null);
   // v1.4.1 AIカード専用の設定ダイアログ（生JSON編集の置き換え／新規作成も兼ねる）。
   // id あり=既存編集 / create あり=新規作成（保存時に create_filter＋矢印接続）。
@@ -811,8 +828,9 @@ function App() {
             { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => la.filter("to_wav16k", cp.x, cp.y, fromId) },
             { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => la.filter("whisper", cp.x, cp.y, fromId) },
             { label: "動画: 長さでクリップ...", onClick: () => la.filter("video_clip", cp.x, cp.y, fromId) },
-            { label: "対話: コマンドプロンプト（一行目設定可）...", onClick: () => la.filter("shell_cmd", cp.x, cp.y, fromId) },
-            { label: "対話: PowerShell（一行目設定可）...", onClick: () => la.filter("shell_powershell", cp.x, cp.y, fromId) },
+            // シェルカード統合（2026-07-06）: 旧「対話: …」2項目を1項目に統合（設定ダイアログで
+            // シェル種別・ウィンドウ 開いたまま/閉じる/出さない を選ぶ）。{in} に引き出し元が入る。
+            { label: "コマンドプロンプト / PowerShell ...", onClick: () => la.filter("shell", cp.x, cp.y, fromId) },
             { label: "外部プログラム...", onClick: () => la.filter("external", cp.x, cp.y, fromId) },
           ];
           setMenu({
@@ -843,8 +861,9 @@ function App() {
                         y: cy,
                         items: [
                           { label: "一般プログラム（.exe を選択）...", onClick: () => la.launcher("program", cp.x, cp.y, fromId) },
-                          { label: "コマンドプロンプト", onClick: () => la.launcher("cmd", cp.x, cp.y, fromId) },
-                          { label: "PowerShell", onClick: () => la.launcher("powershell", cp.x, cp.y, fromId) },
+                          // シェルカード統合（2026-07-06）: cmd/PowerShell はフィルタカード側の
+                          // 「コマンドプロンプト / PowerShell ...」1項目に統合した。
+                          { label: "コマンドプロンプト / PowerShell ...", onClick: () => la.filter("shell", cp.x, cp.y, fromId) },
                         ],
                       }),
                     0
@@ -1060,21 +1079,14 @@ function App() {
               },
             }),
         });
-      } else if (builtin === "shell_cmd" || builtin === "shell_powershell") {
-        // v1.3.11 対話シェル（フィルタ）: cmd/PowerShell を開いて一行目を実行・対話継続。
-        // {in} を書くと接続ファイルのパスに置換。時間制限なし（0=無制限）。
-        const isPwsh = builtin === "shell_powershell";
-        setPrompt({
-          title: `${isPwsh ? "PowerShell" : "コマンドプロンプト"}: 最初に実行するコマンド（空欄=開くだけ・{in}使用可）`,
-          initial: "",
-          onConfirm: (line) =>
-            create(isPwsh ? "PowerShell" : "コマンドプロンプト", {
-              shell: isPwsh ? "powershell" : "cmd",
-              cmd: line,
-              accept_mime: "*/*",
-              timeout_secs: 0,
-              note: "対話シェル（ウィンドウが開いて継続）。一行目に {in} で接続ファイルを渡せます。",
-            }),
+      } else if (builtin === "shell") {
+        // シェルカード統合（2026-07-06）: 旧ランチャー版（開くだけ）と旧対話フィルタ版
+        // （一行目プロンプト）を1カードに統合。作成から専用ダイアログで設定する
+        // （シェル選択・コマンド・ウィンドウ 開いたまま/閉じる/出さない）。
+        setShellDlg({
+          id: null,
+          label: "",
+          create: { x: canvasX, y: canvasY, linkFrom },
         });
       } else if (builtin === "audio_norm") {
         // v1.3.11 #4: ラウドネス正規化（EBU R128 loudnorm）。
@@ -1313,12 +1325,14 @@ function App() {
       // 対象カードが stdin 停止対応（record:true）なら「停止」を出す＋送る文字を拾う。
       let isRec = false;
       let sc = "q";
+      let isShell = false;
       try {
         const obj = objectsRef.current.find((o) => o.id === id);
         if (obj?.filter_ref) {
           const s = JSON.parse(obj.filter_ref);
           isRec = !!s.record;
           if (typeof s.stop_cmd === "string" && s.stop_cmd) sc = s.stop_cmd;
+          isShell = typeof s.shell === "string";
         }
       } catch {
         /* spec が読めなければ停止対応扱いしない */
@@ -1333,7 +1347,23 @@ function App() {
           outputs: string[];
           skipped: string[];
           errors: string[];
+          shell_capture: { exit_code: number | null; output: string; truncated: boolean } | null;
         }>("run_flow", { id });
+        // シェルカード統合（2026-07-06）: ウィンドウなしシェル実行は捕捉出力を結果パネルで
+        // 表示して終わり（カード生成なし・「フローを実行しました」ダイアログは出さない）。
+        if (res.shell_capture) {
+          const label = objectsRef.current.find((o) => o.id === id)?.label ?? "シェル";
+          setShellOut({
+            label,
+            exitCode: res.shell_capture.exit_code,
+            output: res.shell_capture.output,
+            truncated: res.shell_capture.truncated,
+          });
+          return;
+        }
+        // シェルのウィンドウあり起動: ウィンドウ自体がフィードバックなので
+        // 「フローを実行しました」ダイアログは出さない（従来は空の報告が出て煩雑だった）。
+        if (isShell) return;
         if (res.created.length) {
           setTouched((prev) => new Set([...prev, ...res.created]));
           pushUndo([{ kind: "delete", ids: res.created }]);
@@ -1376,13 +1406,22 @@ function App() {
   const handleEditFilter = useCallback(
     (id: string, current: string) => {
       let builtin: string | null = null;
+      let isShell = false;
       try {
-        const b = JSON.parse(current || "{}").builtin;
+        const parsed = JSON.parse(current || "{}");
+        const b = parsed.builtin;
         builtin = typeof b === "string" ? b : null;
+        isShell = typeof parsed.shell === "string";
       } catch {
         builtin = null;
       }
       const label = objectsRef.current.find((o) => o.id === id)?.label ?? "";
+      // シェルカード統合（2026-07-06）: shell キーを持つカードは専用ダイアログ。
+      // 従来は外部プログラム用ダイアログに流れ、NAME/PATH 検証が赤エラーになっていた。
+      if (isShell) {
+        setShellDlg({ id, label, spec: current });
+        return;
+      }
       // v1.4.1 AIカードは専用設定ダイアログ。
       if (builtin === "ai") {
         setAiDlg({ id, label, spec: current });
@@ -4322,7 +4361,7 @@ function App() {
         return;
       }
       if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || typing) return;
-      if (prompt || confirm || filterDlg || builtinDlg || aiDlg || whisperDlg || menu || appPicker) return;
+      if (prompt || confirm || filterDlg || builtinDlg || shellDlg || shellOut || aiDlg || whisperDlg || menu || appPicker) return;
       const k = e.key.toLowerCase();
       if (k === "a") {
         e.preventDefault();
@@ -4361,6 +4400,8 @@ function App() {
     confirm,
     filterDlg,
     builtinDlg,
+    shellDlg,
+    shellOut,
     aiDlg,
     whisperDlg,
     menu,
@@ -4376,7 +4417,7 @@ function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Delete") return;
-      if (prompt || confirm || filterDlg || builtinDlg || aiDlg || whisperDlg || menu) return;
+      if (prompt || confirm || filterDlg || builtinDlg || shellDlg || shellOut || aiDlg || whisperDlg || menu) return;
       const ae = document.activeElement as HTMLElement | null;
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable))
         return;
@@ -4392,7 +4433,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prompt, confirm, filterDlg, builtinDlg, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete, handleDeleteNote]);
+  }, [prompt, confirm, filterDlg, builtinDlg, shellDlg, shellOut, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete, handleDeleteNote]);
 
   const handleChosen = useCallback((info: ProjectInfo) => {
     setShowChooser(false);
@@ -4734,6 +4775,52 @@ function App() {
               });
             }
           }}
+        />
+      )}
+      {shellDlg && (
+        <ShellSettingsDialog
+          initialLabel={shellDlg.label}
+          initialSpec={shellDlg.spec}
+          onCancel={() => setShellDlg(null)}
+          onSave={async (label, spec) => {
+            const dlg = shellDlg;
+            setShellDlg(null);
+            try {
+              if (dlg.id) {
+                await invoke("update_filter", { id: dlg.id, spec });
+                if (label !== dlg.label) {
+                  await invoke("rename_object", { id: dlg.id, label });
+                }
+              } else if (dlg.create) {
+                const vid = await invoke<string>("create_filter", {
+                  label,
+                  spec,
+                  x: dlg.create.x,
+                  y: dlg.create.y,
+                });
+                pushUndo([{ kind: "delete", ids: [vid] }]);
+                if (dlg.create.linkFrom) await linkNewNode(dlg.create.linkFrom, vid);
+              }
+              await refresh();
+            } catch (e) {
+              console.error("shell settings save failed", e);
+              setConfirm({
+                title: "シェルカードを保存できませんでした",
+                message: String(e),
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              });
+            }
+          }}
+        />
+      )}
+      {shellOut && (
+        <ShellOutputDialog
+          label={shellOut.label}
+          exitCode={shellOut.exitCode}
+          output={shellOut.output}
+          truncated={shellOut.truncated}
+          onClose={() => setShellOut(null)}
         />
       )}
       {aiDlg && (

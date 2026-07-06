@@ -221,6 +221,7 @@ pub(crate) fn collect_context(
         outputs: vec![],
         skipped: vec![],
         errors: vec![],
+        shell_capture: None,
     };
     let mut visited = std::collections::HashSet::new();
     for (vid, real_id, vlabel, mime, ext, kind) in &inputs {

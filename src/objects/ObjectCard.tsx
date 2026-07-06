@@ -181,12 +181,22 @@ const FILTER_TYPE_STYLES = {
     badge: "✨ ジェネレータ",
     run: "▶ 生成",
   },
+  // シェルカード統合（2026-07-06）: cmd/PowerShell カード。従来は「⚙ フィルタ」表示で
+  // 見分けがつかなかった。配色はコマンド系を流用（テーマ変数の追加を避ける）。
+  shell: {
+    bg: "var(--card-bg-filter-cmd, #142828)",
+    border: "#3a7a7a",
+    text: "var(--card-filter-cmd-text, #7fd8d8)",
+    badge: "＞_ シェル",
+    run: "▶ 実行",
+  },
 } as const;
 
 function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_STYLES {
   if (!ref) return "filter";
   try {
     const s = JSON.parse(ref);
+    if (typeof s.shell === "string") return "shell";
     if (!s.builtin && (s.type === "command" || s.type === "generator")) return s.type;
   } catch {
     // 壊れたJSONはフィルタ扱いで表示だけ続行（編集ダイアログ側で直せる）

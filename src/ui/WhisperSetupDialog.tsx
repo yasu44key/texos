@@ -146,8 +146,9 @@ export function WhisperSetupDialog({ onCancel, onCreate }: Props) {
       <div
         onMouseDown={(e) => e.stopPropagation()}
         style={{
-          background: "#1c2130",
-          border: "1px solid #38445e",
+          // 2026-07-06: テーマ追従（--panel-* 体系）。暗色固定（2026-06-26決定）は改訂。
+          background: "var(--panel-bg, #1c2130)",
+          border: "1px solid var(--panel-border, #38445e)",
           borderRadius: 10,
           padding: 20,
           width: 560,
@@ -155,7 +156,7 @@ export function WhisperSetupDialog({ onCancel, onCreate }: Props) {
           overflowY: "auto",
           boxShadow: "0 8px 32px #000000aa",
           fontFamily: "sans-serif",
-          color: "#d6dded",
+          color: "var(--panel-text, #d6dded)",
           fontSize: 13,
           lineHeight: 1.6,
         }}
@@ -163,7 +164,7 @@ export function WhisperSetupDialog({ onCancel, onCreate }: Props) {
         <div style={{ fontSize: 15, marginBottom: 4, textAlign: "center" }}>
           Whisper（音声→テキスト）のセットアップ
         </div>
-        <div style={{ fontSize: 11, color: "#8a93a8", marginBottom: 14, textAlign: "center" }}>
+        <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginBottom: 14, textAlign: "center" }}>
           m4a など →（ffmpegで16kHz WAVに変換）→ Whisper → テキスト
         </div>
 
@@ -280,14 +281,14 @@ export function WhisperSetupDialog({ onCancel, onCreate }: Props) {
 }
 
 const sec: React.CSSProperties = {
-  border: "1px solid #2c3550",
+  border: "1px solid var(--panel-border, #2c3550)",
   borderRadius: 8,
   padding: "10px 12px",
   marginBottom: 10,
-  background: "#161b28",
+  background: "var(--panel-header-bg, #161b28)",
 };
 const secTitle: React.CSSProperties = { fontSize: 13, marginBottom: 6 };
-const note: React.CSSProperties = { fontSize: 11, color: "#9aa3b8" };
+const note: React.CSSProperties = { fontSize: 11, color: "var(--panel-muted, #9aa3b8)" };
 const btn: React.CSSProperties = {
   background: "#3a6ea5",
   color: "#fff",
@@ -307,9 +308,9 @@ const btnGhost: React.CSSProperties = {
   fontSize: 12,
 };
 const select: React.CSSProperties = {
-  background: "#0f1420",
-  color: "#d6dded",
-  border: "1px solid #38445e",
+  background: "var(--panel-input-bg, #0f1420)",
+  color: "var(--panel-text, #d6dded)",
+  border: "1px solid var(--panel-border, #38445e)",
   borderRadius: 6,
   padding: "6px 8px",
   fontSize: 12,

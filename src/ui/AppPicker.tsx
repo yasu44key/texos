@@ -48,8 +48,9 @@ export function AppPicker({ onPick, onCancel }: Props) {
       <div
         onMouseDown={(e) => e.stopPropagation()}
         style={{
-          background: "#1c2130",
-          border: "1px solid #38445e",
+          // 2026-07-06: テーマ追従（--panel-* 体系）。暗色固定（2026-06-26決定）は改訂。
+          background: "var(--panel-bg, #1c2130)",
+          border: "1px solid var(--panel-border, #38445e)",
           borderRadius: 10,
           padding: 16,
           width: 460,
@@ -58,7 +59,7 @@ export function AppPicker({ onPick, onCancel }: Props) {
           flexDirection: "column",
           boxShadow: "0 8px 32px #000000aa",
           fontFamily: "sans-serif",
-          color: "#d6dded",
+          color: "var(--panel-text, #d6dded)",
           fontSize: 13,
         }}
       >
@@ -73,10 +74,10 @@ export function AppPicker({ onPick, onCancel }: Props) {
           style={{
             width: "100%",
             padding: "8px 10px",
-            background: "#0e121c",
-            border: "1px solid #38445e",
+            background: "var(--panel-input-bg, #0e121c)",
+            border: "1px solid var(--panel-border, #38445e)",
             borderRadius: 6,
-            color: "#eef2f9",
+            color: "var(--panel-text, #eef2f9)",
             fontSize: 13,
             outline: "none",
             boxSizing: "border-box",
@@ -85,9 +86,9 @@ export function AppPicker({ onPick, onCancel }: Props) {
         />
         <div style={{ overflowY: "auto", flex: 1, minHeight: 120 }}>
           {apps == null ? (
-            <div style={{ color: "#7a8aa6", padding: 20, textAlign: "center" }}>読み込み中...</div>
+            <div style={{ color: "var(--panel-muted, #7a8aa6)", padding: 20, textAlign: "center" }}>読み込み中...</div>
           ) : filtered.length === 0 ? (
-            <div style={{ color: "#7a8aa6", padding: 20, textAlign: "center" }}>
+            <div style={{ color: "var(--panel-muted, #7a8aa6)", padding: 20, textAlign: "center" }}>
               該当するアプリがありません
             </div>
           ) : (
@@ -102,7 +103,7 @@ export function AppPicker({ onPick, onCancel }: Props) {
                   textAlign: "left",
                   padding: "7px 10px",
                   background: "transparent",
-                  color: "#d6dded",
+                  color: "var(--panel-text, #d6dded)",
                   border: "none",
                   borderRadius: 6,
                   cursor: "pointer",
@@ -112,7 +113,7 @@ export function AppPicker({ onPick, onCancel }: Props) {
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                 }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = "#2a3346")}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--panel-header-bg, #2a3346)")}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
               >
                 🚀 {a.name}

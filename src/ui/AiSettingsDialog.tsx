@@ -112,8 +112,10 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
       <div
         onMouseDown={(e) => e.stopPropagation()}
         style={{
-          background: "#1c2130",
-          border: "1px solid #38445e",
+          // 2026-07-06: テーマ追従（--panel-* 体系）。「設定中のアテンション＝暗色固定」の
+          // 2026-06-26 決定は改訂 — シェル/外部プログラム設定と並んだときの不整合を解消。
+          background: "var(--panel-bg, #1c2130)",
+          border: "1px solid var(--panel-border, #38445e)",
           borderRadius: 10,
           padding: 20,
           width: 520,
@@ -121,7 +123,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
           overflowY: "auto",
           boxShadow: "0 8px 32px #000000aa",
           fontFamily: "sans-serif",
-          color: "#d6dded",
+          color: "var(--panel-text, #d6dded)",
           fontSize: 13,
         }}
       >
@@ -209,7 +211,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
                 ↻ 取得
               </button>
             </div>
-            <div style={{ fontSize: 11, color: "#8a93a8", marginTop: 3 }}>
+            <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginTop: 3 }}>
               {modelsState === "loading"
                 ? "取得中…"
                 : modelsState === "error"
@@ -224,7 +226,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
         {spec &&
           row(
             "この PC",
-            <div style={{ fontSize: 11, color: "#8a93a8", lineHeight: 1.5 }}>
+            <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", lineHeight: 1.5 }}>
               {spec.gpu
                 ? `GPU: ${spec.gpu.name}（VRAM ${(spec.gpu.vram_mb / 1024).toFixed(1)}GB）`
                 : "対応 GPU 未検出（CPU 動作）"}
@@ -256,7 +258,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
               placeholder="モデル既定"
               inputMode="decimal"
             />
-            <span style={{ fontSize: 11, color: "#8a93a8" }}>
+            <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
               0=厳密 / 0.7=標準 / 高=多様（空欄=モデル既定）
             </span>
           </div>
@@ -272,7 +274,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
               placeholder={mode === "chat" ? "空欄=無制限" : "空欄=180"}
               inputMode="numeric"
             />
-            <span style={{ fontSize: 11, color: "#8a93a8" }}>
+            <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
               秒で打ち切り（0=無制限）。応答が遅い時は延ばすか 0 に
             </span>
           </div>
@@ -310,7 +312,7 @@ function row(label: string, field: React.ReactNode) {
           width: 92,
           flex: "none",
           textAlign: "right",
-          color: "#aeb8cc",
+          color: "var(--panel-muted, #aeb8cc)",
           fontSize: 12,
           paddingTop: 7,
           whiteSpace: "pre-line",
@@ -327,10 +329,10 @@ function inp(): React.CSSProperties {
   return {
     width: "100%",
     padding: "6px 8px",
-    background: "#0e121c",
-    border: "1px solid #38445e",
+    background: "var(--panel-input-bg, #0e121c)",
+    border: "1px solid var(--panel-border, #38445e)",
     borderRadius: 6,
-    color: "#eef2f9",
+    color: "var(--panel-text, #eef2f9)",
     fontSize: 13,
     outline: "none",
     boxSizing: "border-box",
@@ -340,9 +342,9 @@ function inp(): React.CSSProperties {
 function smallBtn(): React.CSSProperties {
   return {
     padding: "6px 10px",
-    background: "#2a3346",
-    color: "#aeb8cc",
-    border: "1px solid #38445e",
+    background: "var(--panel-btn-bg, #2a3346)",
+    color: "var(--panel-text, #aeb8cc)",
+    border: "1px solid var(--panel-border, #38445e)",
     borderRadius: 6,
     cursor: "pointer",
     fontSize: 12,

@@ -149,14 +149,21 @@ pub(crate) fn run_launcher(id: String, state: State<AppState>) -> Result<(), Str
     Ok(())
 }
 
-/// v1.3.11 対話シェル（フィルタの shell モード）: cmd/PowerShell を detached で開き、
-/// 一時スクリプト（cd → 一行目）を実行して対話を継続（cmd /K / powershell -NoExit）。
-/// 引用符の入れ子を避けるため一時 .bat/.ps1 に書き出してから起動する。
-pub(crate) fn launch_interactive_shell(shell: &str, firstline: &str, root: &Path) -> Result<(), String> {
+/// シェルが PowerShell 系か（"powershell" / "pwsh"）。それ以外は cmd 扱い。
+fn is_powershell(shell: &str) -> bool {
+    shell.eq_ignore_ascii_case("powershell") || shell.eq_ignore_ascii_case("pwsh")
+}
+
+/// シェルカード統合（2026-07-06）: 一時スクリプト（cd → 一行目）を書き出す。
+/// ウィンドウあり/なしの全モードがこの1本を通る — 引用符の入れ子問題を
+/// スクリプト書き出しで避ける定石を起動経路の唯一の形にする（安定化）。
+/// Windows 以外では sh スクリプトを書く（hidden モード用）。
+fn write_shell_script(shell: &str, firstline: &str, root: &Path) -> Result<PathBuf, String> {
     let dir = temp_view_dir().join("shell");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let root_disp = root.display().to_string();
-    let cmdline = if shell.eq_ignore_ascii_case("powershell") || shell.eq_ignore_ascii_case("pwsh") {
+    #[cfg(windows)]
+    let script = if is_powershell(shell) {
         let script = dir.join(format!("{}.ps1", uuid()));
         let body = format!(
             "Set-Location -LiteralPath '{}'\r\n{}\r\n",
@@ -164,15 +171,44 @@ pub(crate) fn launch_interactive_shell(shell: &str, firstline: &str, root: &Path
             firstline
         );
         std::fs::write(&script, body).map_err(|e| e.to_string())?;
-        format!(
-            "start \"\" powershell -NoExit -ExecutionPolicy Bypass -File \"{}\"",
-            script.display()
-        )
+        script
     } else {
         let script = dir.join(format!("{}.bat", uuid()));
         let body = format!("@echo off\r\ncd /d \"{}\"\r\n{}\r\n", root_disp, firstline);
         std::fs::write(&script, body).map_err(|e| e.to_string())?;
-        format!("start \"\" cmd /K \"{}\"", script.display())
+        script
+    };
+    #[cfg(not(windows))]
+    let script = {
+        let _ = shell;
+        let script = dir.join(format!("{}.sh", uuid()));
+        let body = format!("cd \"{}\"\n{}\n", root_disp, firstline);
+        std::fs::write(&script, body).map_err(|e| e.to_string())?;
+        script
+    };
+    Ok(script)
+}
+
+/// v1.3.11 対話シェル（フィルタの shell モード）: cmd/PowerShell をウィンドウ付きで
+/// detached 起動し、一時スクリプト（cd → 一行目）を実行する。
+/// シェルカード統合（2026-07-06）: `keep_open` で「開いたまま（cmd /K・-NoExit）」と
+/// 「実行して閉じる（cmd /C・-File のみ）」を選べるようにした（既定は従来どおり開いたまま）。
+pub(crate) fn launch_shell_window(
+    shell: &str,
+    firstline: &str,
+    root: &Path,
+    keep_open: bool,
+) -> Result<(), String> {
+    let script = write_shell_script(shell, firstline, root)?;
+    let cmdline = if is_powershell(shell) {
+        let noexit = if keep_open { "-NoExit " } else { "" };
+        format!(
+            "start \"\" powershell {noexit}-ExecutionPolicy Bypass -File \"{}\"",
+            script.display()
+        )
+    } else {
+        let switch = if keep_open { "/K" } else { "/C" };
+        format!("start \"\" cmd {switch} \"{}\"", script.display())
     };
     #[cfg(windows)]
     {
@@ -188,6 +224,71 @@ pub(crate) fn launch_interactive_shell(shell: &str, firstline: &str, root: &Path
         let _ = cmdline;
     }
     Ok(())
+}
+
+/// シェルカード統合（2026-07-06）: ウィンドウなし実行（window:"hidden"）。
+/// 一時スクリプトをコンソールなしで走らせ、stdout/stderr（2>&1 で時系列マージ＝
+/// シェルウィンドウに見えるものと同じ並び）を {out} に受けて返す。
+/// タイムアウト・中断・ツリーkill・出力上限は run_external_full の既存の安全弁をそのまま使う。
+pub(crate) fn run_shell_captured(
+    shell: &str,
+    firstline: &str,
+    root: &Path,
+    timeout_secs: Option<u64>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<flow::ExternalOutput, String> {
+    let script = write_shell_script(shell, firstline, root)?;
+    #[cfg(windows)]
+    let cmdline = if is_powershell(shell) {
+        format!(
+            "powershell -ExecutionPolicy Bypass -File \"{}\" > \"{{out}}\" 2>&1",
+            script.display()
+        )
+    } else {
+        format!("call \"{}\" > \"{{out}}\" 2>&1", script.display())
+    };
+    #[cfg(not(windows))]
+    let cmdline = format!("sh \"{}\" > \"{{out}}\" 2>&1", script.display());
+    flow::run_external_full(&cmdline, &[], "txt", timeout_secs, cancel, Some(root), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// シェルカード統合（2026-07-06）: window:"hidden" の捕捉実行。
+    /// stdout と stderr が 2>&1 で1本にマージされ、終了コードが捨てられないこと。
+    #[cfg(windows)]
+    #[test]
+    fn shell_captured_merges_streams_and_exit_code() {
+        let root = std::env::temp_dir();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let o = run_shell_captured(
+            "cmd",
+            "echo hello-out & echo hello-err 1>&2 & exit 5",
+            &root,
+            Some(30),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(o.exit_code, Some(5));
+        let text = String::from_utf8_lossy(&o.output.unwrap_or_default()).to_string();
+        assert!(text.contains("hello-out"), "stdout が捕捉されていない: {text}");
+        assert!(text.contains("hello-err"), "stderr がマージされていない: {text}");
+    }
+
+    /// PowerShell 側も同経路（-File 実行＋cmd レベルの 2>&1 リダイレクト）で捕捉できること。
+    #[cfg(windows)]
+    #[test]
+    fn shell_captured_powershell() {
+        let root = std::env::temp_dir();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let o = run_shell_captured("powershell", "Write-Output ps-out; exit 2", &root, Some(60), &cancel)
+            .unwrap();
+        assert_eq!(o.exit_code, Some(2));
+        let text = String::from_utf8_lossy(&o.output.unwrap_or_default()).to_string();
+        assert!(text.contains("ps-out"), "PowerShell の stdout が捕捉されていない: {text}");
+    }
 }
 
 /// v1.3.11: プロジェクトフォルダ直下の「未登録ファイル」を実身として取り込む。

@@ -124,7 +124,7 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
         <div style={{ fontSize: 15, marginBottom: 4, textAlign: "center" }}>
           画像生成（Text-To-Image）の設定
         </div>
-        <div style={{ fontSize: 11, color: "#8a93a8", marginBottom: 14, textAlign: "center" }}>
+        <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginBottom: 14, textAlign: "center" }}>
           接続したテキストカード（プロンプト）→ 画像（PNG実身）。プロンプト本体は実行時に渡ります。
         </div>
 
@@ -215,7 +215,7 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
         </div>
 
         {/* --- モディファイア（SD/SDXL 中心）。フィルタ流儀＝手持ちアセットから「選ぶ」。--- */}
-        <div style={{ fontSize: 12, color: "#8a93a8", margin: "12px 0 6px", borderTop: "1px solid #2a3145", paddingTop: 10 }}>
+        <div style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", margin: "12px 0 6px", borderTop: "1px solid var(--panel-border, #2a3145)", paddingTop: 10 }}>
           拡張（SD/SDXL）
         </div>
 
@@ -303,9 +303,10 @@ const overlay: React.CSSProperties = {
   justifyContent: "center",
   zIndex: 2000,
 };
+// 2026-07-06: テーマ追従（--panel-* 体系）。暗色固定（2026-06-26決定）は改訂。
 const panel: React.CSSProperties = {
-  background: "#1c2130",
-  border: "1px solid #38445e",
+  background: "var(--panel-bg, #1c2130)",
+  border: "1px solid var(--panel-border, #38445e)",
   borderRadius: 10,
   padding: 20,
   width: 520,
@@ -313,17 +314,17 @@ const panel: React.CSSProperties = {
   overflowY: "auto",
   boxShadow: "0 8px 32px #000000aa",
   fontFamily: "sans-serif",
-  color: "#d6dded",
+  color: "var(--panel-text, #d6dded)",
   fontSize: 13,
   lineHeight: 1.6,
 };
 const row: React.CSSProperties = { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 };
-const lab: React.CSSProperties = { width: 84, color: "#9aa3b8", flexShrink: 0 };
+const lab: React.CSSProperties = { width: 84, color: "var(--panel-muted, #9aa3b8)", flexShrink: 0 };
 const inp: React.CSSProperties = {
   flex: 1,
-  background: "#0f1420",
-  color: "#d6dded",
-  border: "1px solid #38445e",
+  background: "var(--panel-input-bg, #0f1420)",
+  color: "var(--panel-text, #d6dded)",
+  border: "1px solid var(--panel-border, #38445e)",
   borderRadius: 6,
   padding: "6px 8px",
   fontSize: 12,
@@ -333,11 +334,11 @@ const inp: React.CSSProperties = {
 // 数値セル（ラベル上・入力下）。flex:1 + minWidth:0 で等幅に縮み、横あふれしない。
 const cellRow: React.CSSProperties = { display: "flex", gap: 8, marginBottom: 8 };
 const cell: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 3, flex: 1, minWidth: 0 };
-const cellLab: React.CSSProperties = { fontSize: 11, color: "#9aa3b8" };
+const cellLab: React.CSSProperties = { fontSize: 11, color: "var(--panel-muted, #9aa3b8)" };
 const cellInp: React.CSSProperties = {
-  background: "#0f1420",
-  color: "#d6dded",
-  border: "1px solid #38445e",
+  background: "var(--panel-input-bg, #0f1420)",
+  color: "var(--panel-text, #d6dded)",
+  border: "1px solid var(--panel-border, #38445e)",
   borderRadius: 6,
   padding: "6px 8px",
   fontSize: 12,
@@ -345,7 +346,7 @@ const cellInp: React.CSSProperties = {
   minWidth: 0,
   boxSizing: "border-box",
 };
-const note: React.CSSProperties = { fontSize: 11, color: "#9aa3b8" };
+const note: React.CSSProperties = { fontSize: 11, color: "var(--panel-muted, #9aa3b8)" };
 const btn: React.CSSProperties = {
   background: "#3a6ea5",
   color: "#fff",

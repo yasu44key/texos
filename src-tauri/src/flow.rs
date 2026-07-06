@@ -60,6 +60,12 @@ pub struct FilterSpec {
     /// 対話ウィンドウを detached で開き、cmd（一行目のコマンド・{in}可）を実行して継続する。
     #[serde(default)]
     pub shell: Option<String>,
+    /// シェルカード統合（2026-07-06）: ウィンドウモード。"keep"（既定・実行後も開いたまま
+    /// = cmd /K・powershell -NoExit）| "close"（ウィンドウで実行して閉じる）|
+    /// "hidden"（ウィンドウなし・stdout/stderr を捕捉して結果パネルに表示）。
+    /// 未指定は "keep"（既存カードの挙動を変えない）。
+    #[serde(default)]
+    pub window: Option<String>,
     // --- v1.4.0 AIフィルタ（builtin:"ai"）。デュアルプロバイダ設計 ---
     /// "ollama"（既定・ネイティブ /api/chat）| "openai"（OpenAI準拠 /v1/chat/completions）
     #[serde(default)]
@@ -1558,6 +1564,21 @@ mod tests {
     fn is_shell_detection() {
         assert!(spec(r#"{"shell":"cmd"}"#).is_shell());
         assert!(!spec(r#"{"cmd":"sort"}"#).is_shell());
+    }
+
+    /// シェルカード統合（2026-07-06）: window モードのパースと後方互換
+    /// （旧カード＝window 無しは None → run_flow 側で "keep" 扱い）。
+    #[test]
+    fn shell_window_mode_parse() {
+        assert_eq!(spec(r#"{"shell":"cmd"}"#).window, None);
+        assert_eq!(
+            spec(r#"{"shell":"powershell","window":"hidden"}"#).window.as_deref(),
+            Some("hidden")
+        );
+        assert_eq!(
+            spec(r#"{"shell":"cmd","window":"close"}"#).window.as_deref(),
+            Some("close")
+        );
     }
 
     /// §4.1 run_external_full が非0終了コードを「捨てずに」持ち上げること。
