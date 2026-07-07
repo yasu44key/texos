@@ -90,8 +90,20 @@ pub(crate) fn ai_ollama_status(endpoint: Option<String>) -> OllamaStatus {
 }
 
 /// winget で Ollama を自動インストール（Windows）。長時間ブロックする。
+/// v1.5.2 WS-C: 台帳ジョブ化（パネルに出る・二重起動拒否）。winget はプロセス wait 型
+/// なので中断は非対応（ベストエフォート方針）。
 #[tauri::command(async)]
-pub(crate) fn ai_install_ollama() -> Result<(), String> {
+pub(crate) fn ai_install_ollama(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let app = window.app_handle().clone();
+    run_setup_job(state.inner(), &app, "Ollama 導入", |_job| {
+        ai_install_ollama_body()
+    })
+}
+
+fn ai_install_ollama_body() -> Result<(), String> {
     if !has_winget() {
         return Err(
             "winget が無いため自動インストールできません。ダウンロードページから入れてください"
@@ -146,9 +158,12 @@ pub(crate) fn ai_start_ollama() -> Result<(), String> {
 }
 
 /// モデルを取得（既定 gemma3）。/api/pull の進捗を "ollama-pull" イベントで配信。
+/// v1.5.2 WS-C: 台帳ジョブ化＝job:* も配信・ストリーム行ごとに中断可能（Ollama サーバ側の
+/// DL はレジューム可能なので中断はポーリング打ち切りで足りる）。
 #[tauri::command(async)]
 pub(crate) fn ai_pull_model(
     window: tauri::WebviewWindow,
+    state: State<AppState>,
     model: String,
     endpoint: Option<String>,
 ) -> Result<(), String> {
@@ -160,6 +175,11 @@ pub(crate) fn ai_pull_model(
         model.trim().to_string()
     };
     let app = window.app_handle().clone();
+    run_setup_job(
+        state.inner(),
+        &app,
+        &format!("AIモデル取得（{model}）"),
+        |job| {
     std::thread::scope(|s| {
         s.spawn(|| {
             let client = reqwest::blocking::Client::builder()
@@ -174,6 +194,9 @@ pub(crate) fn ai_pull_model(
                 return Err(format!("モデル取得に失敗 ({})", resp.status()));
             }
             for line in std::io::BufReader::new(resp).lines() {
+                if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("中断されました".into());
+                }
                 let line = line.map_err(|e| format!("取得ストリーム読み取り失敗: {e}"))?;
                 let line = line.trim();
                 if line.is_empty() {
@@ -195,6 +218,7 @@ pub(crate) fn ai_pull_model(
                         "ollama-pull",
                         serde_json::json!({ "status": status, "percent": percent }),
                     );
+                    emit_job_progress(&app, job, None, Some(percent));
                 }
             }
             Ok::<(), String>(())
@@ -202,6 +226,8 @@ pub(crate) fn ai_pull_model(
         .join()
         .map_err(|_| "取得スレッドが異常終了しました".to_string())?
     })
+        },
+    )
 }
 
 /// ストリーミング中断（停止ボタン）。DB ロックを取らないので即座に効く。

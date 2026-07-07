@@ -3,7 +3,11 @@ use std::path::Path;
 
 pub fn open(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // v1.5.2 WS-C: ジョブごとの専用接続（並行フロー＋UI接続）が同じ DB へ書くため、
+    // 書き込みロック競合は SQLite 側で待たせる（WAL は既存＝読みは並行可）。
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+    )?;
     // v1.4.17 カード統一 §1: 付箋(notes)→virtual_bodies(kind='note') の一括変換を行う前に、
     // 変換対象がある DB だけ丸ごとバックアップ（.texos/backup/）。コストほぼゼロの保険。
     backup_before_note_unify(&conn, db_path);

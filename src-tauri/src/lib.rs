@@ -28,16 +28,36 @@ pub struct AppState {
     pub app_data: PathBuf,
     /// v1.5.1 WS-B ジョブレジストリ（凍結仕様 §12.B）: 旧 singleton
     /// （flow_cancel / chat_cancel / rec_stdin / flow_running）を JobId キーの台帳へ移送。
-    /// 中断フラグ・stdin 制御はジョブ別、多重起動判定は「台帳に Flow が居るか」。
+    /// 中断フラグ・stdin 制御はジョブ別。v1.5.2 WS-C: 多重起動判定は「同一終端カードの
+    /// Flow が居るか」へ精密化（並行解禁）。
     pub jobs: Jobs,
+    /// v1.5.2 WS-C 資源セマフォ（凍結仕様 §6）: heavy（外部プロセス並行上限・FIFO待ち）／
+    /// ai（エンドポイント単位・既定1・即拒否）／device（入力デバイス単位・排他・即拒否）。
+    pub resources: ResourceLimits,
+    /// v1.5.2 WS-C（凍結 §11.4）: プロジェクトルート単位の採番ロック。並行フローが同一
+    /// プロジェクトへ materialize するとき、固定名照合と prefix 連番（seq）の採番を直列化する。
+    pub write_locks: Mutex<std::collections::HashMap<String, std::sync::Arc<Mutex<()>>>>,
     /// v1.5 Text-To-Image: TexoS が起動・管理する diffusers 常駐デーモン（t2i_server.py）の
     /// 子プロセスハンドル。t2i_stop_server で明示停止できるよう保持する。
     pub t2i_server: Mutex<Option<std::process::Child>>,
 }
+
+/// プロジェクトルート単位の書き込み直列化ロックを取得（無ければ作る）。
+pub(crate) fn project_write_lock(state: &AppState, root: &Path) -> std::sync::Arc<Mutex<()>> {
+    let key = root.to_string_lossy().into_owned();
+    state
+        .write_locks
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
+}
 // --- v1.5.1 WS-B ジョブレジストリ（凍結仕様 §12.B・実装指示書 WS-B）--------------------
 // singleton（同時1つを物理強制する AppState フィールド群）を JobId キーの台帳へ置き換える
 // ＝中央 kill スイッチ（cancel_all）の獲得・WS-C 並行解禁の土台。ジョブは揮発（凍結 §11.5・
-// 永続化しない）。WS-B の間の同時実行ルールは従来同等: Flow 同時1・Chat 単一・相互並行可。
+// 永続化しない）。v1.5.2 WS-C: 並行解禁＝Flow の排他は「同一終端カード」だけに縮小し、
+// 調停は資源セマフォ（ResourceLimits）が担う。セットアップ系（モデルDL等）も台帳に乗る。
 
 pub type JobId = u64;
 
@@ -46,13 +66,18 @@ pub type JobId = u64;
 pub enum JobKind {
     Flow,
     Chat,
+    /// v1.5.2 WS-C: セットアップ系（whisper/ollama/t2i のDL・uv 環境構築）。
+    /// プロジェクト非依存（app_data へ書く）なので project_root は空のまま。
+    Setup,
 }
 
 pub struct Job {
     pub id: JobId,
     pub kind: JobKind,
-    /// 表示用ラベル。登録はカード読み出し前（ロック前拒否のため）なので後から確定する。
-    pub label: Mutex<String>,
+    /// 表示用ラベル。WS-C から登録前にカードを読むため登録時に確定する。
+    pub label: String,
+    /// Flow の終端カード id（同一フロー多重起動の拒否キー・パネルの spec 参照用）。
+    pub card: Option<String>,
     pub started_at: i64,
     /// 中断フラグ（UIの中断ボタン → break_flow / cancel_all）。run_flow が DB の Mutex を
     /// 握っている間も break_flow はこれだけを触るので外部コマンドがストールしてもブレイクできる。
@@ -60,17 +85,24 @@ pub struct Job {
     /// 子プロセス stdin チャネル（v1.4.9 の rec_stdin のジョブ別版）: 実行中フィルタ
     /// （録音など record モード）の stdin 書き込み端。flow_send_stdin が 'q' 等を書く。
     pub control: flow::StdinSlot,
-    /// 起動元プロジェクト。WS-B では**束縛の形だけ**（記録のみ・検査/撤廃は WS-C）。
-    pub project_root: Mutex<String>,
+    /// 起動元プロジェクト（WS-C: ジョブ専用 DB 接続の root＝materialize の行き先）。
+    /// セットアップ系は空（プロジェクト非依存）。
+    pub project_root: String,
+    /// t2i 生成の HTTP を投げている間だけ true。break_flow がデーモンへ /cancel を送るか
+    /// の判定（並行時に他ジョブの生成を誤って止めない）。
+    pub t2i_active: std::sync::atomic::AtomicBool,
+    /// job:progress のスロットル（~10/s・凍結 §11.6）用の最終 emit 時刻。
+    pub progress_at: Mutex<std::time::Instant>,
 }
 
-/// list_jobs の返却行（WS-C 背景ジョブパネルの土台。WS-B の UI は未使用）。
+/// list_jobs の返却行（背景ジョブパネルの復元用）。
 #[derive(Serialize)]
 pub struct JobInfo {
     pub id: JobId,
     pub kind: JobKind,
     pub label: String,
     pub started_at: i64,
+    pub card: Option<String>,
 }
 
 pub struct Jobs {
@@ -85,36 +117,66 @@ impl Jobs {
             map: Mutex::new(std::collections::HashMap::new()),
         }
     }
-    fn make_job(&self, kind: JobKind, label: &str) -> std::sync::Arc<Job> {
+    fn make_job(
+        &self,
+        kind: JobKind,
+        label: &str,
+        card: Option<&str>,
+        project_root: &str,
+    ) -> std::sync::Arc<Job> {
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::sync::Arc::new(Job {
             id,
             kind,
-            label: Mutex::new(label.to_string()),
+            label: label.to_string(),
+            card: card.map(str::to_string),
             started_at: db::now_ms(),
             cancel: std::sync::atomic::AtomicBool::new(false),
             control: Mutex::new(None),
-            project_root: Mutex::new(String::new()),
+            project_root: project_root.to_string(),
+            t2i_active: std::sync::atomic::AtomicBool::new(false),
+            progress_at: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)),
         })
     }
-    /// 登録（排他なし）。Chat 用 — 現状 UI はチャットを直列に使うため物理ガードは要らない。
-    pub fn register(&self, kind: JobKind, label: &str) -> std::sync::Arc<Job> {
-        let job = self.make_job(kind, label);
+    /// Chat の登録（排他なし — 同一エンドポイントの同時実行は ai セマフォが拒否する）。
+    pub fn register_chat(&self, label: &str, project_root: &str) -> std::sync::Arc<Job> {
+        let job = self.make_job(JobKind::Chat, label, None, project_root);
         self.map.lock().unwrap().insert(job.id, job.clone());
         job
     }
-    /// Flow の登録（WS-B は従来同等＝同時1）。台帳に Flow ジョブが居れば登録せず従来文言で
-    /// 即拒否する。台帳ロックは短く、state.current（DB）をロックする**前**に弾くのが要点
-    /// — ここで待つと録音中フローの裏で実行が積み上がる（v1.4.10 の教訓）。
-    pub fn register_flow_exclusive(&self, label: &str) -> Result<std::sync::Arc<Job>, String> {
+    /// Flow の登録（WS-C 並行解禁）: 排他は**同一終端カード**の Flow だけ（v1.4.10 再入
+    /// エラーの一般化）。別フローは並行し、資源の取り合いはセマフォが調停する。
+    pub fn register_flow(
+        &self,
+        card: &str,
+        label: &str,
+        project_root: &str,
+    ) -> Result<std::sync::Arc<Job>, String> {
         let mut map = self.map.lock().unwrap();
-        if map.values().any(|j| j.kind == JobKind::Flow) {
+        if map
+            .values()
+            .any(|j| j.kind == JobKind::Flow && j.card.as_deref() == Some(card))
+        {
             return Err(
-                "ほかのフローを実行中です。完了（録音は「停止」）してからもう一度実行してください"
+                "このフローは実行中です。完了（録音は「停止」）してからもう一度実行してください"
                     .into(),
             );
         }
-        let job = self.make_job(JobKind::Flow, label);
+        let job = self.make_job(JobKind::Flow, label, Some(card), project_root);
+        map.insert(job.id, job.clone());
+        Ok(job)
+    }
+    /// セットアップ系の登録（WS-C）: 同一ラベルの Setup が実行中なら二重起動を拒否する
+    /// （同じモデルの二重DLなど）。別コンポーネントの並行導入は許す。
+    pub fn register_setup(&self, label: &str) -> Result<std::sync::Arc<Job>, String> {
+        let mut map = self.map.lock().unwrap();
+        if map
+            .values()
+            .any(|j| j.kind == JobKind::Setup && j.label == label)
+        {
+            return Err(format!("「{label}」は既に実行中です"));
+        }
+        let job = self.make_job(JobKind::Setup, label, None, "");
         map.insert(job.id, job.clone());
         Ok(job)
     }
@@ -124,8 +186,13 @@ impl Jobs {
     pub fn remove(&self, id: JobId) {
         self.map.lock().unwrap().remove(&id);
     }
-    pub fn any_flow(&self) -> bool {
-        self.map.lock().unwrap().values().any(|j| j.kind == JobKind::Flow)
+    /// 指定プロジェクトに束縛された実行中ジョブがあるか（send_selection の保護用）。
+    pub fn any_bound_to(&self, root: &str) -> bool {
+        self.map
+            .lock()
+            .unwrap()
+            .values()
+            .any(|j| !j.project_root.is_empty() && j.project_root == root)
     }
     /// 中央 kill スイッチ（安全設計 §6.3）: 全ジョブの cancel を立てる。子プロセスの
     /// 物理停止は各実行系の監視ループ（taskkill /T＝既存流用）が担う。
@@ -151,13 +218,220 @@ impl Jobs {
             .map(|j| JobInfo {
                 id: j.id,
                 kind: j.kind,
-                label: j.label.lock().unwrap().clone(),
+                label: j.label.clone(),
                 started_at: j.started_at,
+                card: j.card.clone(),
             })
             .collect();
         v.sort_by_key(|j| j.id);
         v
     }
+}
+
+/// job:progress の emit（凍結 §7.2/§11.6）。percent 連打はジョブ別に ~10/s へスロットル。
+/// note（ノード名・順番待ち等）は低頻度なので素通しし、最終 emit 時刻だけ更新する。
+pub(crate) fn emit_job_progress(
+    app: &tauri::AppHandle,
+    job: &Job,
+    note: Option<&str>,
+    percent: Option<u32>,
+) {
+    use tauri::Emitter;
+    {
+        let mut last = job.progress_at.lock().unwrap();
+        let now = std::time::Instant::now();
+        if note.is_none()
+            && now.duration_since(*last) < std::time::Duration::from_millis(100)
+            && percent != Some(100)
+        {
+            return;
+        }
+        *last = now;
+    }
+    let _ = app.emit(
+        "job:progress",
+        serde_json::json!({ "job_id": job.id, "note": note, "percent": percent }),
+    );
+}
+
+// --- v1.5.2 WS-C 資源セマフォ（凍結仕様 §6・§11.2〜11.3）------------------------------
+// 「安全のための上限（ヒューズ）と資源保護のための上限は同じ機構」。permit は RAII
+// （Drop で解放）。取得順序は device→ai→heavy に固定（§12.D デッドロック防止）。
+// ノードは実行中しか permit を持たない（収集フェーズの pull 再帰では持たない）ため
+// 入れ子保持は発生しない。
+
+/// チケット制の公平（FIFO）カウンティングセマフォ。std に Semaphore が無いので
+/// Mutex＋Condvar で自前実装する（tokio 非依存・待機は 200ms 刻みで cancel を検査）。
+pub struct FairSemaphore {
+    permits: usize,
+    state: Mutex<SemState>,
+    cv: std::sync::Condvar,
+}
+
+struct SemState {
+    active: usize,
+    queue: std::collections::VecDeque<u64>,
+    next_ticket: u64,
+}
+
+pub struct Permit {
+    sem: std::sync::Arc<FairSemaphore>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut st = self.sem.state.lock().unwrap();
+        st.active -= 1;
+        drop(st);
+        self.sem.cv.notify_all();
+    }
+}
+
+impl FairSemaphore {
+    pub fn new(permits: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(FairSemaphore {
+            permits: permits.max(1),
+            state: Mutex::new(SemState {
+                active: 0,
+                queue: std::collections::VecDeque::new(),
+                next_ticket: 0,
+            }),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+
+    /// 即時取得（排他資源＝device/ai 用）。取れなければ None（呼び出し側が拒否＋案内）。
+    pub fn try_acquire(self: &std::sync::Arc<Self>) -> Option<Permit> {
+        let mut st = self.state.lock().unwrap();
+        if st.active < self.permits && st.queue.is_empty() {
+            st.active += 1;
+            Some(Permit { sem: self.clone() })
+        } else {
+            None
+        }
+    }
+
+    /// FIFO 待ち取得（heavy 用）。待ちに入るとき `on_wait` を1回呼ぶ（UI へ「順番待ち」）。
+    /// 待機中も cancel（中断ボタン/Stop-all）が効く。
+    pub fn acquire(
+        self: &std::sync::Arc<Self>,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_wait: impl FnOnce(),
+    ) -> Result<Permit, String> {
+        use std::sync::atomic::Ordering;
+        let my;
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.active < self.permits && st.queue.is_empty() {
+                st.active += 1;
+                return Ok(Permit { sem: self.clone() });
+            }
+            my = st.next_ticket;
+            st.next_ticket += 1;
+            st.queue.push_back(my);
+        }
+        on_wait();
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                st.queue.retain(|&t| t != my);
+                drop(st);
+                self.cv.notify_all();
+                return Err("中断されました".into());
+            }
+            if st.queue.front() == Some(&my) && st.active < self.permits {
+                st.queue.pop_front();
+                st.active += 1;
+                drop(st);
+                self.cv.notify_all();
+                return Ok(Permit { sem: self.clone() });
+            }
+            let (g, _) = self
+                .cv
+                .wait_timeout(st, std::time::Duration::from_millis(200))
+                .unwrap();
+            st = g;
+        }
+    }
+}
+
+/// 資源クラス別のセマフォ台帳（凍結 §6）。
+pub struct ResourceLimits {
+    /// 重い外部プロセスの並行上限（既定=論理コア数・下限2）。超過は FIFO 待ち。
+    pub heavy: std::sync::Arc<FairSemaphore>,
+    /// AI エンドポイント単位（正規化 URL キー・既定許可数1）。超過は即拒否。
+    ai: Mutex<std::collections::HashMap<String, std::sync::Arc<FairSemaphore>>>,
+    /// 入力デバイス単位（排他=1）。超過は即拒否。
+    device: Mutex<std::collections::HashMap<String, std::sync::Arc<FairSemaphore>>>,
+}
+
+impl ResourceLimits {
+    pub fn new() -> Self {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(2);
+        ResourceLimits {
+            heavy: FairSemaphore::new(n),
+            ai: Mutex::new(std::collections::HashMap::new()),
+            device: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+    /// エンドポイントのセマフォ（無ければ許可数1で作る）。key は正規化済み URL を渡すこと。
+    pub fn ai_sem(&self, endpoint_norm: &str) -> std::sync::Arc<FairSemaphore> {
+        self.ai
+            .lock()
+            .unwrap()
+            .entry(endpoint_norm.to_string())
+            .or_insert_with(|| FairSemaphore::new(1))
+            .clone()
+    }
+    pub fn device_sem(&self, name: &str) -> std::sync::Arc<FairSemaphore> {
+        self.device
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_insert_with(|| FairSemaphore::new(1))
+            .clone()
+    }
+}
+
+/// AI エンドポイントの同一性（凍結 §11.3）: trim・スキーム/ホスト部を小文字化・末尾 '/' 除去。
+pub(crate) fn normalize_endpoint(url: &str) -> String {
+    let s = url.trim().trim_end_matches('/');
+    match s.find("://") {
+        Some(i) => {
+            // スキームとホスト（最初のパス区切りまで）を小文字化。パスは大小を保つ。
+            let after = &s[i + 3..];
+            let host_end = after.find('/').map(|j| i + 3 + j).unwrap_or(s.len());
+            format!("{}{}", s[..host_end].to_lowercase(), &s[host_end..])
+        }
+        None => s.to_lowercase(),
+    }
+}
+
+/// v1.5.2 WS-C: セットアップ系コマンド（モデルDL・環境構築）を台帳ジョブとして走らせる
+/// 共通ラッパ。登録（同一ラベルは二重起動拒否）→ job:started → 本体 → job:done/failed。
+/// 本体クロージャは Job を受け取り、DL ループ等で job.cancel を検査して中断に応える。
+pub(crate) fn run_setup_job<T>(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    label: &str,
+    f: impl FnOnce(&Job) -> Result<T, String>,
+) -> Result<T, String> {
+    use tauri::Emitter;
+    let job = state.jobs.register_setup(label)?;
+    let _guard = JobGuard::new(&state.jobs, job.id);
+    let _ = app.emit(
+        "job:started",
+        serde_json::json!({ "job_id": job.id, "kind": "setup", "label": label }),
+    );
+    let result = f(&job);
+    let _ = app.emit(
+        if result.is_ok() { "job:done" } else { "job:failed" },
+        serde_json::json!({ "job_id": job.id }),
+    );
+    result
 }
 
 /// ジョブの台帳からの確実な除去。drop で remove する（早期 return / panic / `?` の
@@ -190,16 +464,24 @@ fn with_db<T>(
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     f(p)
 }
-/// v1.4.11: フロー実行中はプロジェクト切替を拒否する。非ブロッキング実行では run_flow が
-/// 実行中に DB ロックを手放すため、途中で current が別プロジェクトに差し替わると、評価や
-/// 結果の書き込みが別プロジェクトに当たって壊れる。切替系コマンドの入口でこれを弾く。
-/// v1.5.1 WS-B: 判定を「台帳に Flow ジョブが存在するか」に置換（呼び出し側の挙動不変。
-/// 撤廃＝ジョブの起動元プロジェクト束縛は WS-C）。
-fn ensure_no_flow_running(state: &AppState) -> Result<(), String> {
-    if state.jobs.any_flow() {
-        return Err(
-            "フロー実行中はプロジェクトを切り替えられません（完了／録音は「停止」してから）".into(),
-        );
+/// v1.5.2 WS-C: プロジェクト切替ガードは撤廃（ジョブは起動元プロジェクトへの専用 DB 接続で
+/// 束縛される＝切替しても評価・materialize は起動元へ当たる）。残るのは**構造を壊す操作**の
+/// 保護だけ: send_selection_to_project（カードの移動・実ファイルの持ち出し）は、現在の
+/// プロジェクトに束縛された実行中ジョブがある間は拒否する。
+fn ensure_no_jobs_bound_to_current(state: &AppState) -> Result<(), String> {
+    let root: Option<String> = state
+        .current
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|p| p.root.to_string_lossy().into_owned());
+    if let Some(root) = root {
+        if state.jobs.any_bound_to(&root) {
+            return Err(
+                "このプロジェクトで実行中のジョブがあります。完了か中断（録音は「停止」）してから実行してください"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
@@ -350,6 +632,8 @@ pub fn run() {
                 current: Mutex::new(current),
                 app_data: app_dir,
                 jobs: Jobs::new(),
+                resources: ResourceLimits::new(),
+                write_locks: Mutex::new(std::collections::HashMap::new()),
                 t2i_server: std::sync::Mutex::new(None),
             });
             Ok(())
@@ -522,6 +806,112 @@ mod text_decode_tests {
         assert_eq!(enc, "UTF-16LE");
     }
 }
+#[cfg(test)]
+mod ws_c_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 同一終端カードの Flow は拒否・別カードは並行登録できる（WS-C 並行解禁の要）。
+    #[test]
+    fn register_flow_rejects_same_card_only() {
+        let jobs = Jobs::new();
+        let a = jobs.register_flow("card-A", "フローA", "C:\\prj").unwrap();
+        assert!(jobs.register_flow("card-A", "フローA", "C:\\prj").is_err());
+        let b = jobs.register_flow("card-B", "フローB", "C:\\prj").unwrap();
+        // 完了（台帳から除去）すれば同じカードを再実行できる。
+        jobs.remove(a.id);
+        assert!(jobs.register_flow("card-A", "フローA", "C:\\prj").is_ok());
+        jobs.remove(b.id);
+    }
+
+    /// セットアップは同一ラベルだけ二重起動拒否（別コンポーネントの並行導入は可）。
+    #[test]
+    fn register_setup_rejects_same_label() {
+        let jobs = Jobs::new();
+        let _a = jobs.register_setup("Whisper 導入").unwrap();
+        assert!(jobs.register_setup("Whisper 導入").is_err());
+        assert!(jobs.register_setup("Ollama 導入").is_ok());
+    }
+
+    /// any_bound_to は project_root 一致だけを見る（セットアップ系＝空は束縛なし扱い）。
+    #[test]
+    fn any_bound_to_matches_project_root() {
+        let jobs = Jobs::new();
+        let _f = jobs.register_flow("c1", "f", "C:\\prjA").unwrap();
+        let _s = jobs.register_setup("DL").unwrap();
+        assert!(jobs.any_bound_to("C:\\prjA"));
+        assert!(!jobs.any_bound_to("C:\\prjB"));
+        assert!(!jobs.any_bound_to(""));
+    }
+
+    /// 排他資源（permits=1）: try_acquire は2つ目を拒否し、Drop で解放される。
+    #[test]
+    fn fair_semaphore_exclusive_try_acquire() {
+        let sem = FairSemaphore::new(1);
+        let p1 = sem.try_acquire().expect("1つ目は取れる");
+        assert!(sem.try_acquire().is_none(), "2つ目は拒否");
+        drop(p1);
+        assert!(sem.try_acquire().is_some(), "解放後は取れる");
+    }
+
+    /// heavy（FIFO待ち）: 上限まで並行し、待っている取得は解放後に通る。
+    #[test]
+    fn fair_semaphore_waits_fifo() {
+        let sem = FairSemaphore::new(2);
+        let cancel = AtomicBool::new(false);
+        let p1 = sem.acquire(&cancel, || {}).unwrap();
+        let _p2 = sem.acquire(&cancel, || {}).unwrap();
+        // 3つ目は待ちになる → 別スレッドで p1 を解放すると通る。
+        let waited = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _p3 = sem
+                    .acquire(&cancel, || waited.store(true, Ordering::Relaxed))
+                    .unwrap();
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(p1);
+        });
+        assert!(waited.load(Ordering::Relaxed), "3つ目は一度待ちに入った");
+    }
+
+    /// 待機中の中断: cancel が立つと acquire はエラーで抜ける（Stop-all が待ち行列にも効く）。
+    #[test]
+    fn fair_semaphore_wait_cancellable() {
+        let sem = FairSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let _p1 = sem.acquire(&cancel, || {}).unwrap();
+        std::thread::scope(|s| {
+            let h = s.spawn(|| sem.acquire(&cancel, || {}));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cancel.store(true, Ordering::Relaxed);
+            let r = h.join().unwrap();
+            assert!(r.is_err(), "中断でエラー復帰");
+        });
+        // 中断した待ちがキューに残らない（次の try_acquire を邪魔しない）。
+        cancel.store(false, Ordering::Relaxed);
+        drop(_p1);
+        assert!(sem.try_acquire().is_some());
+    }
+
+    /// エンドポイント正規化（凍結 §11.3）: trim・ホスト小文字・末尾 '/' 除去。パスは大小保持。
+    #[test]
+    fn endpoint_normalization() {
+        assert_eq!(
+            normalize_endpoint(" HTTP://LocalHost:11434/ "),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            normalize_endpoint("http://Host:1234/V1"),
+            "http://host:1234/V1"
+        );
+        assert_eq!(
+            normalize_endpoint("http://localhost:11434"),
+            normalize_endpoint("http://localhost:11434/")
+        );
+    }
+}
+
 #[cfg(test)]
 mod gc_tests {
     use super::*;

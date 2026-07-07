@@ -92,7 +92,7 @@ pub(crate) fn add_recent(app_data: &Path, path: &str) {
 /// Create a new project rooted at `path` (folder is created if missing).
 #[tauri::command]
 pub(crate) fn new_project(path: String, state: State<AppState>) -> Result<ProjectInfo, String> {
-    ensure_no_flow_running(state.inner())?;
+    // v1.5.2 WS-C: 切替ガード撤廃（実行中ジョブは起動元プロジェクトへの専用接続で束縛済み）。
     let root = PathBuf::from(&path);
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let project = open_project_at(&root)?;
@@ -105,7 +105,7 @@ pub(crate) fn new_project(path: String, state: State<AppState>) -> Result<Projec
 /// Open an existing TexoS project folder.
 #[tauri::command]
 pub(crate) fn open_project(path: String, state: State<AppState>) -> Result<ProjectInfo, String> {
-    ensure_no_flow_running(state.inner())?;
+    // v1.5.2 WS-C: 切替ガード撤廃（同上）。
     let root = PathBuf::from(&path);
     if !texos_dir(&root).join("texos.db").exists() {
         return Err("このフォルダはTexoSプロジェクトではありません".into());
@@ -657,7 +657,7 @@ pub(crate) fn update_url(id: String, url: String, state: State<AppState>) -> Res
 /// Open the project referenced by a project-object 仮身 (navigation).
 #[tauri::command]
 pub(crate) fn open_project_object(id: String, state: State<AppState>) -> Result<ProjectInfo, String> {
-    ensure_no_flow_running(state.inner())?;
+    // v1.5.2 WS-C: 切替ガード撤廃（同上）。
     let target: String = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
@@ -691,7 +691,7 @@ pub(crate) fn open_origin_project(
     path: String,
     state: State<AppState>,
 ) -> Result<Option<ProjectInfo>, String> {
-    ensure_no_flow_running(state.inner())?;
+    // v1.5.2 WS-C: 切替ガード撤廃（同上）。
     let start = PathBuf::from(&path);
     let mut dir: Option<&Path> = if start.is_dir() {
         Some(start.as_path())

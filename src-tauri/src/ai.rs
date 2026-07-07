@@ -184,35 +184,36 @@ pub(crate) fn upsert_chat_log_card(
 /// 評価して結果を文脈にする（URL→取得→テキスト等のパイプライン結果も使える）。
 /// bytes+mime を保持して返すのでマルチモーダル（画像→image_url）への拡張は
 /// メッセージ組立側の分岐追加だけで済む。
+/// v1.5.2 WS-C: DB 接触はジョブ専用接続（p）。上流フィルタの評価は eval_filter が
+/// 資源セマフォを取得して走る（チャット自身の ai permit はストリーム時に別途取る）。
 pub(crate) fn collect_context(
     state: &AppState,
-    root: &Path,
+    app: &tauri::AppHandle,
+    p: &Project,
     ai_id: &str,
-    cancel: &std::sync::atomic::AtomicBool,
-    stdin_slot: &flow::StdinSlot,
+    job: &Job,
 ) -> Vec<FlowPayload> {
-    // 短ロック: 接続カードを取得（best-effort・失敗は空）。評価・読みはロック外。
-    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> =
-        with_db(state, |p| {
-            let mut stmt = p
-                .conn
-                .prepare(
-                    "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
-                     FROM relations rel
-                     JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
-                     JOIN real_bodies r ON r.id = v.real_id
-                     WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
-                     ORDER BY rel.created_at",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(rusqlite::params![ai_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
-                })
-                .map_err(|e| e.to_string())?;
-            Ok(rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    let cancel = &job.cancel;
+    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = (|| {
+        let mut stmt = p
+            .conn
+            .prepare(
+                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
+                 FROM relations rel
+                 JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                 JOIN real_bodies r ON r.id = v.real_id
+                 WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                 ORDER BY rel.created_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![ai_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(rows.filter_map(|r| r.ok()).collect())
+    })()
+    .unwrap_or_default();
 
     let mut out = Vec::new();
     let mut report = FlowReport {
@@ -229,19 +230,16 @@ pub(crate) fn collect_context(
             break;
         }
         if kind.as_deref() == Some("filter") {
-            if let Ok(v) = eval_filter(state, root, vid, &mut visited, &mut report, cancel, stdin_slot) {
+            if let Ok(v) = eval_filter(state, app, p, vid, &mut visited, &mut report, job) {
                 out.extend(v);
             }
         } else if real_id.starts_with("drop:") {
             continue;
         } else {
-            // 短ロック: 窓の今を解決。ファイル読みはロック外。
-            let path = match with_db(state, |p| {
+            // 窓の今を解決（ジョブ専用接続なのでロック不要）。
+            let path = {
                 refresh_origin_snapshot(p, vid);
-                Ok(resolve_view_path(p, vid, real_id))
-            }) {
-                Ok(path) => path,
-                Err(_) => continue,
+                resolve_view_path(p, vid, real_id)
             };
             if let Ok(d) = std::fs::read(&path) {
                 let stem = std::path::Path::new(vlabel)
@@ -345,20 +343,46 @@ pub(crate) fn ai_chat_send(
         Ok((spec, p.root.clone(), label))
     })?;
 
-    // v1.5.1 WS-B: チャットも Job 登録（Chat は単一運用のまま＝排他ガードなし）。中断は
-    // Job.cancel 経由。job:started の card=カードid で ChatPanel が自分の job_id を拾う。
-    let job = state.jobs.register(JobKind::Chat, &card_label);
+    // v1.5.1 WS-B: チャットも Job 登録。中断は Job.cancel 経由。job:started の card=カードid
+    // で ChatPanel が自分の job_id を拾う。v1.5.2 WS-C: 起動元プロジェクトに束縛（専用接続）。
+    // job:started を出した以上、どの離脱経路でも job:done/failed を必ず出す（パネルの行が
+    // 残らないように）→ 本体を inner に分け、emit は最後の1か所で行う。
+    let job = state
+        .jobs
+        .register_chat(&card_label, &root.to_string_lossy());
     let _guard = JobGuard::new(&state.jobs, job.id);
-    *job.project_root.lock().unwrap() = root.to_string_lossy().into_owned();
     let app = window.app_handle().clone();
     let _ = app.emit(
         "job:started",
         serde_json::json!({ "job_id": job.id, "kind": "chat", "label": card_label, "card": id }),
     );
+    let result = ai_chat_send_inner(&app, state.inner(), &job, &spec, &root, &id, &card_label, &message);
+    let _ = app.emit(
+        if result.is_ok() { "job:done" } else { "job:failed" },
+        serde_json::json!({ "job_id": job.id }),
+    );
+    result
+}
 
-    // v1.4.4 マルチコンテキスト: 接続カードを毎ターン収集（編集が即反映）。v1.4.11: ロック外で
-    // 評価する（上流にフィルタ連鎖があっても DB を握らない＝他操作が固まらない）。
-    let context = collect_context(state.inner(), &root, &id, &job.cancel, &job.control);
+#[allow(clippy::too_many_arguments)]
+fn ai_chat_send_inner(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    job: &Job,
+    spec: &flow::FilterSpec,
+    root: &Path,
+    id: &str,
+    card_label: &str,
+    message: &str,
+) -> Result<String, String> {
+    let id = id.to_string();
+    // v1.5.2 WS-C: ジョブ専用の DB 接続（起動元プロジェクト束縛）。文脈評価とログカードの
+    // 更新をこれで行う＝ストリーム中にプロジェクトを切り替えてもログは起動元へ書かれる。
+    let jp = open_project_at(root)?;
+
+    // v1.4.4 マルチコンテキスト: 接続カードを毎ターン収集（編集が即反映）。上流フィルタの
+    // 評価は資源セマフォに乗る（このジョブの permit 保持はノード実行中だけ）。
+    let context = collect_context(state, app, &jp, &id, job);
 
     let user = message.trim().to_string();
     if user.is_empty() {
@@ -429,6 +453,21 @@ pub(crate) fn ai_chat_send(
         }
     }
 
+    // v1.5.2 WS-C: エンドポイントの ai permit（既定1）をストリームの間だけ保持。文脈収集の
+    // **後**に取る — 上流に同一エンドポイントの AI ノードがいても自分の permit と衝突しない。
+    // 使用中は即拒否＋案内（凍結 §11.2。フロー AI ノードと相互排他）。
+    let ep_key = normalize_endpoint(&flow::effective_ai_endpoint(spec));
+    let ai_permit = state.resources.ai_sem(&ep_key).try_acquire().ok_or_else(|| {
+        let e = format!(
+            "AIエンドポイント（{ep_key}）は使用中です。実行中のAI処理の完了を待つか中断してください"
+        );
+        let _ = app.emit(
+            "ai-chat-done",
+            ChatDoneEvent { id: id.clone(), error: Some(e.clone()) },
+        );
+        e
+    })?;
+
     // ストリーミングは tokio 文脈外の素のOSスレッドで（run_ai と同じ理由）。
     // 中断フラグはこのジョブのもの（ジョブ別＝毎回新品なのでリセット不要）。
     let result = std::thread::scope(|s| {
@@ -442,11 +481,12 @@ pub(crate) fn ai_chat_send(
                     },
                 );
             };
-            flow::run_ai_chat_stream(&spec, &messages, &job.cancel, &mut on_token)
+            flow::run_ai_chat_stream(spec, &messages, &job.cancel, &mut on_token)
         })
         .join()
         .map_err(|_| "AI実行スレッドが異常終了しました".to_string())?
     });
+    drop(ai_permit);
 
     match result {
         Ok(answer) => {
@@ -454,17 +494,13 @@ pub(crate) fn ai_chat_send(
                 role: "assistant".into(),
                 content: answer.clone(),
             });
-            let _ = save_chat_history(&root, &id, &history);
+            let _ = save_chat_history(root, &id, &history);
             // MD実身ログを毎ターン自動更新（固定名上書き＝位置と矢印を保ち緑シグナル再誕生）。
+            // v1.5.2 WS-C: ジョブ専用接続で**起動元プロジェクトへ**書く（切替に影響されない）。
+            if let Err(e) =
+                upsert_chat_log_card(&jp, &id, card_label, spec.log_name.as_deref(), &history)
             {
-                let guard = state.current.lock().unwrap();
-                if let Some(p) = guard.as_ref() {
-                    if let Err(e) =
-                        upsert_chat_log_card(p, &id, &card_label, spec.log_name.as_deref(), &history)
-                    {
-                        eprintln!("チャットログ更新失敗: {e}");
-                    }
-                }
+                eprintln!("チャットログ更新失敗: {e}");
             }
             let _ = app.emit(
                 "ai-chat-done",
@@ -473,7 +509,6 @@ pub(crate) fn ai_chat_send(
                     error: None,
                 },
             );
-            let _ = app.emit("job:done", serde_json::json!({ "job_id": job.id }));
             Ok(answer)
         }
         Err(mut e) => {
@@ -489,7 +524,6 @@ pub(crate) fn ai_chat_send(
                     error: Some(e.clone()),
                 },
             );
-            let _ = app.emit("job:failed", serde_json::json!({ "job_id": job.id }));
             Err(e)
         }
     }

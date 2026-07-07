@@ -19,6 +19,7 @@ import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
 import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
 import { T2iSetupDialog, type T2iStatus } from "./ui/T2iSetupDialog";
+import { JobsPanel, type JobRow } from "./ui/JobsPanel";
 
 // v1.4.8 ①: Whisper 文字起こしカードの spec（外部コマンドフィルタ）。
 // whisper-cli は app_data 共有・絶対パス参照。-of {out_noext} が <base>.txt を書き {out} と一致。
@@ -139,19 +140,16 @@ function App() {
     allowEmpty?: boolean;
     onConfirm: (v: string) => void;
   } | null>(null);
-  // フロー実行中の表示と中断ボタン（外部コマンドのストール対策）
-  const [flowRunning, setFlowRunning] = useState(false);
-  // v1.4.10 二度押し抑止: 実行中の再入を同期的に弾くためのミラー（state は非同期更新で
-  // 連打に間に合わない）。バックエンド run_flow にも再入ガードがあるが、ここで先に止めて
-  // 「他のフロー実行中」エラーダイアログを出さない（録音ハングバグの UX 側修正）。
-  const flowRunningRef = useRef(false);
-  // v1.4.9: 実行中のカードが stdin 停止対応（record:true）かどうか。true のときだけ「停止」を出す
-  // （文字起こし等ふつうの実行で停止ボタンが出ると紛らわしいため）。stopCmdRun=送る文字（既定 q）。
-  const [recordingRun, setRecordingRun] = useState(false);
-  const [stopCmdRun, setStopCmdRun] = useState("q");
-  // v1.5.1 WS-B: 実行中フローの job_id（job:started で受領）。停止/中断コマンドに渡す。
-  // まだ届いていない瞬間の中断は cancel_all（中央 kill）へフォールバックする。
-  const flowJobIdRef = useRef<number | null>(null);
+  // v1.5.2 WS-C 背景ジョブパネル: 実行中ジョブの一覧（job:started/progress/done/failed で
+  // 更新・マウント時に list_jobs で復元）。旧「フロー実行中…」1行パネルの置き換え。
+  const [jobs, setJobs] = useState<JobRow[]>([]);
+  // v1.4.10 二度押し抑止の WS-C 版: 同一カードの▶連打を同期的に弾く（並行解禁後は
+  // カード単位。バックエンド register_flow も同一終端カードを拒否するが、ここで先に
+  // 止めてエラーダイアログを出さない）。
+  const runningCardsRef = useRef<Set<string>>(new Set());
+  // v1.5.2 WS-C: 実行完了時に「起動時と同じプロジェクトか」を判定するためのミラー
+  // （切替後に完了したフローの結果は起動元プロジェクトにあり、現キャンバスには無い）。
+  const projectPathRef = useRef<string | null>(null);
   // v1.5 外部プログラムフィルタの設定ダイアログ（作成 or 既存カードの編集）
   const [filterDlg, setFilterDlg] = useState<{
     x: number;
@@ -397,22 +395,91 @@ function App() {
     };
   }, [refresh]);
 
-  // v1.5.1 WS-B: job:started でフローの job_id を受領（停止/中断コマンドが対象を指せる）。
-  // WS-B はフロー同時1なので最後に受けた flow ジョブを保持すれば足りる（一覧パネルは WS-C）。
+  // v1.5.2 WS-C 背景ジョブパネル: job:* イベントで一覧を維持する。started で行を追加
+  // （flow は card から録音対応/停止コマンドを spec で引く）、progress で note/percent 更新、
+  // done/failed で行を除去。マウント時に list_jobs で復元（イベント欠落・リロード保険）。
   useEffect(() => {
     let alive = true;
-    let un: (() => void) | undefined;
-    listen<{ job_id: number; kind: string; label: string }>("job:started", (e) => {
-      if (e.payload.kind === "flow") flowJobIdRef.current = e.payload.job_id;
-    }).then((u) => {
-      if (alive) un = u;
-      else u();
-    });
+    const uns: (() => void)[] = [];
+    const recordOf = (card?: string) => {
+      const obj = card ? objectsRef.current.find((o) => o.id === card) : undefined;
+      if (!obj?.filter_ref) return { record: false, stopCmd: "q" };
+      try {
+        const s = JSON.parse(obj.filter_ref);
+        return {
+          record: !!s.record,
+          stopCmd: typeof s.stop_cmd === "string" && s.stop_cmd ? s.stop_cmd : "q",
+        };
+      } catch {
+        return { record: false, stopCmd: "q" };
+      }
+    };
+    void listen<{ job_id: number; kind: string; label: string; card?: string }>(
+      "job:started",
+      (e) => {
+        const { record, stopCmd } = recordOf(e.payload.card);
+        setJobs((prev) => [
+          ...prev.filter((j) => j.id !== e.payload.job_id),
+          {
+            id: e.payload.job_id,
+            kind: e.payload.kind,
+            label: e.payload.label,
+            startedAt: Date.now(),
+            record,
+            stopCmd,
+          },
+        ]);
+      }
+    ).then((u) => (alive ? uns.push(u) : u()));
+    void listen<{ job_id: number; note?: string; percent?: number }>("job:progress", (e) => {
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.id === e.payload.job_id
+            ? { ...j, note: e.payload.note ?? j.note, percent: e.payload.percent ?? j.percent }
+            : j
+        )
+      );
+    }).then((u) => (alive ? uns.push(u) : u()));
+    for (const ev of ["job:done", "job:failed"]) {
+      void listen<{ job_id: number }>(ev, (e) => {
+        setJobs((prev) => prev.filter((j) => j.id !== e.payload.job_id));
+      }).then((u) => (alive ? uns.push(u) : u()));
+    }
+    // 復元（リロード時など。started_at はバックエンドの unix ms をそのまま使う）。
+    void invoke<{ id: number; kind: string; label: string; started_at: number; card?: string }[]>(
+      "list_jobs"
+    )
+      .then((rows) => {
+        if (!alive || rows.length === 0) return;
+        setJobs((prev) => {
+          const known = new Set(prev.map((j) => j.id));
+          const add = rows
+            .filter((r) => !known.has(r.id))
+            .map((r) => {
+              const { record, stopCmd } = recordOf(r.card ?? undefined);
+              return {
+                id: r.id,
+                kind: r.kind,
+                label: r.label,
+                startedAt: r.started_at,
+                record,
+                stopCmd,
+              };
+            });
+          return add.length ? [...prev, ...add] : prev;
+        });
+      })
+      .catch(() => {});
     return () => {
       alive = false;
-      un?.();
+      for (const u of uns) u();
     };
   }, []);
+
+  // v1.5.2 WS-C: 現在のプロジェクトパスのミラー（実行完了時の一致判定用）。
+  useEffect(() => {
+    projectPathRef.current = project?.path ?? null;
+  }, [project]);
 
   // v1.3 メモ② UNDO/REDO — useUndo に分離（v1.3.2 リファクタ）。
   // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y のキーバインドもフック内。
@@ -1338,28 +1405,23 @@ function App() {
   // フローを実行（手動トリガー — 確定方針4）。結果カードは緑シグナル＋Ctrl+Zで戻せる。
   const handleRunFlow = useCallback(
     async (id: string) => {
-      // v1.4.10 二度押し抑止: すでに実行中なら無視（録音中に▶を連打して run_flow が
-      // 積み上がり、停止しても次の録音が走るハングを防ぐ）。解放は finally で。
-      if (flowRunningRef.current) return;
-      flowRunningRef.current = true;
-      // 対象カードが stdin 停止対応（record:true）なら「停止」を出す＋送る文字を拾う。
-      let isRec = false;
-      let sc = "q";
+      // v1.5.2 WS-C: 二度押し抑止は**カード単位**（並行解禁後は別フローの同時実行が正規の
+      // 使い方。同一カードの連打だけ弾く）。バックエンド register_flow にも同じガードがある。
+      if (runningCardsRef.current.has(id)) return;
+      runningCardsRef.current.add(id);
+      // 起動元プロジェクトを記憶 — 実行中に切り替えられたら結果は起動元にあり、
+      // このキャンバスには無い（refresh・緑シグナル・UNDO はスキップする）。
+      const startPath = projectPathRef.current;
       let isShell = false;
       try {
         const obj = objectsRef.current.find((o) => o.id === id);
         if (obj?.filter_ref) {
           const s = JSON.parse(obj.filter_ref);
-          isRec = !!s.record;
-          if (typeof s.stop_cmd === "string" && s.stop_cmd) sc = s.stop_cmd;
           isShell = typeof s.shell === "string";
         }
       } catch {
-        /* spec が読めなければ停止対応扱いしない */
+        /* spec が読めなければシェル扱いしない */
       }
-      setRecordingRun(isRec);
-      setStopCmdRun(sc);
-      setFlowRunning(true);
       try {
         const res = await invoke<{
           created: string[];
@@ -1384,19 +1446,27 @@ function App() {
         // シェルのウィンドウあり起動: ウィンドウ自体がフィードバックなので
         // 「フローを実行しました」ダイアログは出さない（従来は空の報告が出て煩雑だった）。
         if (isShell) return;
-        if (res.created.length) {
-          setTouched((prev) => new Set([...prev, ...res.created]));
-          pushUndo([{ kind: "delete", ids: res.created }]);
+        // v1.5.2 WS-C: 実行中にプロジェクトが切り替わっていたら、結果は起動元プロジェクトに
+        // materialize されている。このキャンバスの refresh・緑シグナル・UNDO は行わない。
+        const samePrj = projectPathRef.current === startPath;
+        if (samePrj) {
+          if (res.created.length) {
+            setTouched((prev) => new Set([...prev, ...res.created]));
+            pushUndo([{ kind: "delete", ids: res.created }]);
+          }
+          // 固定名上書きで中身が変わった既存カード: 緑シグナルのみ（削除Undoはしない）
+          if (res.updated.length) {
+            setTouched((prev) => new Set([...prev, ...res.updated]));
+          }
+          await refresh();
         }
-        // 固定名上書きで中身が変わった既存カード: 緑シグナルのみ（削除Undoはしない）
-        if (res.updated.length) {
-          setTouched((prev) => new Set([...prev, ...res.updated]));
-        }
-        await refresh();
         const lines = [
           ...res.outputs.map((o) => `生成: ${o}`),
           ...res.skipped.map((s) => `スキップ: ${s}`),
         ];
+        if (!samePrj) {
+          lines.push("（結果は起動元プロジェクトに出力されました。開き直すと表示されます）");
+        }
         setConfirm({
           title: "フローを実行しました",
           message: lines.join("\n") || "出力はありません",
@@ -1413,10 +1483,7 @@ function App() {
           onConfirm: () => setConfirm(null),
         });
       } finally {
-        setFlowRunning(false);
-        setRecordingRun(false);
-        flowRunningRef.current = false;
-        flowJobIdRef.current = null;
+        runningCardsRef.current.delete(id);
       }
     },
     [refresh, pushUndo]
@@ -4987,93 +5054,9 @@ function App() {
           }}
         />
       )}
-      {flowRunning && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: 24,
-            left: "50%",
-            transform: "translateX(-50%)",
-            zIndex: 2500,
-            display: "flex",
-            alignItems: "center",
-            gap: 14,
-            background: "#1c2130",
-            border: "1px solid #38445e",
-            borderRadius: 10,
-            padding: "10px 18px",
-            color: "#d6dded",
-            fontFamily: "sans-serif",
-            fontSize: 13,
-            boxShadow: "0 8px 32px #000000aa",
-          }}
-        >
-          <span>フロー実行中…</span>
-          {/* v1.4.9: 停止＝stdin に停止コマンドを送って正常終了（録音=WAV確定）。stdin停止対応
-              カードのときだけ出す。中断＝強制終了（kill）。 */}
-          {recordingRun && (
-            <button
-              title={`stdin に "${stopCmdRun}" を送って正常終了させます（録音は WAV を確定）`}
-              onClick={() => {
-                const jobId = flowJobIdRef.current;
-                if (jobId != null)
-                  void invoke("flow_send_stdin", { jobId, text: stopCmdRun }).catch(() => {});
-              }}
-              style={{
-                padding: "6px 16px",
-                background: "#2f6f4f",
-                color: "#ffffff",
-                border: "none",
-                borderRadius: 6,
-                cursor: "pointer",
-                fontSize: 13,
-                fontFamily: "sans-serif",
-              }}
-            >
-              ⏹ 停止（正常終了）
-            </button>
-          )}
-          <button
-            title="プロセスツリーを強制終了します（出力は破棄）"
-            onClick={() => {
-              // job_id 未着（job:started 前）の連打は中央 kill へフォールバック。
-              const jobId = flowJobIdRef.current;
-              if (jobId != null) void invoke("break_flow", { jobId }).catch(() => {});
-              else void invoke("cancel_all").catch(() => {});
-            }}
-            style={{
-              padding: "6px 16px",
-              background: "#b03a3a",
-              color: "#ffffff",
-              border: "none",
-              borderRadius: 6,
-              cursor: "pointer",
-              fontSize: 13,
-              fontFamily: "sans-serif",
-            }}
-          >
-            ■ 中断
-          </button>
-          {/* v1.5.1 WS-B: 中央 kill スイッチ。全ジョブ（フロー＋チャット＋t2i 生成）の cancel を
-              立てる。WS-B はフロー同時1なので中断とほぼ同義だが、並行チャットも一括で止まる。 */}
-          <button
-            title="実行中のすべてのジョブ（フロー・チャット・画像生成）を停止します"
-            onClick={() => void invoke("cancel_all").catch(() => {})}
-            style={{
-              padding: "6px 16px",
-              background: "#7a3a3a",
-              color: "#ffffff",
-              border: "1px solid #a05050",
-              borderRadius: 6,
-              cursor: "pointer",
-              fontSize: 13,
-              fontFamily: "sans-serif",
-            }}
-          >
-            ■ Stop-all
-          </button>
-        </div>
-      )}
+      {/* v1.5.2 WS-C 背景ジョブパネル: 実行中ジョブの一覧＋個別停止/中断＋Stop-all。
+          プロジェクト切替後も残る（最後の物理停止＝自律安全 §6.3）。 */}
+      <JobsPanel jobs={jobs} />
       {prompt && (
         <PromptDialog
           title={prompt.title}

@@ -515,6 +515,13 @@ pub(crate) fn t2i_download_model(
     t2i_ensure_server(&app_data, state.inner())?;
     let app = window.app_handle().clone();
     let url = format!("http://127.0.0.1:{}/pull", flow::T2I_PORT);
+    // v1.5.2 WS-C: 台帳ジョブ化＝job:* も配信・進捗行ごとに中断可能（デーモン側の DL は
+    // 継続するが huggingface_hub はレジューム可能。ポーリング打ち切りで UI は解放される）。
+    run_setup_job(
+        state.inner(),
+        &app,
+        &format!("画像生成モデル取得（{model}）"),
+        |job| {
     std::thread::scope(|s| {
         s.spawn(|| {
             use std::io::BufRead;
@@ -530,6 +537,9 @@ pub(crate) fn t2i_download_model(
                 return Err(format!("モデル取得に失敗 ({})", resp.status()));
             }
             for line in std::io::BufReader::new(resp).lines() {
+                if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("中断されました".into());
+                }
                 let line = line.map_err(|e| format!("進捗の読み取りに失敗: {e}"))?;
                 let line = line.trim();
                 if line.is_empty() {
@@ -550,6 +560,12 @@ pub(crate) fn t2i_download_model(
                             "percent": v["percent"].as_u64().unwrap_or(0),
                         }),
                     );
+                    emit_job_progress(
+                        &app,
+                        job,
+                        None,
+                        Some(v["percent"].as_u64().unwrap_or(0) as u32),
+                    );
                 }
             }
             // 既定モデルとして記録。
@@ -565,6 +581,8 @@ pub(crate) fn t2i_download_model(
         .join()
         .map_err(|_| "ダウンロードスレッドが異常終了しました".to_string())?
     })
+        },
+    )
 }
 
 /// 既定モデルを切り替え、デーモンに warm ロードさせる（取得済みのものから）。

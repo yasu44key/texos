@@ -110,8 +110,20 @@ pub(crate) fn whisper_status(state: State<AppState>) -> WhisperStatus {
 }
 
 /// winget で ffmpeg（Gyan.FFmpeg）を自動インストール。導入後は PATH 反映のため要再起動。
+/// v1.5.2 WS-C: 台帳ジョブ化（パネルに出る・二重起動拒否）。winget はプロセス wait 型
+/// なので中断は非対応（ベストエフォート方針）。
 #[tauri::command(async)]
-pub(crate) fn whisper_install_ffmpeg() -> Result<(), String> {
+pub(crate) fn whisper_install_ffmpeg(
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let app = window.app_handle().clone();
+    run_setup_job(state.inner(), &app, "ffmpeg 導入", |_job| {
+        whisper_install_ffmpeg_body()
+    })
+}
+
+fn whisper_install_ffmpeg_body() -> Result<(), String> {
     if !has_winget() {
         return Err(
             "winget が無いため自動インストールできません。ffmpeg.org から入れてください".into(),
@@ -144,7 +156,8 @@ pub(crate) fn whisper_install_ffmpeg() -> Result<(), String> {
 }
 
 /// whisper.cpp の Windows バイナリ zip を取得して app_data\whisper\bin に展開。
-/// 進捗は "whisper-install" イベント（{status, percent}）で配信。
+/// 進捗は "whisper-install" イベント（{status, percent}・ダイアログ用）で配信。
+/// v1.5.2 WS-C: 台帳ジョブ化＝job:started/progress/done/failed も配信・DL 中は中断可能。
 #[tauri::command(async)]
 pub(crate) fn whisper_install(window: tauri::WebviewWindow, state: State<AppState>) -> Result<(), String> {
     let app_data = state.app_data.clone();
@@ -153,6 +166,7 @@ pub(crate) fn whisper_install(window: tauri::WebviewWindow, state: State<AppStat
     let url = format!(
         "https://github.com/ggml-org/whisper.cpp/releases/download/{WHISPER_TAG}/whisper-bin-x64.zip"
     );
+    run_setup_job(state.inner(), &app, "Whisper 導入", |job| {
     std::thread::scope(|s| {
         s.spawn(|| {
             use std::io::Read;
@@ -176,6 +190,9 @@ pub(crate) fn whisper_install(window: tauri::WebviewWindow, state: State<AppStat
             let mut chunk = [0u8; 65536];
             let mut downloaded = 0u64;
             loop {
+                if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("中断されました".into());
+                }
                 let n = resp.read(&mut chunk).map_err(|e| format!("読み取り失敗: {e}"))?;
                 if n == 0 {
                     break;
@@ -191,6 +208,7 @@ pub(crate) fn whisper_install(window: tauri::WebviewWindow, state: State<AppStat
                     "whisper-install",
                     serde_json::json!({ "status": "ダウンロード中…", "percent": pct }),
                 );
+                emit_job_progress(&app, job, None, Some(pct));
             }
             let _ = app.emit(
                 "whisper-install",
@@ -226,10 +244,12 @@ pub(crate) fn whisper_install(window: tauri::WebviewWindow, state: State<AppStat
         .join()
         .map_err(|_| "インストールスレッドが異常終了しました".to_string())?
     })
+    })
 }
 
 /// GGMLモデルを HuggingFace から取得して app_data\whisper\models に保存し、現在モデルにする。
-/// 進捗は "whisper-model" イベント（{model, percent}）で配信。
+/// 進捗は "whisper-model" イベント（{model, percent}・ダイアログ用）で配信。
+/// v1.5.2 WS-C: 台帳ジョブ化＝job:* も配信・DL 中は中断可能（.part を掃除して戻る）。
 #[tauri::command(async)]
 pub(crate) fn whisper_download_model(
     window: tauri::WebviewWindow,
@@ -245,6 +265,11 @@ pub(crate) fn whisper_download_model(
     };
     let app = window.app_handle().clone();
     let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model}.bin");
+    run_setup_job(
+        state.inner(),
+        &app,
+        &format!("Whisperモデル取得（{model}）"),
+        |job| {
     std::thread::scope(|s| {
         s.spawn(|| {
             use std::io::{Read, Write};
@@ -266,6 +291,11 @@ pub(crate) fn whisper_download_model(
             let mut chunk = [0u8; 131072];
             let mut downloaded = 0u64;
             loop {
+                if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err("中断されました".into());
+                }
                 let n = resp.read(&mut chunk).map_err(|e| format!("読み取り失敗: {e}"))?;
                 if n == 0 {
                     break;
@@ -281,6 +311,7 @@ pub(crate) fn whisper_download_model(
                     "whisper-model",
                     serde_json::json!({ "model": model, "percent": pct }),
                 );
+                emit_job_progress(&app, job, None, Some(pct));
             }
             drop(f);
             std::fs::rename(&tmp, &dest).map_err(|e| format!("保存に失敗: {e}"))?;
@@ -296,6 +327,8 @@ pub(crate) fn whisper_download_model(
         .join()
         .map_err(|_| "ダウンロードスレッドが異常終了しました".to_string())?
     })
+        },
+    )
 }
 
 /// 現在の Whisper モデルを切り替える（取得済みのものから）。

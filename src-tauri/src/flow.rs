@@ -414,6 +414,30 @@ const AI_DEFAULT_TIMEOUT_SECS: u64 = 180;
 /// 「Cannot drop a runtime in a context where blocking is not allowed」でパニックし、
 /// 握っている DB Mutex を poison させてアプリ全体を巻き込む。そこで HTTP は
 /// tokio 文脈を持たない素の OS スレッドに逃がして実行する（scope で借用は安全）。
+/// v1.5.2 WS-C: この spec が実際に叩く AI エンドポイント（資源セマフォのキー導出用）。
+/// run_ai / run_ai_chat_stream の既定値と一致させること（ここが実体の写し）。
+pub fn effective_ai_endpoint(spec: &FilterSpec) -> String {
+    let provider = spec.provider.as_deref().unwrap_or("ollama");
+    let explicit = spec
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (provider, explicit) {
+        (_, Some(e)) => e.to_string(),
+        ("openai", None) => "http://localhost:1234/v1".to_string(),
+        (_, None) => "http://localhost:11434".to_string(),
+    }
+}
+
+/// v1.5.2 WS-C: 録音ジェネレータの CMD から dshow の音声デバイス名を抜き出す
+/// （`-i audio="マイク (…)"` / `-i audio=NAME`）。デバイス単位の排他セマフォのキー。
+pub fn dshow_audio_device(cmd: &str) -> Option<String> {
+    let re = regex::Regex::new(r#"audio=(?:"([^"]+)"|([^\s"]+))"#).ok()?;
+    let c = re.captures(cmd)?;
+    c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string())
+}
+
 pub fn run_ai(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, String), String> {
     std::thread::scope(|s| {
         s.spawn(|| run_ai_blocking(spec, input))
@@ -1564,6 +1588,39 @@ mod tests {
     fn is_shell_detection() {
         assert!(spec(r#"{"shell":"cmd"}"#).is_shell());
         assert!(!spec(r#"{"cmd":"sort"}"#).is_shell());
+    }
+
+    /// v1.5.2 WS-C: 資源セマフォのキー導出 — AI エンドポイントの実効値（run_ai の既定と一致）。
+    #[test]
+    fn effective_ai_endpoint_defaults() {
+        assert_eq!(
+            effective_ai_endpoint(&spec(r#"{"builtin":"ai","model":"x"}"#)),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            effective_ai_endpoint(&spec(r#"{"builtin":"ai","model":"x","provider":"openai"}"#)),
+            "http://localhost:1234/v1"
+        );
+        assert_eq!(
+            effective_ai_endpoint(&spec(
+                r#"{"builtin":"ai","model":"x","endpoint":" http://192.168.1.5:11434 "}"#
+            )),
+            "http://192.168.1.5:11434"
+        );
+    }
+
+    /// v1.5.2 WS-C: 録音デバイス名の抽出（dshow・引用あり/なし・無指定は None）。
+    #[test]
+    fn dshow_audio_device_parse() {
+        assert_eq!(
+            dshow_audio_device(r#"-f dshow -i audio="マイク (USB MICROPHONE)" -ar 16000 {out}"#),
+            Some("マイク (USB MICROPHONE)".to_string())
+        );
+        assert_eq!(
+            dshow_audio_device("-f dshow -i audio=mic0 {out}"),
+            Some("mic0".to_string())
+        );
+        assert_eq!(dshow_audio_device("-t 5 {out}"), None);
     }
 
     /// シェルカード統合（2026-07-06）: window モードのパースと後方互換

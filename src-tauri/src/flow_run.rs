@@ -76,6 +76,7 @@ pub(crate) struct NodeRun {
 /// 種別判定（flow::NodeKind）に応じて内蔵フィルタ / AI / 外部プロセスへ振り分ける。
 /// 入力の収集・型チェック・命名（stem）は呼び出し側（eval_filter）の責務で、ここは
 /// 「与えられた入力でこの spec を1回実行する」ことだけに専念する（データ/フローの関心を分離）。
+/// v1.5.2 WS-C: cancel/stdin_slot 個別渡しを Job 渡しへ（t2i_active の点灯もここで行う）。
 ///
 /// inputs は (bytes, ext, mime) の並び:
 /// - Generator … 空（入力を取らない）
@@ -86,10 +87,11 @@ pub(crate) fn execute_node(
     spec: &flow::FilterSpec,
     kind: flow::NodeKind,
     inputs: &[(&[u8], &str, &str)],
-    cancel: &std::sync::atomic::AtomicBool,
-    stdin_slot: &flow::StdinSlot,
+    job: &Job,
 ) -> Result<NodeRun, String> {
     use flow::NodeKind;
+    let cancel = &job.cancel;
+    let stdin_slot = &job.control;
     let plain = |bytes: Vec<u8>, ext: String, mime: String| NodeRun {
         outputs: vec![(bytes, ext, mime)],
         exit_code: None,
@@ -143,7 +145,12 @@ pub(crate) fn execute_node(
                     )
                 }
             };
-            let (bytes, ext, mime) = flow::run_t2i(spec, prompt, init)?;
+            // v1.5.2 WS-C: 生成 HTTP 中だけ t2i_active を点灯 — break_flow はこれを見て
+            // デーモンへ /cancel を送る（並行時に他ジョブの生成を誤って止めない）。
+            job.t2i_active.store(true, std::sync::atomic::Ordering::Relaxed);
+            let run = flow::run_t2i(spec, prompt, init);
+            job.t2i_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            let (bytes, ext, mime) = run?;
             // v1.5.1 WS-B t2i 中断の実効化: 中断（break_flow/cancel_all → デーモン /cancel）
             // されると diffusers は次ステップ境界で denoise を抜け**部分画像を返して完走**する。
             // そのまま進むと中途半端な画像カードが生まれるので、ここで破棄してエラー化する
@@ -204,39 +211,107 @@ pub(crate) fn execute_node(
     }
 }
 
+/// ノードの必要資源を導出して permit を取得する（凍結 §5・§6。WS-C）。
+/// 取得順序は device→ai→heavy に固定（§12.D）。permit はノード実行中だけ保持し、
+/// 返り値の Vec が drop されると解放される。排他資源（device/ai）は即拒否＋案内、
+/// heavy は FIFO 待ち（待機中も job.cancel が効く・待ち始めに job:progress を1回出す）。
+fn acquire_node_permits(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    job: &Job,
+    spec: &flow::FilterSpec,
+    kind: flow::NodeKind,
+) -> Result<Vec<Permit>, String> {
+    use flow::NodeKind;
+    let mut permits = Vec::new();
+    // 1) device（録音ジェネレータ）: dshow デバイス名で排他。
+    if kind == NodeKind::Generator && spec.record {
+        let name = flow::dshow_audio_device(spec.cmd.as_deref().unwrap_or(""))
+            .unwrap_or_else(|| "既定デバイス".to_string());
+        let sem = state.resources.device_sem(&name);
+        permits.push(sem.try_acquire().ok_or_else(|| {
+            format!(
+                "録音デバイス「{name}」は使用中です。実行中の録音を「停止」してからもう一度実行してください"
+            )
+        })?);
+    }
+    // 2) ai（AI/T2i）: 正規化エンドポイント単位（既定許可数1）。
+    let endpoint = match kind {
+        NodeKind::Ai => Some(flow::effective_ai_endpoint(spec)),
+        NodeKind::T2i => Some(format!("http://127.0.0.1:{}", flow::T2I_PORT)),
+        _ => None,
+    };
+    if let Some(ep) = endpoint {
+        let key = normalize_endpoint(&ep);
+        let sem = state.resources.ai_sem(&key);
+        permits.push(sem.try_acquire().ok_or_else(|| {
+            format!(
+                "AIエンドポイント（{key}）は使用中です。実行中のAI処理・画像生成の完了を待つか中断してください"
+            )
+        })?);
+    }
+    // 3) heavy（外部プロセス）: 上限まで並行・超過は順番待ち。録音ジェネレータは
+    //    デバイス排他で守られる長時間ジョブなので heavy 枠を消費しない。
+    if kind == NodeKind::External || (kind == NodeKind::Generator && !spec.record) {
+        let p = state.resources.heavy.acquire(&job.cancel, || {
+            emit_job_progress(app, job, Some("順番待ち…"), None);
+        })?;
+        permits.push(p);
+    }
+    Ok(permits)
+}
+
+/// job:progress の note 用にカード名を引く（best-effort・パネルの「いま何が走っているか」）。
+fn node_note(p: &Project, fid: &str) -> String {
+    p.conn
+        .query_row(
+            "SELECT label FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![fid],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|l| format!("実行中: {l}"))
+        .unwrap_or_else(|_| "実行中…".to_string())
+}
+
 /// フィルタを再帰評価する（pull型連鎖 — 実行モデル3）。
 /// 入力にフィルタカードが繋がっていれば先にそれを評価し、結果をこのフィルタに通す。
 /// `visited` は評価中パスのスタックで、循環を検出したらエラー。
+/// v1.5.2 WS-C: DB 接触は**ジョブ専用接続**（p）で行う（state.current 非依存＝実行中の
+/// プロジェクト切替に影響されない）。state は資源セマフォの取得にだけ使う。
 pub(crate) fn eval_filter(
     state: &AppState,
-    root: &Path,
+    app: &tauri::AppHandle,
+    p: &Project,
     fid: &str,
     visited: &mut std::collections::HashSet<String>,
     report: &mut FlowReport,
-    cancel: &std::sync::atomic::AtomicBool,
-    stdin_slot: &flow::StdinSlot,
+    job: &Job,
 ) -> Result<Vec<FlowPayload>, String> {
+    let root: &Path = &p.root;
+    let cancel = &job.cancel;
     if !visited.insert(fid.to_string()) {
         return Err("フローに循環があります".into());
     }
-    // 短ロック: フィルタ spec を読む（実行はこのあとロック外で）。
-    let spec_json: Option<String> = with_db(state, |p| {
-        p.conn
-            .query_row(
-                "SELECT filter_ref FROM virtual_bodies
-                 WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
-                rusqlite::params![fid],
-                |r| r.get(0),
-            )
-            .map_err(|_| "フィルタカードが見つかりません".to_string())
-    })?;
+    let spec_json: Option<String> = p
+        .conn
+        .query_row(
+            "SELECT filter_ref FROM virtual_bodies
+             WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
+            rusqlite::params![fid],
+            |r| r.get(0),
+        )
+        .map_err(|_| "フィルタカードが見つかりません".to_string())?;
     let spec = flow::parse_spec(spec_json.as_deref().unwrap_or("{}"))?;
     let accept = spec.accept_mime.clone().unwrap_or_else(|| "*/*".into());
 
     // ジェネレータ型: 入力を取らず1回実行してファイルを生む（入力矢印は無視）。
     // §4.1: 実行は execute_node に一任し、ここは命名（stem＝prefix or "output"）だけ担う。
     if spec.node_kind() == flow::NodeKind::Generator {
-        let run = execute_node(root, &spec, flow::NodeKind::Generator, &[], cancel, stdin_slot);
+        let run = acquire_node_permits(state, app, job, &spec, flow::NodeKind::Generator)
+            .and_then(|_permits| {
+                emit_job_progress(app, job, Some(&node_note(p, fid)), None);
+                execute_node(root, &spec, flow::NodeKind::Generator, &[], job)
+            });
         visited.remove(fid);
         return run.map(|r| {
             let stem = spec
@@ -260,27 +335,25 @@ pub(crate) fn eval_filter(
     // §4.3 拡張点アンカー: 将来 relations.kind='flow' に「成功時/失敗時/常に」の制御属性を
     // 持たせる（オートメーション設計メモ §1.2）。そのとき execute_node が返す NodeRun.exit_code
     // を見て分岐し、矢印の制御属性でこの収集をフィルタする。今はモデルを汚さず収集は無条件。
-    // 短ロック: このフィルタへ入る flow 矢印（接続順）を取得。
-    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> =
-        with_db(state, |p| {
-            let mut stmt = p
-                .conn
-                .prepare(
-                    "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
-                     FROM relations rel
-                     JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
-                     JOIN real_bodies r ON r.id = v.real_id
-                     WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
-                     ORDER BY rel.created_at",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(rusqlite::params![fid], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
-                })
-                .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
-        })?;
+    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
+        let mut stmt = p
+            .conn
+            .prepare(
+                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
+                 FROM relations rel
+                 JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                 JOIN real_bodies r ON r.id = v.real_id
+                 WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                 ORDER BY rel.created_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![fid], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+    };
 
     let mut produced = Vec::new();
     // フェーズ1: 全入力のペイロードを接続順に収集（{inN} の番号は矢印を張った順）
@@ -293,8 +366,8 @@ pub(crate) fn eval_filter(
             break;
         }
         let payloads: Vec<FlowPayload> = if kind.as_deref() == Some("filter") {
-            // 再帰評価（呼び出し先が自分で短ロックを取る。ここではロックを保持しない）。
-            match eval_filter(state, root, vid, visited, report, cancel, stdin_slot) {
+            // 再帰評価（上流の permit は上流ノードの実行中だけ保持される）。
+            match eval_filter(state, app, p, vid, visited, report, job) {
                 Ok(v) => v,
                 Err(e) => {
                     report.errors.push(format!("{vlabel}: {e}"));
@@ -309,15 +382,15 @@ pub(crate) fn eval_filter(
         } else if kind.as_deref() == Some("note") {
             // v1.4.17 カード統一＝定数カード: 付箋は本文をそのまま text/plain として供給する
             //（実体・CAS 非依存の読み出し専用テキスト。付箋→AI/t2i/grep がそのまま繋がる）。
-            let text = match with_db(state, |p| {
-                p.conn
-                    .query_row(
-                        "SELECT note_text FROM virtual_bodies WHERE id = ?1",
-                        rusqlite::params![vid],
-                        |r| Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default()),
-                    )
-                    .map_err(|e| e.to_string())
-            }) {
+            let text = match p
+                .conn
+                .query_row(
+                    "SELECT note_text FROM virtual_bodies WHERE id = ?1",
+                    rusqlite::params![vid],
+                    |r| Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default()),
+                )
+                .map_err(|e| e.to_string())
+            {
                 Ok(t) => t,
                 Err(e) => {
                     report.errors.push(format!("{vlabel}: {e}"));
@@ -336,16 +409,10 @@ pub(crate) fn eval_filter(
                 stem,
             }]
         } else {
-            // 短ロック: 窓の今を解決（snapshot 更新＋ビューパス）。ファイル読みはロック外。
-            let path = match with_db(state, |p| {
+            // 窓の今を解決（snapshot 更新＋ビューパス）— ジョブ専用接続なのでロック不要。
+            let path = {
                 refresh_origin_snapshot(p, vid);
-                Ok(resolve_view_path(p, vid, real_id))
-            }) {
-                Ok(path) => path,
-                Err(e) => {
-                    report.errors.push(format!("{vlabel}: {e}"));
-                    continue;
-                }
+                resolve_view_path(p, vid, real_id)
             };
             match std::fs::read(&path) {
                 Ok(d) => {
@@ -407,7 +474,11 @@ pub(crate) fn eval_filter(
                 .first()
                 .map(|pl| pl.stem.clone())
                 .unwrap_or_else(|| "output".to_string());
-            match execute_node(root, &spec, kind, &ins, cancel, stdin_slot) {
+            let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
+                emit_job_progress(app, job, Some(&node_note(p, fid)), None);
+                execute_node(root, &spec, kind, &ins, job)
+            });
+            match run {
                 Ok(run) => {
                     for (bytes, ext, mime) in run.outputs {
                         produced.push(FlowPayload { bytes, ext, mime, stem: stem0.clone() });
@@ -438,7 +509,11 @@ pub(crate) fn eval_filter(
                 }
             }
             let ins = [(pl.bytes.as_slice(), pl.ext.as_str(), pl.mime.as_str())];
-            match execute_node(root, &spec, kind, &ins, cancel, stdin_slot) {
+            let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
+                emit_job_progress(app, job, Some(&node_note(p, fid)), None);
+                execute_node(root, &spec, kind, &ins, job)
+            });
+            match run {
                 Ok(run) => {
                     for (bytes, ext, mime) in run.outputs {
                         produced.push(FlowPayload {
@@ -470,29 +545,9 @@ pub(crate) fn run_flow(
     app: tauri::AppHandle,
     state: State<AppState>,
 ) -> Result<FlowReport, String> {
-    // v1.5.1 WS-B 多重起動ガードの台帳版（v1.4.10 録音ハング修正の継承）: 台帳に Flow ジョブが
-    // 居れば state.current をロックする**前**に即エラーで弾く（ここで待つと録音中フローの裏で
-    // 積み上がる）。完了同期返しは維持＝この関数は従来どおり FlowReport を返す。
-    let job = state.jobs.register_flow_exclusive("フロー実行")?;
-    let _guard = JobGuard::new(&state.jobs, job.id);
-    let result = run_flow_inner(&id, &app, &state, &job);
-    // job:done / job:failed（WS-C 全規格の先行最小3種の後ろ2つ。progress は WS-C）。
-    // report 内のエラーは「完了した実行の報告」なので done 扱い＝Err はコマンド自体の失敗。
-    let _ = app.emit(
-        if result.is_ok() { "job:done" } else { "job:failed" },
-        serde_json::json!({ "job_id": job.id }),
-    );
-    result
-}
-
-fn run_flow_inner(
-    id: &str,
-    app: &tauri::AppHandle,
-    state: &State<AppState>,
-    job: &Job,
-) -> Result<FlowReport, String> {
-    let id = id.to_string();
-    // 短ロック: 終端フィルタの位置・ラベル・spec と root を取得（実行中はロックを手放す）。
+    // v1.5.2 WS-C 並行解禁: 短ロックで終端カードとルートを読み、**同一終端カード**の Flow
+    // だけを拒否して登録（v1.4.10 再入エラーの一般化）。別フローとは並行し、資源の
+    // 取り合いはセマフォ（acquire_node_permits）が調停する。完了同期返しは維持。
     let (fx, fy, flabel, fref, root): (f64, f64, String, Option<String>, PathBuf) =
         with_db(state.inner(), |p| {
             let (fx, fy, flabel, fref): (f64, f64, String, Option<String>) = p
@@ -506,17 +561,44 @@ fn run_flow_inner(
                 .map_err(|_| "フィルタカードが見つかりません".to_string())?;
             Ok((fx, fy, flabel, fref, p.root.clone()))
         })?;
-    // 終端フィルタの設定が出力先と命名を決める（prefix連番 / 出力フォルダ）
-    let term_spec = flow::parse_spec(fref.as_deref().unwrap_or("{}"))?;
-
-    // v1.5.1 WS-B: ラベル・起動元プロジェクト（記録のみ）を確定し job:started を通知。
-    // フロントはこの job_id を保持して break_flow / flow_send_stdin に渡す。
-    *job.label.lock().unwrap() = flabel.clone();
-    *job.project_root.lock().unwrap() = root.to_string_lossy().into_owned();
+    let job = state
+        .jobs
+        .register_flow(&id, &flabel, &root.to_string_lossy())?;
+    let _guard = JobGuard::new(&state.jobs, job.id);
+    // card 付き（パネルが録音対応/停止コマンドを spec から引く）。
     let _ = app.emit(
         "job:started",
-        serde_json::json!({ "job_id": job.id, "kind": "flow", "label": flabel }),
+        serde_json::json!({ "job_id": job.id, "kind": "flow", "label": flabel, "card": id }),
     );
+    let result = run_flow_inner(&id, fx, fy, &flabel, fref.as_deref(), &root, &app, &state, &job);
+    // report 内のエラーは「完了した実行の報告」なので done 扱い＝Err はコマンド自体の失敗。
+    let _ = app.emit(
+        if result.is_ok() { "job:done" } else { "job:failed" },
+        serde_json::json!({ "job_id": job.id }),
+    );
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_flow_inner(
+    id: &str,
+    fx: f64,
+    fy: f64,
+    flabel: &str,
+    fref: Option<&str>,
+    root: &Path,
+    app: &tauri::AppHandle,
+    state: &State<AppState>,
+    job: &Job,
+) -> Result<FlowReport, String> {
+    let id = id.to_string();
+    let flabel = flabel.to_string();
+    // 終端フィルタの設定が出力先と命名を決める（prefix連番 / 出力フォルダ）
+    let term_spec = flow::parse_spec(fref.unwrap_or("{}"))?;
+
+    // v1.5.2 WS-C: ジョブ専用の DB 接続（起動元プロジェクト束縛）。以後の評価・materialize は
+    // すべてこの接続で行う＝実行中にプロジェクトを切り替えてもこのジョブは起動元へ書き続ける。
+    let jp = open_project_at(root)?;
 
     // v1.5 Text-To-Image: 終端が t2i カードなら生成デーモンを先に起こしておく（▶実行を
     // 「ただ押せば動く」に）。best-effort — 起動できなければ run_t2i が分かりやすく案内する。
@@ -530,10 +612,10 @@ fn run_flow_inner(
     // detached ウィンドウ、"hidden" はウィンドウなしで捕捉して結果パネルへ返す。
     if term_spec.is_shell() {
         let shell = term_spec.shell.as_deref().unwrap_or("").to_string();
-        // 短ロック: 接続された最初の入力の生きた実ファイルを解決（起動はロック外）。
-        let input: Option<PathBuf> = with_db(state.inner(), |p| {
-            Ok(p
-                .conn
+        // 接続された最初の入力の生きた実ファイルを解決（ジョブ専用接続）。
+        let input: Option<PathBuf> = {
+            let p = &jp;
+            p.conn
                 .query_row(
                     "SELECT v.id, v.real_id, v.committed_path FROM relations rel
                      JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
@@ -555,8 +637,8 @@ fn run_flow_inner(
                         .map(PathBuf::from)
                         .filter(|c| c.is_file())
                         .unwrap_or_else(|| resolve_view_path(p, &vid, &real_id))
-                }))
-        })?;
+                })
+        };
         let firstline = term_spec.cmd.clone().unwrap_or_default();
         let firstline = match &input {
             Some(pb) => firstline.replace("{in}", &format!("\"{}\"", pb.display())),
@@ -568,7 +650,7 @@ fn run_flow_inner(
             let out = run_shell_captured(
                 &shell,
                 &firstline,
-                &root,
+                root,
                 term_spec.timeout_secs,
                 &job.cancel,
             )?;
@@ -589,7 +671,7 @@ fn run_flow_inner(
                 truncated,
             })
         } else {
-            launch_shell_window(&shell, &firstline, &root, window != "close")?;
+            launch_shell_window(&shell, &firstline, root, window != "close")?;
             None
         };
         return Ok(FlowReport {
@@ -621,7 +703,7 @@ fn run_flow_inner(
             }
             (pb, true)
         }
-        None => (root.clone(), false),
+        None => (root.to_path_buf(), false),
     };
 
     let mut report = FlowReport {
@@ -633,18 +715,10 @@ fn run_flow_inner(
         shell_capture: None,
     };
     let mut visited = std::collections::HashSet::new();
-    // 評価フェーズ: eval_filter が DB 接触ごとに短ロックを取り、実行（外部/AI/録音）は
-    // ロック外で走る。録音/AI 中も他のコマンドが state.current を取れる＝UI が固まらない。
+    // 評価フェーズ: DB 接触はジョブ専用接続（jp）＝ UI の state.current とは独立。
+    // 実行（外部/AI/録音）中も UI・他フローが固まらない。資源の取り合いはセマフォが調停。
     // 中断フラグ・stdin 制御はこのジョブのもの（ジョブ別＝毎回新品なのでリセット不要）。
-    let payloads = eval_filter(
-        state.inner(),
-        &root,
-        &id,
-        &mut visited,
-        &mut report,
-        &job.cancel,
-        &job.control,
-    )?;
+    let payloads = eval_filter(state.inner(), app, &jp, &id, &mut visited, &mut report, job)?;
     if payloads.is_empty() && report.skipped.is_empty() && report.errors.is_empty() {
         // 自己完結コマンド（{out} を書かないカメラ起動・読み上げ等）は出力ゼロで正常終了する
         // のが正しい。それ以外で空なら入力の繋ぎ忘れとして案内する。
@@ -664,8 +738,13 @@ fn run_flow_inner(
         .take(24)
         .collect();
 
-    // マテリアライズ（DB と fs のみ・長時間プロセスなし → 1回の短ロックでまとめて書く）。
-    with_db(state.inner(), |p| {
+    // マテリアライズ（DB と fs のみ・長時間プロセスなし）。ジョブ専用接続で起動元へ書く。
+    // v1.5.2 WS-C（凍結 §11.4）: プロジェクト単位の採番ロックで、並行フローの固定名照合と
+    // prefix 連番（seq）の採番・書き戻しを直列化する（同じ空き番号を同時に掴む競合の防止）。
+    let write_lock = project_write_lock(state.inner(), root);
+    let _write_guard = write_lock.lock().unwrap();
+    {
+    let p = &jp;
     let mut out_i = 0usize;
     for pl in &payloads {
         // 結果の置き場と名前: prefix＋連番→「prefix連番.ext」（空き番号まで進める）、
@@ -798,7 +877,7 @@ fn run_flow_inner(
     // （未知フィールドを保持するため serde_json::Value 経由で seq だけ更新）
     if prefix.is_some() && term_spec.seq.unwrap_or(0) != seq {
         if let Ok(mut v) =
-            serde_json::from_str::<serde_json::Value>(fref.as_deref().unwrap_or("{}"))
+            serde_json::from_str::<serde_json::Value>(fref.unwrap_or("{}"))
         {
             v["seq"] = seq.into();
             let _ = p.conn.execute(
@@ -821,25 +900,28 @@ fn run_flow_inner(
         "UPDATE virtual_bodies SET memo = ?1 WHERE id = ?2",
         rusqlite::params![log, id],
     );
-    Ok(())
-    })?;
+    }
 
     Ok(report)
 }
 
-/// フロー実行の中断（UIの中断ボタン・v1.5.1 WS-B で job_id 引数化）。run_flow が外部コマンドで
+/// ジョブの中断（UIの中断ボタン・v1.5.1 WS-B で job_id 引数化）。run_flow が外部コマンドで
 /// ストールしていてもこのコマンドは DB の Mutex を取らないため即座に通り、監視ループがツリー
 /// ごと kill する。ジョブが既に終わっていれば黙って何もしない（連打・競合は無害）。
+/// v1.5.2 WS-C: Flow に限らず任意のジョブ（Chat/Setup）の cancel を立てる汎用中断口。
+/// デーモンへの /cancel は**そのジョブが t2i 生成中のときだけ**送る（並行時に他ジョブの
+/// 生成を誤って止めない）。
 #[tauri::command(async)]
 pub(crate) fn break_flow(job_id: u64, state: State<AppState>) {
     if let Some(job) = state.jobs.get(job_id) {
         job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        if job.t2i_active.load(std::sync::atomic::Ordering::Relaxed) {
+            flow::t2i_post_cancel();
+        }
     }
-    // 画像生成中ならデーモン側の生成も止める（GPU を握り続けないように）。best-effort。
-    flow::t2i_post_cancel();
 }
 
-/// v1.5.1 WS-B: 実行中ジョブの一覧（WS-C 背景ジョブパネルの土台。現 UI は未使用）。
+/// v1.5.1 WS-B: 実行中ジョブの一覧（WS-C 背景ジョブパネルの復元用）。
 #[tauri::command]
 pub(crate) fn list_jobs(state: State<AppState>) -> Vec<JobInfo> {
     state.jobs.list()

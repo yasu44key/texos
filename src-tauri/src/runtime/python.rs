@@ -435,11 +435,20 @@ pub(crate) fn python_build_env(
     }
     // spec.rs の推奨に従って torch の取得先を選ぶ（GPU なし／VRAM 少は cpu ＝確実に動く）。
     let torch_index = gather_spec().torch_index;
-    std::thread::scope(|s| {
-        s.spawn(|| ensure_env(&app, &app_data, &name, &torch_index))
-            .join()
-            .map_err(|_| "環境構築スレッドが異常終了しました".to_string())?
-    })
+    // v1.5.2 WS-C: 台帳ジョブ化（パネルに出る・二重起動拒否）。uv はプロセス wait 型なので
+    // 中断は非対応（ベストエフォート方針）。
+    run_setup_job(
+        state.inner(),
+        &app,
+        &format!("Python環境構築（{name}）"),
+        |_job| {
+            std::thread::scope(|s| {
+                s.spawn(|| ensure_env(&app, &app_data, &name, &torch_index))
+                    .join()
+                    .map_err(|_| "環境構築スレッドが異常終了しました".to_string())?
+            })
+        },
+    )
 }
 
 /// Python 実行環境の明示切替（"managed" / "system" / "auto"）。auto は設定を消す。

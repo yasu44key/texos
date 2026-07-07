@@ -1033,7 +1033,9 @@ pub(crate) fn send_selection_to_project(
     move_out: bool,
     state: State<AppState>,
 ) -> Result<SendSelectionResult, String> {
-    ensure_no_flow_running(state.inner())?;
+    // v1.5.2 WS-C: 切替ガードの精密版 — カード移動は評価中フローの構造破壊になるため、
+    // **現在のプロジェクトに束縛された**実行中ジョブがある間だけ拒否（単なる切替は自由）。
+    ensure_no_jobs_bound_to_current(state.inner())?;
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
 
