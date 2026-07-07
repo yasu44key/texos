@@ -20,6 +20,7 @@ import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog"
 import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
 import { T2iSetupDialog, type T2iStatus } from "./ui/T2iSetupDialog";
 import { JobsPanel, type JobRow } from "./ui/JobsPanel";
+import { InputOrderDialog } from "./ui/InputOrderDialog";
 
 // v1.4.8 ①: Whisper 文字起こしカードの spec（外部コマンドフィルタ）。
 // whisper-cli は app_data 共有・絶対パス参照。-of {out_noext} が <base>.txt を書き {out} と一致。
@@ -150,6 +151,8 @@ function App() {
   // v1.5.2 WS-C: 実行完了時に「起動時と同じプロジェクトか」を判定するためのミラー
   // （切替後に完了したフローの結果は起動元プロジェクトにあり、現キャンバスには無い）。
   const projectPathRef = useRef<string | null>(null);
+  // v1.5.3 WS-P1: 入力の順序ダイアログ（カード右クリック「入力の順序 ...」）。
+  const [inputOrderDlg, setInputOrderDlg] = useState<{ id: string; label: string } | null>(null);
   // v1.5 外部プログラムフィルタの設定ダイアログ（作成 or 既存カードの編集）
   const [filterDlg, setFilterDlg] = useState<{
     x: number;
@@ -892,6 +895,7 @@ function App() {
             { label: "AI: 変換（一発・MD出力）...", onClick: () => la.filter("ai_chat", cp.x, cp.y, fromId) },
             { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => la.filter("md_codeblock", cp.x, cp.y, fromId) },
             { label: "画像生成: Text-To-Image（テキスト→画像）...", onClick: () => la.filter("t2i", cp.x, cp.y, fromId) },
+            { label: "セレクタ（最初の有データ枝を採用）", onClick: () => la.filter("select", cp.x, cp.y, fromId) },
             { label: "テキスト: grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
             { label: "テキスト: 置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
             { label: "画像: リサイズ（幅指定）...", onClick: () => la.filter("img_resize", cp.x, cp.y, fromId) },
@@ -976,6 +980,71 @@ function App() {
       console.error("delete_relation failed", e);
     }
   }, [pushUndo]);
+
+  // v1.5.3 WS-P1（オペ層 §5.4.2）: flow 矢印のクリック＝条件メニュー（削除は項目に降格）。
+  // when=通過条件（成功時/失敗時/常に）・carry=運ぶもの。設定は relations.attrs へ
+  // マージ書き込み（NULL=従来）。リンク矢印（kind='link'）は従来どおりクリック=削除。
+  const handleFlowRelationClick = useCallback(
+    (r: RelationInfo, clientX: number, clientY: number) => {
+      let attrs: { when?: string; carry?: string } = {};
+      try {
+        attrs = JSON.parse(r.attrs ?? "{}");
+      } catch {
+        /* 壊れた JSON は既定扱い */
+      }
+      const when = attrs.when ?? "always";
+      const carry = attrs.carry ?? "";
+      const setAttrs = (patch: { when?: string; carry?: string }) => {
+        void invoke("set_relation_attrs", { id: r.id, ...patch })
+          .then(async () => setRelations(await invoke<RelationInfo[]>("list_relations")))
+          .catch((e) => console.error("set_relation_attrs failed", e));
+      };
+      const check = (on: boolean, label: string) => (on ? `✓ ${label}` : `　 ${label}`);
+      setMenu({
+        x: clientX,
+        y: clientY,
+        items: [
+          { label: "フロー矢印の通過条件", onClick: () => {}, disabled: true },
+          { label: check(when === "always", "常に（既定）"), onClick: () => setAttrs({ when: "always" }) },
+          {
+            label: check(when === "success", "成功したときだけ"),
+            hint: "上流がエラーなく完走したときだけデータを通します。失敗は経路選択の情報になり、フローのエラーにしません。",
+            onClick: () => setAttrs({ when: "success" }),
+          },
+          {
+            label: check(when === "failure", "失敗したときだけ"),
+            hint: "上流が失敗したときだけ通します（既定はエラーメッセージを運ぶ＝AI に読ませて分岐できます）。",
+            onClick: () => setAttrs({ when: "failure" }),
+          },
+          { label: "", onClick: () => {}, divider: true },
+          { label: "運ぶもの", onClick: () => {}, disabled: true },
+          {
+            label: check(carry === "", "既定（成功=出力／失敗=エラーメッセージ）"),
+            onClick: () => setAttrs({ carry: "" }),
+          },
+          {
+            label: check(carry === "stderr", "エラーメッセージ"),
+            onClick: () => setAttrs({ carry: "stderr" }),
+          },
+          {
+            label: check(carry === "input", "失敗時の入力（リトライ材料）"),
+            onClick: () => setAttrs({ carry: "input" }),
+          },
+          {
+            label: check(carry === "none", "なし（信号のみ＝ゲート）"),
+            onClick: () => setAttrs({ carry: "none" }),
+          },
+          { label: "", onClick: () => {}, divider: true },
+          {
+            label: "矢印を削除",
+            danger: true,
+            onClick: () => void handleDeleteRelation(r.id),
+          },
+        ],
+      });
+    },
+    [handleDeleteRelation]
+  );
 
   // --- v1.4 オートフロー⑤ ----------------------------------------------------
 
@@ -1089,6 +1158,10 @@ function App() {
             });
           },
         });
+      } else if (builtin === "select") {
+        // v1.5.3 WS-P1: セレクタ（オペ層 §5.4.1）。パラメータなし＝即作成。
+        // 入力順の first-match（最初の有データ枝を採用）・no-data 吸収を内包。
+        create("セレクタ", { builtin: "select", accept_mime: "*/*" });
       } else if (builtin === "text_grep") {
         setPrompt({
           title: "grep: 抽出する正規表現",
@@ -4139,6 +4212,7 @@ function App() {
         saveLauncherToLibrary: handleSaveLauncherToLibrary,
         deleteLibraryLauncher: handleDeleteLibraryLauncher,
         editFilter: handleEditFilter,
+        inputOrder: (id: string, label: string) => setInputOrderDlg({ id, label }),
         saveFilterToLibrary: handleSaveFilterToLibrary,
         addLibraryFilter: handleAddLibraryFilter,
         deleteLibraryFilter: handleDeleteLibraryFilter,
@@ -4610,6 +4684,7 @@ function App() {
           relations={relations}
           tempLine={linkDrag}
           onDeleteRelation={handleDeleteRelation}
+          onFlowRelationClick={handleFlowRelationClick}
           invalidIds={invalidFlowIds}
         />
         {objects.map((obj) => (
@@ -5052,6 +5127,18 @@ function App() {
               });
             }
           }}
+        />
+      )}
+      {/* v1.5.3 WS-P1: 入力の順序ダイアログ（{inN}・セレクタの採用順を並べ替え）。 */}
+      {inputOrderDlg && (
+        <InputOrderDialog
+          cardId={inputOrderDlg.id}
+          cardLabel={inputOrderDlg.label}
+          onSaved={() => {
+            setInputOrderDlg(null);
+            void invoke<RelationInfo[]>("list_relations").then(setRelations).catch(() => {});
+          }}
+          onCancel={() => setInputOrderDlg(null)}
         />
       )}
       {/* v1.5.2 WS-C 背景ジョブパネル: 実行中ジョブの一覧＋個別停止/中断＋Stop-all。

@@ -200,6 +200,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     // 既存行は ref 列から推定してバックフィル（repair_mime_types と同じ「開くたび修復」方式）。
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN kind TEXT", []);
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN filter_ref TEXT", []);
+    // v1.5.3 WS-P1（オペ層設計 §5.4.2）: 矢印の制御属性 {when, carry, port}。
+    // NULL = 無条件・接続順＝完全後方互換。条件・運搬・順序を全部ここへ。
+    let _ = conn.execute("ALTER TABLE relations ADD COLUMN attrs TEXT", []);
+    // v1.5.3 WS-P1（オペ層設計 §6.1）: 構造化実行記録 {at, exit, ok, nodata, skipped, message}。
+    // memo の人間向けログとは別。WS-P2 のウォッチャ・運用前評価・メタ認知カードが読む。
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN last_run TEXT", []);
     // v1.3.6: 拡張子/MIME は「そのファイルの見え方」＝仮身の属性。空ファイル等は内容
     // ハッシュが同一で実身(real_bodies)を共有するため、実身の ext/mime だけだと別名・
     // 別形式のファイルが同じ型に潰れる。仮身側にも持たせ、表示/オープン/コミットで優先する。

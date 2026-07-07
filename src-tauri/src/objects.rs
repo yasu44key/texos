@@ -172,7 +172,7 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
             "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), v.pos_x, v.pos_y,
                     v.committed_path, v.committed_mtime, v.project_ref, COALESCE(v.ext, r.ext), v.expanded,
                     v.url_ref, v.memo, v.z_order, v.folder_ref, v.origin_path, v.panel_w,
-                    v.kind, v.filter_ref, v.window_of
+                    v.kind, v.filter_ref, v.window_of, v.last_run
              FROM virtual_bodies v
              JOIN real_bodies r ON r.id = v.real_id
              WHERE v.desktop_id IS NULL AND v.deleted_at IS NULL
@@ -223,6 +223,7 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
                 kind: row.get(17)?,
                 filter_ref: row.get(18)?,
                 window_of: row.get(19)?,
+                last_run: row.get(20)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1568,7 +1569,7 @@ pub(crate) fn list_relations(state: State<AppState>) -> Result<Vec<RelationInfo>
         // arrows that are deleted themselves or whose endpoint is currently
         // deleted. v1.4.17: 付箋も virtual_bodies に統一されたので anti-join は1本。
         .prepare(
-            "SELECT id, from_id, to_id, kind FROM relations rel
+            "SELECT id, from_id, to_id, kind, attrs FROM relations rel
              WHERE rel.deleted_at IS NULL
                AND NOT EXISTS (
                  SELECT 1 FROM virtual_bodies d
@@ -1584,11 +1585,146 @@ pub(crate) fn list_relations(state: State<AppState>) -> Result<Vec<RelationInfo>
                 from_id: row.get(1)?,
                 to_id: row.get(2)?,
                 kind: row.get(3)?,
+                attrs: row.get(4)?,
             })
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+}
+
+/// v1.5.3 WS-P1: 矢印の制御属性（{when, carry, port}）をマージ更新する。
+/// when="always"・carry=""・port=0 は「キーを消す＝従来へ戻す」。全キーが消えたら
+/// attrs を NULL に戻す（NULL=完全後方互換の原則を保つ）。
+#[tauri::command]
+pub(crate) fn set_relation_attrs(
+    id: i64,
+    when: Option<String>,
+    carry: Option<String>,
+    port: Option<i64>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let cur: Option<String> = p
+        .conn
+        .query_row(
+            "SELECT attrs FROM relations WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .map_err(|_| "矢印が見つかりません".to_string())?;
+    let mut v: serde_json::Value = cur
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let obj = v.as_object_mut().ok_or("attrs が壊れています")?;
+    if let Some(w) = when {
+        if w == "always" || w.is_empty() {
+            obj.remove("when");
+        } else {
+            obj.insert("when".into(), serde_json::json!(w));
+        }
+    }
+    if let Some(c) = carry {
+        if c.is_empty() {
+            obj.remove("carry");
+        } else {
+            obj.insert("carry".into(), serde_json::json!(c));
+        }
+    }
+    if let Some(n) = port {
+        if n <= 0 {
+            obj.remove("port");
+        } else {
+            obj.insert("port".into(), serde_json::json!(n));
+        }
+    }
+    let new_attrs: Option<String> = if obj.is_empty() { None } else { Some(v.to_string()) };
+    p.conn
+        .execute(
+            "UPDATE relations SET attrs = ?1 WHERE id = ?2",
+            rusqlite::params![new_attrs, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// v1.5.3 WS-P1: カードへ入る flow 矢印の一覧（実効順=port昇順→接続順）。
+/// 「入力の順序」ダイアログの表示用。
+#[derive(Serialize)]
+pub struct FlowInputInfo {
+    pub relation_id: i64,
+    pub label: String,
+    pub port: Option<i64>,
+    pub when: Option<String>,
+}
+
+#[tauri::command]
+pub(crate) fn list_flow_inputs(id: String, state: State<AppState>) -> Result<Vec<FlowInputInfo>, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let mut stmt = p
+        .conn
+        .prepare(
+            "SELECT rel.id, v.label, rel.attrs FROM relations rel
+             JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+             WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+             ORDER BY rel.created_at",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut items: Vec<FlowInputInfo> = rows
+        .filter_map(|r| r.ok())
+        .map(|(rid, label, attrs)| {
+            let a = crate::flow::parse_edge_attrs(attrs.as_deref());
+            FlowInputInfo {
+                relation_id: rid,
+                label,
+                port: a.port,
+                when: a.when,
+            }
+        })
+        .collect();
+    // eval_filter と同じ実効順（安定ソート: port なしは末尾＝接続順）。
+    items.sort_by_key(|i| i.port.unwrap_or(i64::MAX));
+    Ok(items)
+}
+
+/// v1.5.3 WS-P1: 入力の順序を確定する（ダイアログの並びどおり port=1..N を書く）。
+/// {inN} の番号・セレクタの first-match 順がこの並びになる。
+#[tauri::command]
+pub(crate) fn set_input_order(relation_ids: Vec<i64>, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    for (i, rid) in relation_ids.iter().enumerate() {
+        let cur: Option<String> = p
+            .conn
+            .query_row(
+                "SELECT attrs FROM relations WHERE id = ?1 AND deleted_at IS NULL",
+                rusqlite::params![rid],
+                |r| r.get(0),
+            )
+            .map_err(|_| "矢印が見つかりません".to_string())?;
+        let mut v: serde_json::Value = cur
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("port".into(), serde_json::json!((i + 1) as i64));
+        }
+        p.conn
+            .execute(
+                "UPDATE relations SET attrs = ?1 WHERE id = ?2",
+                rusqlite::params![v.to_string(), rid],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

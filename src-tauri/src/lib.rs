@@ -548,6 +548,9 @@ pub struct VirtualBodyInfo {
     pub filter_ref: Option<String>,
     /// v1.3.10 窓モデル: 内部仮身が指す実身カードの id（外部=origin_path とは別レーン）。
     pub window_of: Option<String>,
+    /// v1.5.3 WS-P1（オペ層 §6.1）: 構造化実行記録 {at, exit, ok, nodata, skipped, message}
+    /// の JSON。WS-P2 のウォッチャ・運用前評価・メタ認知カードが読む口（本号は保存と返却まで）。
+    pub last_run: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 pub struct ViewTransform {
@@ -575,6 +578,8 @@ pub struct RelationInfo {
     pub from_id: String,
     pub to_id: String,
     pub kind: String,
+    /// v1.5.3 WS-P1: 矢印の制御属性 JSON（{when, carry, port}・NULL=従来）。
+    pub attrs: Option<String>,
 }
 // ---------------------------------------------------------------------------
 // モジュール分割（v1.4.26 WS1: docs/実行環境整備とリファクタリング計画.md）
@@ -664,6 +669,9 @@ pub fn run() {
             create_relation,
             list_relations,
             delete_relation,
+            set_relation_attrs,
+            list_flow_inputs,
+            set_input_order,
             delete_object,
             restore_object,
             restore_note,

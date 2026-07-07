@@ -3,6 +3,24 @@ export interface RelationInfo {
   from_id: string;
   to_id: string;
   kind: string;
+  /// v1.5.3 WS-P1: 矢印の制御属性 JSON（{when, carry, port}・null=従来）。
+  attrs?: string | null;
+}
+
+/// v1.5.3 WS-P1: 矢印の中点ラベル（通過条件・運ぶもの）。null=無条件（表示なし）。
+function edgeLabel(attrs?: string | null): string | null {
+  if (!attrs) return null;
+  try {
+    const a = JSON.parse(attrs);
+    const parts: string[] = [];
+    if (a.when === "success") parts.push("成功時");
+    else if (a.when === "failure") parts.push("失敗時");
+    if (a.carry === "none") parts.push("信号のみ");
+    else if (a.carry === "input") parts.push("入力を運ぶ");
+    return parts.length ? parts.join("・") : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Anything an arrow can attach to: object cards AND comment notes (v1.3.1). */
@@ -20,6 +38,8 @@ interface LinkLayerProps {
   /** Temporary line while dragging a new link (canvas coords). */
   tempLine?: { x1: number; y1: number; x2: number; y2: number } | null;
   onDeleteRelation?: (id: number) => void;
+  /** v1.5.3 WS-P1: flow 矢印のクリック（条件メニューを開く）。未指定なら削除にフォールバック。 */
+  onFlowRelationClick?: (r: RelationInfo, clientX: number, clientY: number) => void;
   /** v1.4 オートフロー: 型チェック不合格のフロー矢印（赤で警告表示）。 */
   invalidIds?: Set<number>;
 }
@@ -41,7 +61,14 @@ export function edgePoint(n: NodeBox, toward: { x: number; y: number }) {
   return { x: c.x + dx * t, y: c.y + dy * t };
 }
 
-export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation, invalidIds }: LinkLayerProps) {
+export function LinkLayer({
+  nodes,
+  relations,
+  tempLine,
+  onDeleteRelation,
+  onFlowRelationClick,
+  invalidIds,
+}: LinkLayerProps) {
   const byId = new Map(nodes.map((n) => [n.id, n]));
 
   // Large symmetric viewBox so canvas coords (incl. negatives) map 1:1 and
@@ -113,9 +140,12 @@ export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation, invali
           ? "var(--arrow-flow, #57c7a3)"
           : "var(--arrow-color, #5a9fe0)";
         const markerId = bad ? "arrowhead-bad" : isFlow ? "arrowhead-flow" : "arrowhead";
+        // v1.5.3 WS-P1: 条件付き矢印は中点にラベル（成功時/失敗時・信号のみ 等）。
+        const label = isFlow ? edgeLabel(r.attrs) : null;
+        const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
         return (
           <g key={r.id}>
-            {/* invisible fat line for easier click-to-delete */}
+            {/* invisible fat line for easier clicking */}
             {/* data-rel-id: ドラッグ中はカードと同じ命令的DOM更新で端点を追従させる（v1.4.17） */}
             <line
               data-rel-id={r.id}
@@ -126,7 +156,12 @@ export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation, invali
               stroke="transparent"
               strokeWidth={12}
               style={{ pointerEvents: "stroke", cursor: "pointer" }}
-              onClick={() => onDeleteRelation?.(r.id)}
+              onClick={(e) => {
+                // v1.5.3 WS-P1: flow 矢印は条件メニュー（削除/通過条件/運ぶもの）、
+                // リンク矢印は従来どおりクリック=削除。
+                if (isFlow && onFlowRelationClick) onFlowRelationClick(r, e.clientX, e.clientY);
+                else onDeleteRelation?.(r.id);
+              }}
             />
             <line
               data-rel-id={r.id}
@@ -141,6 +176,24 @@ export function LinkLayer({ nodes, relations, tempLine, onDeleteRelation, invali
               strokeDasharray={isFlow ? "9 5" : undefined}
               markerEnd={`url(#${markerId})`}
             />
+            {label && (
+              <text
+                x={mid.x}
+                y={mid.y - 6}
+                textAnchor="middle"
+                style={{
+                  fill: stroke,
+                  fontSize: 11,
+                  fontFamily: "sans-serif",
+                  pointerEvents: "none",
+                  paintOrder: "stroke",
+                  stroke: "var(--canvas-bg, #10131a)",
+                  strokeWidth: 3,
+                }}
+              >
+                {label}
+              </text>
+            )}
           </g>
         );
       })}

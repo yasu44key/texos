@@ -186,6 +186,8 @@ pub(crate) fn upsert_chat_log_card(
 /// メッセージ組立側の分岐追加だけで済む。
 /// v1.5.2 WS-C: DB 接触はジョブ専用接続（p）。上流フィルタの評価は eval_filter が
 /// 資源セマフォを取得して走る（チャット自身の ai permit はストリーム時に別途取る）。
+/// v1.5.3 WS-P1: チャットの IN もエッジ属性（when/carry/port）を尊重する。no-data 枝は
+/// 落とす（チャットは対話＝吸収相当）。エラーは従来どおり best-effort で黙って除外。
 pub(crate) fn collect_context(
     state: &AppState,
     app: &tauri::AppHandle,
@@ -194,11 +196,11 @@ pub(crate) fn collect_context(
     job: &Job,
 ) -> Vec<FlowPayload> {
     let cancel = &job.cancel;
-    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = (|| {
+    let mut inputs: Vec<(String, String, String, String, Option<String>, Option<String>, flow::EdgeAttrs)> = (|| {
         let mut stmt = p
             .conn
             .prepare(
-                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
+                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind, rel.attrs
                  FROM relations rel
                  JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
                  JOIN real_bodies r ON r.id = v.real_id
@@ -208,12 +210,27 @@ pub(crate) fn collect_context(
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![ai_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
-        Ok::<_, String>(rows.filter_map(|r| r.ok()).collect())
+        Ok::<_, String>(
+            rows.filter_map(|r| r.ok())
+                .map(|(vid, rid, l, m, e, k, attrs): (String, String, String, String, Option<String>, Option<String>, Option<String>)| {
+                    (vid, rid, l, m, e, k, flow::parse_edge_attrs(attrs.as_deref()))
+                })
+                .collect::<Vec<_>>(),
+        )
     })()
     .unwrap_or_default();
+    inputs.sort_by_key(|(.., a)| a.port.unwrap_or(i64::MAX));
 
     let mut out = Vec::new();
     let mut report = FlowReport {
@@ -225,34 +242,45 @@ pub(crate) fn collect_context(
         shell_capture: None,
     };
     let mut visited = std::collections::HashSet::new();
-    for (vid, real_id, vlabel, mime, ext, kind) in &inputs {
+    let mut memo = EvalMemo::new(); // メモ化は1ターン単位（§5.1-5）
+    for (vid, real_id, vlabel, mime, ext, kind, attrs) in &inputs {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        if kind.as_deref() == Some("filter") {
-            if let Ok(v) = eval_filter(state, app, p, vid, &mut visited, &mut report, job) {
-                out.extend(v);
-            }
+        // 上流の評価結果を得て when/carry を適用（flow_run と同じ意味論・簡略版）。
+        let up: Option<EvalOut> = if kind.as_deref() == Some("filter") {
+            eval_filter(state, app, p, vid, &mut visited, &mut memo, &mut report, job).ok()
         } else if real_id.starts_with("drop:") {
-            continue;
+            None
         } else {
-            // 窓の今を解決（ジョブ専用接続なのでロック不要）。
             let path = {
                 refresh_origin_snapshot(p, vid);
                 resolve_view_path(p, vid, real_id)
             };
-            if let Ok(d) = std::fs::read(&path) {
-                let stem = std::path::Path::new(vlabel)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(vlabel)
-                    .to_string();
-                out.push(FlowPayload {
-                    bytes: d,
-                    ext: ext.clone().unwrap_or_else(|| "bin".into()),
-                    mime: mime.clone(),
-                    stem,
-                });
+            match std::fs::read(&path) {
+                Ok(d) => {
+                    let stem = std::path::Path::new(vlabel)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(vlabel)
+                        .to_string();
+                    Some(EvalOut::data(
+                        vec![FlowPayload {
+                            bytes: d,
+                            ext: ext.clone().unwrap_or_else(|| "bin".into()),
+                            mime: mime.clone(),
+                            stem,
+                        }],
+                        None,
+                    ))
+                }
+                Err(_) => None,
+            }
+        };
+        if let Some(up) = up {
+            let edge = apply_edge(&up, attrs, vlabel, &mut report);
+            if !edge.nodata {
+                out.extend(edge.payloads);
             }
         }
     }

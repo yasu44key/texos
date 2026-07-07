@@ -52,6 +52,8 @@ pub struct ShellCapture {
 
 /// パイプラインの中間結果。中間ファイル・中間カードは作らず、メモリで次段へ渡す
 /// （外部コマンドの一時ファイルは flow.rs 側で即削除）。
+/// v1.5.3 WS-P1: メモ化（ジョブスコープ）で複数下流に配るため Clone。
+#[derive(Clone)]
 pub(crate) struct FlowPayload {
     pub(crate) bytes: Vec<u8>,
     pub(crate) ext: String,
@@ -207,6 +209,9 @@ pub(crate) fn execute_node(
                 stderr,
             })
         }
+        // セレクタは eval_filter 側で完結する（first-match・実行しない）。ここへ来るのは
+        // 呼び出しバグなので防御的にエラー。
+        NodeKind::Select => Err("セレクタは実行ノードではありません".into()),
         NodeKind::Invalid => Err("フィルタ定義に builtin も cmd もありません".into()),
     }
 }
@@ -273,20 +278,159 @@ fn node_note(p: &Project, fid: &str) -> String {
         .unwrap_or_else(|_| "実行中…".to_string())
 }
 
+// --- v1.5.3 WS-P1 オペレーション層 Phase1（オペ層設計 §5.4.2）------------------------
+// eval_filter の結果を「payload の列」から一級の評価結果 EvalOut へ。when 条件（成功時/
+// 失敗時）・no-data・メモ化・セレクタがこの上に載る。relations.attrs（NULL=従来）が
+// エッジの意味論を決める＝§4.3 拡張点アンカーの成立形。
+
+/// ノード1回の評価結果（ジョブ内で揮発・メモ化で共有）。
+#[derive(Clone)]
+pub(crate) struct EvalOut {
+    pub(crate) payloads: Vec<FlowPayload>,
+    /// no-data 一級（オペ層 §5.1-4）: 枝が取られなかった／材料が揃わなかった。
+    /// エラーでも空ファイルでもない第三の結果。伝搬型ノードはこれを NULL 伝搬する。
+    pub(crate) nodata: bool,
+    /// このノードの実行がエラーなしで完走したか（when="success"/"failure" が読む）。
+    pub(crate) ok: bool,
+    /// 外部ノードの exit code（完走できた場合のみ。内蔵/AI/データカードは None）。
+    pub(crate) exit: Option<i32>,
+    /// このノードで起きた実行エラー。**report へは直接流さない** — 消費側エッジが
+    /// when=always なら従来どおり report.errors へ（後方互換）、when 付きなら
+    /// 経路選択の情報として黙って分岐する（失敗の格下げ・§5.4.2）。
+    pub(crate) errors: Vec<String>,
+    /// 失敗時の入力スナップショット（carry:"input" のリトライ材料。失敗時のみ保持）。
+    pub(crate) failed_inputs: Vec<FlowPayload>,
+}
+
+impl EvalOut {
+    pub(crate) fn data(payloads: Vec<FlowPayload>, exit: Option<i32>) -> Self {
+        EvalOut { payloads, nodata: false, ok: true, exit, errors: vec![], failed_inputs: vec![] }
+    }
+    fn nodata_out() -> Self {
+        EvalOut { payloads: vec![], nodata: true, ok: true, exit: None, errors: vec![], failed_inputs: vec![] }
+    }
+    fn failed(errors: Vec<String>, exit: Option<i32>, failed_inputs: Vec<FlowPayload>) -> Self {
+        EvalOut { payloads: vec![], nodata: false, ok: false, exit, errors, failed_inputs }
+    }
+}
+
+/// ジョブスコープのメモ表（§5.1-5）: 複数下流が同じカードを pull しても実行は1回。
+/// 副作用のある上流（録音・AI 呼び出し）の二重実行を防ぐ。run_flow / チャット1ターンごと。
+pub(crate) type EvalMemo = std::collections::HashMap<String, EvalOut>;
+
+/// 構造化実行記録 last_run の保存（§6.1: {at, exit, ok, nodata, skipped, message}）。
+/// message = このノードで起きたエラー文言（一級の語彙 — メタ認知カードの入力になる）。
+fn write_last_run(p: &Project, fid: &str, out: &EvalOut, skipped: u32) {
+    let v = serde_json::json!({
+        "at": db::now_ms(),
+        "exit": out.exit,
+        "ok": out.ok,
+        "nodata": out.nodata,
+        "skipped": skipped,
+        "message": if out.errors.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(out.errors.join("\n"))
+        },
+    });
+    let _ = p.conn.execute(
+        "UPDATE virtual_bodies SET last_run = ?1 WHERE id = ?2",
+        rusqlite::params![v.to_string(), fid],
+    );
+}
+
+/// 評価の終端処理: visited を抜け・last_run を保存・メモ表へ登録して返す。
+fn finish_eval(
+    p: &Project,
+    fid: &str,
+    visited: &mut std::collections::HashSet<String>,
+    memo: &mut EvalMemo,
+    skipped: u32,
+    out: EvalOut,
+) -> Result<EvalOut, String> {
+    visited.remove(fid);
+    write_last_run(p, fid, &out, skipped);
+    memo.insert(fid.to_string(), out.clone());
+    Ok(out)
+}
+
+/// エッジ1本の収集結果（フェーズ1）。nodata=枝が取られなかった（NULL伝搬の種）。
+pub(crate) struct EdgeOut {
+    pub(crate) payloads: Vec<FlowPayload>,
+    pub(crate) nodata: bool,
+}
+
+/// when/carry をエッジに適用する（§5.4.2）。上流の no-data は when に関わらず no-data
+/// （NULL伝搬）。always エッジだけが上流エラーを report へ流す＝失敗の格下げの実装点。
+pub(crate) fn apply_edge(
+    up: &EvalOut,
+    attrs: &flow::EdgeAttrs,
+    vlabel: &str,
+    report: &mut FlowReport,
+) -> EdgeOut {
+    if up.nodata {
+        return EdgeOut { payloads: vec![], nodata: true };
+    }
+    let when = attrs.when.as_deref().unwrap_or("always");
+    let taken = match when {
+        "success" => up.ok,
+        "failure" => !up.ok,
+        _ => {
+            // always（従来）: 上流エラーはフロー全体のエラーとして伝搬（後方互換）。
+            for e in &up.errors {
+                report.errors.push(e.clone());
+            }
+            true
+        }
+    };
+    if !taken {
+        return EdgeOut { payloads: vec![], nodata: true };
+    }
+    // 運ぶもの: 成功枝の既定=上流出力／失敗枝の既定=エラーメッセージ（stderr・§6.1 一級）。
+    let carry = attrs
+        .carry
+        .as_deref()
+        .unwrap_or(if when == "failure" { "stderr" } else { "output" });
+    let payloads = match carry {
+        "none" => vec![], // 信号のみ（エッジ属性版ゲート）。no-data ではない＝枝は取られた
+        "stderr" => {
+            let msg = if up.errors.is_empty() {
+                "（エラーメッセージなし）".to_string()
+            } else {
+                up.errors.join("\n")
+            };
+            vec![FlowPayload {
+                bytes: msg.into_bytes(),
+                ext: "txt".into(),
+                mime: "text/plain".into(),
+                stem: format!("{vlabel}のエラー"),
+            }]
+        }
+        "input" => up.failed_inputs.clone(),
+        _ => up.payloads.clone(),
+    };
+    EdgeOut { payloads, nodata: false }
+}
+
 /// フィルタを再帰評価する（pull型連鎖 — 実行モデル3）。
 /// 入力にフィルタカードが繋がっていれば先にそれを評価し、結果をこのフィルタに通す。
 /// `visited` は評価中パスのスタックで、循環を検出したらエラー。
-/// v1.5.2 WS-C: DB 接触は**ジョブ専用接続**（p）で行う（state.current 非依存＝実行中の
-/// プロジェクト切替に影響されない）。state は資源セマフォの取得にだけ使う。
+/// v1.5.2 WS-C: DB 接触は**ジョブ専用接続**（p）で行う（state.current 非依存）。
+/// v1.5.3 WS-P1: 返り値を EvalOut に（when/no-data/セレクタ/メモ化はこの関数が担う）。
 pub(crate) fn eval_filter(
     state: &AppState,
     app: &tauri::AppHandle,
     p: &Project,
     fid: &str,
     visited: &mut std::collections::HashSet<String>,
+    memo: &mut EvalMemo,
     report: &mut FlowReport,
     job: &Job,
-) -> Result<Vec<FlowPayload>, String> {
+) -> Result<EvalOut, String> {
+    // メモ化（§5.1-5）: 同一ジョブ内の再 pull は実行せず前回結果を配る。
+    if let Some(hit) = memo.get(fid) {
+        return Ok(hit.clone());
+    }
     let root: &Path = &p.root;
     let cancel = &job.cancel;
     if !visited.insert(fid.to_string()) {
@@ -312,34 +456,41 @@ pub(crate) fn eval_filter(
                 emit_job_progress(app, job, Some(&node_note(p, fid)), None);
                 execute_node(root, &spec, flow::NodeKind::Generator, &[], job)
             });
-        visited.remove(fid);
-        return run.map(|r| {
-            let stem = spec
-                .prefix
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "output".into());
-            r.outputs
-                .into_iter()
-                .map(|(bytes, ext, mime)| FlowPayload {
-                    bytes,
-                    ext,
-                    mime,
-                    stem: stem.clone(),
-                })
-                .collect()
-        });
+        let out = match run {
+            Ok(r) => {
+                let stem = spec
+                    .prefix
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "output".into());
+                let exit = r.exit_code;
+                EvalOut::data(
+                    r.outputs
+                        .into_iter()
+                        .map(|(bytes, ext, mime)| FlowPayload {
+                            bytes,
+                            ext,
+                            mime,
+                            stem: stem.clone(),
+                        })
+                        .collect(),
+                    exit,
+                )
+            }
+            Err(e) => EvalOut::failed(vec![e], None, vec![]),
+        };
+        return finish_eval(p, fid, visited, memo, 0, out);
     }
 
-    // 入力: このフィルタへ入る flow 矢印（生きているカードのみ・接続順）。
-    // §4.3 拡張点アンカー: 将来 relations.kind='flow' に「成功時/失敗時/常に」の制御属性を
-    // 持たせる（オートメーション設計メモ §1.2）。そのとき execute_node が返す NodeRun.exit_code
-    // を見て分岐し、矢印の制御属性でこの収集をフィルタする。今はモデルを汚さず収集は無条件。
-    let inputs: Vec<(String, String, String, String, Option<String>, Option<String>)> = {
+    // 入力: このフィルタへ入る flow 矢印（生きているカードのみ）。
+    // v1.5.3 WS-P1（§4.3 拡張点アンカーの成立形）: rel.attrs {when, carry, port} を読み、
+    // 並びは port 昇順 → created_at（attrs=NULL は従来どおり接続順）。{inN} の番号・
+    // セレクタの first-match 順はこの並びに従う。
+    let mut inputs: Vec<(String, String, String, String, Option<String>, Option<String>, flow::EdgeAttrs)> = {
         let mut stmt = p
             .conn
             .prepare(
-                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind
+                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind, rel.attrs
                  FROM relations rel
                  JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
                  JOIN real_bodies r ON r.id = v.real_id
@@ -349,32 +500,48 @@ pub(crate) fn eval_filter(
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![fid], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(vid, rid, l, m, e, k, attrs): (String, String, String, String, Option<String>, Option<String>, Option<String>)| {
+                (vid, rid, l, m, e, k, flow::parse_edge_attrs(attrs.as_deref()))
+            })
+            .collect()
     };
+    // 安定ソート: port 指定なしは末尾（created_at 順を保つ＝完全後方互換）。
+    inputs.sort_by_key(|(.., a)| a.port.unwrap_or(i64::MAX));
 
     let mut produced = Vec::new();
-    // フェーズ1: 全入力のペイロードを接続順に収集（{inN} の番号は矢印を張った順）
-    let mut collected: Vec<FlowPayload> = Vec::new();
-    for (vid, real_id, vlabel, mime, ext, kind) in &inputs {
-        // 入力ペイロードを集める: 上流フィルタ＝再帰評価／データカード＝窓の今を読む
+    // フェーズ1: エッジごとに上流を評価し when/carry を適用（EdgeOut の列で保持＝
+    // セレクタの first-match と no-data の NULL 伝搬はエッジ単位の情報が要る）。
+    let mut edges: Vec<EdgeOut> = Vec::new();
+    for (vid, real_id, vlabel, mime, ext, kind, attrs) in &inputs {
         // 中断後は新しいプロセスを起こさない（複数入力の連鎖を断つ）
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             report.errors.push("中断されました".into());
             break;
         }
-        let payloads: Vec<FlowPayload> = if kind.as_deref() == Some("filter") {
-            // 再帰評価（上流の permit は上流ノードの実行中だけ保持される）。
-            match eval_filter(state, app, p, vid, visited, report, job) {
+        // 上流の評価結果（EvalOut）を得る: フィルタ＝再帰評価（メモ化）／データカード＝窓の今
+        let up: EvalOut = if kind.as_deref() == Some("filter") {
+            match eval_filter(state, app, p, vid, visited, memo, report, job) {
                 Ok(v) => v,
-                Err(e) => {
-                    report.errors.push(format!("{vlabel}: {e}"));
-                    continue;
-                }
+                // 構造エラー（循環・カード不明）も「失敗」として一級化 — when=failure で拾える。
+                Err(e) => EvalOut::failed(vec![format!("{vlabel}: {e}")], None, vec![]),
             }
         } else if real_id.starts_with("drop:") {
+            // ドロップポイント未投入は従来どおり「スキップ」（no-data にはしない＝後方互換。
+            // 伝搬型ノードを止めたければ将来 no-data 化を検討 — 申し送り参照）。
             report
                 .skipped
                 .push(format!("{vlabel}（まだファイルが投入されていません）"));
@@ -382,7 +549,7 @@ pub(crate) fn eval_filter(
         } else if kind.as_deref() == Some("note") {
             // v1.4.17 カード統一＝定数カード: 付箋は本文をそのまま text/plain として供給する
             //（実体・CAS 非依存の読み出し専用テキスト。付箋→AI/t2i/grep がそのまま繋がる）。
-            let text = match p
+            match p
                 .conn
                 .query_row(
                     "SELECT note_text FROM virtual_bodies WHERE id = ?1",
@@ -391,23 +558,24 @@ pub(crate) fn eval_filter(
                 )
                 .map_err(|e| e.to_string())
             {
-                Ok(t) => t,
-                Err(e) => {
-                    report.errors.push(format!("{vlabel}: {e}"));
-                    continue;
+                Ok(text) => {
+                    let stem = if vlabel.trim().is_empty() {
+                        "コメント".to_string()
+                    } else {
+                        vlabel.clone()
+                    };
+                    EvalOut::data(
+                        vec![FlowPayload {
+                            bytes: text.into_bytes(),
+                            ext: "txt".into(),
+                            mime: "text/plain".into(),
+                            stem,
+                        }],
+                        None,
+                    )
                 }
-            };
-            let stem = if vlabel.trim().is_empty() {
-                "コメント".to_string()
-            } else {
-                vlabel.clone()
-            };
-            vec![FlowPayload {
-                bytes: text.into_bytes(),
-                ext: "txt".into(),
-                mime: "text/plain".into(),
-                stem,
-            }]
+                Err(e) => EvalOut::failed(vec![format!("{vlabel}: {e}")], None, vec![]),
+            }
         } else {
             // 窓の今を解決（snapshot 更新＋ビューパス）— ジョブ専用接続なのでロック不要。
             let path = {
@@ -421,27 +589,60 @@ pub(crate) fn eval_filter(
                         .and_then(|s| s.to_str())
                         .unwrap_or("output")
                         .to_string();
-                    vec![FlowPayload {
-                        bytes: d,
-                        ext: ext.clone().unwrap_or_else(|| "bin".into()),
-                        mime: mime.clone(),
-                        stem,
-                    }]
+                    EvalOut::data(
+                        vec![FlowPayload {
+                            bytes: d,
+                            ext: ext.clone().unwrap_or_else(|| "bin".into()),
+                            mime: mime.clone(),
+                            stem,
+                        }],
+                        None,
+                    )
                 }
                 Err(e) => {
-                    report.errors.push(format!("{vlabel}: 読み込み失敗 ({e})"));
-                    continue;
+                    EvalOut::failed(vec![format!("{vlabel}: 読み込み失敗 ({e})")], None, vec![])
                 }
             }
         };
-        collected.extend(payloads);
+        edges.push(apply_edge(&up, attrs, vlabel, report));
     }
+
+    // セレクタ（§5.4.1）: 実行せず「最初に有データを返した枝」を採用。no-data 吸収を内包し、
+    // 全滅なら自分が no-data（エラーではない — 下流やレポートが no-data として扱う）。
+    if spec.node_kind() == flow::NodeKind::Select {
+        let out = match edges.iter().find(|e| !e.nodata && !e.payloads.is_empty()) {
+            Some(e) => EvalOut::data(e.payloads.clone(), None),
+            None => EvalOut::nodata_out(),
+        };
+        return finish_eval(p, fid, visited, memo, 0, out);
+    }
+
+    // no-data の NULL 伝搬（§5.1-4）: 伝搬型（既定）は入力エッジに1つでも no-data が
+    // あれば自分も no-data（実行しない）。吸収型（nodata:"absorb"）は欠けを落として続行。
+    if !spec.absorbs_nodata() && edges.iter().any(|e| e.nodata) {
+        return finish_eval(p, fid, visited, memo, 0, EvalOut::nodata_out());
+    }
+    let all_nodata = !edges.is_empty() && edges.iter().all(|e| e.nodata);
+    if all_nodata {
+        // 吸収型でも材料が全滅なら no-data（実行するものがない）。
+        return finish_eval(p, fid, visited, memo, 0, EvalOut::nodata_out());
+    }
+    let collected: Vec<FlowPayload> = edges
+        .into_iter()
+        .filter(|e| !e.nodata)
+        .flat_map(|e| e.payloads)
+        .collect();
 
     // フェーズ2: 実行。種別ごとの分岐は execute_node へ一本化（§4.1）。ここに残るのは
     // 「型チェック（受け入れMIME・想定拡張子）」と「集約/ファンアウトの入力の束ね方」だけ。
     // 集約か個別かは CMD の書き方で決まる（{in*} か {in2} 以降があれば全入力を1回 = 集約:
     // gcc分割ソース・画像合成 / {in}/{in1} のみなら入力ごとに実行 = 従来のファンアウト）。
+    // v1.5.3 WS-P1: 実行エラーは report へ直接流さず errs に持ち上げる（消費側エッジが
+    // when=always のときだけ report へ＝失敗の格下げ）。型スキップは従来どおり report.skipped。
     let kind = spec.node_kind();
+    let mut errs: Vec<String> = Vec::new();
+    let mut skips: u32 = 0;
+    let mut last_exit: Option<i32> = None;
     // T2i は集約ノード（プロンプト＋元画像など全入力を集めて1回実行＝1枚生成）。
     if spec.is_aggregate() || kind == flow::NodeKind::T2i {
         // 集約実行は引数の位置・本数が意味を持つ → 合わない入力はスキップではなくエラー
@@ -460,7 +661,7 @@ pub(crate) fn eval_filter(
             }
         }
         if !bad.is_empty() {
-            report.errors.extend(bad);
+            errs.extend(bad);
         } else if !collected.is_empty()
             // v1.4.17: t2i はパネルの追加プロンプトだけでも生成できる（入力ゼロで実行可）。
             || (kind == flow::NodeKind::T2i && spec.own_prompt().is_some())
@@ -480,19 +681,21 @@ pub(crate) fn eval_filter(
             });
             match run {
                 Ok(run) => {
+                    last_exit = run.exit_code;
                     for (bytes, ext, mime) in run.outputs {
                         produced.push(FlowPayload { bytes, ext, mime, stem: stem0.clone() });
                     }
                 }
-                Err(e) => report.errors.push(format!("{stem0}: {e}")),
+                Err(e) => errs.push(format!("{stem0}: {e}")),
             }
         }
     } else {
-        for pl in collected {
+        for pl in &collected {
             if !flow::mime_matches(&accept, &pl.mime) {
                 report
                     .skipped
                     .push(format!("{}（{} は受け入れ対象外）", pl.stem, pl.mime));
+                skips += 1;
                 continue;
             }
             // 想定拡張子のチェック（新形式 IN欄。空なら制限なし）
@@ -505,6 +708,7 @@ pub(crate) fn eval_filter(
                     report
                         .skipped
                         .push(format!("{}（.{} は想定拡張子外）", pl.stem, pl.ext));
+                    skips += 1;
                     continue;
                 }
             }
@@ -515,6 +719,7 @@ pub(crate) fn eval_filter(
             });
             match run {
                 Ok(run) => {
+                    last_exit = run.exit_code;
                     for (bytes, ext, mime) in run.outputs {
                         produced.push(FlowPayload {
                             bytes,
@@ -524,12 +729,166 @@ pub(crate) fn eval_filter(
                         });
                     }
                 }
-                Err(e) => report.errors.push(format!("{}: {e}", pl.stem)),
+                Err(e) => errs.push(format!("{}: {e}", pl.stem)),
             }
         }
     }
-    visited.remove(fid);
-    Ok(produced)
+    let out = if errs.is_empty() {
+        EvalOut::data(produced, last_exit)
+    } else {
+        // 失敗: 入力スナップショットを carry:"input" 用に保持（リトライ材料）。
+        // 部分成功（ファンアウトの一部だけ失敗）も ok=false 扱い — 成功分 payloads は
+        // 残す（always 枝は従来どおり両方見える。§5.4.2 の when は全体成否で読む）。
+        EvalOut {
+            payloads: produced,
+            nodata: false,
+            ok: false,
+            exit: last_exit,
+            errors: errs,
+            failed_inputs: collected,
+        }
+    };
+    finish_eval(p, fid, visited, memo, skips, out)
+}
+
+#[cfg(test)]
+mod ws_p1_tests {
+    use super::*;
+
+    fn payload(stem: &str, bytes: &[u8]) -> FlowPayload {
+        FlowPayload {
+            bytes: bytes.to_vec(),
+            ext: "txt".into(),
+            mime: "text/plain".into(),
+            stem: stem.into(),
+        }
+    }
+    fn empty_report() -> FlowReport {
+        FlowReport {
+            created: vec![],
+            updated: vec![],
+            outputs: vec![],
+            skipped: vec![],
+            errors: vec![],
+            shell_capture: None,
+        }
+    }
+    fn attrs(json: &str) -> flow::EdgeAttrs {
+        flow::parse_edge_attrs(Some(json))
+    }
+
+    /// always（既定）: 上流エラーは report へ伝搬し、payload はそのまま通る（後方互換）。
+    #[test]
+    fn always_edge_propagates_errors() {
+        let mut up = EvalOut::data(vec![payload("a", b"x")], Some(0));
+        up.ok = false;
+        up.errors = vec!["a: 失敗".into()];
+        let mut report = empty_report();
+        let e = apply_edge(&up, &flow::EdgeAttrs::default(), "a", &mut report);
+        assert_eq!(report.errors, vec!["a: 失敗".to_string()]);
+        assert!(!e.nodata);
+        assert_eq!(e.payloads.len(), 1);
+    }
+
+    /// success: 成功時は上流出力を運び、失敗は no-data（report にエラーを流さない＝格下げ）。
+    #[test]
+    fn success_edge_downgrades_failure() {
+        let ok = EvalOut::data(vec![payload("a", b"x")], Some(0));
+        let bad = EvalOut::failed(vec!["a: 失敗".into()], Some(1), vec![]);
+        let mut report = empty_report();
+        let a = attrs(r#"{"when":"success"}"#);
+        let e1 = apply_edge(&ok, &a, "a", &mut report);
+        assert!(!e1.nodata);
+        assert_eq!(e1.payloads.len(), 1);
+        let e2 = apply_edge(&bad, &a, "a", &mut report);
+        assert!(e2.nodata, "失敗は枝が取られない＝no-data");
+        assert!(report.errors.is_empty(), "条件付き矢印はエラーを格下げする");
+    }
+
+    /// failure: 既定はエラーメッセージ（stderr）を text/plain で運ぶ。成功時は no-data。
+    #[test]
+    fn failure_edge_carries_stderr_by_default() {
+        let bad = EvalOut::failed(vec!["a: exit 1\nstderr本文".into()], Some(1), vec![]);
+        let ok = EvalOut::data(vec![payload("a", b"x")], Some(0));
+        let mut report = empty_report();
+        let a = attrs(r#"{"when":"failure"}"#);
+        let e1 = apply_edge(&bad, &a, "a", &mut report);
+        assert!(!e1.nodata);
+        assert_eq!(e1.payloads.len(), 1);
+        assert_eq!(e1.payloads[0].mime, "text/plain");
+        assert!(String::from_utf8_lossy(&e1.payloads[0].bytes).contains("stderr本文"));
+        let e2 = apply_edge(&ok, &a, "a", &mut report);
+        assert!(e2.nodata, "成功時は失敗枝が取られない");
+        assert!(report.errors.is_empty());
+    }
+
+    /// carry: "input"=失敗時の入力を横流し／"none"=データなしで枝だけ通す（ゲート）。
+    #[test]
+    fn failure_edge_carry_variants() {
+        let bad = EvalOut::failed(
+            vec!["a: 失敗".into()],
+            Some(2),
+            vec![payload("in1", b"retry-me")],
+        );
+        let mut report = empty_report();
+        let e_in = apply_edge(&bad, &attrs(r#"{"when":"failure","carry":"input"}"#), "a", &mut report);
+        assert_eq!(e_in.payloads.len(), 1);
+        assert_eq!(e_in.payloads[0].bytes, b"retry-me");
+        let e_none = apply_edge(&bad, &attrs(r#"{"when":"failure","carry":"none"}"#), "a", &mut report);
+        assert!(!e_none.nodata, "枝は取られている（信号のみ）");
+        assert!(e_none.payloads.is_empty());
+    }
+
+    /// 上流 no-data は when に関わらず no-data（NULL伝搬・§5.1-4）。
+    #[test]
+    fn nodata_null_propagates_through_any_when() {
+        let nd = EvalOut::nodata_out();
+        let mut report = empty_report();
+        for a in [
+            flow::EdgeAttrs::default(),
+            attrs(r#"{"when":"success"}"#),
+            attrs(r#"{"when":"failure"}"#),
+        ] {
+            let e = apply_edge(&nd, &a, "a", &mut report);
+            assert!(e.nodata);
+        }
+        assert!(report.errors.is_empty());
+    }
+
+    /// last_run の構造化保存（§6.1）: at/exit/ok/nodata/skipped/message が JSON で入る。
+    #[test]
+    fn last_run_is_persisted_as_json() {
+        let dir = std::env::temp_dir().join(format!("texos_p1_test_{}", db::now_ms()));
+        let cas_root = dir.join(".texos").join("cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
+        let p = Project {
+            conn,
+            root: dir.clone(),
+            cas_root,
+        };
+        let h = cas::store_bytes(&p.cas_root, b"spec").unwrap();
+        db::insert_real_body(&p.conn, &h, "application/json", 4, None).unwrap();
+        db::insert_virtual_body(&p.conn, "f1", &h, "フィルタ", 0.0, 0.0, None, None).unwrap();
+        let out = EvalOut::failed(vec!["exit 1: 詳細".into()], Some(1), vec![]);
+        write_last_run(&p, "f1", &out, 2);
+        let s: String = p
+            .conn
+            .query_row(
+                "SELECT last_run FROM virtual_bodies WHERE id='f1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["exit"], serde_json::json!(1));
+        assert_eq!(v["nodata"], serde_json::json!(false));
+        assert_eq!(v["skipped"], serde_json::json!(2));
+        assert!(v["message"].as_str().unwrap().contains("詳細"));
+        assert!(v["at"].as_i64().unwrap() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// フローを実行（手動トリガー — 確定方針4）。
@@ -715,10 +1074,28 @@ fn run_flow_inner(
         shell_capture: None,
     };
     let mut visited = std::collections::HashSet::new();
+    let mut memo = EvalMemo::new();
     // 評価フェーズ: DB 接触はジョブ専用接続（jp）＝ UI の state.current とは独立。
     // 実行（外部/AI/録音）中も UI・他フローが固まらない。資源の取り合いはセマフォが調停。
     // 中断フラグ・stdin 制御はこのジョブのもの（ジョブ別＝毎回新品なのでリセット不要）。
-    let payloads = eval_filter(state.inner(), app, &jp, &id, &mut visited, &mut report, job)?;
+    let out = eval_filter(
+        state.inner(),
+        app,
+        &jp,
+        &id,
+        &mut visited,
+        &mut memo,
+        &mut report,
+        job,
+    )?;
+    // v1.5.3 WS-P1: 終端ノード自身の失敗は常に報告（エッジによる格下げは中間ノードの話）。
+    report.errors.extend(out.errors.clone());
+    if out.nodata {
+        report
+            .skipped
+            .push("no-data: 条件を満たす枝がありませんでした（材料なし＝エラーではありません）".into());
+    }
+    let payloads = out.payloads;
     if payloads.is_empty() && report.skipped.is_empty() && report.errors.is_empty() {
         // 自己完結コマンド（{out} を書かないカメラ起動・読み上げ等）は出力ゼロで正常終了する
         // のが正しい。それ以外で空なら入力の繋ぎ忘れとして案内する。

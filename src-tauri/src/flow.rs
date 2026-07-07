@@ -136,6 +136,32 @@ pub struct FilterSpec {
     /// 入力が無ければこれ単独がプロンプトになる（パネルだけで生成できる）。
     #[serde(default)]
     pub prompt: Option<String>,
+    /// v1.5.3 WS-P1（オペ層 §5.4.2）: no-data の振る舞い。"propagate"(既定=キー無し)＝
+    /// 入力に no-data が1つでもあれば自分も no-data（NULL伝搬・実行しない）／
+    /// "absorb"＝欠けは欠けたまま、返ってきたものだけで実行（統合系）。
+    #[serde(default)]
+    pub nodata: Option<String>,
+}
+
+/// v1.5.3 WS-P1（オペ層 §5.4.2）: フロー矢印の制御属性（relations.attrs の JSON）。
+/// NULL/キー無し = 従来（無条件・接続順）＝完全後方互換。
+#[derive(Deserialize, Default, Debug, Clone)]
+pub struct EdgeAttrs {
+    /// 通過条件: "success" | "failure" | 無し="always"。上流の**ジョブ内評価結果**を読む。
+    #[serde(default)]
+    pub when: Option<String>,
+    /// 枝が取られたとき運ぶもの: "stderr"(失敗枝の既定) | "input" | "none"。
+    /// 成功枝の既定は上流出力（キー無し＝従来どおり）。
+    #[serde(default)]
+    pub carry: Option<String>,
+    /// IN 順の明示（1始まり）。無し = created_at 接続順（port 昇順 → created_at で安定）。
+    #[serde(default)]
+    pub port: Option<i64>,
+}
+
+/// relations.attrs の JSON を読む（NULL・壊れた JSON は既定＝従来挙動）。
+pub fn parse_edge_attrs(s: Option<&str>) -> EdgeAttrs {
+    s.and_then(|t| serde_json::from_str(t).ok()).unwrap_or_default()
 }
 
 /// v1.4.10 リファクタリング（§4.2 ノード種別の体系化）: いままで eval_filter / run_flow に
@@ -156,6 +182,10 @@ pub enum NodeKind {
     Ai,
     /// builtin:"t2i" — 常駐 diffusers デーモン経由の画像生成（テキスト→PNG・別経路）。
     T2i,
+    /// builtin:"select" — セレクタ（v1.5.3 WS-P1・オペ層 §5.4.1）。実行はせず port 順の
+    /// first-match で「最初に有データを返した枝」を採用する。no-data 吸収を内包。
+    /// eval_filter 側で完結し execute_node には到達しない。
+    Select,
     /// その他の内蔵フィルタ（text_grep / text_replace / img_* / md_codeblock …）。
     Builtin,
     /// 外部コマンド／プログラム（{in}/{out} 展開）。集約か個別かは is_aggregate() で。
@@ -175,6 +205,7 @@ impl FilterSpec {
             return match b {
                 "ai" => NodeKind::Ai,
                 "t2i" => NodeKind::T2i,
+                "select" => NodeKind::Select,
                 _ => NodeKind::Builtin,
             };
         }
@@ -208,6 +239,12 @@ impl FilterSpec {
     /// v1.4.17 t2i インラインパネルの追加プロンプト（空白のみは無いのと同じ）。
     pub fn own_prompt(&self) -> Option<&str> {
         self.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// v1.5.3 WS-P1: no-data を吸収するノードか（spec の absorb フラグ or セレクタ）。
+    /// 既定は伝搬型＝入力に no-data があれば自分も no-data（オペ層 §5.1-4）。
+    pub fn absorbs_nodata(&self) -> bool {
+        self.nodata.as_deref() == Some("absorb") || self.node_kind() == NodeKind::Select
     }
 }
 
@@ -1607,6 +1644,23 @@ mod tests {
             )),
             "http://192.168.1.5:11434"
         );
+    }
+
+    /// v1.5.3 WS-P1: エッジ属性のパース（NULL/壊れたJSON=既定＝従来）とセレクタ判定。
+    #[test]
+    fn edge_attrs_and_select_kind() {
+        let a = parse_edge_attrs(Some(r#"{"when":"failure","carry":"input","port":2}"#));
+        assert_eq!(a.when.as_deref(), Some("failure"));
+        assert_eq!(a.carry.as_deref(), Some("input"));
+        assert_eq!(a.port, Some(2));
+        let d = parse_edge_attrs(None);
+        assert!(d.when.is_none() && d.carry.is_none() && d.port.is_none());
+        let broken = parse_edge_attrs(Some("{not json"));
+        assert!(broken.when.is_none());
+        assert_eq!(spec(r#"{"builtin":"select"}"#).node_kind(), NodeKind::Select);
+        assert!(spec(r#"{"builtin":"select"}"#).absorbs_nodata());
+        assert!(spec(r#"{"cmd":"x {out}","nodata":"absorb"}"#).absorbs_nodata());
+        assert!(!spec(r#"{"cmd":"x {out}"}"#).absorbs_nodata());
     }
 
     /// v1.5.2 WS-C: 録音デバイス名の抽出（dshow・引用あり/なし・無指定は None）。

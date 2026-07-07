@@ -30,6 +30,8 @@ export interface MenuActions {
   saveLauncherToLibrary: (id: string) => void;
   deleteLibraryLauncher: (name: string) => void;
   editFilter: (id: string, current: string) => void;
+  // v1.5.3 WS-P1: 入力（flow矢印）の順序編集ダイアログ（{inN}・セレクタの採用順）。
+  inputOrder: (id: string, label: string) => void;
   // v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断）
   saveFilterToLibrary: (id: string) => void;
   addLibraryFilter: (name: string, x: number, y: number) => void;
@@ -423,6 +425,12 @@ export function buildObjectMenu(
         // 外部プログラムは設定ダイアログ、内蔵フィルタはJSON編集（App側で分岐）
         label: "フィルタ設定を編集...",
         onClick: () => a.editFilter(targetId, obj.filter_ref ?? "{}"),
+      },
+      // v1.5.3 WS-P1（オペ層 §5.4.3 第1段）: 入力の並べ替え（attrs.port を書く）。
+      {
+        label: "入力の順序 ...",
+        hint: "このカードへ入る矢印の順番を並べ替えます（{in2} 等の位置指定・セレクタの採用順に効きます）。",
+        onClick: () => a.inputOrder(targetId, obj.label),
       },
       // v1.5: 設定済みフィルタに名前を付けてプロジェクト横断で再利用
       { label: "ライブラリに登録...", onClick: () => a.saveFilterToLibrary(targetId) },
@@ -907,6 +915,12 @@ export function buildCanvasMenu(
           { label: "AI: 変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat", pos.canvasX, pos.canvasY) },
           { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => a.addFilter("md_codeblock", pos.canvasX, pos.canvasY) },
           { label: "画像生成: Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i", pos.canvasX, pos.canvasY) },
+          // v1.5.3 WS-P1: セレクタ（オペ層 §5.4.1）。exit code 分岐の合流点。
+          {
+            label: "セレクタ（最初の有データ枝を採用）",
+            hint: "入力の順に見て、最初にデータを返した枝を採用します。成功枝/失敗枝の合流点（矢印の通過条件と組み合わせて使います）。",
+            onClick: () => a.addFilter("select", pos.canvasX, pos.canvasY),
+          },
           { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
           { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
           { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
