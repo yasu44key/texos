@@ -22,6 +22,11 @@ pub(crate) fn create_filter(
     y: f64,
     state: State<AppState>,
 ) -> Result<String, String> {
+    // v1.5.4 WS-P2: op カード（トリガ/タイマ/ウォッチャ）は「op キーを持つ spec」で見分けて
+    // kind='op' として作る（フロントは create_filter を使い続ける＝入口を増やさない）。
+    if ops::is_op_spec(&spec) {
+        return ops::create_op_card(label, spec, x, y, state.inner());
+    }
     flow::parse_spec(&spec)?; // 保存前に検証（壊れたJSONをDBに入れない）
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
@@ -337,6 +342,10 @@ pub(crate) fn list_installed_apps() -> Result<Vec<InstalledApp>, String> {
 /// フィルタ定義（JSON）を更新。フォーム自動生成（JSON Schema）はフェーズ2。
 #[tauri::command]
 pub(crate) fn update_filter(id: String, spec: String, state: State<AppState>) -> Result<(), String> {
+    // v1.5.4 WS-P2: op カードの設定保存も同じ入口（spec の op キーで分岐）。
+    if ops::is_op_spec(&spec) {
+        return ops::update_op_card(&id, &spec, state.inner());
+    }
     flow::parse_spec(&spec)?;
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;

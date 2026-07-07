@@ -1,6 +1,6 @@
 [package]
 name = "texos"
-version = "1.5.3"
+version = "1.5.4"
 description = "TexoS - 織り紡ぐ者たち"
 authors = ["you"]
 edition = "2021"
@@ -40,6 +40,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 元バイト列は変更しない非破壊ビュー。実身化（UTF-8変換）はフィルタ側の分担。
 encoding_rs = "0.8"
 chardetng = "0.1"
+# v1.5.4 WS-P2: タイマの at:"HH:MM"（ローカル時刻）判定用。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 # v1.4.0 AIフィルタの回帰テスト用。本番(Tauri command async)と同じ tokio 文脈を

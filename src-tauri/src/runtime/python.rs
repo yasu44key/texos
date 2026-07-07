@@ -58,6 +58,9 @@ pub(crate) const ENV_REQUIREMENTS: &[(&str, &[&str])] = &[(
         "safetensors",
         "pillow",
         "huggingface_hub",
+        // LoRA 適用に必要（無くても生成自体は動くので check_deps() には含めない＝
+        // peft 無しの既存 env を「壊れている」と誤判定させない）。
+        "peft",
     ],
 )];
 

@@ -131,6 +131,11 @@ function App() {
   const [shapeSnap, setShapeSnap] = useState<boolean>(
     () => localStorage.getItem("texos-shape-snap") === "1"
   );
+  // v1.5.4 WS-P2: リクエスト矢印（req・opカードの発行線）の表示（既定オン・永続化）。
+  // 非表示でも発行は動き続ける（見た目のトグルだけ）。
+  const [showReqArrows, setShowReqArrows] = useState<boolean>(
+    () => localStorage.getItem("texos-show-req") !== "0"
+  );
   const [newNoteId, setNewNoteId] = useState<string | null>(null);
   const [relations, setRelations] = useState<RelationInfo[]>([]);
   const [linkDrag, setLinkDrag] = useState<LinkDrag | null>(null);
@@ -162,11 +167,14 @@ function App() {
   // v1.4.29 ⑤: ビルトインフィルタ専用の設定ダイアログ（生JSON編集の置き換え）。
   // 種別ごとのスキーマからフォームを自動生成する（text_grep / text_replace /
   // img_resize / img_convert / md_codeblock）。id あり=既存編集。
+  // v1.5.4 WS-P2: op カード（op_trigger/op_timer/op_watch）もこのダイアログで作成・編集
+  // する（id あり=既存編集 / create あり=新規作成）。
   const [builtinDlg, setBuiltinDlg] = useState<{
-    id: string;
+    id: string | null;
     builtin: string;
     label: string;
-    spec: string;
+    spec?: string;
+    create?: { x: number; y: number; linkFrom?: string };
   } | null>(null);
   // シェルカード統合（2026-07-06）: コマンドプロンプト/PowerShell カード専用の設定
   // ダイアログ（作成・編集兼用）。id あり=既存編集 / create あり=新規作成。
@@ -446,6 +454,9 @@ function App() {
     for (const ev of ["job:done", "job:failed"]) {
       void listen<{ job_id: number }>(ev, (e) => {
         setJobs((prev) => prev.filter((j) => j.id !== e.payload.job_id));
+        // v1.5.4 WS-P2: タイマ/ウォッチャ発の背景フローは完了ダイアログを出さないので、
+        // 完了時にキャンバスを更新して結果カードを見せる（手動実行の refresh と重なっても無害）。
+        if (ev === "job:done") void refresh();
       }).then((u) => (alive ? uns.push(u) : u()));
     }
     // 復元（リロード時など。started_at はバックエンドの unix ms をそのまま使う）。
@@ -1086,6 +1097,22 @@ function App() {
           });
         }
       };
+      // v1.5.4 WS-P2 オペレーション: トリガは即作成（設定項目なし）、タイマ/ウォッチャは
+      // スキーマフォーム（BuiltinFilterDialog）で作成。spec の op キーを見て backend の
+      // create_filter が kind='op' として作る。
+      if (builtin === "op_trigger") {
+        create("トリガ", { op: "trigger" });
+        return;
+      }
+      if (builtin === "op_timer" || builtin === "op_watch") {
+        setBuiltinDlg({
+          id: null,
+          builtin,
+          label: builtin === "op_timer" ? "タイマ" : "ウォッチャ",
+          create: { x: canvasX, y: canvasY, linkFrom },
+        });
+        return;
+      }
       if (builtin === "ai_dialog" || builtin === "ai_chat") {
         // v1.4.1 AIカードの作成は専用設定ダイアログで（モデル/システム/温度を一括設定）。
         // 作成・編集で同じダイアログ＝システムプロンプトも複数行で書ける。
@@ -1478,6 +1505,30 @@ function App() {
   // フローを実行（手動トリガー — 確定方針4）。結果カードは緑シグナル＋Ctrl+Zで戻せる。
   const handleRunFlow = useCallback(
     async (id: string) => {
+      // v1.5.4 WS-P2: op カード（トリガ▶）は run_flow ではなく fire_op（代理発行）。
+      // fire_op はスレッドへ発行してすぐ返る＝進行はジョブパネル・結果は job:done の refresh。
+      // 同一終端の多重はジョブ台帳（register_flow）が拒否するので二度押しガードは不要。
+      if (objectsRef.current.find((o) => o.id === id)?.kind === "op") {
+        try {
+          const n = await invoke<number>("fire_op", { id });
+          await refresh(); // fired_count の書き戻しを拾う
+          setConfirm({
+            title: "発行しました",
+            message: `${n} 件のフローを発行しました。進行状況は背景ジョブパネルに表示されます。`,
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        } catch (e) {
+          console.error("fire_op failed", e);
+          setConfirm({
+            title: "発行できませんでした",
+            message: String(e),
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+        return;
+      }
       // v1.5.2 WS-C: 二度押し抑止は**カード単位**（並行解禁後は別フローの同時実行が正規の
       // 使い方。同一カードの連打だけ弾く）。バックエンド register_flow にも同じガードがある。
       if (runningCardsRef.current.has(id)) return;
@@ -1568,15 +1619,22 @@ function App() {
     (id: string, current: string) => {
       let builtin: string | null = null;
       let isShell = false;
+      let opKind: string | null = null;
       try {
         const parsed = JSON.parse(current || "{}");
         const b = parsed.builtin;
         builtin = typeof b === "string" ? b : null;
         isShell = typeof parsed.shell === "string";
+        // v1.5.4 WS-P2: op カード（トリガ/タイマ/ウォッチャ）は op キーで見分ける。
+        opKind = typeof parsed.op === "string" ? parsed.op : null;
       } catch {
         builtin = null;
       }
       const label = objectsRef.current.find((o) => o.id === id)?.label ?? "";
+      if (opKind) {
+        setBuiltinDlg({ id, builtin: `op_${opKind}`, label, spec: current });
+        return;
+      }
       // シェルカード統合（2026-07-06）: shell キーを持つカードは専用ダイアログ。
       // 従来は外部プログラム用ダイアログに流れ、NAME/PATH 検証が赤エラーになっていた。
       if (isShell) {
@@ -4234,6 +4292,13 @@ function App() {
             localStorage.setItem("texos-menu-hints", nv ? "1" : "0");
             return nv;
           }),
+        // v1.5.4 WS-P2: リクエスト矢印（req）の表示トグル（永続化）。
+        toggleReqArrows: () =>
+          setShowReqArrows((v) => {
+            const nv = !v;
+            localStorage.setItem("texos-show-req", nv ? "1" : "0");
+            return nv;
+          }),
         toggleCardHints: () =>
           setShowCardHints((v) => {
             const nv = !v;
@@ -4400,6 +4465,7 @@ function App() {
             menuHints: showMenuHints,
             cardHints: showCardHints,
             shapeSnap,
+            showReqArrows,
           },
           actions
         );
@@ -4686,6 +4752,7 @@ function App() {
           onDeleteRelation={handleDeleteRelation}
           onFlowRelationClick={handleFlowRelationClick}
           invalidIds={invalidFlowIds}
+          showReq={showReqArrows}
         />
         {objects.map((obj) => (
           <ObjectCard
@@ -4923,15 +4990,28 @@ function App() {
             const dlg = builtinDlg;
             setBuiltinDlg(null);
             try {
-              await invoke("update_filter", { id: dlg.id, spec });
-              if (label !== dlg.label) {
-                await invoke("rename_object", { id: dlg.id, label });
+              if (dlg.id) {
+                await invoke("update_filter", { id: dlg.id, spec });
+                if (label !== dlg.label) {
+                  await invoke("rename_object", { id: dlg.id, label });
+                }
+              } else if (dlg.create) {
+                // v1.5.4 WS-P2: op カード（タイマ/ウォッチャ）の新規作成もこのダイアログ経由。
+                // spec の op キーで backend が kind='op' として作る。
+                const vid = await invoke<string>("create_filter", {
+                  label,
+                  spec,
+                  x: dlg.create.x,
+                  y: dlg.create.y,
+                });
+                pushUndo([{ kind: "delete", ids: [vid] }]);
+                if (dlg.create.linkFrom) await linkNewNode(dlg.create.linkFrom, vid);
               }
               await refresh();
             } catch (e) {
               console.error("builtin filter save failed", e);
               setConfirm({
-                title: "フィルタを保存できませんでした",
+                title: "設定を保存できませんでした",
                 message: String(e),
                 okLabel: "OK",
                 onConfirm: () => setConfirm(null),

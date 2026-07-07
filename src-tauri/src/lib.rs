@@ -593,6 +593,7 @@ mod flow_run;
 mod launcher;
 mod notes;
 mod objects;
+mod ops;
 mod os_integration;
 mod proc;
 mod project;
@@ -606,6 +607,7 @@ pub(crate) use flow_run::*;
 pub(crate) use launcher::*;
 pub(crate) use notes::*;
 pub(crate) use objects::*;
+pub(crate) use ops::*;
 pub(crate) use os_integration::*;
 pub(crate) use proc::*;
 pub(crate) use project::*;
@@ -641,6 +643,9 @@ pub fn run() {
                 write_locks: Mutex::new(std::collections::HashMap::new()),
                 t2i_server: std::sync::Mutex::new(None),
             });
+            // v1.5.4 WS-P2: オペ層スケジューラ（タイマ/ウォッチャの発火判定・tick 1秒・
+            // 現在開いているプロジェクトの op カードだけが対象）。
+            start_op_scheduler(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -724,6 +729,7 @@ pub fn run() {
             create_filter,
             update_filter,
             run_flow,
+            fire_op,
             break_flow,
             list_jobs,
             cancel_all,

@@ -902,8 +902,18 @@ mod ws_p1_tests {
 pub(crate) fn run_flow(
     id: String,
     app: tauri::AppHandle,
-    state: State<AppState>,
 ) -> Result<FlowReport, String> {
+    run_flow_for(&id, &app)
+}
+
+/// run_flow の実体（v1.5.4 WS-P2: 代理発行の入口）。トリガ/タイマ/ウォッチャ（ops.rs）と
+/// スケジューラは AppHandle しか持たないスレッドから呼ぶため、State はここで引く。
+/// ジョブ台帳への登録・job:started/done/failed の emit まで含む＝呼び出し元はスレッドに
+/// 乗せるだけでパネル表示と Stop-all が効く。
+pub(crate) fn run_flow_for(id: &str, app: &tauri::AppHandle) -> Result<FlowReport, String> {
+    use tauri::Manager;
+    let state: State<AppState> = app.state();
+    let id = id.to_string();
     // v1.5.2 WS-C 並行解禁: 短ロックで終端カードとルートを読み、**同一終端カード**の Flow
     // だけを拒否して登録（v1.4.10 再入エラーの一般化）。別フローとは並行し、資源の
     // 取り合いはセマフォ（acquire_node_permits）が調停する。完了同期返しは維持。
@@ -929,7 +939,7 @@ pub(crate) fn run_flow(
         "job:started",
         serde_json::json!({ "job_id": job.id, "kind": "flow", "label": flabel, "card": id }),
     );
-    let result = run_flow_inner(&id, fx, fy, &flabel, fref.as_deref(), &root, &app, &state, &job);
+    let result = run_flow_inner(&id, fx, fy, &flabel, fref.as_deref(), &root, app, &state, &job);
     // report 内のエラーは「完了した実行の報告」なので done 扱い＝Err はコマンド自体の失敗。
     let _ = app.emit(
         if result.is_ok() { "job:done" } else { "job:failed" },

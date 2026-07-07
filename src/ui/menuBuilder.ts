@@ -57,6 +57,8 @@ export interface MenuActions {
   toggleMenuHints: () => void;
   // v1.4.29: カードの説明ツールチップ表示のオン/オフ（メニューとは別系統）。
   toggleCardHints: () => void;
+  /// v1.5.4 WS-P2: リクエスト矢印（req・破線琥珀）の表示トグル。
+  toggleReqArrows: () => void;
   switchProject: () => void;
   // v1.4.12: キーボードショートカット一覧（? / F1 でも開閉）。
   showHelp: () => void;
@@ -838,6 +840,8 @@ interface CanvasMenuCtx {
   cardHints: boolean;
   /// v1.4.25 ⑤: 図形グリッドスナップの現在のオン/オフ（トグル表示用）。
   shapeSnap: boolean;
+  /// v1.5.4 WS-P2: リクエスト矢印（req）の表示オン/オフ（トグル表示用）。
+  showReqArrows: boolean;
 }
 
 // v1.4.16: UIカラーの連続比較用サブメニュー。選んでもメニューは閉じず（keepOpen）、
@@ -957,6 +961,24 @@ export function buildCanvasMenu(
     },
     // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
     { label: "外部プログラム...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
+    // ── オペレーション（v1.5.4 WS-P2: 発行系 — フローを「起動する」カード。
+    //    リクエスト矢印(req)で実行したいフィルタカードへつなぐ。データレーンには乗らない）──
+    { label: "── オペレーション ──", onClick: () => {}, disabled: true },
+    {
+      label: "トリガ（設置型▶・一括発行）",
+      hint: "▶を押すと、リクエスト矢印の先につないだフィルタを実行します。複数につなげば一括発行できます。",
+      onClick: () => a.addFilter("op_trigger", pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "タイマ（周期・時刻で発行）...",
+      hint: "指定した周期（秒）または時刻（HH:MM）に、矢印の先のフィルタを自動実行します。発火間隔の下限と累計回数の上限（ヒューズ）付き。",
+      onClick: () => a.addFilter("op_timer", pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "ウォッチャ（ファイル監視で発行）...",
+      hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
+      onClick: () => a.addFilter("op_watch", pos.canvasX, pos.canvasY),
+    },
     // ── ユーザーのカード（ライブラリ登録済み・登録があるときだけ）──
     ...(ctx.launcherLibrary.length || ctx.library.length
       ? [
@@ -1055,6 +1077,12 @@ export function buildCanvasMenu(
       label: (ctx.cardHints ? "✓ " : "　") + "カードのツールチップを表示",
       hint: "カードにカーソルを合わせたときの説明（種別・メモ・使い方や仮身/実身の状態）を表示します。オフにすると非表示になります。",
       onClick: () => a.toggleCardHints(),
+    },
+    {
+      // v1.5.4 WS-P2: リクエスト矢印（op カードの発行線・破線琥珀）の表示トグル。
+      label: (ctx.showReqArrows ? "✓ " : "　") + "リクエスト矢印を表示",
+      hint: "トリガ・タイマ・ウォッチャから引いたリクエスト矢印（破線）の表示/非表示を切り替えます。非表示でも発行は動き続けます。",
+      onClick: () => a.toggleReqArrows(),
     },
     {
       label: "ショートカット一覧（?）",

@@ -140,6 +140,7 @@ function iconFor(mime: string, ext?: string | null): string {
   if (mime === "application/vnd.texos.folder") return "📂";
   if (mime === "application/vnd.texos.filter") return "⚗️";
   if (mime === "application/vnd.texos.drop") return "📥";
+  if (mime === "application/vnd.texos.op") return "⚡";
   // Extension first — most specific for unknown MIME types.
   if (ext) {
     const hit = EXT_ICON[ext.toLowerCase()];
@@ -190,12 +191,39 @@ const FILTER_TYPE_STYLES = {
     badge: "＞_ シェル",
     run: "▶ 実行",
   },
+  // v1.5.4 WS-P2 オペレーション（kind='op'）: 琥珀系の亜種（ジェネレータより赤みを足して
+  // 「発行する側」を見分ける）。▶ボタンはトリガのみ（run が空の種別はボタンなし）。
+  op_trigger: {
+    bg: "var(--card-bg-op, #2c1e10)",
+    border: "#8a6230",
+    text: "var(--card-op-text, #f0c070)",
+    badge: "⚡ トリガ",
+    run: "▶ 発行",
+  },
+  op_timer: {
+    bg: "var(--card-bg-op, #2c1e10)",
+    border: "#8a6230",
+    text: "var(--card-op-text, #f0c070)",
+    badge: "⚡ タイマ",
+    run: "",
+  },
+  op_watch: {
+    bg: "var(--card-bg-op, #2c1e10)",
+    border: "#8a6230",
+    text: "var(--card-op-text, #f0c070)",
+    badge: "⚡ ウォッチャ",
+    run: "",
+  },
 } as const;
 
 function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_STYLES {
   if (!ref) return "filter";
   try {
     const s = JSON.parse(ref);
+    // v1.5.4 WS-P2: op カード（トリガ/タイマ/ウォッチャ）は op キーで見分ける。
+    if (s.op === "trigger" || s.op === "timer" || s.op === "watch") {
+      return `op_${s.op}` as keyof typeof FILTER_TYPE_STYLES;
+    }
     if (typeof s.shell === "string") return "shell";
     if (!s.builtin && (s.type === "command" || s.type === "generator")) return s.type;
   } catch {
@@ -520,7 +548,7 @@ export function ObjectCard({
           : isT2i
           ? `🎨 画像生成\nダブルクリック: 生成パネル（プロンプト編集＋実行） ／ ボタン: フローを実行\n右クリック → 設定: モデル・パラメータ変更${memo ? `\n\n${memo}` : ""}`
           : isFilter
-          ? `${fstyle.badge}\nダブルクリック: 設定を開く ／ ボタン: ${fstyle.run}\n右クリック: メニュー${memo ? `\n\n${memo}` : ""}`
+          ? `${fstyle.badge}\nダブルクリック: 設定を開く${fstyle.run ? ` ／ ボタン: ${fstyle.run}` : ""}\n右クリック: メニュー${memo ? `\n\n${memo}` : ""}`
           : isDrop
           ? `ここにファイルをドロップ→下流を自動実行\nダブルクリック: 投入するファイルを選択${memo ? `\n\n${memo}` : ""}`
           : `${mimeType}\nid: ${id}${memo ? `\n\n${memo}` : ""}`
@@ -614,8 +642,9 @@ export function ObjectCard({
               </span>
             )}
             {/* v1.3.9: 実行は明示ボタンで（ダブルクリックは設定）。誤爆を防ぐ。
-                v1.4.1: AI対話カードは「実行」ではなくチャットパネルを開く。 */}
-            {isFilter && (
+                v1.4.1: AI対話カードは「実行」ではなくチャットパネルを開く。
+                v1.5.4: op カードの▶はトリガのみ（run が空のタイマ/ウォッチャはボタンなし）。 */}
+            {isFilter && (isAiChat || fstyle.run) && (
               <button
                 onMouseDown={(e) => e.stopPropagation()}
                 onDoubleClick={(e) => e.stopPropagation()}

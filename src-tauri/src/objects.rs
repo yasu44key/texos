@@ -1520,6 +1520,25 @@ pub(crate) fn create_relation(
     // v1.4 オートフロー⑤: フィルタカードに入る/出る矢印は自動的にフロー
     // （新しい矢印種のUIは作らない — 確定方針1）。
     let kind = kind.unwrap_or_else(|| {
+        // v1.5.4 WS-P2: op カード（トリガ/タイマ/ウォッチャ）に触れる矢印は自動的に
+        // kind='req'（リクエスト矢印）。eval_filter の入力収集は kind='flow' 限定クエリ
+        // なので req はデータレーンに乗らない＝フロー評価から自然に不可視。
+        // （WS-M の op:"in"/"out" は透過ノードとして flow を張る予定 — その時に再分岐）
+        let is_op_node = |vid: &str| -> bool {
+            p.conn
+                .query_row(
+                    "SELECT 1 FROM virtual_bodies WHERE id = ?1 AND kind = 'op'",
+                    rusqlite::params![vid],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        if is_op_node(&from_id) || is_op_node(&to_id) {
+            return "req".to_string();
+        }
         // v1.3.11: フィルタに加えランチャー（kind='launcher'）への矢印もフロー扱い
         // （ランチャーに入る {in} 入力＝開くファイルを flow エッジで表す）。
         let is_flow_node = |vid: &str| -> bool {

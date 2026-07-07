@@ -22,6 +22,8 @@ interface FieldSchema {
   options?: { value: string; label: string }[];
   /** number の最小値。 */
   min?: number;
+  /** v1.5.4 WS-P2: カンマ区切りの値を文字列配列として保存する（例 events）。 */
+  asList?: boolean;
 }
 
 interface BuiltinSchema {
@@ -30,6 +32,10 @@ interface BuiltinSchema {
   /** この builtin が常に持つ固定キー（accept_mime 等）。保存時に必ず付与する。 */
   fixed: Record<string, unknown>;
   fields: FieldSchema[];
+  /** v1.5.4 WS-P2: op カード（kind='op'）のスキーマ。spec に builtin キーを入れない。 */
+  opCard?: boolean;
+  /** ダイアログ上部に出す説明（op カードの使い方案内）。 */
+  note?: string;
 }
 
 // 対象は run_builtin の match アームと一致する5種のみ（ai / t2i は各専用ダイアログ）。
@@ -117,6 +123,108 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       },
     ],
   },
+  // ── v1.5.4 WS-P2 オペレーション（op カード・kind='op'）。builtin ではないが、
+  //    「スキーマからフォームを自動生成して update_filter/create_filter で保存」という
+  //    仕組みは同じなのでここに同居させる（キーは "op_<種別>"）。
+  op_trigger: {
+    title: "トリガ（設置型▶・一括発行）",
+    opCard: true,
+    fixed: { op: "trigger" },
+    note: "▶を押すと、このカードから引いたリクエスト矢印（破線）の先のフィルタを実行します。複数につなげば一括発行。設定項目はありません（名前だけ変えられます）。",
+    fields: [],
+  },
+  op_timer: {
+    title: "タイマ（周期・時刻で発行）",
+    opCard: true,
+    fixed: { op: "timer" },
+    note: "リクエスト矢印の先のフィルタを、周期または時刻で自動実行します。every か at のどちらかを設定してください。",
+    fields: [
+      {
+        key: "every",
+        label: "周期（秒）",
+        type: "number",
+        optional: true,
+        min: 1,
+        placeholder: "例: 300（5分ごと）",
+        hint: "この秒数ごとに発行します。時刻指定（at）だけを使う場合は空欄に。",
+      },
+      {
+        key: "at",
+        label: "時刻 (HH:MM)",
+        type: "text",
+        optional: true,
+        placeholder: "例: 07:30（毎日その時刻に1回）",
+        hint: "ローカル時刻。1日1回発行します。周期（every）と併用も可能。",
+      },
+      {
+        key: "min_interval",
+        label: "発火間隔の下限（秒）",
+        type: "number",
+        default: 5,
+        min: 0,
+        hint: "ヒューズ: これより短い間隔では発火しません。",
+      },
+      {
+        key: "max_fires",
+        label: "累計発火数の上限",
+        type: "number",
+        default: 100,
+        min: 0,
+        hint: "ヒューズ: 累計がこの回数に達したら止まります（0=無制限。無制限は明示設定のみ）。",
+      },
+    ],
+  },
+  op_watch: {
+    title: "ウォッチャ（ファイル監視で発行）",
+    opCard: true,
+    fixed: { op: "watch" },
+    note: "パスを監視し、変化が止まって静穏時間が経ったらリクエスト矢印の先のフィルタを実行します（ポーリング方式）。",
+    fields: [
+      {
+        key: "path",
+        label: "監視パス",
+        type: "text",
+        placeholder: "監視するファイルまたはフォルダのフルパス",
+        hint: "フォルダを指定すると直下のファイルの作成・更新を監視します。",
+      },
+      {
+        key: "events",
+        label: "反応するイベント",
+        type: "select",
+        asList: true,
+        default: "create,modify",
+        options: [
+          { value: "create,modify", label: "作成・更新の両方" },
+          { value: "create", label: "作成のみ（新しいファイルが現れたら）" },
+          { value: "modify", label: "更新のみ（中身が変わったら）" },
+        ],
+      },
+      {
+        key: "debounce",
+        label: "静穏時間（秒）",
+        type: "number",
+        default: 2,
+        min: 0,
+        hint: "変化が止まってからこの秒数待って発火します（書き込み途中のファイルを掴まない）。",
+      },
+      {
+        key: "min_interval",
+        label: "発火間隔の下限（秒）",
+        type: "number",
+        default: 5,
+        min: 0,
+        hint: "ヒューズ: これより短い間隔では発火しません（自己発火ループ対策）。",
+      },
+      {
+        key: "max_fires",
+        label: "累計発火数の上限",
+        type: "number",
+        default: 100,
+        min: 0,
+        hint: "ヒューズ: 累計がこの回数に達したら止まります（0=無制限。無制限は明示設定のみ）。",
+      },
+    ],
+  },
 };
 
 /** この builtin がダイアログ対応か（未対応なら呼び出し側で従来の JSON 編集へフォールバック）。 */
@@ -140,6 +248,8 @@ function initVals(schema: BuiltinSchema | undefined, base: Record<string, unknow
   for (const f of schema?.fields ?? []) {
     const cur = base[f.key];
     if (typeof cur === "string" || typeof cur === "number") v[f.key] = String(cur);
+    // v1.5.4 WS-P2: 配列値（events 等）はカンマ区切りへ（asList の往復）。
+    else if (Array.isArray(cur)) v[f.key] = cur.join(",");
     else if (f.default !== undefined) v[f.key] = String(f.default);
     else v[f.key] = "";
   }
@@ -171,11 +281,19 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
   const setVal = (k: string, val: string) => setVals((prev) => ({ ...prev, [k]: val }));
 
   // 元 spec を土台に、builtin・固定キー・既知フィールドを上書き（未知キーは温存）。
+  // v1.5.4 WS-P2: op カードは builtin キーを持たない（op キーが種別・fixed が付与する）。
   const buildSpec = (): Record<string, unknown> => {
-    const spec: Record<string, unknown> = { ...base, builtin, ...schema.fixed };
+    const spec: Record<string, unknown> = schema.opCard
+      ? { ...base, ...schema.fixed }
+      : { ...base, builtin, ...schema.fixed };
     for (const f of schema.fields) {
       const raw = (vals[f.key] ?? "").trim();
-      if (f.type === "number") {
+      if (f.asList) {
+        // カンマ区切り → 文字列配列（events 等）。空欄はキーごと省く。
+        const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+        if (list.length) spec[f.key] = list;
+        else delete spec[f.key];
+      } else if (f.type === "number") {
         const n = parseInt(raw, 10);
         if (Number.isFinite(n)) spec[f.key] = Math.max(f.min ?? 0, n);
         else if (f.default !== undefined) spec[f.key] = f.default;
@@ -267,7 +385,7 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
         }}
       >
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
-          <div style={{ fontSize: 15 }}>ビルトインフィルタの設定</div>
+          <div style={{ fontSize: 15 }}>{schema.opCard ? "オペレーションカードの設定" : "ビルトインフィルタの設定"}</div>
           {/* v1.4.29 ⑤+: フォーム⇄JSON の切替。JSON は機微な設定（フォーム外のキー）用。 */}
           <button
             style={{ ...smallBtn(), fontSize: 11 }}
@@ -279,6 +397,9 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
         </div>
         <div style={{ fontSize: 12, marginBottom: 16, color: "var(--panel-muted, #8a93a8)" }}>
           {schema.title}
+          {schema.note && (
+            <div style={{ marginTop: 6, lineHeight: 1.6 }}>{schema.note}</div>
+          )}
         </div>
 
         {row(

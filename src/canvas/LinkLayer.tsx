@@ -42,6 +42,8 @@ interface LinkLayerProps {
   onFlowRelationClick?: (r: RelationInfo, clientX: number, clientY: number) => void;
   /** v1.4 オートフロー: 型チェック不合格のフロー矢印（赤で警告表示）。 */
   invalidIds?: Set<number>;
+  /** v1.5.4 WS-P2: リクエスト矢印（kind='req'）の表示。false で非表示（発行は動き続ける）。 */
+  showReq?: boolean;
 }
 
 // v1.4.17: ドラッグ中の矢印追従（App.redrawArrowsFor）が同じ端点計算を使うため export。
@@ -68,6 +70,7 @@ export function LinkLayer({
   onDeleteRelation,
   onFlowRelationClick,
   invalidIds,
+  showReq = true,
 }: LinkLayerProps) {
   const byId = new Map(nodes.map((n) => [n.id, n]));
 
@@ -112,6 +115,18 @@ export function LinkLayer({
         >
           <path d="M0,0 L6,3 L0,6 Z" style={{ fill: "var(--arrow-flow, #57c7a3)" }} />
         </marker>
+        {/* v1.5.4 WS-P2: リクエスト矢印（op カードの発行線・琥珀の細破線） */}
+        <marker
+          id="arrowhead-req"
+          markerWidth="8"
+          markerHeight="8"
+          refX="6"
+          refY="3"
+          orient="auto"
+          markerUnits="strokeWidth"
+        >
+          <path d="M0,0 L6,3 L0,6 Z" style={{ fill: "var(--arrow-req, #d9a05a)" }} />
+        </marker>
         <marker
           id="arrowhead-bad"
           markerWidth="8"
@@ -132,14 +147,25 @@ export function LinkLayer({
         const p1 = edgePoint(from, center(to));
         const p2 = edgePoint(to, center(from));
         // v1.4: flow矢印はパイプの見た目（破線・緑系）、型不一致は赤で実行前に分かる。
+        // v1.5.4 WS-P2: req 矢印は琥珀の細破線（データレーンではなく「発行の線」）。
         const isFlow = r.kind === "flow";
+        const isReq = r.kind === "req";
+        if (isReq && !showReq) return null;
         const bad = invalidIds?.has(r.id) ?? false;
         const stroke = bad
           ? "var(--arrow-bad, #d96a6a)"
+          : isReq
+          ? "var(--arrow-req, #d9a05a)"
           : isFlow
           ? "var(--arrow-flow, #57c7a3)"
           : "var(--arrow-color, #5a9fe0)";
-        const markerId = bad ? "arrowhead-bad" : isFlow ? "arrowhead-flow" : "arrowhead";
+        const markerId = bad
+          ? "arrowhead-bad"
+          : isReq
+          ? "arrowhead-req"
+          : isFlow
+          ? "arrowhead-flow"
+          : "arrowhead";
         // v1.5.3 WS-P1: 条件付き矢印は中点にラベル（成功時/失敗時・信号のみ 等）。
         const label = isFlow ? edgeLabel(r.attrs) : null;
         const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
@@ -173,7 +199,7 @@ export function LinkLayer({
                 stroke,
                 strokeWidth: "var(--arrow-width, 2)",
               }}
-              strokeDasharray={isFlow ? "9 5" : undefined}
+              strokeDasharray={isReq ? "3 4" : isFlow ? "9 5" : undefined}
               markerEnd={`url(#${markerId})`}
             />
             {label && (
