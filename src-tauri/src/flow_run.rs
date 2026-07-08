@@ -679,7 +679,10 @@ pub(crate) fn eval_filter(
 
     // v1.5.6 WS-M M1（§9.4）: IN/OUT バーチャルカードは素通し＝入力をそのまま返す。
     // 型チェックも実行も無し。入力が無ければ no-data（未接続の口＝材料なし）。
-    if passthrough {
+    // v1.5.7: シェルカードも連鎖評価では素通し（実行ノードではない — ウィンドウを開くのは
+    // run_flow の終端分岐だけ）。これで run_flow がシェル終端から eval_filter(自ID) を呼ぶと
+    // 上流の採用ペイロードがそのまま返り、トリガ発行→シェルで上流全体が pull で動く。
+    if passthrough || spec.is_shell() {
         let out = if collected.is_empty() {
             EvalOut::nodata_out()
         } else {
@@ -1049,42 +1052,115 @@ fn run_flow_inner(
     }
 
     // v1.3.11 対話シェル: cmd/PowerShell で一行目（cmd）を実行。
-    // 接続された最初の入力の生きた実ファイルを {in} に展開する。§4.2: 種別判定は is_shell() に集約。
     // シェルカード統合（2026-07-06）: window="keep"（既定・開いたまま）/"close"（実行して閉じる）は
     // detached ウィンドウ、"hidden" はウィンドウなしで捕捉して結果パネルへ返す。
+    // v1.5.7: {in} の解決を2段に。
+    //  ①直結の実ファイルカード（生きたファイルを持つ kind='file'）＝従来動作。ライブパスを
+    //    そのまま渡す（`notepad {in}` で本物を編集できる意味論を保つ）。従来はフィルタ/op/付箋
+    //    カードも拾って存在しない CAS パスに展開されるバグがあった（kind 条件で解消）。
+    //  ②無ければ上流を pull 評価（eval_filter はシェルを素通し扱い）し、採用ペイロードを
+    //    一時ファイルへ実体化して渡す — トリガ発行→シェルで上流全体が動く（要求駆動の入口）。
     if term_spec.is_shell() {
         let shell = term_spec.shell.as_deref().unwrap_or("").to_string();
-        // 接続された最初の入力の生きた実ファイルを解決（ジョブ専用接続）。
-        let input: Option<PathBuf> = {
-            let p = &jp;
-            p.conn
-                .query_row(
-                    "SELECT v.id, v.real_id, v.committed_path FROM relations rel
-                     JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
-                     WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
-                     ORDER BY rel.created_at LIMIT 1",
-                    rusqlite::params![id],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .map(|(vid, real_id, committed)| {
-                    committed
-                        .map(PathBuf::from)
-                        .filter(|c| c.is_file())
-                        .unwrap_or_else(|| resolve_view_path(p, &vid, &real_id))
-                })
+        let mut report = FlowReport {
+            created: vec![],
+            updated: vec![],
+            outputs: vec![],
+            skipped: vec![],
+            errors: vec![],
+            shell_capture: None,
         };
         let firstline = term_spec.cmd.clone().unwrap_or_default();
-        let firstline = match &input {
-            Some(pb) => firstline.replace("{in}", &format!("\"{}\"", pb.display())),
-            None => firstline.replace("{in}", ""),
+        let firstline = if firstline.contains("{in}") {
+            // ① 直結の実ファイルカード（ジョブ専用接続）。ファイルが実在するときだけ採用。
+            let direct: Option<PathBuf> = {
+                let p = &jp;
+                p.conn
+                    .query_row(
+                        "SELECT v.id, v.real_id, v.committed_path FROM relations rel
+                         JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                         WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                           AND v.kind = 'file'
+                         ORDER BY rel.created_at LIMIT 1",
+                        rusqlite::params![id],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .and_then(|(vid, real_id, committed)| {
+                        committed
+                            .map(PathBuf::from)
+                            .filter(|c| c.is_file())
+                            .or_else(|| {
+                                let pb = resolve_view_path(p, &vid, &real_id);
+                                pb.is_file().then_some(pb)
+                            })
+                    })
+            };
+            // ② 上流の pull 評価 → 一時実体化（{stem}.{ext} 名＝exe やバッチが素直に動く）。
+            let resolved: Option<PathBuf> = match direct {
+                Some(p) => Some(p),
+                None => {
+                    let mut visited = std::collections::HashSet::new();
+                    let mut memo = EvalMemo::new();
+                    let out = eval_filter(
+                        state.inner(),
+                        app,
+                        &jp,
+                        &id,
+                        &mut visited,
+                        &mut memo,
+                        &mut report,
+                        job,
+                    )?;
+                    report.errors.extend(out.errors.clone());
+                    if out.nodata {
+                        report.skipped.push(
+                            "no-data: 条件を満たす枝がありませんでした（材料なし＝エラーではありません）"
+                                .into(),
+                        );
+                    }
+                    match out.payloads.first() {
+                        Some(pl) => {
+                            let dir = crate::os_integration::temp_view_dir()
+                                .join("shell_in")
+                                .join(uuid());
+                            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                            let stem: String = pl
+                                .stem
+                                .chars()
+                                .map(|c| match c {
+                                    '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                                    c if c.is_control() => '_',
+                                    c => c,
+                                })
+                                .take(48)
+                                .collect();
+                            let stem = if stem.trim().is_empty() { "input".to_string() } else { stem };
+                            let path = dir.join(format!("{stem}.{}", pl.ext));
+                            std::fs::write(&path, &pl.bytes).map_err(|e| e.to_string())?;
+                            Some(path)
+                        }
+                        None => None,
+                    }
+                }
+            };
+            // 材料が無くエラーだけなら窓を開かず報告（コンパイル失敗が黙って素通りしない）。
+            if resolved.is_none() && !report.errors.is_empty() {
+                return Ok(report);
+            }
+            match &resolved {
+                Some(pb) => firstline.replace("{in}", &format!("\"{}\"", pb.display())),
+                None => firstline.replace("{in}", ""),
+            }
+        } else {
+            firstline
         };
         let window = term_spec.window.as_deref().unwrap_or("keep");
         let capture = if window == "hidden" {
@@ -1116,14 +1192,8 @@ fn run_flow_inner(
             launch_shell_window(&shell, &firstline, root, window != "close")?;
             None
         };
-        return Ok(FlowReport {
-            created: vec![],
-            updated: vec![],
-            outputs: vec![],
-            skipped: vec![],
-            errors: vec![],
-            shell_capture: capture,
-        });
+        report.shell_capture = capture;
+        return Ok(report);
     }
 
     let prefix = term_spec
