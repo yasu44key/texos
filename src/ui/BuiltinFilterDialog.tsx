@@ -137,7 +137,7 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     title: "タイマ（周期・時刻で発行）",
     opCard: true,
     fixed: { op: "timer" },
-    note: "リクエスト矢印の先のフィルタを、周期または時刻で自動実行します。every か at のどちらかを設定してください。",
+    note: "リクエスト矢印の先のフィルタを、周期または時刻で自動実行します。every か at のどちらかを設定してください。作成直後は一時停止の状態です — 配線が終わったらカードの「▶ 稼働開始」で動かします。",
     fields: [
       {
         key: "every",
@@ -178,7 +178,7 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     title: "ウォッチャ（ファイル監視で発行）",
     opCard: true,
     fixed: { op: "watch" },
-    note: "パスを監視し、変化が止まって静穏時間が経ったらリクエスト矢印の先のフィルタを実行します（ポーリング方式）。",
+    note: "パスを監視し、変化が止まって静穏時間が経ったらリクエスト矢印の先のフィルタを実行します（ポーリング方式）。作成直後は一時停止の状態です — 配線が終わったらカードの「▶ 稼働開始」で動かします（再開時は今の状態を基準に監視します）。",
     fields: [
       {
         key: "path",

@@ -1109,6 +1109,9 @@ function App() {
           id: null,
           builtin,
           label: builtin === "op_timer" ? "タイマ" : "ウォッチャ",
+          // v1.5.5: 停止状態で生成（構成中の誤発火防止・実機FB）。配線後に「▶ 稼働開始」。
+          // paused はフォーム外キーなのでダイアログの base として温存される。
+          spec: '{"paused":true}',
           create: { x: canvasX, y: canvasY, linkFrom },
         });
         return;
@@ -1611,6 +1614,61 @@ function App() {
       }
     },
     [refresh, pushUndo]
+  );
+
+  // v1.5.5: タイマ/ウォッチャの稼働/停止トグル（構成中の誤発火防止スイッチ・実機FB）。
+  const handleToggleOpPause = useCallback(
+    async (id: string) => {
+      try {
+        await invoke<boolean>("toggle_op_paused", { id });
+        await refresh();
+      } catch (e) {
+        console.error("toggle_op_paused failed", e);
+        setConfirm({
+          title: "稼働状態を切り替えられませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh]
+  );
+
+  // v1.5.5 WS-P2 B（オペ層 §6.2）: 運用前評価。実行せず、このカードから上流に pull で
+  // 到達する範囲を静的検査し「<カード名>の評価.md」レポートカードを生成/上書きする。
+  const handleEvaluateFlow = useCallback(
+    async (id: string) => {
+      try {
+        const res = await invoke<{
+          errors: number;
+          warnings: number;
+          infos: number;
+          report_id: string;
+        }>("evaluate_flow", { id });
+        setTouched((prev) => new Set([...prev, res.report_id]));
+        await refresh();
+        const clean = res.errors === 0 && res.warnings === 0 && res.infos === 0;
+        setConfirm({
+          title: "運用前評価が完了しました",
+          message: clean
+            ? "問題は見つかりませんでした。評価レポートカードを生成しました。"
+            : `エラー ${res.errors}・警告 ${res.warnings}・情報 ${res.infos} 件。詳細は評価レポートカードを開いてください。`,
+          warning: res.errors ? "エラーがあります。実行前に確認してください。" : undefined,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      } catch (e) {
+        console.error("evaluate_flow failed", e);
+        setConfirm({
+          title: "運用前評価を実行できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh]
   );
 
   // フィルタ定義の編集。外部プログラムは設定ダイアログ（v1.5）、
@@ -4264,6 +4322,8 @@ function App() {
         addUrl: handleAddUrl,
         addFilter: handleAddFilter,
         runFlow: handleRunFlow,
+        evaluateFlow: handleEvaluateFlow,
+        toggleOpPause: handleToggleOpPause,
         addLauncher: handleAddLauncher,
         runLauncher: handleRunLauncher,
         addLibraryLauncher: handleAddLibraryLauncher,
@@ -4797,6 +4857,7 @@ function App() {
             onAfterSave={refresh}
             onRequestEdit={handleEditInCanvas}
             onRunFlow={obj.kind === "launcher" ? handleRunLauncher : handleRunFlow}
+            onToggleOpPause={handleToggleOpPause}
           />
         ))}
         {notes.map((n) => (

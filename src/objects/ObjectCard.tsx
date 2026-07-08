@@ -80,6 +80,8 @@ interface Props {
   onRequestEdit?: (id: string) => void;
   /** v1.3.9: フィルタ/コマンド/ジェネレータの ▶実行 ボタン（ダブルクリックは設定に変更）。 */
   onRunFlow?: (id: string) => void;
+  /** v1.5.5: タイマ/ウォッチャの稼働/停止トグル（構成中の誤発火防止スイッチ）。 */
+  onToggleOpPause?: (id: string) => void;
   onMoveEnd?: (id: string, x: number, y: number) => void;
   /** v1.4.17: 単体ドラッグ中の生位置（矢印の同時追従用。永続化はしない）。 */
   onDragLive?: (id: string, x: number, y: number) => void;
@@ -232,6 +234,15 @@ function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_
   return "filter";
 }
 
+// v1.5.5: op カード（タイマ/ウォッチャ）の一時停止状態。キー無し=稼働（後方互換）。
+function opPausedOf(ref: string | null | undefined): boolean {
+  try {
+    return JSON.parse(ref ?? "{}").paused === true;
+  } catch {
+    return false;
+  }
+}
+
 // v1.4.1: AIフィルタの動作モード判定。"chat"=対話パネル / "transform"=一発変換。
 function aiModeOf(ref: string | null | undefined): "chat" | "transform" | null {
   if (!ref) return null;
@@ -275,9 +286,14 @@ export function ObjectCard({
   panelW = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onCtrlClone, onSelectConnected, onSelect, onGroupDragStart,
   onMoveEnd, onDragLive, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
+  onToggleOpPause,
   showHints = true,
 }: Props) {
-  const fstyle = FILTER_TYPE_STYLES[filterTypeOf(filterRef)];
+  const ftype = filterTypeOf(filterRef);
+  const fstyle = FILTER_TYPE_STYLES[ftype];
+  // v1.5.5: タイマ/ウォッチャの稼働状態（面のトグルボタン）。トリガは手動▶のみなので対象外。
+  const isOpSched = ftype === "op_timer" || ftype === "op_watch";
+  const opPaused = isOpSched && opPausedOf(filterRef);
   const isAiChat = aiModeOf(filterRef) === "chat"; // v1.4.1 対話パネルを持つAIカード
   const isT2i = isT2iOf(filterRef); // v1.4.17 インライン生成パネルを持つ画像生成カード
   const posRef = useRef({ x, y });
@@ -668,6 +684,37 @@ export function ObjectCard({
                 }}
               >
                 {isAiChat ? "💬 チャット" : fstyle.run}
+              </button>
+            )}
+            {/* v1.5.5: タイマ/ウォッチャの稼働/停止トグル（構成中の誤発火防止スイッチ）。
+                停止中はスケジューラが発火せず、再開時に監視のベースラインを取り直す。 */}
+            {isOpSched && (
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleOpPause?.(id);
+                }}
+                title={
+                  opPaused
+                    ? "一時停止中です。クリックで稼働を開始します（自動発火が始まります）"
+                    : "稼働中です。クリックで一時停止します（構成中の誤発火を防げます）"
+                }
+                style={{
+                  marginTop: 2,
+                  padding: "2px 12px",
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: "#fff",
+                  background: opPaused ? "var(--card-op-paused, #5a5f66)" : fstyle.border,
+                  border: "none",
+                  borderRadius: 5,
+                  cursor: "pointer",
+                  fontFamily: "sans-serif",
+                }}
+              >
+                {opPaused ? "▶ 稼働開始" : "⏸ 稼働中"}
               </button>
             )}
             {isDrop && (

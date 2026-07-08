@@ -50,9 +50,19 @@ pub(crate) struct OpSpec {
     /// 累計発火数（seq の流儀で spec へ書き戻し・再起動しても残る）。
     #[serde(default)]
     pub fired_count: u64,
+    /// v1.5.5: 一時停止（構成中の誤発火防止スイッチ・実機確認フィードバック）。
+    /// true の間はスケジューラが発火しない。手動▶（fire_op）は動作確認の入口として通す。
+    /// タイマ/ウォッチャは**停止状態で生成**され、配線後に「▶ 稼働開始」で動き出す。
+    /// false は省略して保存（v1.5.4 の既存カードと同形＝稼働扱い・後方互換）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub paused: bool,
     /// 未知キーの温存（設定ダイアログの流儀と同じ後方互換）。
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl OpSpec {
@@ -232,8 +242,38 @@ fn dispatch(targets: Vec<String>, app: &tauri::AppHandle) {
     }
 }
 
+/// タイマ/ウォッチャの稼働/停止トグル（v1.5.5・構成中の誤発火防止スイッチ）。
+/// 返り値 = 新しい paused 状態。ランタイム状態の破棄は tick 側が paused を見て行う。
+#[tauri::command]
+pub(crate) fn toggle_op_paused(id: String, state: State<AppState>) -> Result<bool, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let spec_json: String = p
+        .conn
+        .query_row(
+            "SELECT filter_ref FROM virtual_bodies
+             WHERE id = ?1 AND kind = 'op' AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or("opカードが見つかりません")?;
+    let mut spec = parse_op_spec(&spec_json)?;
+    spec.paused = !spec.paused;
+    let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
+    p.conn
+        .execute(
+            "UPDATE virtual_bodies SET filter_ref = ?1 WHERE id = ?2 AND kind = 'op'",
+            rusqlite::params![json, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(spec.paused)
+}
+
 /// トリガ（設置型▶）の手動発火。req 矢印の先（複数可）へ一括発行する。
-/// タイマ/ウォッチャも手動発火できる（動作確認の入口・スケジューラと同じ経路）。
+/// タイマ/ウォッチャも手動発火できる（動作確認の入口・スケジューラと同じ経路。
+/// **一時停止中でも通す** — 停止＝自動発火の停止であり、手動テストの禁止ではない）。
 #[tauri::command(async)]
 pub(crate) fn fire_op(id: String, app: tauri::AppHandle) -> Result<usize, String> {
     let state: State<AppState> = app.state();
@@ -319,10 +359,17 @@ fn tick(app: &tauri::AppHandle, rt: &mut HashMap<String, OpRuntime>) {
         let Ok(spec) = parse_op_spec(&spec_json) else {
             continue; // 壊れた spec は黙ってスキップ（設定を開けば validation が案内する）
         };
+        let key = format!("{root}\n{id}");
+        // v1.5.5: 一時停止中は発火しない。ランタイム状態も破棄＝再開時にベースラインを
+        // 取り直す（停止中に構成し直したフォルダの変化・溜まった時間で発火させない）。
+        if spec.paused {
+            rt.remove(&key);
+            continue;
+        }
         if spec.fuse_blown() {
             continue;
         }
-        let r = rt.entry(format!("{root}\n{id}")).or_default();
+        let r = rt.entry(key).or_default();
         let due = match spec.op.as_str() {
             "timer" => timer_due(&spec, r, now),
             "watch" => watch_due(&spec, r, now),
@@ -502,6 +549,19 @@ mod tests {
         assert!(!s.fuse_blown());
         let s = parse_op_spec(r#"{"op":"timer","every":60,"max_fires":3,"fired_count":3}"#).unwrap();
         assert!(s.fuse_blown());
+    }
+
+    #[test]
+    fn paused_flag_roundtrip() {
+        // 既定=稼働（v1.5.4 の既存カードは paused キー無し＝動き続ける・後方互換）。
+        let s = parse_op_spec(r#"{"op":"timer","every":60}"#).unwrap();
+        assert!(!s.paused);
+        let mut s = parse_op_spec(r#"{"op":"watch","path":"C:/x","paused":true}"#).unwrap();
+        assert!(s.paused);
+        // 稼働に戻したら paused キーは省略される（既存カードと同形を保つ）。
+        s.paused = false;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("paused"));
     }
 
     #[test]

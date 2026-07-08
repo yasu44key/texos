@@ -595,6 +595,7 @@ mod notes;
 mod objects;
 mod ops;
 mod os_integration;
+mod preflight;
 mod proc;
 mod project;
 mod runtime;
@@ -609,6 +610,7 @@ pub(crate) use notes::*;
 pub(crate) use objects::*;
 pub(crate) use ops::*;
 pub(crate) use os_integration::*;
+pub(crate) use preflight::*;
 pub(crate) use proc::*;
 pub(crate) use project::*;
 pub(crate) use runtime::*;
@@ -730,6 +732,8 @@ pub fn run() {
             update_filter,
             run_flow,
             fire_op,
+            toggle_op_paused,
+            evaluate_flow,
             break_flow,
             list_jobs,
             cancel_all,

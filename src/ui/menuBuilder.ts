@@ -22,6 +22,10 @@ export interface MenuActions {
   // v1.4 オートフロー
   addFilter: (builtin: string, x: number, y: number) => void;
   runFlow: (id: string) => void;
+  // v1.5.5 WS-P2 B: 終端カードから上流の到達集合を静的検査（実行しない）→評価レポートカード。
+  evaluateFlow: (id: string) => void;
+  // v1.5.5: タイマ/ウォッチャの稼働/停止トグル（構成中の誤発火防止スイッチ）。
+  toggleOpPause: (id: string) => void;
   // v1.3.11 ランチャー（一般プログラム/cmd/PowerShell の登録・起動）
   addLauncher: (builtin: string, x: number, y: number) => void;
   runLauncher: (id: string) => void;
@@ -419,9 +423,47 @@ export function buildObjectMenu(
   }
   // v1.4 オートフロー: フィルタカード（パイプラインの処理ノード）
   if (obj && (obj.kind === "filter" || obj.filter_ref)) {
+    // v1.5.5 検証修正#2: op カード（トリガ/タイマ/ウォッチャ）もこの分岐に入る（filter_ref
+    // を持つ）が、「運用前評価」は出さない — 評価の起点はフィルタカード（発行先）に限る。
+    // 稼働スイッチ: タイマ/ウォッチャは paused トグルをメニューにも出す（面のボタンと同じ）。
+    const { isOp, opSched, opPaused } = ((): { isOp: boolean; opSched: boolean; opPaused: boolean } => {
+      try {
+        const s = JSON.parse(obj.filter_ref ?? "{}");
+        const isOp = typeof s.op === "string";
+        return {
+          isOp,
+          opSched: s.op === "timer" || s.op === "watch",
+          opPaused: s.paused === true,
+        };
+      } catch {
+        return { isOp: false, opSched: false, opPaused: false };
+      }
+    })();
     return [
       { label: `⚗「${obj.label}」`, onClick: () => {}, disabled: true },
       { label: "▶ フローを実行", onClick: () => a.runFlow(targetId) },
+      ...(opSched
+        ? [
+            {
+              label: opPaused ? "▶ 稼働を開始" : "⏸ 一時停止",
+              hint: opPaused
+                ? "自動発火を開始します（タイマは今から間隔を数え、ウォッチャは今の状態を基準に監視します）。"
+                : "自動発火を止めます。フローの構成中の誤発火を防げます（手動の実行は可能なまま）。",
+              onClick: () => a.toggleOpPause(targetId),
+            },
+          ]
+        : []),
+      // v1.5.5 WS-P2 B（オペ層 §6.2）: 実行せず、このカードから上流に pull で到達する範囲を
+      // 静的検査し「<カード名>の評価.md」レポートカードを出す（循環・型不一致・依存未解決 等）。
+      ...(!isOp
+        ? [
+            {
+              label: "運用前評価（実行せず検査）",
+              hint: "このカードから上流へつながる範囲を実行せずに検査し、循環・型不一致・依存未解決などをレポートカードにまとめます（別のフローの入力にも使えます）。",
+              onClick: () => a.evaluateFlow(targetId),
+            },
+          ]
+        : []),
       { label: "つながりを選択", hint: "関係矢印でつながったカード全体を選択します（Alt+クリックと同じ）。", onClick: () => a.selectConnected(targetId) },
       {
         // 外部プログラムは設定ダイアログ、内蔵フィルタはJSON編集（App側で分岐）
