@@ -133,6 +133,21 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     note: "▶を押すと、このカードから引いたリクエスト矢印（破線）の先のフィルタを実行します。複数につなげば一括発行。設定項目はありません（名前だけ変えられます）。",
     fields: [],
   },
+  // v1.5.6 WS-M M1（§9）: IN/OUT バーチャルカード（設定項目なし・名前だけ変えられる）。
+  op_in: {
+    title: "IN（モジュールの入口）",
+    opCard: true,
+    fixed: { op: "in" },
+    note: "データの入口（素通し）。外から来るフロー矢印をここに受け、中のフィルタへ流します。モジュールの差し替え可能な口です。設定項目はありません。",
+    fields: [],
+  },
+  op_out: {
+    title: "OUT（モジュールの出口・▶実行）",
+    opCard: true,
+    fixed: { op: "out" },
+    note: "データの出口。▶で上流をさかのぼって実行し、結果カードが横に生まれます（何度でも押せる口）。設定項目はありません。",
+    fields: [],
+  },
   op_timer: {
     title: "タイマ（周期・時刻で発行）",
     opCard: true,

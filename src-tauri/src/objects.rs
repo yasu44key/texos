@@ -1523,25 +1523,36 @@ pub(crate) fn create_relation(
         // v1.5.4 WS-P2: op カード（トリガ/タイマ/ウォッチャ）に触れる矢印は自動的に
         // kind='req'（リクエスト矢印）。eval_filter の入力収集は kind='flow' 限定クエリ
         // なので req はデータレーンに乗らない＝フロー評価から自然に不可視。
-        // （WS-M の op:"in"/"out" は透過ノードとして flow を張る予定 — その時に再分岐）
-        let is_op_node = |vid: &str| -> bool {
+        // v1.5.6 WS-M M1: op:"in"/"out"（IN/OUT バーチャルカード）は**データレーンの住人**
+        // ＝透過ノードなので req ではなく flow を張る（分岐の精密化・§9.4）。
+        let op_spec_of = |vid: &str| -> Option<String> {
             p.conn
                 .query_row(
-                    "SELECT 1 FROM virtual_bodies WHERE id = ?1 AND kind = 'op'",
+                    "SELECT filter_ref FROM virtual_bodies WHERE id = ?1 AND kind = 'op'",
                     rusqlite::params![vid],
-                    |_| Ok(()),
+                    |r| r.get::<_, Option<String>>(0),
                 )
                 .optional()
                 .ok()
                 .flatten()
-                .is_some()
+                .flatten()
         };
-        if is_op_node(&from_id) || is_op_node(&to_id) {
+        let is_req_op = |vid: &str| -> bool {
+            op_spec_of(vid)
+                .map(|s| !ops::is_io_op_spec(&s))
+                .unwrap_or(false)
+        };
+        if is_req_op(&from_id) || is_req_op(&to_id) {
             return "req".to_string();
         }
         // v1.3.11: フィルタに加えランチャー（kind='launcher'）への矢印もフロー扱い
         // （ランチャーに入る {in} 入力＝開くファイルを flow エッジで表す）。
+        // v1.5.6: IN/OUT バーチャルカードもフローノード（op_spec_of が Some＝ここに来るのは
+        // is_io_op_spec のときだけ）。
         let is_flow_node = |vid: &str| -> bool {
+            if op_spec_of(vid).is_some() {
+                return true;
+            }
             p.conn
                 .query_row(
                     "SELECT 1 FROM virtual_bodies WHERE id = ?1 AND kind IN ('filter','launcher')",

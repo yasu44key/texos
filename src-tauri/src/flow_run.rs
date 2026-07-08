@@ -436,16 +436,24 @@ pub(crate) fn eval_filter(
     if !visited.insert(fid.to_string()) {
         return Err("フローに循環があります".into());
     }
+    // v1.5.6 WS-M M1: IN/OUT バーチャルカード（kind='op'・op:"in"/"out"）も評価対象
+    // （素通しノード＝入力をそのまま返す）。トリガ/タイマ/ウォッチャは req レーンなので
+    // ここには来ない（来ても Invalid 定義エラーで安全に落ちる）。
     let spec_json: Option<String> = p
         .conn
         .query_row(
             "SELECT filter_ref FROM virtual_bodies
-             WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
+             WHERE id = ?1 AND kind IN ('filter','op') AND deleted_at IS NULL",
             rusqlite::params![fid],
             |r| r.get(0),
         )
         .map_err(|_| "フィルタカードが見つかりません".to_string())?;
-    let spec = flow::parse_spec(spec_json.as_deref().unwrap_or("{}"))?;
+    let passthrough = ops::is_io_op_spec(spec_json.as_deref().unwrap_or("{}"));
+    let spec = if passthrough {
+        flow::parse_spec("{}")? // 素通しノードに FilterSpec の意味は無い（既定値で安全に）
+    } else {
+        flow::parse_spec(spec_json.as_deref().unwrap_or("{}"))?
+    };
     let accept = spec.accept_mime.clone().unwrap_or_else(|| "*/*".into());
 
     // ジェネレータ型: 入力を取らず1回実行してファイルを生む（入力矢印は無視）。
@@ -533,7 +541,9 @@ pub(crate) fn eval_filter(
             break;
         }
         // 上流の評価結果（EvalOut）を得る: フィルタ＝再帰評価（メモ化）／データカード＝窓の今
-        let up: EvalOut = if kind.as_deref() == Some("filter") {
+        // v1.5.6: 上流が IN/OUT バーチャルカード（kind='op'）なら再帰評価＝透過。
+        // req レーンの op（トリガ等）は flow 矢印を持たないのでここには現れない。
+        let up: EvalOut = if matches!(kind.as_deref(), Some("filter") | Some("op")) {
             match eval_filter(state, app, p, vid, visited, memo, report, job) {
                 Ok(v) => v,
                 // 構造エラー（循環・カード不明）も「失敗」として一級化 — when=failure で拾える。
@@ -632,6 +642,17 @@ pub(crate) fn eval_filter(
         .filter(|e| !e.nodata)
         .flat_map(|e| e.payloads)
         .collect();
+
+    // v1.5.6 WS-M M1（§9.4）: IN/OUT バーチャルカードは素通し＝入力をそのまま返す。
+    // 型チェックも実行も無し。入力が無ければ no-data（未接続の口＝材料なし）。
+    if passthrough {
+        let out = if collected.is_empty() {
+            EvalOut::nodata_out()
+        } else {
+            EvalOut::data(collected, None)
+        };
+        return finish_eval(p, fid, visited, memo, 0, out);
+    }
 
     // フェーズ2: 実行。種別ごとの分岐は execute_node へ一本化（§4.1）。ここに残るのは
     // 「型チェック（受け入れMIME・想定拡張子）」と「集約/ファンアウトの入力の束ね方」だけ。
@@ -917,17 +938,33 @@ pub(crate) fn run_flow_for(id: &str, app: &tauri::AppHandle) -> Result<FlowRepor
     // v1.5.2 WS-C 並行解禁: 短ロックで終端カードとルートを読み、**同一終端カード**の Flow
     // だけを拒否して登録（v1.4.10 再入エラーの一般化）。別フローとは並行し、資源の
     // 取り合いはセマフォ（acquire_node_permits）が調停する。完了同期返しは維持。
+    // v1.5.6 WS-M M1（§9.3）: OUT バーチャルカード（op:"out"）も終端になれる＝▶で
+    // さかのぼり pull 実行・結果カードが OUT の横に生まれる（受容体の最小形）。
+    // それ以外の op（トリガ/タイマ/ウォッチャ/IN）は run_flow の終端にしない。
     let (fx, fy, flabel, fref, root): (f64, f64, String, Option<String>, PathBuf) =
         with_db(state.inner(), |p| {
             let (fx, fy, flabel, fref): (f64, f64, String, Option<String>) = p
                 .conn
                 .query_row(
                     "SELECT pos_x, pos_y, label, filter_ref FROM virtual_bodies
-                     WHERE id = ?1 AND kind = 'filter' AND deleted_at IS NULL",
+                     WHERE id = ?1 AND kind IN ('filter','op') AND deleted_at IS NULL",
                     rusqlite::params![id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .map_err(|_| "フィルタカードが見つかりません".to_string())?;
+            if let Some(spec) = fref.as_deref().filter(|s| ops::is_op_spec(s)) {
+                let is_out = serde_json::from_str::<serde_json::Value>(spec)
+                    .ok()
+                    .and_then(|v| v.get("op").and_then(|o| o.as_str().map(String::from)))
+                    .as_deref()
+                    == Some("out");
+                if !is_out {
+                    return Err(
+                        "このカードは実行の終端にできません（OUT カードまたはフィルタカードで実行してください）"
+                            .into(),
+                    );
+                }
+            }
             Ok((fx, fy, flabel, fref, p.root.clone()))
         })?;
     let job = state

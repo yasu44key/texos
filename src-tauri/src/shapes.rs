@@ -24,6 +24,11 @@ pub struct ShapeInfo {
     pub opacity: f64,
     pub z_order: i64,
     pub label: String,
+    /// v1.5.6 WS-M M1（§8.1）: メンバーをロック（アウト不可・削除不可・イン警告・🔒表示）。
+    pub locked: bool,
+    /// v1.5.6 実機FB: ロック時のメンバースナップショット（カード id）。幾何ではなく所属＝
+    /// 図形をリサイズ/Shift移動してもメンバーシップは変わらない。非ロック時は空。
+    pub members: Vec<String>,
 }
 
 #[tauri::command]
@@ -58,7 +63,7 @@ pub(crate) fn list_shapes(state: State<AppState>) -> Result<Vec<ShapeInfo>, Stri
     let mut stmt = p
         .conn
         .prepare(
-            "SELECT id, kind, pos_x, pos_y, width, height, rotation, fill, opacity, z_order, label
+            "SELECT id, kind, pos_x, pos_y, width, height, rotation, fill, opacity, z_order, label, locked, members
              FROM shapes WHERE deleted_at IS NULL ORDER BY z_order, created_at",
         )
         .map_err(|e| e.to_string())?;
@@ -76,11 +81,79 @@ pub(crate) fn list_shapes(state: State<AppState>) -> Result<Vec<ShapeInfo>, Stri
                 opacity: r.get(8)?,
                 z_order: r.get(9)?,
                 label: r.get(10)?,
+                locked: r.get::<_, i64>(11)? != 0,
+                members: r
+                    .get::<_, Option<String>>(12)?
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+}
+
+/// v1.5.6 WS-M M1（§8.1）: 図形「メンバーをロック」トグル。
+/// ロック ON = その瞬間に乗っていたカード id をスナップショット（member_ids はフロントの
+/// cardsOnShape が計算）。以後のメンバーシップは**所属**であって幾何ではない＝図形の
+/// リサイズや Shift 移動では変わらない（実機FB 2026-07-08）。ロック OFF = メンバー消去
+///（ゆるいグループ＝動的包含へ戻る）。
+#[tauri::command]
+pub(crate) fn set_shape_locked(
+    id: String,
+    locked: bool,
+    member_ids: Option<Vec<String>>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let members: Option<String> = if locked {
+        Some(serde_json::to_string(&member_ids.unwrap_or_default()).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    p.conn
+        .execute(
+            "UPDATE shapes SET locked=?1, members=?2 WHERE id=?3",
+            rusqlite::params![locked as i64, members, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// v1.5.6: ロック中図形へのドラッグイン（§8.1 警告付きで可）＝メンバーへ追加。
+#[tauri::command]
+pub(crate) fn add_shape_member(
+    shape_id: String,
+    card_id: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let cur: Option<String> = p
+        .conn
+        .query_row(
+            "SELECT members FROM shapes WHERE id=?1 AND locked=1 AND deleted_at IS NULL",
+            rusqlite::params![shape_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let mut members: Vec<String> = cur
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if !members.contains(&card_id) {
+        members.push(card_id);
+        p.conn
+            .execute(
+                "UPDATE shapes SET members=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_string(&members).map_err(|e| e.to_string())?, shape_id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Move/resize/rotate a shape.

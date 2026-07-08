@@ -206,6 +206,16 @@ fn migrate(conn: &Connection) -> Result<()> {
     // v1.5.3 WS-P1（オペ層設計 §6.1）: 構造化実行記録 {at, exit, ok, nodata, skipped, message}。
     // memo の人間向けログとは別。WS-P2 のウォッチャ・運用前評価・メタ認知カードが読む。
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN last_run TEXT", []);
+    // v1.5.6 WS-M M1（共有とモジュール設計 §8.1）: 図形「メンバーをロック」。
+    // ロック中はメンバーのドラッグアウト不可・削除不可・イン警告。
+    let _ = conn.execute(
+        "ALTER TABLE shapes ADD COLUMN locked INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // v1.5.6 実機FB: メンバーシップは幾何（中心点包含＝ゆるいグループ）ではなく**明示の
+    // スナップショット**。ロックした瞬間に乗っていたカード id の JSON 配列を図形が持つ
+    //（図形=モジュール=メンバーリストの器）。解除で NULL に戻る＝宙ぶらりんが出ない。
+    let _ = conn.execute("ALTER TABLE shapes ADD COLUMN members TEXT", []);
     // v1.3.6: 拡張子/MIME は「そのファイルの見え方」＝仮身の属性。空ファイル等は内容
     // ハッシュが同一で実身(real_bodies)を共有するため、実身の ext/mime だけだと別名・
     // 別形式のファイルが同じ型に潰れる。仮身側にも持たせ、表示/オープン/コミットで優先する。

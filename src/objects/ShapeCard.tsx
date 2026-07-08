@@ -15,6 +15,11 @@ export interface ShapeInfo {
   opacity: number; // 0..1 — 元から半透明（重なりは透ける）
   z_order: number;
   label: string;
+  /// v1.5.6 WS-M M1（§8.1）: メンバーをロック（アウト不可・削除不可・イン警告・🔒表示）。
+  locked: boolean;
+  /// v1.5.6 実機FB: ロック時のメンバースナップショット（カード id・所属＝幾何ではない）。
+  /// 図形のリサイズ/Shift移動では変わらない。非ロック時は空。
+  members: string[];
 }
 
 interface Props {
@@ -187,7 +192,8 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
       )}
 
       {/* label (top-left, full opacity, not affected by shape alpha) */}
-      {s.label && (
+      {/* v1.5.6 WS-M M1: ロック中はラベルが無くても 🔒 を出す（モジュール境界の目印）。 */}
+      {(s.label || s.locked) && (
         <div
           style={{
             position: "absolute",
@@ -204,6 +210,7 @@ export function ShapeCard({ shape, selected = false, onGeomEnd, onClickSelect, o
             whiteSpace: "nowrap",
           }}
         >
+          {s.locked ? "🔒 " : ""}
           {s.label}
         </div>
       )}

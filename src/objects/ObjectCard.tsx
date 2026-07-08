@@ -216,6 +216,22 @@ const FILTER_TYPE_STYLES = {
     badge: "⚡ ウォッチャ",
     run: "",
   },
+  // v1.5.6 WS-M M1（§9）: IN/OUT バーチャルカード＝データレーンの口（発行系ではないので
+  // 琥珀ではなく青系＝ドロップポイントの親戚として見せる）。OUT だけ ▶（さかのぼり実行）。
+  op_in: {
+    bg: "var(--card-bg-drop, #102030)",
+    border: "#4a90d9",
+    text: "var(--card-drop-text, #7fb0d8)",
+    badge: "⊳ IN（入口）",
+    run: "",
+  },
+  op_out: {
+    bg: "var(--card-bg-drop, #102030)",
+    border: "#3a7a5a",
+    text: "var(--card-filter-text, #7fd8b0)",
+    badge: "⊲ OUT（出口）",
+    run: "▶ 実行",
+  },
 } as const;
 
 function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_STYLES {
@@ -223,7 +239,8 @@ function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_
   try {
     const s = JSON.parse(ref);
     // v1.5.4 WS-P2: op カード（トリガ/タイマ/ウォッチャ）は op キーで見分ける。
-    if (s.op === "trigger" || s.op === "timer" || s.op === "watch") {
+    // v1.5.6 WS-M M1: IN/OUT バーチャルカードも同じ器（op:"in"/"out"）。
+    if (["trigger", "timer", "watch", "in", "out"].includes(s.op)) {
       return `op_${s.op}` as keyof typeof FILTER_TYPE_STYLES;
     }
     if (typeof s.shell === "string") return "shell";

@@ -70,6 +70,8 @@ struct Graph {
     ops_into: Vec<OpCard>,
     /// プロジェクト内で req ターゲットを持たない op カード（未接続の情報項目用・ラベル）。
     dangling_ops: Vec<String>,
+    /// v1.5.6 WS-M M1: フロー矢印が1本も繋がれていない IN/OUT バーチャルカード（ラベル）。
+    dangling_ios: Vec<String>,
     /// v1.5.5 検証修正#5: 仮身でないもの（付箋など）からのフロー矢印が入っているカード id。
     /// キャンバスでは赤矢印警告になるが collect の JOIN では落ちるため、別枠で拾う。
     bad_inputs: Vec<String>,
@@ -183,38 +185,61 @@ fn collect(p: &Project, terminal: &str) -> Result<Graph, String> {
     }
 
     // op カード（トリガ/タイマ/ウォッチャ）と req ターゲットを読む。
-    let (ops_into, dangling_ops) = collect_ops(p, &nodes);
+    let (ops_into, dangling_ops, dangling_ios) = collect_ops(p, &nodes);
     Ok(Graph {
         nodes,
         edges,
         ops_into,
         dangling_ops,
+        dangling_ios,
         bad_inputs,
     })
 }
 
 /// op カードを読み、①到達集合へ発行する op（自己発火・ヒューズ検査用）②ターゲット無しの
-/// dangling op（未接続の情報項目用）に分ける。
-fn collect_ops(p: &Project, reachable: &HashMap<String, Node>) -> (Vec<OpCard>, Vec<String>) {
+/// dangling op ③フロー未接続の IN/OUT（どちらも未接続の情報項目用）に分ける。
+fn collect_ops(
+    p: &Project,
+    reachable: &HashMap<String, Node>,
+) -> (Vec<OpCard>, Vec<String>, Vec<String>) {
     let mut ops_into = Vec::new();
     let mut dangling = Vec::new();
+    let mut dangling_ios = Vec::new();
     let mut stmt = match p.conn.prepare(
         "SELECT id, label, filter_ref FROM virtual_bodies
          WHERE kind = 'op' AND deleted_at IS NULL AND filter_ref IS NOT NULL",
     ) {
         Ok(s) => s,
-        Err(_) => return (ops_into, dangling),
+        Err(_) => return (ops_into, dangling, dangling_ios),
     };
     let rows: Vec<(String, String, String)> = match stmt.query_map([], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
     }) {
         Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-        Err(_) => return (ops_into, dangling),
+        Err(_) => return (ops_into, dangling, dangling_ios),
     };
     for (id, label, spec_json) in rows {
         let Ok(spec) = ops::parse_op_spec(&spec_json) else {
             continue;
         };
+        // v1.5.6 WS-M M1: IN/OUT はデータレーンの住人＝req ターゲットの概念が無い。
+        // フロー矢印が1本も無いものを「未接続」情報として拾う（§6.2 の表の後半）。
+        if spec.op == "in" || spec.op == "out" {
+            let flows: i64 = p
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM relations rel
+                     WHERE (rel.from_id = ?1 OR rel.to_id = ?1)
+                       AND rel.kind = 'flow' AND rel.deleted_at IS NULL",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if flows == 0 {
+                dangling_ios.push(label);
+            }
+            continue;
+        }
         // req ターゲット（生きているフィルタカード）を集める。
         let targets: Vec<String> = p
             .conn
@@ -234,7 +259,7 @@ fn collect_ops(p: &Project, reachable: &HashMap<String, Node>) -> (Vec<OpCard>, 
             ops_into.push(OpCard { label, spec });
         }
     }
-    (ops_into, dangling)
+    (ops_into, dangling, dangling_ios)
 }
 
 /// filterOutputMime（front model.ts）の Rust 版。外部コマンドは出力 MIME 不明で None。
@@ -547,6 +572,17 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
             ),
         });
     }
+    // v1.5.6 WS-M M1（§6.2 の表の後半）: フロー矢印が無い IN/OUT バーチャルカード。
+    for label in &g.dangling_ios {
+        f.push(Finding {
+            level: Level::Info,
+            category: "未接続",
+            message: format!(
+                "IN/OUT カード「{}」にフロー矢印が繋がれていません（口として機能していません）",
+                label
+            ),
+        });
+    }
 
     f
 }
@@ -817,14 +853,23 @@ pub(crate) fn evaluate_flow(id: String, state: State<AppState>) -> Result<EvalSu
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
         let g = collect(p, &id)?;
-        // v1.5.5 検証修正#2: op カードは評価の起点にしない（req 先を辿らないため空レポート
-        // になる上、write_report が op カードに flow 矢印を張り不変条件を壊す）。
-        // メニュー側でも出さないが、将来の呼び出し経路に備えた防御。
-        if g.nodes.get(&id).map(|n| n.kind == "op").unwrap_or(false) {
-            return Err(
-                "opカード（トリガ/タイマ/ウォッチャ）は評価の起点にできません。リクエスト矢印の先のフィルタカードで「運用前評価」を実行してください"
-                    .into(),
-            );
+        // v1.5.5 検証修正#2: 発行系の op カードは評価の起点にしない（req 先を辿らないため
+        // 空レポートになる上、write_report が op カードに flow 矢印を張り不変条件を壊す）。
+        // v1.5.6 WS-M M1（§6.2）: **OUT バーチャルカードは起点にできる**（終端カードまたは
+        // OUT が正・データレーンの住人なので flow を上流に辿れる）。IN は口の向きが逆なので不可。
+        let terminal_op = g.nodes.get(&id).filter(|n| n.kind == "op").and_then(|n| {
+            n.filter_ref
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.get("op").and_then(|o| o.as_str().map(String::from)))
+        });
+        if let Some(k) = terminal_op {
+            if k != "out" {
+                return Err(
+                    "このカードは評価の起点にできません。フィルタカードまたは OUT カードで「運用前評価」を実行してください"
+                        .into(),
+                );
+            }
         }
         let label = g
             .nodes
@@ -904,6 +949,7 @@ mod tests {
                 .collect(),
             ops_into: vec![],
             dangling_ops: vec![],
+            dangling_ios: vec![],
             bad_inputs: vec![],
         }
     }

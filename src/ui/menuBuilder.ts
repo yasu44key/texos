@@ -130,6 +130,13 @@ export interface MenuActions {
   shapeAroundSelection: () => void;
   // v1.4.25 ⑤: 図形グリッドスナップのオン/オフ切替と、全図形の強制スナップ。
   toggleShapeSnap: () => void;
+  // v1.5.6 WS-M M1: 図形ロック＋モジュール化。
+  shapeToggleLock: (id: string, locked: boolean) => void;
+  modularizeShape: (id: string) => void;
+  /// ロック時スナップショットのメンバーを id で選択（外に出たメンバーの回収手段）。
+  selectShapeMembers: (id: string) => void;
+  // v1.5.6 WS-M M1: IN/OUT バーチャルカードの溶解（矢印を直結に戻して消す）。
+  dissolveOp: (id: string) => void;
   snapAllShapes: () => void;
   shapeStyle: (id: string, fill: string, opacity: number) => void;
   shapeRotate: (id: string, deg: number) => void;
@@ -424,24 +431,32 @@ export function buildObjectMenu(
   // v1.4 オートフロー: フィルタカード（パイプラインの処理ノード）
   if (obj && (obj.kind === "filter" || obj.filter_ref)) {
     // v1.5.5 検証修正#2: op カード（トリガ/タイマ/ウォッチャ）もこの分岐に入る（filter_ref
-    // を持つ）が、「運用前評価」は出さない — 評価の起点はフィルタカード（発行先）に限る。
+    // を持つ）が、「運用前評価」の起点はフィルタカードと OUT カード（§6.2）に限る。
     // 稼働スイッチ: タイマ/ウォッチャは paused トグルをメニューにも出す（面のボタンと同じ）。
-    const { isOp, opSched, opPaused } = ((): { isOp: boolean; opSched: boolean; opPaused: boolean } => {
+    // v1.5.6 WS-M M1: IN/OUT バーチャルカード＝データレーンの住人。「溶解」を出し、
+    // IN には実行系（▶）を出さない（OUT の▶=さかのぼり pull 実行は出す）。
+    const { opKind, opSched, opPaused } = ((): {
+      opKind: string | null;
+      opSched: boolean;
+      opPaused: boolean;
+    } => {
       try {
         const s = JSON.parse(obj.filter_ref ?? "{}");
-        const isOp = typeof s.op === "string";
         return {
-          isOp,
+          opKind: typeof s.op === "string" ? s.op : null,
           opSched: s.op === "timer" || s.op === "watch",
           opPaused: s.paused === true,
         };
       } catch {
-        return { isOp: false, opSched: false, opPaused: false };
+        return { opKind: null, opSched: false, opPaused: false };
       }
     })();
+    const canEvaluate = opKind === null || opKind === "out";
     return [
       { label: `⚗「${obj.label}」`, onClick: () => {}, disabled: true },
-      { label: "▶ フローを実行", onClick: () => a.runFlow(targetId) },
+      ...(opKind !== "in"
+        ? [{ label: "▶ フローを実行", onClick: () => a.runFlow(targetId) }]
+        : []),
       ...(opSched
         ? [
             {
@@ -455,12 +470,21 @@ export function buildObjectMenu(
         : []),
       // v1.5.5 WS-P2 B（オペ層 §6.2）: 実行せず、このカードから上流に pull で到達する範囲を
       // 静的検査し「<カード名>の評価.md」レポートカードを出す（循環・型不一致・依存未解決 等）。
-      ...(!isOp
+      ...(canEvaluate
         ? [
             {
               label: "運用前評価（実行せず検査）",
               hint: "このカードから上流へつながる範囲を実行せずに検査し、循環・型不一致・依存未解決などをレポートカードにまとめます（別のフローの入力にも使えます）。",
               onClick: () => a.evaluateFlow(targetId),
+            },
+          ]
+        : []),
+      ...(opKind === "in" || opKind === "out"
+        ? [
+            {
+              label: "このカードを溶解",
+              hint: "つながっているフロー矢印を直結に繋ぎ変えて、このカードを取り除きます（足場を畳む操作）。",
+              onClick: () => a.dissolveOp(targetId),
             },
           ]
         : []),
@@ -856,6 +880,28 @@ export function buildShapeMenu(
       hint: "選択中のカード・コメントを囲む大きさに図形を合わせます（選択が無ければ図形の上のカードに合わせます）。",
       onClick: () => a.shapeFitToCards(shapeId),
     },
+    // v1.5.6 WS-M M1（§8.1）: モジュール境界＝図形＋ロック。
+    // メンバーシップは**ロックした瞬間のスナップショット（所属）**— 図形のリサイズや
+    // Shift 移動では変わらない。解除すると所属は消え、ゆるいグループ（動的包含）に戻る。
+    {
+      label: (sh?.locked ? "✓ " : "　") + "メンバーをロック",
+      hint: "いま上に乗っているカードをメンバーとして固定します。ロック中は外へのドラッグ・削除ができません（外から入れると警告付きでメンバーに追加）。解除すると固定も解けます。",
+      onClick: () => a.shapeToggleLock(shapeId, !(sh?.locked ?? false)),
+    },
+    ...(sh?.locked && sh.members.length
+      ? [
+          {
+            label: `メンバーを選択（${sh.members.length}枚）`,
+            hint: "ロック時に固定したメンバーを ID で選択します。図形のリサイズなどで見た目の外に出てしまったメンバーも、ここから回収できます。",
+            onClick: () => a.selectShapeMembers(shapeId),
+          },
+        ]
+      : []),
+    {
+      label: "モジュール化（境界に IN/OUT を挿入）",
+      hint: "図形の境界をまたぐフロー矢印の位置に IN/OUT カードを自動で挟み、入口と出口を実体化します。またぐ矢印が無ければ何もしません。",
+      onClick: () => a.modularizeShape(shapeId),
+    },
     { label: "名前を変更...", onClick: () => a.shapeLabel(shapeId, sh?.label ?? "") },
     { label: "最前面へ（図形内）", onClick: () => a.shapeZ(shapeId, true) },
     { label: "最背面へ（図形内）", onClick: () => a.shapeZ(shapeId, false) },
@@ -1020,6 +1066,18 @@ export function buildCanvasMenu(
       label: "ウォッチャ（ファイル監視で発行）...",
       hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
       onClick: () => a.addFilter("op_watch", pos.canvasX, pos.canvasY),
+    },
+    // v1.5.6 WS-M M1（§9.1 手動設置）: 先に入口・出口を置いて中を組む／独立モジュールに
+    // 意図的に口を付ける。モジュール化コマンド（図形右クリック）でも自動生成される。
+    {
+      label: "IN（モジュールの入口）",
+      hint: "データの入口カード。外から来るフロー矢印をここに受け、中のフィルタへ流します（素通し）。モジュールの差し替え可能な口になります。",
+      onClick: () => a.addFilter("op_in", pos.canvasX, pos.canvasY),
+    },
+    {
+      label: "OUT（モジュールの出口・▶実行）",
+      hint: "データの出口カード。▶を押すと上流をさかのぼって実行し、結果カードが横に生まれます（何度でも押せる口）。",
+      onClick: () => a.addFilter("op_out", pos.canvasX, pos.canvasY),
     },
     // ── ユーザーのカード（ライブラリ登録済み・登録があるときだけ）──
     ...(ctx.launcherLibrary.length || ctx.library.length

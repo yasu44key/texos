@@ -758,8 +758,99 @@ function App() {
     [refresh, pushUndo, linkNewNode]
   );
 
+  // v1.5.6 WS-M M1（§8.1）: ロック中図形のメンバー判定（cardsOnShape と同じ中心点包含）。
+  const cardCenterInShape = useCallback((x: number, y: number, s: ShapeInfo) => {
+    const cx = x + CARD_W / 2;
+    const cy = y + CARD_H / 2;
+    return cx >= s.pos_x && cx <= s.pos_x + s.width && cy >= s.pos_y && cy <= s.pos_y + s.height;
+  }, []);
+  // 移動がロックを破る（メンバーの中心がロック図形の外で終わる）なら、その図形を返す。
+  // v1.5.6 実機FB: 対象はそのカードが**所属する**ロック図形だけ（幾何の偶然の重なりは無関係）。
+  // 既に外にいるメンバー（リサイズ等の帰結）も「中へ戻す移動」以外は弾く＝迷子を増やさない。
+  const lockViolation = useCallback(
+    (cardId: string, newX: number, newY: number): ShapeInfo | null => {
+      for (const s of shapesRef.current) {
+        if (!s.locked || !s.members.includes(cardId)) continue;
+        if (!cardCenterInShape(newX, newY, s)) return s;
+      }
+      return null;
+    },
+    [cardCenterInShape]
+  );
+  // カードがロック中図形のメンバーなら、その図形を返す（削除ガード・§8.1 メンバー保全）。
+  // v1.5.6 実機FB: 判定は**所属（members の id）**であって幾何ではない — 図形をリサイズ
+  // したり Shift 移動しても、ロック時に取ったスナップショットのメンバーは守られ続ける。
+  const lockedMemberShape = useCallback(
+    (cardId: string): ShapeInfo | null =>
+      shapesRef.current.find((s) => s.locked && s.members.includes(cardId)) ?? null,
+    []
+  );
+  // redrawArrowsFor は後方（矢印まわり）で定義されるため、前方のハンドラからは ref 経由で呼ぶ
+  //（TDZ 回避。レンダーごとに最新を差し込む）。
+  const redrawArrowsForRef = useRef<(moved: Map<string, { x: number; y: number }>) => void>(
+    () => {}
+  );
+  // ロック図形へ入る移動（イン警告＝許可し、**メンバーに追加**する・§8.1）。
+  // 非メンバーのカードの中心がロック図形の矩形に入ったとき、その図形を返す。
+  const lockEntry = useCallback(
+    (cardId: string, oldX: number, oldY: number, newX: number, newY: number): ShapeInfo | null => {
+      for (const s of shapesRef.current) {
+        if (!s.locked || s.members.includes(cardId)) continue;
+        if (!cardCenterInShape(oldX, oldY, s) && cardCenterInShape(newX, newY, s)) return s;
+      }
+      return null;
+    },
+    [cardCenterInShape]
+  );
+  // イン確定: バックエンドへ追加し、ローカルの members も同期する。
+  const addShapeMember = useCallback(async (shapeId: string, cardId: string) => {
+    try {
+      await invoke("add_shape_member", { shapeId, cardId });
+      setShapes((prev) =>
+        prev.map((s) =>
+          s.id === shapeId && !s.members.includes(cardId)
+            ? { ...s, members: [...s.members, cardId] }
+            : s
+        )
+      );
+    } catch (e) {
+      console.error("add_shape_member failed", e);
+    }
+  }, []);
+
   const handleMoveEnd = useCallback(async (id: string, x: number, y: number) => {
     const prev = objectsRef.current.find((o) => o.id === id);
+    // v1.5.6 WS-M M1（§8.1）: ロック中図形のメンバーのドラッグアウトは弾く（位置を戻す）。
+    if (prev) {
+      const viol = lockViolation(id, x, y);
+      if (viol) {
+        // React の VDOM 差分は「座標が変わっていない」ため DOM を書き戻さない — ドラッグ中に
+        // 直接書かれた transform を**命令的に**戻す（矢印も同様＝redrawArrowsFor の流儀）。
+        const el = document.querySelector<HTMLElement>(
+          `[data-object-id="${CSS.escape(id)}"]`
+        );
+        if (el) el.style.transform = `translate(${prev.pos_x}px, ${prev.pos_y}px)`;
+        redrawArrowsForRef.current(new Map([[id, { x: prev.pos_x, y: prev.pos_y }]]));
+        setConfirm({
+          title: "モジュールがロックされています",
+          message: `このカードは 🔒「${viol.label || "図形"}」のメンバーです。外へ出すには、図形メニューの「メンバーをロック」を解除してください。`,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+      const entry = lockEntry(id, prev.pos_x, prev.pos_y, x, y);
+      if (entry) {
+        // イン警告（§8.1）: 入れるのは自由。**所属（members）にも追加**＝以後はロックで守られる。
+        void addShapeMember(entry.id, id);
+        setConfirm({
+          title: "ロック中のモジュールに追加されました",
+          message: `カードは 🔒「${entry.label || "図形"}」のメンバーになりました（ロック解除するまで外へ出せません・削除もできません）。`,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    }
     try {
       await invoke("move_object", { id, x, y });
       if (prev && (prev.pos_x !== x || prev.pos_y !== y)) {
@@ -771,7 +862,7 @@ function App() {
     } catch (e) {
       console.error("move_object failed", e);
     }
-  }, [pushUndo]);
+  }, [pushUndo, lockViolation, lockEntry, addShapeMember]);
 
   const handleTransformChange = useCallback((t: Transform) => {
     transformRef.current = t;
@@ -1102,6 +1193,15 @@ function App() {
       // create_filter が kind='op' として作る。
       if (builtin === "op_trigger") {
         create("トリガ", { op: "trigger" });
+        return;
+      }
+      // v1.5.6 WS-M M1（§9.1 手動設置）: IN/OUT バーチャルカード＝即作成（設定項目なし）。
+      if (builtin === "op_in") {
+        create("IN", { op: "in" });
+        return;
+      }
+      if (builtin === "op_out") {
+        create("OUT", { op: "out" });
         return;
       }
       if (builtin === "op_timer" || builtin === "op_watch") {
@@ -1511,7 +1611,28 @@ function App() {
       // v1.5.4 WS-P2: op カード（トリガ▶）は run_flow ではなく fire_op（代理発行）。
       // fire_op はスレッドへ発行してすぐ返る＝進行はジョブパネル・結果は job:done の refresh。
       // 同一終端の多重はジョブ台帳（register_flow）が拒否するので二度押しガードは不要。
-      if (objectsRef.current.find((o) => o.id === id)?.kind === "op") {
+      // v1.5.6 WS-M M1: OUT バーチャルカード（op:"out"）は通常の run_flow（さかのぼり pull
+      // 実行・§9.3）へ流す。IN は実行の口ではないので案内だけ。
+      const opObj = objectsRef.current.find((o) => o.id === id);
+      const opKind: string | null = (() => {
+        if (opObj?.kind !== "op") return null;
+        try {
+          const k = JSON.parse(opObj.filter_ref ?? "{}").op;
+          return typeof k === "string" ? k : null;
+        } catch {
+          return null;
+        }
+      })();
+      if (opKind === "in") {
+        setConfirm({
+          title: "IN カードは実行できません",
+          message: "IN はモジュールの入口（素通し）です。実行は OUT カードの ▶ か、下流のフィルタカードから行ってください。",
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+      if (opKind !== null && opKind !== "out") {
         try {
           const n = await invoke<number>("fire_op", { id });
           await refresh(); // fired_count の書き戻しを拾う
@@ -1955,6 +2076,21 @@ function App() {
   );
 
   const handleDeleteObject = useCallback(async (id: string) => {
+    // v1.5.6 WS-M M1（§8.1 メンバー保全・実機FB）: ロック中図形のメンバーは削除も不可。
+    // ここが削除の要衝（右クリック削除・Del キー単体が全部通る）＝入口で一括ガード。
+    const obj = objectsRef.current.find((o) => o.id === id);
+    if (obj) {
+      const lockShape = lockedMemberShape(obj.id);
+      if (lockShape) {
+        setConfirm({
+          title: "モジュールがロックされています",
+          message: `このカードは 🔒「${lockShape.label || "図形"}」のメンバーです。削除するには、先に図形メニューの「メンバーをロック」を解除してください。`,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+    }
     try {
       await invoke("delete_object", { id });
       // 復活の呪文: 削除はソフトデリートなのでCtrl+Zで矢印リンクごと復活する。
@@ -1964,7 +2100,7 @@ function App() {
     } catch (e) {
       console.error("delete_object failed", e);
     }
-  }, [pushUndo]);
+  }, [pushUndo, lockedMemberShape]);
 
   // Confirm before deleting a committed object (its real file is removed too).
   const handleRequestDelete = useCallback(
@@ -2672,6 +2808,19 @@ function App() {
     const targets = objectsRef.current.filter((o) => selectedRef.current.has(o.id));
     const noteTargets = notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
     if (!targets.length && !noteTargets.length) return;
+    // v1.5.6 WS-M M1（§8.1 メンバー保全・実機FB）: ロック中図形のメンバーが含まれていたら
+    // 一括削除ごと止める（グループ移動の弾きと同じ「全体を守る」方針・部分削除はしない）。
+    const lockedHit = targets.find((o) => lockedMemberShape(o.id));
+    if (lockedHit) {
+      const lockShape = lockedMemberShape(lockedHit.id);
+      setConfirm({
+        title: "モジュールがロックされています",
+        message: `選択の中に 🔒「${lockShape?.label || "図形"}」のメンバー（例: ${lockedHit.label}）が含まれています。削除するには先にロックを解除してください（削除は行いませんでした）。`,
+        okLabel: "OK",
+        onConfirm: () => setConfirm(null),
+      });
+      return;
+    }
     const committedCount = targets.filter((o) => o.committed_path).length;
     const parts = [
       ...(targets.length ? [`${targets.length} 件のカード`] : []),
@@ -2715,7 +2864,7 @@ function App() {
         await refresh();
       },
     });
-  }, [refresh, pushUndo]);
+  }, [refresh, pushUndo, lockedMemberShape]);
 
   // 一時的に閲覧: open a disposable temp copy (real body stays pristine).
   // 閲覧のみなのでシグナルは変えない。
@@ -3085,6 +3234,7 @@ function App() {
         if (!from || !to) continue;
         const p1 = nodeEdgePoint(from, nodeCenter(to));
         const p2 = nodeEdgePoint(to, nodeCenter(from));
+        // （v1.5.6: ロック弾きの命令的リセットが redrawArrowsForRef 経由でここを呼ぶ）
         document
           .querySelectorAll<SVGLineElement>(`line[data-rel-id="${r.id}"]`)
           .forEach((ln) => {
@@ -3103,6 +3253,8 @@ function App() {
     (id: string, x: number, y: number) => redrawArrowsFor(new Map([[id, { x, y }]])),
     [redrawArrowsFor]
   );
+  // v1.5.6: 前方のハンドラ（handleMoveEnd のロック弾き）から呼ぶための差し込み（TDZ 回避）。
+  redrawArrowsForRef.current = redrawArrowsFor;
 
   const handleGroupDragStart = useCallback((id: string, clientX: number, clientY: number) => {
     if (!selectedRef.current.size && !selectedNotesRef.current.size) return;
@@ -3154,6 +3306,35 @@ function App() {
         }
         return;
       }
+      // v1.5.6 WS-M M1（§8.1）: グループ移動でもロック中図形のメンバーは外へ出せない。
+      // 1枚でも違反があれば移動全体を戻す（モジュールの整合を優先・部分適用はしない）。
+      const violated = [...cardStarts.entries()].find(([oid, s]) =>
+        lockViolation(oid, s.x + dx, s.y + dy)
+      );
+      if (violated) {
+        const vShape = lockViolation(violated[0], violated[1].x + dx, violated[1].y + dy);
+        // React の VDOM 差分は座標不変だと DOM を書き戻さないため、**命令的に**元へ戻す
+        //（ドラッグ中の transform 直書きと同じレーンで返す・矢印も再描画）。
+        cardStarts.forEach((s, oid) => {
+          const el = elOf("data-object-id", oid);
+          if (el) el.style.transform = `translate(${s.x}px, ${s.y}px)`;
+        });
+        noteStarts.forEach((s, nid) => {
+          const el = elOf("data-note-id", nid);
+          if (el) el.style.transform = `translate(${s.x}px, ${s.y}px)`;
+        });
+        const back = new Map<string, { x: number; y: number }>();
+        cardStarts.forEach((s, oid) => back.set(oid, { x: s.x, y: s.y }));
+        noteStarts.forEach((s, nid) => back.set(nid, { x: s.x, y: s.y }));
+        redrawArrowsFor(back);
+        setConfirm({
+          title: "モジュールがロックされています",
+          message: `選択の中に 🔒「${vShape?.label || "図形"}」のメンバーが含まれています。外へ出すにはロックを解除してください（移動は取り消しました）。`,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
       const moves = [...cardStarts.entries()].map(([oid, s]) => ({
         id: oid,
         x: s.x + dx,
@@ -3173,13 +3354,32 @@ function App() {
       try {
         await applyObjectMoves(moves);
         await applyNoteMoves(noteMoves);
+        // v1.5.6: グループ移動でロック図形へ入ったカードも所属に追加（単体ドラッグと同じ）。
+        let enteredShape: ShapeInfo | null = null;
+        let enteredCount = 0;
+        for (const [oid, s] of cardStarts) {
+          const entry = lockEntry(oid, s.x, s.y, s.x + dx, s.y + dy);
+          if (entry) {
+            void addShapeMember(entry.id, oid);
+            enteredShape = entry;
+            enteredCount++;
+          }
+        }
+        if (enteredShape) {
+          setConfirm({
+            title: "ロック中のモジュールに追加されました",
+            message: `${enteredCount} 枚のカードが 🔒「${enteredShape.label || "図形"}」のメンバーになりました（ロック解除するまで外へ出せません・削除もできません）。`,
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
       } catch (e) {
         console.error("group move failed", e);
       }
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-  }, [pushUndo, applyObjectMoves, applyNoteMoves, redrawArrowsFor]);
+  }, [pushUndo, applyObjectMoves, applyNoteMoves, redrawArrowsFor, lockViolation, lockEntry, addShapeMember]);
 
   // --- Clipboard paste (v1.3-④) ---------------------------------------------
 
@@ -3520,6 +3720,22 @@ function App() {
     async (id: string, x: number, y: number, w: number, h: number) => {
       const s = shapesRef.current.find((sh) => sh.id === id);
       if (!s) return;
+      // v1.5.6 実機FB: メンバーシップは所属（members）なので、図形を縮めても**外れない**。
+      // ただし「メンバーが図形の外に見える」状態は紛らわしいので知らせる（回収手段つき）。
+      if (s.locked && (w !== s.width || h !== s.height)) {
+        const newRect = { ...s, pos_x: x, pos_y: y, width: w, height: h };
+        const outside = objectsRef.current.filter(
+          (o) => s.members.includes(o.id) && !cardCenterInShape(o.pos_x, o.pos_y, newRect)
+        );
+        if (outside.length) {
+          setConfirm({
+            title: "メンバーが図形の外になります",
+            message: `${outside.length} 枚のメンバーが 🔒「${s.label || "図形"}」の見た目の外になります（例: ${outside[0].label}）。所属は維持され、ロックの保護（移動・削除の禁止）も続きます。図形右クリック「メンバーを選択」でいつでも回収できます。`,
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+      }
       if (s.pos_x !== x || s.pos_y !== y || s.width !== w || s.height !== h) {
         const old = { id, x: s.pos_x, y: s.pos_y, w: s.width, h: s.height, rot: s.rotation };
         pushUndo([{ kind: "shapes", geoms: [old] }]);
@@ -3530,7 +3746,7 @@ function App() {
         console.error("update_shape_geom failed", e);
       }
     },
-    [pushUndo, applyShapeGeoms]
+    [pushUndo, applyShapeGeoms, cardCenterInShape]
   );
 
   // クリック（ドラッグなし）= 図形上のカード・コメントをまとめて選択（思考のグループ）。
@@ -3600,9 +3816,20 @@ function App() {
         }
         const cardStarts = new Map<string, { x: number; y: number }>();
         const noteStarts = new Map<string, { x: number; y: number }>();
+        // v1.5.6 WS-M M1（§8.3 片ロック規則）: 動かない側のロック図形の**メンバー（所属）**は
+        // その図形に残る（ドラッグする図形が手放す）。両ロックの仮身分裂（§8.3）は
+        // 後回し＝当面は保守的に「残る」側に倒す（申し送り参照）。
+        const movingIds = new Set(moving.keys());
+        const lockedOutside = shapesRef.current.filter(
+          (sh) => sh.locked && !movingIds.has(sh.id)
+        );
+        const heldByLock = (cardId: string) =>
+          lockedOutside.some((L) => L.members.includes(cardId));
         for (const sh of moving.values()) {
           cardsOnShape(sh).forEach((c) => {
-            if (!separating || selCards.has(c.id)) cardStarts.set(c.id, { x: c.pos_x, y: c.pos_y });
+            if ((!separating || selCards.has(c.id)) && !heldByLock(c.id)) {
+              cardStarts.set(c.id, { x: c.pos_x, y: c.pos_y });
+            }
           });
           notesOnShape(sh).forEach((n) => {
             if (!separating || selNotes.has(n.id)) noteStarts.set(n.id, { x: n.pos_x, y: n.pos_y });
@@ -3678,7 +3905,7 @@ function App() {
         })();
       }
     },
-    [cardsOnShape, notesOnShape, growShapeGroup, pushUndo, applyObjectMoves, applyNoteMoves, applyShapeGeoms, redrawArrowsFor]
+    [cardsOnShape, notesOnShape, growShapeGroup, pushUndo, applyObjectMoves, applyNoteMoves, applyShapeGeoms, redrawArrowsFor, cardCenterInShape]
   );
 
   const handleShapeDelete = useCallback(
@@ -3698,6 +3925,91 @@ function App() {
       }
     },
     [pushUndo]
+  );
+
+  // v1.5.6 WS-M M1（§8.1）: 図形「メンバーをロック」トグル。
+  // ロック ON = その瞬間に乗っているカードをスナップショット（所属＝幾何ではない）。
+  // OFF = 所属を消してゆるいグループ（動的包含）へ戻る。
+  const handleShapeToggleLock = useCallback(
+    async (id: string, locked: boolean) => {
+      const s = shapesRef.current.find((sh) => sh.id === id);
+      if (!s) return;
+      const memberIds = locked ? cardsOnShape(s).map((c) => c.id) : [];
+      try {
+        await invoke("set_shape_locked", { id, locked, memberIds });
+        setShapes((prev) =>
+          prev.map((sh) => (sh.id === id ? { ...sh, locked, members: memberIds } : sh))
+        );
+      } catch (e) {
+        console.error("set_shape_locked failed", e);
+      }
+    },
+    [cardsOnShape]
+  );
+
+  // v1.5.6 実機FB: メンバーを id で選択（図形の外に出てしまったメンバーの回収手段）。
+  const handleSelectShapeMembers = useCallback((id: string) => {
+    const s = shapesRef.current.find((sh) => sh.id === id);
+    if (!s || !s.members.length) return;
+    const alive = new Set(objectsRef.current.map((o) => o.id));
+    setSelected(new Set(s.members.filter((m) => alive.has(m))));
+    setSelectedNotes(new Set());
+  }, []);
+
+  // v1.5.6 WS-M M1（§9.1）: モジュール化＝境界をまたぐ flow 矢印に IN/OUT を自動挿入。
+  const handleModularizeShape = useCallback(
+    async (id: string) => {
+      const s = shapesRef.current.find((sh) => sh.id === id);
+      if (!s) return;
+      // ロック済みなら所属スナップショット（正）、未ロックなら動的包含（ゆるいグループ）。
+      const memberIds =
+        s.locked && s.members.length ? s.members : cardsOnShape(s).map((c) => c.id);
+      try {
+        const created = await invoke<string[]>("modularize_members", { memberIds });
+        // Ctrl+Z（カード削除）では繋ぎ替えた矢印が戻らないため undo には積まない。
+        // 逆操作は各 IN/OUT の「溶解」（矢印を直結に戻して消す＝属性も復元される）。
+        if (created.length) {
+          setTouched((prev) => new Set([...prev, ...created]));
+        }
+        await refresh();
+        setConfirm({
+          title: "モジュール化",
+          message: created.length
+            ? `境界をまたぐ矢印 ${created.length} 本に IN/OUT カードを挿入しました。元に戻すときは各 IN/OUT の右クリック「このカードを溶解」を使ってください。`
+            : "境界をまたぐフロー矢印はありませんでした（このモジュールは独立しています）。",
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      } catch (e) {
+        console.error("modularize_members failed", e);
+        setConfirm({
+          title: "モジュール化できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [cardsOnShape, refresh]
+  );
+
+  // v1.5.6 WS-M M1（§9.2）: IN/OUT の溶解＝矢印を直結に繋ぎ変えてカードを消す。
+  const handleDissolveOp = useCallback(
+    async (id: string) => {
+      try {
+        await invoke("dissolve_op", { id });
+        await refresh();
+      } catch (e) {
+        console.error("dissolve_op failed", e);
+        setConfirm({
+          title: "溶解できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh]
   );
 
   const handleShapeStyle = useCallback(async (id: string, fill: string, opacity: number) => {
@@ -4324,6 +4636,11 @@ function App() {
         runFlow: handleRunFlow,
         evaluateFlow: handleEvaluateFlow,
         toggleOpPause: handleToggleOpPause,
+        // v1.5.6 WS-M M1: 図形ロック・モジュール化・IN/OUT 溶解。
+        shapeToggleLock: handleShapeToggleLock,
+        modularizeShape: handleModularizeShape,
+        selectShapeMembers: handleSelectShapeMembers,
+        dissolveOp: handleDissolveOp,
         addLauncher: handleAddLauncher,
         runLauncher: handleRunLauncher,
         addLibraryLauncher: handleAddLibraryLauncher,

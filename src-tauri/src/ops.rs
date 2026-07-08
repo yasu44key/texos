@@ -95,10 +95,22 @@ pub(crate) fn is_op_spec(spec: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// v1.5.6 WS-M M1: IN/OUT バーチャルカード（op:"in"/"out"）か。
+/// これらは**データレーンの住人**（矢印は flow・eval は素通し）＝発行系（req）ではない。
+pub(crate) fn is_io_op_spec(spec: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(spec)
+        .map(|v| matches!(v.get("op").and_then(|o| o.as_str()), Some("in") | Some("out")))
+        .unwrap_or(false)
+}
+
 pub(crate) fn parse_op_spec(spec: &str) -> Result<OpSpec, String> {
     let s: OpSpec = serde_json::from_str(spec).map_err(|e| format!("opカード定義が不正です: {e}"))?;
     match s.op.as_str() {
         "trigger" => {}
+        // v1.5.6 WS-M M1（共有とモジュール §9.4）: IN/OUT バーチャルカード＝発火しない静的 op。
+        // スケジューラの対象外（tick は timer/watch のみ）・paused の対象外・データレーンの
+        // 素通しノード（eval_filter が透過評価する）。
+        "in" | "out" => {}
         "timer" => {
             let every_ok = s.every.map(|e| e > 0).unwrap_or(false);
             let at_ok = s
@@ -291,6 +303,226 @@ pub(crate) fn fire_op(id: String, app: tauri::AppHandle) -> Result<usize, String
     let n = targets.len();
     dispatch(targets, &app);
     Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+// モジュール化と溶解 (v1.5.6 WS-M M1 — 共有とモジュール設計 §9)
+// ---------------------------------------------------------------------------
+
+/// モジュール化（図形右クリック）: メンバー集合の境界をまたぐ flow 矢印の位置に
+/// IN/OUT バーチャルカード（kind='op'・op:"in"/"out"）を自動挿入して繋ぎ替える。
+/// 1またぎ矢印=1口（§8.4 ポート＝またぎ矢印の実体化）。メンバー判定（中心点包含）は
+/// フロントの cardsOnShape が担い、ここは member_ids を受けてグラフ手術だけ行う。
+/// 返り値 = 作った IN/OUT カードの id（フロントが undo に積む）。
+#[tauri::command]
+pub(crate) fn modularize_members(
+    member_ids: Vec<String>,
+    state: State<AppState>,
+) -> Result<Vec<String>, String> {
+    let members: std::collections::HashSet<String> = member_ids.into_iter().collect();
+    if members.is_empty() {
+        return Err("図形の上にカードがありません".into());
+    }
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // またぎ flow 矢印（両端が生きているもの）を列挙。
+    let mut stmt = p
+        .conn
+        .prepare(
+            "SELECT rel.id, rel.from_id, rel.to_id, rel.attrs,
+                    vf.pos_x, vf.pos_y, vt.pos_x, vt.pos_y
+             FROM relations rel
+             JOIN virtual_bodies vf ON vf.id = rel.from_id AND vf.deleted_at IS NULL
+             JOIN virtual_bodies vt ON vt.id = rel.to_id AND vt.deleted_at IS NULL
+             WHERE rel.kind = 'flow' AND rel.deleted_at IS NULL",
+        )
+        .map_err(|e| e.to_string())?;
+    #[allow(clippy::type_complexity)]
+    let rels: Vec<(i64, String, String, Option<String>, f64, f64, f64, f64)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // 実身センチネル（op カード共通）。
+    p.conn
+        .execute(
+            "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+             VALUES ('op:empty', ?1, 0, ?2)",
+            rusqlite::params![OP_MIME, db::now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut created: Vec<String> = Vec::new();
+    for (rel_id, from, to, attrs, fx, fy, tx, ty) in rels {
+        let from_in = members.contains(&from);
+        let to_in = members.contains(&to);
+        if from_in == to_in {
+            continue; // またいでいない（内部 or 完全外部）
+        }
+        // またぎ点（両端の中点）に IN/OUT を置く。inbound=IN（外→内）/ outbound=OUT（内→外）。
+        let (op, label) = if to_in { ("in", "IN") } else { ("out", "OUT") };
+        let (mx, my) = ((fx + tx) / 2.0, (fy + ty) / 2.0);
+        let vid = uuid();
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies
+                    (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+                 VALUES (?1, 'op:empty', ?2, ?3, ?4, ?5, 'op', ?6)",
+                rusqlite::params![vid, label, mx, my, db::now_ms(), format!("{{\"op\":\"{op}\"}}")],
+            )
+            .map_err(|e| e.to_string())?;
+        // 属性の分配（WS-P1 の意味論を保存する）:
+        //   when/carry は「上流の結果を読む」条件 → 上流側エッジ（U→IN / U→OUT）へ。
+        //   port は「消費側の入力順」 → 消費側エッジ（IN→D / OUT→D）へ。
+        let parsed = flow::parse_edge_attrs(attrs.as_deref());
+        let mut up = serde_json::Map::new();
+        if let Some(w) = &parsed.when {
+            up.insert("when".into(), serde_json::Value::String(w.clone()));
+        }
+        if let Some(c) = &parsed.carry {
+            up.insert("carry".into(), serde_json::Value::String(c.clone()));
+        }
+        let up_attrs: Option<String> = if up.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&serde_json::Value::Object(up)).ok()
+        };
+        let down_attrs: Option<String> =
+            parsed.port.map(|pt| format!("{{\"port\":{pt}}}"));
+        let now = db::now_ms();
+        p.conn
+            .execute(
+                "UPDATE relations SET deleted_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, rel_id],
+            )
+            .map_err(|e| e.to_string())?;
+        p.conn
+            .execute(
+                "INSERT INTO relations (from_id, to_id, kind, attrs, created_at)
+                 VALUES (?1, ?2, 'flow', ?3, ?4)",
+                rusqlite::params![from, vid, up_attrs, now],
+            )
+            .map_err(|e| e.to_string())?;
+        p.conn
+            .execute(
+                "INSERT INTO relations (from_id, to_id, kind, attrs, created_at)
+                 VALUES (?1, ?2, 'flow', ?3, ?4)",
+                rusqlite::params![vid, to, down_attrs, now],
+            )
+            .map_err(|e| e.to_string())?;
+        created.push(vid);
+    }
+    Ok(created)
+}
+
+/// 溶解（IN/OUT 右クリック・§9.2）: 繋がれている flow 矢印を直結に繋ぎ変えてカードを消す。
+/// 入り×出の全組合せを直結（attrs は 上流側エッジの when/carry ＋ 下流側エッジの port を合成）。
+#[tauri::command]
+pub(crate) fn dissolve_op(id: String, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let spec_json: String = p
+        .conn
+        .query_row(
+            "SELECT filter_ref FROM virtual_bodies
+             WHERE id = ?1 AND kind = 'op' AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or("opカードが見つかりません")?;
+    if !is_io_op_spec(&spec_json) {
+        return Err("溶解できるのは IN/OUT カードだけです".into());
+    }
+    // 入り（U→me）と出（me→D）の flow 矢印（相手が生きているもの）。
+    let read_edges = |sql: &str| -> Result<Vec<(String, Option<String>)>, String> {
+        let mut stmt = p.conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    };
+    let ins = read_edges(
+        "SELECT rel.from_id, rel.attrs FROM relations rel
+         JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+         WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+         ORDER BY rel.created_at",
+    )?;
+    let outs = read_edges(
+        "SELECT rel.to_id, rel.attrs FROM relations rel
+         JOIN virtual_bodies v ON v.id = rel.to_id AND v.deleted_at IS NULL
+         WHERE rel.from_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+         ORDER BY rel.created_at",
+    )?;
+    let now = db::now_ms();
+    for (u, in_attrs) in &ins {
+        for (d, out_attrs) in &outs {
+            if u == d {
+                continue; // 直結すると自己ループになる組は捨てる（create_relation と同じ禁止）
+            }
+            let ia = flow::parse_edge_attrs(in_attrs.as_deref());
+            let oa = flow::parse_edge_attrs(out_attrs.as_deref());
+            let mut merged = serde_json::Map::new();
+            if let Some(w) = ia.when {
+                merged.insert("when".into(), serde_json::Value::String(w));
+            }
+            if let Some(c) = ia.carry {
+                merged.insert("carry".into(), serde_json::Value::String(c));
+            }
+            if let Some(pt) = oa.port {
+                merged.insert("port".into(), serde_json::Value::from(pt));
+            }
+            let attrs: Option<String> = if merged.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&serde_json::Value::Object(merged)).ok()
+            };
+            // 既に同じ直結があるなら張らない（create_relation の重複ガードと同じ）。
+            p.conn
+                .execute(
+                    "INSERT INTO relations (from_id, to_id, kind, attrs, created_at)
+                     SELECT ?1, ?2, 'flow', ?3, ?4
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM relations
+                         WHERE from_id = ?1 AND to_id = ?2 AND kind = 'flow' AND deleted_at IS NULL
+                     )",
+                    rusqlite::params![u, d, attrs, now],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    // カード本体と自分に触れる flow 矢印をソフト削除（足場を畳む）。
+    p.conn
+        .execute(
+            "UPDATE relations SET deleted_at = ?1
+             WHERE (from_id = ?2 OR to_id = ?2) AND kind = 'flow' AND deleted_at IS NULL",
+            rusqlite::params![now, id],
+        )
+        .map_err(|e| e.to_string())?;
+    p.conn
+        .execute(
+            "UPDATE virtual_bodies SET deleted_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +759,13 @@ mod tests {
         assert!(parse_op_spec(r#"{"op":"unknown"}"#).is_err());
         assert!(is_op_spec(r#"{"op":"timer","every":5}"#));
         assert!(!is_op_spec(r#"{"builtin":"select"}"#));
+        // v1.5.6 WS-M M1: IN/OUT バーチャルカード（発火しない静的 op・データレーンの住人）。
+        assert!(parse_op_spec(r#"{"op":"in"}"#).is_ok());
+        assert!(parse_op_spec(r#"{"op":"out"}"#).is_ok());
+        assert!(is_io_op_spec(r#"{"op":"in"}"#));
+        assert!(is_io_op_spec(r#"{"op":"out"}"#));
+        assert!(!is_io_op_spec(r#"{"op":"timer","every":5}"#));
+        assert!(!is_io_op_spec(r#"{"builtin":"select"}"#));
     }
 
     #[test]
