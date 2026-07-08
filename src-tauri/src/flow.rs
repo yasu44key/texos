@@ -47,12 +47,18 @@ pub struct FilterSpec {
     /// 出力先フォルダ。空=プロジェクト直下にコミット済み実身／指定=そこへ書き出して窓（仮身）
     #[serde(default)]
     pub out_dir: Option<String>,
-    /// 出力名の接頭辞（空=従来の「入力名_フィルタ名」命名）
+    /// 出力名の接頭辞（空=従来の「入力名_フィルタ名」命名）。
+    /// v1.5.7 セレクタ設定: セレクタでは「下流に送る出力名」— 採用した枝のペイロードの
+    /// stem をこの名前に差し替える（"fibo.exe" のように拡張子付きなら ext も変える）。
     #[serde(default)]
     pub prefix: Option<String>,
     /// 接頭辞使用時の次の連番。実行のたびにカードへ書き戻す
     #[serde(default)]
     pub seq: Option<u32>,
+    /// v1.5.7 セレクタ設定: エラー時メッセージ。失敗時矢印の枝を採用したとき、枝が運ぶ
+    /// エラーテキストの代わりにこの文を text/plain で下流へ送る（空=そのままスルー）。
+    #[serde(default)]
+    pub fail_text: Option<String>,
     /// ユーザーメモ
     #[serde(default)]
     pub note: Option<String>,
@@ -246,6 +252,21 @@ impl FilterSpec {
     pub fn absorbs_nodata(&self) -> bool {
         self.nodata.as_deref() == Some("absorb") || self.node_kind() == NodeKind::Select
     }
+}
+
+/// v1.5.7 セレクタ設定: 出力名を stem と拡張子に分ける。"fibo.exe" → ("fibo", Some("exe"))。
+/// 拡張子とみなすのは最後の '.' 以降が 1〜8 文字の英数字のときだけ（"v1.5" や末尾ドットは
+/// 名前の一部として全体を stem に）。ユーザーが拡張子込みで書いても素直に通すための寛容化。
+pub fn split_output_name(name: &str) -> (&str, Option<&str>) {
+    if let Some((stem, ext)) = name.rsplit_once('.') {
+        let ok = !stem.is_empty()
+            && (1..=8).contains(&ext.len())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric());
+        if ok {
+            return (stem, Some(ext));
+        }
+    }
+    (name, None)
 }
 
 /// 外部プログラムの解決: 絶対パス → <project>/.texos/filters → 環境変数PATH の順
@@ -1661,6 +1682,20 @@ mod tests {
         assert!(spec(r#"{"builtin":"select"}"#).absorbs_nodata());
         assert!(spec(r#"{"cmd":"x {out}","nodata":"absorb"}"#).absorbs_nodata());
         assert!(!spec(r#"{"cmd":"x {out}"}"#).absorbs_nodata());
+    }
+
+    /// v1.5.7 セレクタ設定: 出力名の stem/拡張子分解（拡張子付きの宣言を寛容に受ける）。
+    #[test]
+    fn split_output_name_cases() {
+        assert_eq!(split_output_name("fibo.exe"), ("fibo", Some("exe")));
+        assert_eq!(split_output_name("fibo"), ("fibo", None));
+        assert_eq!(split_output_name("report.md"), ("report", Some("md")));
+        // 拡張子に見えないものは名前の一部（バージョン表記・末尾ドット・非英数）
+        assert_eq!(split_output_name("v1.5"), ("v1", Some("5"))); // 1桁英数は拡張子扱い
+        assert_eq!(split_output_name("名前."), ("名前.", None));
+        assert_eq!(split_output_name(".gitignore"), (".gitignore", None));
+        assert_eq!(split_output_name("a.tar.gz"), ("a.tar", Some("gz")));
+        assert_eq!(split_output_name("データ.実験"), ("データ.実験", None));
     }
 
     /// v1.5.2 WS-C: 録音デバイス名の抽出（dshow・引用あり/なし・無指定は None）。

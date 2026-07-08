@@ -123,6 +123,31 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       },
     ],
   },
+  // v1.5.7 セレクタ設定パネル: 下流に送る情報（出力名・エラー時メッセージ）を宣言できる。
+  // flow_run.rs のセレクタ分岐（NodeKind::Select）が prefix / fail_text を読む。
+  select: {
+    title: "セレクタ（最初の有データ枝を採用）",
+    fixed: { accept_mime: "*/*" },
+    note: "複数の入力枝のうち「最初にデータを返した枝」を採用して下流へ流します（実行はしません）。枝の順序は右クリック「入力の順序」で変えられます。",
+    fields: [
+      {
+        key: "prefix",
+        label: "出力名",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=入力の名前をそのまま通す（例: fibo.exe）",
+        hint: "採用したデータをこの名前で下流へ送ります（拡張子付きも可）。このカード自身を▶実行すると、この名前の固定ファイルとして毎回上書きされます。後段に別の終端を置く場合は、その終端の命名規則が最後に適用されます。",
+      },
+      {
+        key: "fail_text",
+        label: "エラー時メッセージ",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=枝が運ぶエラーテキストをそのまま流す",
+        hint: "失敗時矢印の枝を採用したとき、コンパイラ等のエラーテキストの代わりにこの文を下流へ送ります。",
+      },
+    ],
+  },
   // ── v1.5.4 WS-P2 オペレーション（op カード・kind='op'）。builtin ではないが、
   //    「スキーマからフォームを自動生成して update_filter/create_filter で保存」という
   //    仕組みは同じなのでここに同居させる（キーは "op_<種別>"）。

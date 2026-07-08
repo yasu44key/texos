@@ -355,9 +355,11 @@ fn finish_eval(
 }
 
 /// エッジ1本の収集結果（フェーズ1）。nodata=枝が取られなかった（NULL伝搬の種）。
+/// failure=失敗時矢印（when:"failure"）で取られた枝（v1.5.7 セレクタのエラー時メッセージ用）。
 pub(crate) struct EdgeOut {
     pub(crate) payloads: Vec<FlowPayload>,
     pub(crate) nodata: bool,
+    pub(crate) failure: bool,
 }
 
 /// when/carry をエッジに適用する（§5.4.2）。上流の no-data は when に関わらず no-data
@@ -369,7 +371,7 @@ pub(crate) fn apply_edge(
     report: &mut FlowReport,
 ) -> EdgeOut {
     if up.nodata {
-        return EdgeOut { payloads: vec![], nodata: true };
+        return EdgeOut { payloads: vec![], nodata: true, failure: false };
     }
     let when = attrs.when.as_deref().unwrap_or("always");
     let taken = match when {
@@ -384,7 +386,7 @@ pub(crate) fn apply_edge(
         }
     };
     if !taken {
-        return EdgeOut { payloads: vec![], nodata: true };
+        return EdgeOut { payloads: vec![], nodata: true, failure: false };
     }
     // 運ぶもの: 成功枝の既定=上流出力／失敗枝の既定=エラーメッセージ（stderr・§6.1 一級）。
     let carry = attrs
@@ -409,7 +411,7 @@ pub(crate) fn apply_edge(
         "input" => up.failed_inputs.clone(),
         _ => up.payloads.clone(),
     };
-    EdgeOut { payloads, nodata: false }
+    EdgeOut { payloads, nodata: false, failure: when == "failure" }
 }
 
 /// フィルタを再帰評価する（pull型連鎖 — 実行モデル3）。
@@ -619,9 +621,41 @@ pub(crate) fn eval_filter(
 
     // セレクタ（§5.4.1）: 実行せず「最初に有データを返した枝」を採用。no-data 吸収を内包し、
     // 全滅なら自分が no-data（エラーではない — 下流やレポートが no-data として扱う）。
+    // v1.5.7 セレクタ設定: 採用後に (1) 失敗枝ならエラー時メッセージへ差し替え（fail_text）、
+    // (2) 出力名（prefix）で stem/拡張子を宣言名に差し替え、してから下流へ流す。
     if spec.node_kind() == flow::NodeKind::Select {
         let out = match edges.iter().find(|e| !e.nodata && !e.payloads.is_empty()) {
-            Some(e) => EvalOut::data(e.payloads.clone(), None),
+            Some(e) => {
+                let mut pls = e.payloads.clone();
+                if e.failure {
+                    if let Some(msg) =
+                        spec.fail_text.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        let stem = pls
+                            .first()
+                            .map(|pl| pl.stem.clone())
+                            .unwrap_or_else(|| "エラー".into());
+                        pls = vec![FlowPayload {
+                            bytes: msg.as_bytes().to_vec(),
+                            ext: "txt".into(),
+                            mime: "text/plain".into(),
+                            stem,
+                        }];
+                    }
+                }
+                if let Some(name) =
+                    spec.prefix.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                {
+                    let (stem, ext) = flow::split_output_name(name);
+                    for pl in &mut pls {
+                        pl.stem = stem.to_string();
+                        if let Some(x) = ext {
+                            pl.ext = x.to_string();
+                        }
+                    }
+                }
+                EvalOut::data(pls, None)
+            }
             None => EvalOut::nodata_out(),
         };
         return finish_eval(p, fid, visited, memo, 0, out);
@@ -820,6 +854,7 @@ mod ws_p1_tests {
         let a = attrs(r#"{"when":"success"}"#);
         let e1 = apply_edge(&ok, &a, "a", &mut report);
         assert!(!e1.nodata);
+        assert!(!e1.failure, "成功枝は失敗枝フラグを立てない");
         assert_eq!(e1.payloads.len(), 1);
         let e2 = apply_edge(&bad, &a, "a", &mut report);
         assert!(e2.nodata, "失敗は枝が取られない＝no-data");
@@ -835,6 +870,7 @@ mod ws_p1_tests {
         let a = attrs(r#"{"when":"failure"}"#);
         let e1 = apply_edge(&bad, &a, "a", &mut report);
         assert!(!e1.nodata);
+        assert!(e1.failure, "失敗枝フラグ（v1.5.7 セレクタのエラー時メッセージが見る）");
         assert_eq!(e1.payloads.len(), 1);
         assert_eq!(e1.payloads[0].mime, "text/plain");
         assert!(String::from_utf8_lossy(&e1.payloads[0].bytes).contains("stderr本文"));
@@ -1182,7 +1218,15 @@ fn run_flow_inner(
                     break cand;
                 }
             },
-            (Some(px), None) => out_root.join(format!("{px}.{}", pl.ext)),
+            // v1.5.7: 拡張子込みで書かれた固定名（"fibo.exe" 等）に .ext を重ねない。
+            (Some(px), None) => {
+                let dot_ext = format!(".{}", pl.ext);
+                if px.to_ascii_lowercase().ends_with(&dot_ext.to_ascii_lowercase()) {
+                    out_root.join(px)
+                } else {
+                    out_root.join(format!("{px}{dot_ext}"))
+                }
+            }
             (None, _) => {
                 unique_file_path(&out_root, &format!("{}_{safe_flabel}.{}", pl.stem, pl.ext))
             }
