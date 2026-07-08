@@ -591,6 +591,7 @@ mod clipboard_in;
 mod filters;
 mod flow_run;
 mod launcher;
+mod modules;
 mod notes;
 mod objects;
 mod ops;
@@ -606,6 +607,7 @@ pub(crate) use clipboard_in::*;
 pub(crate) use filters::*;
 pub(crate) use flow_run::*;
 pub(crate) use launcher::*;
+pub(crate) use modules::*;
 pub(crate) use notes::*;
 pub(crate) use objects::*;
 pub(crate) use ops::*;
@@ -776,6 +778,11 @@ pub fn run() {
             list_launcher_library,
             save_launcher_library,
             delete_launcher_library,
+            list_module_library,
+            save_module_library,
+            place_module_from_library,
+            delete_module_library,
+            export_libraries_to_project,
             list_installed_apps,
             create_drop_point,
             drop_into_point,

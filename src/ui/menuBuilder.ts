@@ -40,6 +40,12 @@ export interface MenuActions {
   saveFilterToLibrary: (id: string) => void;
   addLibraryFilter: (name: string, x: number, y: number) => void;
   deleteLibraryFilter: (name: string) => void;
+  // v1.5.8 WS-M M2: モジュールライブラリ（AppData/modules・共有とモジュール設計 §10）
+  saveModuleToLibrary: (shapeId: string) => void;
+  addLibraryModule: (name: string, x: number, y: number) => void;
+  deleteLibraryModule: (name: string) => void;
+  // T3 決着: 全個人フィルタ・ランチャー・モジュールをプロジェクトへ書き出し（バックアップ代用）。
+  exportLibraries: () => void;
   feedDrop: (id: string) => void;
   runDrop: (id: string) => void;
   newSubproject: (sibling: boolean, x: number, y: number) => void;
@@ -902,6 +908,12 @@ export function buildShapeMenu(
       hint: "図形の境界をまたぐフロー矢印の位置に IN/OUT カードを自動で挟み、入口と出口を実体化します。またぐ矢印が無ければ何もしません。",
       onClick: () => a.modularizeShape(shapeId),
     },
+    // v1.5.8 WS-M M2（§10.1）: ロック済みメンバーを名前付きモジュールとして個人ライブラリへ。
+    {
+      label: "ライブラリに登録（モジュール）...",
+      hint: "ロックしたメンバー（カード・矢印・設定・データの実身コピー）を名前を付けて個人ライブラリに保存します。展開は「自動化カードを追加 → ユーザーのモジュール」から（どのプロジェクトでも使えます）。",
+      onClick: () => a.saveModuleToLibrary(shapeId),
+    },
     { label: "名前を変更...", onClick: () => a.shapeLabel(shapeId, sh?.label ?? "") },
     { label: "最前面へ（図形内）", onClick: () => a.shapeZ(shapeId, true) },
     { label: "最背面へ（図形内）", onClick: () => a.shapeZ(shapeId, false) },
@@ -920,6 +932,8 @@ interface CanvasMenuCtx {
   library: string[];
   /// v1.3.11: ライブラリ登録済みランチャー名（「ユーザーのランチャー」として列挙）
   launcherLibrary: string[];
+  /// v1.5.8 WS-M M2: ライブラリ登録済みモジュール名（「ユーザーのモジュール」として列挙）
+  moduleLibrary: string[];
   /// v1.4.9: dshow 音声デバイス名（「マイク録音」プリセットの選択肢）。
   audioDevices: string[];
   /// v1.3.4: メニュー説明ツールチップの現在のオン/オフ（トグル表示用）。
@@ -1091,6 +1105,21 @@ export function buildCanvasMenu(
             label: `⚗ ${name}`,
             onClick: () => a.addLibraryFilter(name, pos.canvasX, pos.canvasY),
           })),
+        ]
+      : []),
+    // ── ユーザーのモジュール（v1.5.8 WS-M M2・§10.1: 図形右クリック「ライブラリに登録」の展開先）──
+    ...(ctx.moduleLibrary.length
+      ? [
+          { label: "── ユーザーのモジュール ──", onClick: () => {}, disabled: true },
+          ...ctx.moduleLibrary.map((name) => ({
+            label: `📦 ${name}`,
+            hint: "モジュール（カード・矢印・データ同梱）をこの場所にロック済み図形ごと展開します。展開後のカードは普通のカードと同等です（透過＝インライン展開）。",
+            onClick: () => a.addLibraryModule(name, pos.canvasX, pos.canvasY),
+          })),
+        ]
+      : []),
+    ...(ctx.launcherLibrary.length || ctx.library.length || ctx.moduleLibrary.length
+      ? [
           {
             label: "ライブラリから削除 ...",
             danger: true,
@@ -1105,6 +1134,11 @@ export function buildCanvasMenu(
                   label: `⚗ ${name} を削除`,
                   danger: true,
                   onClick: () => a.deleteLibraryFilter(name),
+                })),
+                ...ctx.moduleLibrary.map((name) => ({
+                  label: `📦 ${name} を削除`,
+                  danger: true,
+                  onClick: () => a.deleteLibraryModule(name),
                 })),
               ]),
           },
@@ -1135,6 +1169,13 @@ export function buildCanvasMenu(
       label: "孤立データを削除（正規化）...",
       hint: "どのカードからも参照されなくなった実身データ（CAS）を削除して容量を回収します。まず件数・サイズを確認してから実行します（生きたカード・ゴミ箱・履歴は残ります）。先に「ゴミ箱を空にする」と回収量が増えます。",
       onClick: () => a.gcCas(),
+    },
+    // v1.5.8 WS-M M2（T3 決着・§10.1）: 個人ライブラリのバックアップ代用。
+    // ライブラリはプロジェクトに付いていかないため、zip で持ち出すときはここで写しを置く。
+    {
+      label: "個人ライブラリをプロジェクトへ書き出し...",
+      hint: "アプリ共通の個人ライブラリ（ユーザーのフィルタ・ランチャー・モジュール）の写しを、このプロジェクトの「ライブラリバックアップ」フォルダに書き出します（バックアップ代用。プロジェクトをzipで渡してもライブラリは自動では付いていきません）。",
+      onClick: () => a.exportLibraries(),
     },
   ];
   const newProjectSub: MenuItem[] = [

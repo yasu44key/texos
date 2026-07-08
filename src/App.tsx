@@ -259,6 +259,24 @@ function App() {
   useEffect(() => {
     void reloadLauncherLibrary();
   }, [reloadLauncherLibrary]);
+  // v1.5.8 WS-M M2: モジュールライブラリ（AppData/modules・共有とモジュール設計 §10）。
+  const [moduleLibrary, setModuleLibrary] = useState<
+    { name: string; created_at: number; cards: number; total_blob_bytes: number }[]
+  >([]);
+  const reloadModuleLibrary = useCallback(async () => {
+    try {
+      setModuleLibrary(
+        await invoke<{ name: string; created_at: number; cards: number; total_blob_bytes: number }[]>(
+          "list_module_library"
+        )
+      );
+    } catch {
+      setModuleLibrary([]);
+    }
+  }, []);
+  useEffect(() => {
+    void reloadModuleLibrary();
+  }, [reloadModuleLibrary]);
   // v1.3.11 #A: インストール済みアプリのピッカー（Start Menu 走査）。開いている間だけ
   // 配置先座標と linkFrom を保持する。
   const [appPicker, setAppPicker] = useState<{ x: number; y: number; linkFrom?: string } | null>(null);
@@ -1969,6 +1987,161 @@ function App() {
     },
     [reloadFilterLibrary]
   );
+
+  // v1.5.8 WS-M M2（§10.1）: ロック済み図形のメンバーを名前付きモジュールとして
+  // 個人ライブラリ（AppData/modules）へ登録。実身は常にコピー同梱（§10.2）・
+  // 合計サイズがしきい値超過なら確認してから登録（巨大データ警告）。
+  const handleSaveModuleToLibrary = useCallback(
+    (shapeId: string) => {
+      const sh = shapesRef.current.find((s) => s.id === shapeId);
+      if (!sh) return;
+      if (!sh.locked || !sh.members.length) {
+        setConfirm({
+          title: "ライブラリに登録（モジュール）",
+          message:
+            "先に図形右クリック「メンバーをロック」でメンバーを固定してください。\nライブラリ化はロックした瞬間のスナップショット（所属メンバー）を保存します。",
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+      const doSave = async (name: string, allowLarge: boolean) => {
+        try {
+          const res = await invoke<{ saved: boolean; total_bytes: number; cards: number }>(
+            "save_module_library",
+            { name, shapeId, allowLarge }
+          );
+          if (!res.saved) {
+            // §10.2 巨大データ警告: しきい値超過は確認してから同梱する。
+            const mb = (res.total_bytes / (1024 * 1024)).toFixed(1);
+            setConfirm({
+              title: "モジュールのデータが大きい",
+              message: `同梱する実身データの合計が ${mb} MB あります。\nライブラリはアプリ共通の置き場（AppData）にコピーを保持します。登録しますか？`,
+              okLabel: "登録する",
+              onConfirm: () => {
+                setConfirm(null);
+                void doSave(name, true);
+              },
+            });
+            return;
+          }
+          await reloadModuleLibrary();
+          setConfirm({
+            title: "ライブラリに登録しました",
+            message: `モジュール「${name}」（カード ${res.cards} 枚）を登録しました。\nキャンバス右クリック「自動化カードを追加 → ユーザーのモジュール」で、どのプロジェクトにも展開できます。`,
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        } catch (e) {
+          setConfirm({
+            title: "ライブラリに登録できませんでした",
+            message: String(e),
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+      };
+      setPrompt({
+        title: "ライブラリに登録: モジュール名（同名は上書き）",
+        initial: sh.label || "モジュール",
+        onConfirm: (name) => void doSave(name, false),
+      });
+    },
+    [reloadModuleLibrary]
+  );
+
+  // v1.5.8 WS-M M2: ライブラリのモジュールをキャンバスへ展開（§8.5 透過＝インライン展開）。
+  // ID は全再割当・実身はプロジェクト CAS へ・図形はロック済みで置かれる。
+  // 未導入の依存があれば注意カード（付箋）が添えられる（§10.3 初回アテンション）。
+  const handleAddLibraryModule = useCallback(
+    async (name: string, x: number, y: number) => {
+      try {
+        const res = await invoke<{
+          new_card_ids: string[];
+          shape_id: string;
+          note_id: string | null;
+          missing: string[];
+        }>("place_module_from_library", { name, x, y });
+        await refresh();
+        // 展開したカードを選択状態で迎える（send_selection の受け入れと同じ流儀）。
+        setSelected(new Set(res.new_card_ids));
+        setSelectedNotes(new Set());
+        if (res.missing.length) {
+          setConfirm({
+            title: "モジュールを展開しました（依存に注意）",
+            message:
+              `未導入の依存があります:\n${res.missing.map((s) => `・${s}`).join("\n")}\n\n` +
+              "注意カード（付箋）を図形の横に添えました。導入後はそのまま実行できます。",
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+      } catch (e) {
+        setConfirm({
+          title: "モジュールを展開できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh]
+  );
+
+  // v1.5.8 WS-M M2: ライブラリからモジュールを削除（展開済みのカードには影響しない）。
+  const handleDeleteLibraryModule = useCallback(
+    (name: string) => {
+      setConfirm({
+        title: "ライブラリから削除",
+        message: `モジュール「${name}」をライブラリから削除します（同梱データのコピーも消えます）。\n（展開済みのカードには影響しません）`,
+        okLabel: "削除",
+        onConfirm: async () => {
+          setConfirm(null);
+          try {
+            await invoke("delete_module_library", { name });
+          } catch (e) {
+            console.error("delete_module_library failed", e);
+          }
+          await reloadModuleLibrary();
+        },
+      });
+    },
+    [reloadModuleLibrary]
+  );
+
+  // v1.5.8 WS-M M2（T3 決着）: 全個人ライブラリをプロジェクトへ書き出し（バックアップ代用）。
+  const handleExportLibraries = useCallback(() => {
+    setConfirm({
+      title: "個人ライブラリをプロジェクトへ書き出し",
+      message:
+        "アプリ共通の個人ライブラリ（ユーザーのフィルタ・ランチャー・モジュール）の写しを、このプロジェクトの「ライブラリバックアップ」フォルダへ書き出します。\n（既存の「ライブラリバックアップ」フォルダは上書きされます）",
+      okLabel: "書き出す",
+      onConfirm: async () => {
+        setConfirm(null);
+        try {
+          const res = await invoke<{
+            path: string;
+            filters: number;
+            launchers: number;
+            modules: number;
+          }>("export_libraries_to_project");
+          setConfirm({
+            title: "書き出しました",
+            message: `フィルタ ${res.filters} 件・ランチャー ${res.launchers} 件・モジュール ${res.modules} 件\n→ ${res.path}`,
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        } catch (e) {
+          setConfirm({
+            title: "書き出せませんでした",
+            message: String(e),
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
+      },
+    });
+  }, []);
 
   // ドロップポイントから flow 矢印を下流へ辿り、末端のフィルタ（その先に
   // フィルタが繋がっていないもの）を実行する。中間のフィルタ連鎖は run_flow の
@@ -3971,6 +4144,22 @@ function App() {
         if (created.length) {
           setTouched((prev) => new Set([...prev, ...created]));
         }
+        // v1.5.8 WS-M M2: 口（IN/OUT）もモジュールの一員。ロック中なら所属へ追加して
+        // 削除・ドラッグアウトの保護とライブラリ登録の範囲に含める。
+        if (created.length && s.locked) {
+          for (const cid of created) {
+            try {
+              await invoke("add_shape_member", { shapeId: id, cardId: cid });
+            } catch (e) {
+              console.error("add_shape_member failed", e);
+            }
+          }
+          setShapes((prev) =>
+            prev.map((sh) =>
+              sh.id === id ? { ...sh, members: [...sh.members, ...created] } : sh
+            )
+          );
+        }
         await refresh();
         setConfirm({
           title: "モジュール化",
@@ -4651,6 +4840,11 @@ function App() {
         saveFilterToLibrary: handleSaveFilterToLibrary,
         addLibraryFilter: handleAddLibraryFilter,
         deleteLibraryFilter: handleDeleteLibraryFilter,
+        // v1.5.8 WS-M M2: モジュールライブラリ（登録・展開・削除・全書き出し）。
+        saveModuleToLibrary: handleSaveModuleToLibrary,
+        addLibraryModule: handleAddLibraryModule,
+        deleteLibraryModule: handleDeleteLibraryModule,
+        exportLibraries: handleExportLibraries,
         feedDrop: handleFeedDrop,
         runDrop: runDownstreamFlows,
         newSubproject: handleNewSubproject,
@@ -4838,6 +5032,7 @@ function App() {
             bulkItems,
             library: filterLibrary.map((e) => e.name),
             launcherLibrary: launcherLibrary.map((e) => e.name),
+            moduleLibrary: moduleLibrary.map((e) => e.name),
             audioDevices: audioDevicesRef.current,
             menuHints: showMenuHints,
             cardHints: showCardHints,
@@ -4912,6 +5107,10 @@ function App() {
       handleSaveFilterToLibrary,
       handleAddLibraryFilter,
       handleDeleteLibraryFilter,
+      handleSaveModuleToLibrary,
+      handleAddLibraryModule,
+      handleDeleteLibraryModule,
+      handleExportLibraries,
       handleAddLauncher,
       handleRunLauncher,
       handleAddLibraryLauncher,
@@ -4927,6 +5126,7 @@ function App() {
       notes,
       filterLibrary,
       launcherLibrary,
+      moduleLibrary,
       cardsOnShape,
       notesOnShape,
     ]
