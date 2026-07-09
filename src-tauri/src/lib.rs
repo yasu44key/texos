@@ -783,6 +783,8 @@ pub fn run() {
             place_module_from_library,
             delete_module_library,
             export_libraries_to_project,
+            list_library_backup,
+            import_library_backup_entry,
             list_installed_apps,
             create_drop_point,
             drop_into_point,

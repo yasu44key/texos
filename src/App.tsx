@@ -2143,6 +2143,89 @@ function App() {
     });
   }, []);
 
+  // v1.5.9: ライブラリバックアップから取り込み（読み戻し）。バックアップの一覧を取得し、
+  // 項目クリックで1件ずつ個人ライブラリへ戻すサブメニューを開く（keepOpen・✓=取り込み済み・
+  // 同名上書きは事前にラベルで知らせる）。運用: 別PCへの移植・自分のライブラリを壊したときの復元。
+  const handleImportLibraries = useCallback(
+    async (openSubmenu: (items: MenuItem[]) => void) => {
+      type Entry = { name: string; exists: boolean };
+      let list: { filters: Entry[]; launchers: Entry[]; modules: Entry[] };
+      try {
+        list = await invoke("list_library_backup");
+      } catch (e) {
+        setConfirm({
+          title: "取り込めません",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+      const total = list.filters.length + list.launchers.length + list.modules.length;
+      if (!total) {
+        setConfirm({
+          title: "ライブラリバックアップから取り込み",
+          message: "「ライブラリバックアップ」フォルダはありますが、中身が空です。",
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+      // 取り込み済みマーク（このサブメニューを開いている間だけの状態）。
+      const done = new Set<string>();
+      const importOne = async (kind: string, name: string) => {
+        try {
+          await invoke("import_library_backup_entry", { kind, name });
+          done.add(`${kind}:${name}`);
+        } catch (e) {
+          console.error("import_library_backup_entry failed", e);
+        }
+      };
+      const reloadAll = () =>
+        Promise.all([reloadFilterLibrary(), reloadLauncherLibrary(), reloadModuleLibrary()]);
+      const build = (): MenuItem[] => {
+        const item = (kind: string, icon: string, e: Entry): MenuItem => ({
+          label: done.has(`${kind}:${e.name}`)
+            ? `✓ ${icon} ${e.name}（取り込み済み）`
+            : `　${icon} ${e.name}${e.exists ? "（同名を上書き）" : ""}`,
+          keepOpen: true,
+          onClick: async () => {
+            await importOne(kind, e.name);
+            await reloadAll();
+            openSubmenu(build());
+          },
+        });
+        const section = (title: string, kind: string, icon: string, entries: Entry[]): MenuItem[] =>
+          entries.length
+            ? [
+                { label: `── ${title} ──`, onClick: () => {}, disabled: true },
+                ...entries.map((e) => item(kind, icon, e)),
+              ]
+            : [];
+        return [
+          ...section("フィルタ", "filter", "⚗", list.filters),
+          ...section("ランチャー", "launcher", "🚀", list.launchers),
+          ...section("モジュール", "module", "📦", list.modules),
+          { divider: true, label: "", onClick: () => {} },
+          {
+            label: `すべて取り込み（${total}件）`,
+            keepOpen: true,
+            onClick: async () => {
+              for (const e of list.filters) await importOne("filter", e.name);
+              for (const e of list.launchers) await importOne("launcher", e.name);
+              for (const e of list.modules) await importOne("module", e.name);
+              await reloadAll();
+              openSubmenu(build());
+            },
+          },
+          { label: "OK（閉じる）", onClick: () => {} },
+        ];
+      };
+      openSubmenu(build());
+    },
+    [reloadFilterLibrary, reloadLauncherLibrary, reloadModuleLibrary]
+  );
+
   // ドロップポイントから flow 矢印を下流へ辿り、末端のフィルタ（その先に
   // フィルタが繋がっていないもの）を実行する。中間のフィルタ連鎖は run_flow の
   // pull 評価がメモリ上で通過させる（中間ファイル・中間カードは生まれない）。
@@ -4811,10 +4894,12 @@ function App() {
       const el = document.elementFromPoint(info.clientX, info.clientY);
 
       // App のハンドラ群をメニュービルダー（ui/menuBuilder.ts）への窓口にまとめる。
+      // サブメニューを同位置に開き直す（既存メニューのクローズ後に）。v1.5.9: バックアップ
+      // 取り込みのような「非同期に組み立てるサブメニュー」からも使うため名前付きで持つ。
+      const openSubmenu = (sub: MenuItem[]) =>
+        window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items: sub }), 0);
       const actions: MenuActions = {
-        // サブメニューを同位置に開き直す（既存メニューのクローズ後に）。
-        openSubmenu: (sub) =>
-          window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items: sub }), 0),
+        openSubmenu,
         contextPlace: handleContextPlace,
         newFile: handleNewFile,
         addNote: handleAddNote,
@@ -4845,6 +4930,7 @@ function App() {
         addLibraryModule: handleAddLibraryModule,
         deleteLibraryModule: handleDeleteLibraryModule,
         exportLibraries: handleExportLibraries,
+        importLibraries: () => void handleImportLibraries(openSubmenu),
         feedDrop: handleFeedDrop,
         runDrop: runDownstreamFlows,
         newSubproject: handleNewSubproject,
@@ -5111,6 +5197,7 @@ function App() {
       handleAddLibraryModule,
       handleDeleteLibraryModule,
       handleExportLibraries,
+      handleImportLibraries,
       handleAddLauncher,
       handleRunLauncher,
       handleAddLibraryLauncher,

@@ -852,6 +852,162 @@ pub(crate) fn export_libraries_to_project(state: State<AppState>) -> Result<Expo
     })
 }
 
+// ---------------------------------------------------------------------------
+// v1.5.9: ライブラリバックアップからの取り込み（読み戻し・T3「バックアップ代用」の補完）
+//
+// 運用（2026-07-09 ユーザー確認）:
+//   - 他人に渡す = バックアップ無しのプロジェクトのキャンバスに必要なモジュールを展開して渡す
+//     （受け手は図形右クリック「ライブラリに登録」・§10.1 の正規ルート）
+//   - 自分の復元 = 「ライブラリバックアップ」フォルダ入りプロジェクトから**選んで戻す**（本機能）
+// ---------------------------------------------------------------------------
+
+fn backup_dir(root: &Path) -> PathBuf {
+    root.join("ライブラリバックアップ")
+}
+
+fn read_backup_lib(path: &Path) -> Vec<LibFilter> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+#[derive(Serialize)]
+pub(crate) struct BackupEntry {
+    pub name: String,
+    /// 現在の個人ライブラリに同名があるか（取り込むと上書きになる）。
+    pub exists: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct BackupList {
+    pub filters: Vec<BackupEntry>,
+    pub launchers: Vec<BackupEntry>,
+    pub modules: Vec<BackupEntry>,
+}
+
+/// 開いているプロジェクトの「ライブラリバックアップ」フォルダの中身を一覧する
+/// （メニュー「ライブラリバックアップから取り込み」の素材）。
+#[tauri::command]
+pub(crate) fn list_library_backup(state: State<AppState>) -> Result<BackupList, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let dir = backup_dir(&p.root);
+    if !dir.is_dir() {
+        return Err(
+            "このプロジェクトに「ライブラリバックアップ」フォルダがありません。\n書き出し元の環境で「個人ライブラリをプロジェクトへ書き出し」を実行したプロジェクトを開いてください".into(),
+        );
+    }
+    let cur_filters: std::collections::HashSet<String> = read_library(&state.app_data)
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let cur_launchers: std::collections::HashSet<String> = read_launcher_library(&state.app_data)
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let filters = read_backup_lib(&dir.join("filter_library.json"))
+        .into_iter()
+        .map(|e| BackupEntry {
+            exists: cur_filters.contains(&e.name),
+            name: e.name,
+        })
+        .collect();
+    let launchers = read_backup_lib(&dir.join("launcher_library.json"))
+        .into_iter()
+        .map(|e| BackupEntry {
+            exists: cur_launchers.contains(&e.name),
+            name: e.name,
+        })
+        .collect();
+    let mut modules: Vec<BackupEntry> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir.join("modules")) {
+        for e in rd.flatten() {
+            if let Ok(s) = std::fs::read_to_string(e.path().join("module.json")) {
+                if let Ok(m) = serde_json::from_str::<ModuleJson>(&s) {
+                    let exists = modules_dir(&state.app_data)
+                        .join(e.file_name())
+                        .join("module.json")
+                        .is_file();
+                    modules.push(BackupEntry { name: m.name, exists });
+                }
+            }
+        }
+    }
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(BackupList {
+        filters,
+        launchers,
+        modules,
+    })
+}
+
+/// バックアップから1件を個人ライブラリへ取り込む（同名は上書き＝復元の意味論）。
+/// kind = "filter" | "launcher" | "module"。
+#[tauri::command]
+pub(crate) fn import_library_backup_entry(
+    kind: String,
+    name: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let dir = backup_dir(&p.root);
+    match kind.as_str() {
+        "filter" => {
+            let entry = read_backup_lib(&dir.join("filter_library.json"))
+                .into_iter()
+                .find(|e| e.name == name)
+                .ok_or_else(|| format!("バックアップにフィルタ「{name}」がありません"))?;
+            flow::parse_spec(&entry.spec)?; // 壊れた定義を戻さない（save_filter_library と同じ）
+            let mut list = read_library(&state.app_data);
+            list.retain(|e| e.name != name);
+            list.push(entry);
+            list.sort_by(|a, b| a.name.cmp(&b.name));
+            write_library(&state.app_data, &list)
+        }
+        "launcher" => {
+            let entry = read_backup_lib(&dir.join("launcher_library.json"))
+                .into_iter()
+                .find(|e| e.name == name)
+                .ok_or_else(|| format!("バックアップにランチャー「{name}」がありません"))?;
+            flow::parse_spec(&entry.spec)?;
+            let mut list = read_launcher_library(&state.app_data);
+            list.retain(|e| e.name != name);
+            list.push(entry);
+            list.sort_by(|a, b| a.name.cmp(&b.name));
+            let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+            std::fs::write(launcher_library_path(&state.app_data), json).map_err(|e| e.to_string())
+        }
+        "module" => {
+            // フォルダ名でなく module.json の name で照合（sanitize 前の名前が正）。
+            let src_root = dir.join("modules");
+            let mut found: Option<(PathBuf, std::ffi::OsString)> = None;
+            if let Ok(rd) = std::fs::read_dir(&src_root) {
+                for e in rd.flatten() {
+                    if let Ok(s) = std::fs::read_to_string(e.path().join("module.json")) {
+                        if let Ok(m) = serde_json::from_str::<ModuleJson>(&s) {
+                            if m.name == name {
+                                found = Some((e.path(), e.file_name()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let (src, folder) =
+                found.ok_or_else(|| format!("バックアップにモジュール「{name}」がありません"))?;
+            let dst = modules_dir(&state.app_data).join(&folder);
+            if dst.exists() {
+                std::fs::remove_dir_all(&dst)
+                    .map_err(|e| format!("既存モジュールの削除に失敗: {e}"))?;
+            }
+            copy_dir_all(&src, &dst).map_err(|e| format!("コピーに失敗: {e}"))
+        }
+        other => Err(format!("不明な種別です: {other}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

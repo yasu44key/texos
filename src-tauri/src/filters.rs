@@ -170,11 +170,12 @@ pub(crate) fn import_filter_program(src: String, state: State<AppState>) -> Resu
 // --- v1.5 フィルタライブラリ（アプリ共通・プロジェクト横断） ---------------------
 
 /// ライブラリの1エントリ。spec は filter_ref と同じ JSON。
+/// v1.5.9: フィールドは modules.rs（バックアップ取り込み）からも読むため crate 公開。
 #[derive(Serialize, Deserialize)]
 pub(crate) struct LibFilter {
-    name: String,
-    spec: String,
-    created_at: i64,
+    pub(crate) name: String,
+    pub(crate) spec: String,
+    pub(crate) created_at: i64,
 }
 
 pub(crate) fn library_path(app_data: &Path) -> PathBuf {

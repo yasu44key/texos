@@ -1,6 +1,6 @@
 [package]
 name = "texos"
-version = "1.5.8"
+version = "1.5.9"
 description = "TexoS - 織り紡ぐ者たち"
 authors = ["you"]
 edition = "2021"

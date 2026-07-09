@@ -46,6 +46,8 @@ export interface MenuActions {
   deleteLibraryModule: (name: string) => void;
   // T3 決着: 全個人フィルタ・ランチャー・モジュールをプロジェクトへ書き出し（バックアップ代用）。
   exportLibraries: () => void;
+  // v1.5.9: プロジェクトの「ライブラリバックアップ」から選んで個人ライブラリへ戻す（読み戻し）。
+  importLibraries: () => void;
   feedDrop: (id: string) => void;
   runDrop: (id: string) => void;
   newSubproject: (sibling: boolean, x: number, y: number) => void;
@@ -1176,6 +1178,12 @@ export function buildCanvasMenu(
       label: "個人ライブラリをプロジェクトへ書き出し...",
       hint: "アプリ共通の個人ライブラリ（ユーザーのフィルタ・ランチャー・モジュール）の写しを、このプロジェクトの「ライブラリバックアップ」フォルダに書き出します（バックアップ代用。プロジェクトをzipで渡してもライブラリは自動では付いていきません）。",
       onClick: () => a.exportLibraries(),
+    },
+    // v1.5.9: 読み戻し（別PCへの移植・ライブラリを壊したときの復元）。
+    {
+      label: "ライブラリバックアップから取り込み ...",
+      hint: "このプロジェクトの「ライブラリバックアップ」フォルダ（別の環境で書き出したもの）から、フィルタ・ランチャー・モジュールを選んで自分の個人ライブラリへ戻します（同名は上書き）。",
+      onClick: () => a.importLibraries(),
     },
   ];
   const newProjectSub: MenuItem[] = [
