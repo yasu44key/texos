@@ -795,6 +795,25 @@ function App() {
     },
     [cardCenterInShape]
   );
+  // v1.5.9: コメント（付箋）版のドラッグアウト判定。付箋も members に入るように
+  // なったので（要件1）、カードと同じく所属ロック図形の外へ出す移動を弾く。中心は
+  // 付箋の実測サイズで測る（notesOnShape と同じ流儀）。
+  const noteLockViolation = useCallback(
+    (noteId: string, newX: number, newY: number): ShapeInfo | null => {
+      const n = notesRef.current.find((it) => it.id === noteId);
+      if (!n) return null;
+      const sz = measuredNoteSize(n);
+      const cx = newX + sz.w / 2;
+      const cy = newY + sz.h / 2;
+      for (const s of shapesRef.current) {
+        if (!s.locked || !s.members.includes(noteId)) continue;
+        if (!(cx >= s.pos_x && cx <= s.pos_x + s.width && cy >= s.pos_y && cy <= s.pos_y + s.height))
+          return s;
+      }
+      return null;
+    },
+    [measuredNoteSize]
+  );
   // カードがロック中図形のメンバーなら、その図形を返す（削除ガード・§8.1 メンバー保全）。
   // v1.5.6 実機FB: 判定は**所属（members の id）**であって幾何ではない — 図形をリサイズ
   // したり Shift 移動しても、ロック時に取ったスナップショットのメンバーは守られ続ける。
@@ -3066,12 +3085,16 @@ function App() {
     if (!targets.length && !noteTargets.length) return;
     // v1.5.6 WS-M M1（§8.1 メンバー保全・実機FB）: ロック中図形のメンバーが含まれていたら
     // 一括削除ごと止める（グループ移動の弾きと同じ「全体を守る」方針・部分削除はしない）。
-    const lockedHit = targets.find((o) => lockedMemberShape(o.id));
+    // v1.5.9: 付箋（コメント）もメンバーになりうるので、カードと共通に判定する。
+    const lockedHit =
+      targets.find((o) => lockedMemberShape(o.id)) ??
+      noteTargets.find((n) => lockedMemberShape(n.id));
     if (lockedHit) {
       const lockShape = lockedMemberShape(lockedHit.id);
+      const example = "label" in lockedHit ? lockedHit.label : lockedHit.text;
       setConfirm({
         title: "モジュールがロックされています",
-        message: `選択の中に 🔒「${lockShape?.label || "図形"}」のメンバー（例: ${lockedHit.label}）が含まれています。削除するには先にロックを解除してください（削除は行いませんでした）。`,
+        message: `選択の中に 🔒「${lockShape?.label || "図形"}」のメンバー（例: ${example}）が含まれています。削除するには先にロックを解除してください（削除は行いませんでした）。`,
         okLabel: "OK",
         onConfirm: () => setConfirm(null),
       });
@@ -3564,11 +3587,17 @@ function App() {
       }
       // v1.5.6 WS-M M1（§8.1）: グループ移動でもロック中図形のメンバーは外へ出せない。
       // 1枚でも違反があれば移動全体を戻す（モジュールの整合を優先・部分適用はしない）。
-      const violated = [...cardStarts.entries()].find(([oid, s]) =>
+      // v1.5.9: 付箋（コメント）もメンバーになりうるので、カードと共通に判定する。
+      const violCard = [...cardStarts.entries()].find(([oid, s]) =>
         lockViolation(oid, s.x + dx, s.y + dy)
       );
-      if (violated) {
-        const vShape = lockViolation(violated[0], violated[1].x + dx, violated[1].y + dy);
+      const violNote = violCard
+        ? undefined
+        : [...noteStarts.entries()].find(([nid, s]) => noteLockViolation(nid, s.x + dx, s.y + dy));
+      if (violCard || violNote) {
+        const vShape = violCard
+          ? lockViolation(violCard[0], violCard[1].x + dx, violCard[1].y + dy)
+          : noteLockViolation(violNote![0], violNote![1].x + dx, violNote![1].y + dy);
         // React の VDOM 差分は座標不変だと DOM を書き戻さないため、**命令的に**元へ戻す
         //（ドラッグ中の transform 直書きと同じレーンで返す・矢印も再描画）。
         cardStarts.forEach((s, oid) => {
@@ -3635,7 +3664,7 @@ function App() {
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-  }, [pushUndo, applyObjectMoves, applyNoteMoves, redrawArrowsFor, lockViolation, lockEntry, addShapeMember]);
+  }, [pushUndo, applyObjectMoves, applyNoteMoves, redrawArrowsFor, lockViolation, noteLockViolation, lockEntry, addShapeMember]);
 
   // --- Clipboard paste (v1.3-④) ---------------------------------------------
 
@@ -4186,11 +4215,15 @@ function App() {
   // v1.5.6 WS-M M1（§8.1）: 図形「メンバーをロック」トグル。
   // ロック ON = その瞬間に乗っているカードをスナップショット（所属＝幾何ではない）。
   // OFF = 所属を消してゆるいグループ（動的包含）へ戻る。
+  // v1.5.9: メンバーにコメント（付箋）も含める。付箋も虚身（virtual_bodies）なので
+  // members に id を入れればロック保護もライブラリ化の範囲にも自然に乗る（要件1・2）。
   const handleShapeToggleLock = useCallback(
     async (id: string, locked: boolean) => {
       const s = shapesRef.current.find((sh) => sh.id === id);
       if (!s) return;
-      const memberIds = locked ? cardsOnShape(s).map((c) => c.id) : [];
+      const memberIds = locked
+        ? [...cardsOnShape(s).map((c) => c.id), ...notesOnShape(s).map((n) => n.id)]
+        : [];
       try {
         await invoke("set_shape_locked", { id, locked, memberIds });
         setShapes((prev) =>
@@ -4200,16 +4233,18 @@ function App() {
         console.error("set_shape_locked failed", e);
       }
     },
-    [cardsOnShape]
+    [cardsOnShape, notesOnShape]
   );
 
   // v1.5.6 実機FB: メンバーを id で選択（図形の外に出てしまったメンバーの回収手段）。
+  // v1.5.9: メンバーにはコメント（付箋）も含まれるので、カードと付箋の両方を選択へ振り分ける。
   const handleSelectShapeMembers = useCallback((id: string) => {
     const s = shapesRef.current.find((sh) => sh.id === id);
     if (!s || !s.members.length) return;
-    const alive = new Set(objectsRef.current.map((o) => o.id));
-    setSelected(new Set(s.members.filter((m) => alive.has(m))));
-    setSelectedNotes(new Set());
+    const aliveCards = new Set(objectsRef.current.map((o) => o.id));
+    const aliveNotes = new Set(notesRef.current.map((n) => n.id));
+    setSelected(new Set(s.members.filter((m) => aliveCards.has(m))));
+    setSelectedNotes(new Set(s.members.filter((m) => aliveNotes.has(m))));
   }, []);
 
   // v1.5.6 WS-M M1（§9.1）: モジュール化＝境界をまたぐ flow 矢印に IN/OUT を自動挿入。
@@ -4745,6 +4780,23 @@ function App() {
 
   const handleNoteMove = useCallback(async (id: string, x: number, y: number) => {
     const prev = notesRef.current.find((n) => n.id === id);
+    // v1.5.9: ロック中図形のメンバー付箋のドラッグアウトは弾く（カードと共通の保護）。
+    if (prev) {
+      const viol = noteLockViolation(id, x, y);
+      if (viol) {
+        // 座標不変だと VDOM は書き戻さないので、命令的に元位置へ戻す（矢印も再描画）。
+        const el = document.querySelector<HTMLElement>(`[data-note-id="${CSS.escape(id)}"]`);
+        if (el) el.style.transform = `translate(${prev.pos_x}px, ${prev.pos_y}px)`;
+        redrawArrowsForRef.current(new Map([[id, { x: prev.pos_x, y: prev.pos_y }]]));
+        setConfirm({
+          title: "モジュールがロックされています",
+          message: `このコメントは 🔒「${viol.label || "図形"}」のメンバーです。外へ出すには、図形メニューの「メンバーをロック」を解除してください。`,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+        return;
+      }
+    }
     try {
       await invoke("move_note", { id, x, y });
       if (prev && (prev.pos_x !== x || prev.pos_y !== y)) {
@@ -4754,7 +4806,7 @@ function App() {
     } catch (e) {
       console.error("move_note failed", e);
     }
-  }, [pushUndo]);
+  }, [pushUndo, noteLockViolation]);
 
   const handleNoteSave = useCallback(async (id: string, text: string) => {
     try {
@@ -4860,6 +4912,17 @@ function App() {
   );
 
   const handleDeleteNote = useCallback(async (id: string) => {
+    // v1.5.9: ロック中図形のメンバー付箋は削除も不可（カードの delete ガードと共通）。
+    const lockShape = lockedMemberShape(id);
+    if (lockShape) {
+      setConfirm({
+        title: "モジュールがロックされています",
+        message: `このコメントは 🔒「${lockShape.label || "図形"}」のメンバーです。削除するには、先に図形メニューの「メンバーをロック」を解除してください。`,
+        okLabel: "OK",
+        onConfirm: () => setConfirm(null),
+      });
+      return;
+    }
     try {
       await invoke("delete_note", { id });
       // 復活の呪文: 矢印リンクの行も残っているので、Ctrl+Zで一緒に戻る。
@@ -4868,7 +4931,7 @@ function App() {
     } catch (e) {
       console.error("delete_note failed", e);
     }
-  }, [pushUndo]);
+  }, [pushUndo, lockedMemberShape]);
 
   // v1.3-④: コメントを実ファイル化（以後はファイルリンク付箋として編集が書き戻る）。
   // v1.3.5: コメントの内容から独立したテキスト仮身カードを作る（実身化の後継）。

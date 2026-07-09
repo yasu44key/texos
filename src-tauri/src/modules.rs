@@ -67,6 +67,9 @@ struct ModCard {
     note_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     style_ref: Option<String>,
+    /// v1.5.9: プレビュー展開状態（チャット欄・テキスト/画像プレビュー）を保存・復元（要件3）。
+    #[serde(default)]
+    expanded: bool,
     /// 参照 real_body（センチネル "filter:sentinel" 等も含めて再現する）。
     real_id: String,
     real_mime: String,
@@ -367,6 +370,7 @@ pub(crate) fn save_module_library(
         window_of: Option<String>,
         note_text: Option<String>,
         style_ref: Option<String>,
+        expanded: bool,
         real_mime: String,
         real_ext: Option<String>,
     }
@@ -380,6 +384,7 @@ pub(crate) fn save_module_library(
                 "SELECT v.real_id, v.label, v.pos_x, v.pos_y, v.kind, v.filter_ref,
                         v.url_ref, v.folder_ref, v.project_ref, v.memo, v.z_order,
                         v.ext, v.mime_type, v.window_of, v.note_text, v.style_ref,
+                        v.expanded,
                         COALESCE(v.mime_type, r.mime_type), r.ext
                  FROM virtual_bodies v JOIN real_bodies r ON r.id = v.real_id
                  WHERE v.id = ?1 AND v.deleted_at IS NULL",
@@ -402,8 +407,9 @@ pub(crate) fn save_module_library(
                         window_of: r.get(13)?,
                         note_text: r.get(14)?,
                         style_ref: r.get(15)?,
-                        real_mime: r.get(16)?,
-                        real_ext: r.get(17)?,
+                        expanded: r.get::<_, i64>(16)? != 0,
+                        real_mime: r.get(17)?,
+                        real_ext: r.get(18)?,
                     })
                 },
             )
@@ -411,7 +417,7 @@ pub(crate) fn save_module_library(
             .map_err(|e| e.to_string())?;
         let Some(MemberRow {
             real_id, label, x, y, kind, filter_ref, url_ref, folder_ref, project_ref,
-            memo, z, ext, mime_type, window_of, note_text, style_ref, real_mime, real_ext,
+            memo, z, ext, mime_type, window_of, note_text, style_ref, expanded, real_mime, real_ext,
         }) = row
         else {
             continue; // 削除済みメンバーはスキップ（回収漏れの残骸）
@@ -478,6 +484,7 @@ pub(crate) fn save_module_library(
             window_of,
             note_text,
             style_ref,
+            expanded,
             real_id,
             real_mime,
             real_ext,
@@ -685,8 +692,8 @@ pub(crate) fn place_module_from_library(
             .execute(
                 "INSERT INTO virtual_bodies
                     (id,real_id,label,pos_x,pos_y,created_at,kind,filter_ref,url_ref,
-                     folder_ref,memo,z_order,ext,mime_type,window_of,note_text,style_ref)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                     folder_ref,memo,z_order,ext,mime_type,window_of,note_text,style_ref,expanded)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 rusqlite::params![
                     new_id,
                     real_id,
@@ -705,6 +712,7 @@ pub(crate) fn place_module_from_library(
                     new_window,
                     c.note_text,
                     c.style_ref,
+                    c.expanded as i64,
                 ],
             )
             .map_err(|e| e.to_string())?;
