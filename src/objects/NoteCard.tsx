@@ -56,6 +56,8 @@ interface Props {
   onToggleSelect?: (id: string) => void;
   /** 素クリック（未選択時）: このコメントだけを選択（v1.3.8 マウスモデル刷新）。 */
   onSelect?: (id: string) => void;
+  /** v1.5.11 UIの気づき３-2①: Alt+クリック = つながりを選択（カードと同格）。additive=Ctrl+Alt。 */
+  onSelectConnected?: (id: string, additive?: boolean) => void;
   /** When set and selected, delegate the drag to the parent (group move). */
   onGroupDragStart?: (id: string, clientX: number, clientY: number) => void;
   /** Begin dragging an arrow link from this note (v1.3.1). */
@@ -73,7 +75,7 @@ export function NoteCard({
   id, text, x, y,
   width = 220, fontSize = 13, bold = false, color = null, titleSize = null, fileRef = null,
   startEditing, zIndex = 0, selected = false,
-  onToggleSelect, onSelect, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onDragLive, onSave, onResize,
+  onToggleSelect, onSelect, onSelectConnected, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onDragLive, onSave, onResize,
 }: Props) {
   const c = noteColors(color, fileRef);
   const posRef = useRef({ x, y });
@@ -126,7 +128,17 @@ export function NoteCard({
   };
 
   const startDrag = (e: React.MouseEvent<HTMLElement>, mode: "move" | "resize") => {
-    if (e.button !== 0 || e.altKey) return;
+    if (e.button !== 0) return;
+    // v1.5.11 UIの気づき３-2①: Alt+クリック = つながりを選択（カードと同格・Ctrl+Alt=追加選択）。
+    // 従来の「Alt は素通し（キャンバスに落とす）」はハンドラ未配線と resize ハンドルでのみ維持。
+    if (e.altKey) {
+      if (mode === "move" && onSelectConnected) {
+        e.stopPropagation();
+        e.preventDefault();
+        onSelectConnected(id, e.ctrlKey || e.metaKey);
+      }
+      return;
+    }
     e.stopPropagation();
     e.preventDefault();
 

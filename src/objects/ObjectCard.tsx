@@ -57,7 +57,7 @@ interface Props {
   /** v1.4.12: Ctrl+左ドラッグでこのカードの仮身（化身）をドロップ位置に作る。(id, clientX, clientY) */
   onCtrlClone?: (id: string, clientX: number, clientY: number) => void;
   /** v1.4.12: Alt+クリックで関係矢印の連結成分（つながり）をまるごと選択。 */
-  onSelectConnected?: (id: string) => void;
+  onSelectConnected?: (id: string, additive?: boolean) => void;
   /** 素クリック（未選択時）: このカードだけを選択（v1.3.8 マウスモデル刷新）。 */
   onSelect?: (id: string) => void;
   /** When set and this card is selected, delegate the drag to the parent
@@ -363,8 +363,9 @@ export function ObjectCard({
     e.preventDefault();
 
     // v1.4.12: Alt+クリック = 関係矢印でつながった連結成分（つながり）をまるごと選択。
+    // v1.5.11 UIの気づき３-2②: Ctrl+Alt = 他の選択を解除せず、つながりを追加選択。
     if (e.altKey) {
-      onSelectConnected?.(id);
+      onSelectConnected?.(id, e.ctrlKey || e.metaKey);
       return;
     }
 

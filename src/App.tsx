@@ -3192,8 +3192,9 @@ function App() {
   // v1.4.12: Alt+クリック／右クリック「つながりを選択」= 関係矢印でつながった連結成分を
   // まるごと選択（向きは問わない＝両方向に辿る）。フロー／モジュールを一掴みするための基盤。
   // relations は カード・コメント両方を端点に取りうるので、結果を selected/selectedNotes に振り分ける。
+  // v1.5.11 UIの気づき３-2②: additive=true（Ctrl+Alt+クリック）は既存の選択を解除せず追加する。
   const handleSelectConnected = useCallback(
-    (startId: string) => {
+    (startId: string, additive = false) => {
       const adj = new Map<string, string[]>();
       for (const r of relationsRef.current) {
         (adj.get(r.from_id) ?? adj.set(r.from_id, []).get(r.from_id)!).push(r.to_id);
@@ -3209,8 +3210,8 @@ function App() {
       }
       const cardIds = objectsRef.current.filter((o) => seen.has(o.id)).map((o) => o.id);
       const noteIds = notesRef.current.filter((n) => seen.has(n.id)).map((n) => n.id);
-      setSelected(new Set(cardIds));
-      setSelectedNotes(new Set(noteIds));
+      setSelected((prev) => (additive ? new Set([...prev, ...cardIds]) : new Set(cardIds)));
+      setSelectedNotes((prev) => (additive ? new Set([...prev, ...noteIds]) : new Set(noteIds)));
     },
     [setSelected, setSelectedNotes]
   );
@@ -5545,6 +5546,7 @@ function App() {
             selected={selectedNotes.has(n.id)}
             onToggleSelect={handleNoteToggleSelect}
             onSelect={handleNoteSelectOnly}
+            onSelectConnected={handleSelectConnected}
             onGroupDragStart={handleGroupDragStart}
             onStartLink={handleStartLink}
             onMeasure={handleNoteMeasure}
