@@ -13,11 +13,14 @@ use tauri::{Emitter, Manager, State};
 
 #[derive(Serialize)]
 pub struct ClipboardPaste {
-    /// "image" (object was created) | "text" (frontend decides note/URL) | "empty"
+    /// "image" (object was created) | "files" (paths to import) |
+    /// "text" (frontend decides note/URL) | "empty"
     pub kind: String,
     pub text: Option<String>,
     /// id of the created object (image paste) — 作成UNDOの記録用 (v1.3.2)
     pub id: Option<String>,
+    /// v1.5.12: CF_HDROP のパス一覧（kind="files"）。フロントが D&D と同一経路で取り込む。
+    pub paths: Option<Vec<String>>,
 }
 
 /// Paste the OS clipboard at (x, y). An image becomes a new 仮身 backed by a
@@ -48,6 +51,25 @@ pub(crate) fn paste_clipboard(x: f64, y: f64, state: State<AppState>) -> Result<
             kind: "image".into(),
             text: None,
             id: Some(vid),
+            paths: None,
+        });
+    }
+
+    // v1.5.12: ファイルのペースト＝ドラッグインと同一動作へ改定（設計合意 2026-07-10）。
+    // v1.3.4 は「実身のコピーは実身/キャンバス=仮身の場」の概念衝突を理由に案内止まりに
+    // したが、その後の基盤で理由が失効した: ①D&Dの実体は CAS スナップショット=コピー
+    // ②CAS内容アドレスで自己往復は実身共有に落ちる ③Ctrl+C は未コミットをコミットして
+    // 実パスを出す→in_project 分岐が内部窓（window_of）を作る=正しいカード複製の意味。
+    // パス一覧を返し、フロントが D&D と同一経路（handleDropFiles）で取り込む。
+    // テキストより先に判定する: 両形式を併せ持つアプリからのコピーで、パス文字列の
+    // テキストカードができる誤動作を避ける（ファイルが本命）。
+    #[cfg(windows)]
+    if let Some(paths) = clipboard_out::get_clipboard_files() {
+        return Ok(ClipboardPaste {
+            kind: "files".into(),
+            text: None,
+            id: None,
+            paths: Some(paths),
         });
     }
 
@@ -57,25 +79,15 @@ pub(crate) fn paste_clipboard(x: f64, y: f64, state: State<AppState>) -> Result<
                 kind: "text".into(),
                 text: Some(text),
                 id: None,
+                paths: None,
             });
         }
-    }
-    // v1.3.4: クリップボードがファイル一覧（CF_HDROP）の場合 — TexoS自身がコピー
-    // したファイルも他アプリでコピーしたファイルもここに来る。「実身のコピーは実身」
-    // という一般原則と仮身モデルの整合のため、内部ペーストでファイルを取り込むことは
-    // せず、正しい持ち込み方（D&D で仮身化）を案内する（フロントでダイアログ）。
-    #[cfg(windows)]
-    if clipboard_out::clipboard_has_files() {
-        return Ok(ClipboardPaste {
-            kind: "files".into(),
-            text: None,
-            id: None,
-        });
     }
     Ok(ClipboardPaste {
         kind: "empty".into(),
         text: None,
         id: None,
+        paths: None,
     })
 }
 

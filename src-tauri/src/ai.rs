@@ -66,7 +66,8 @@ pub(crate) fn upsert_chat_log_card(
     log_name: Option<&str>,
     history: &[ChatMsg],
 ) -> Result<(), String> {
-    // 1) transcript Markdown（**You:** / **AI:**）
+    // 1) transcript Markdown。v1.5.12 実機FB: 旧「**You:** 本文」の1行連結＋太字囲みは
+    // grep 等での切り出しが面倒 →「You:」行の次行から本文（行頭アンカーで機械可読）。
     let mut md = format!("# {ai_label}\n\n");
     for m in history {
         let who = match m.role.as_str() {
@@ -74,7 +75,7 @@ pub(crate) fn upsert_chat_log_card(
             "assistant" => "AI",
             other => other,
         };
-        md.push_str(&format!("**{who}:** {}\n\n", m.content));
+        md.push_str(&format!("{who}:\n{}\n\n", m.content));
     }
     let bytes = md.into_bytes();
 

@@ -52,7 +52,6 @@ export interface MenuActions {
   runDrop: (id: string) => void;
   newSubproject: (sibling: boolean, x: number, y: number) => void;
   linkProject: (x: number, y: number) => void;
-  autoLayout: () => void;
   commitAll: () => void;
   // v1.4.19 カードを検索: ライブ検索→フォーカス（Ctrl+F）。
   openSearch: () => void;
@@ -78,7 +77,7 @@ export interface MenuActions {
   focusSelection: () => void;
   // v1.4.12: 関係矢印でつながった連結成分（つながり）をまるごと選択（Alt+クリックと同じ）。
   selectConnected: (id: string) => void;
-  alignSelected: (mode: "row" | "col" | "grid" | "dist-h" | "dist-v") => void;
+  alignSelected: (mode: "row" | "col" | "grid" | "grid-keep" | "dist-h" | "dist-v") => void;
   bulkCommit: () => void;
   bulkUncommit: () => void;
   bulkDelete: () => void;
@@ -150,6 +149,8 @@ export interface MenuActions {
   shapeRotate: (id: string, deg: number) => void;
   shapeFitToCards: (id: string) => void;
   shapeAlignGrid: (id: string) => void;
+  // v1.5.12: 配置を保って重なり解消＋図形フィット。
+  shapeArrangeKeep: (id: string) => void;
   shapeLabel: (id: string, current: string) => void;
   shapeZ: (id: string, front: boolean) => void;
   shapeDelete: (id: string) => void;
@@ -176,7 +177,16 @@ export function buildAlignItems(a: MenuActions): MenuItem[] {
   return [
     { label: "横一列に整列（水平）", onClick: () => a.alignSelected("row") },
     { label: "縦一列に整列（垂直）", onClick: () => a.alignSelected("col") },
-    { label: "格子状に整列", onClick: () => a.alignSelected("grid") },
+    {
+      label: "格子状に整列",
+      hint: "選択を重なりなく格子に詰め直します。並び順は矢印の上流→下流を優先、同順位は作った順（左→右・上→下）。",
+      onClick: () => a.alignSelected("grid"),
+    },
+    {
+      label: "重なりを解消して配置",
+      hint: "位置関係（思考の流れ）はそのままに、重なりだけ解消して格子に置き直します。",
+      onClick: () => a.alignSelected("grid-keep"),
+    },
     { label: "横方向に均等配置", onClick: () => a.alignSelected("dist-h") },
     { label: "縦方向に均等配置", onClick: () => a.alignSelected("dist-v") },
   ];
@@ -550,36 +560,9 @@ export function buildObjectMenu(
   // v1.3.6: 内部実身（外部の戻り先が無い実身）。仮身に戻す／実身化し直すは出さない
   // （戻り先が無く、実行すると編集を捨てるだけ＝危険）。その場取り込みもこれに含む。
   const internalReal = !!obj && isInternalReal(obj);
-  // v1.3.6 変更③: 危険度の高い操作（仮身に戻す・実身化し直す・クリップボードにコピー）は
-  // 「特別 ...」サブメニューへ退避して優先度を下げる（誤操作防止）。「仮身に戻す」は origin を
-  // 指す実身（外部取り込み／フォーク由来）だけに出す＝編集破棄の戻し操作。
-  const specialItems: MenuItem[] = compact([
-    ...(committed && !internalReal
-      ? [
-          {
-            label: "実身化し直す",
-            hint: "現在の編集を破棄し、取り込み時点の内容で実身化し直します。",
-            onClick: () => a.recommit(targetId),
-          },
-          {
-            label: "仮身に戻す",
-            hint: "プロジェクト内の実体を消し、元ファイルへの参照（仮身）に戻します。編集内容は破棄されます。",
-            danger: true,
-            onClick: () => a.uncommit(targetId),
-          },
-        ]
-      : []),
-    ...(!multi
-      ? [
-          {
-            label: "クリップボードにコピー",
-            hint: "このカードをファイルとしてOSのクリップボードへ。Explorerや他アプリに貼り付けられます。未保存の仮身は自動で実身化されます。",
-            shortcut: "Ctrl+C",
-            onClick: () => a.copyFiles([targetId]),
-          },
-        ]
-      : []),
-  ]);
+  // v1.5.12: 「特別 ...」サブメニューを廃止（v1.3.6 変更③の退避を解消）。
+  // クリップボードにコピーは常用に昇格してトップへ（ファイルペースト対応で双方向が揃った）。
+  // 危険な2操作（実身化し直す・仮身に戻す）は「その他の機能 ...」末尾へ退避。
   // v1.4.x ③: 安全だが低頻度の操作を「その他の機能 ...」へ集約してメニューを短くする
   // （よく使う「開く・編集」「実身⇔仮身」「表示名」「削除」をトップに残す）。
   const otherItems: MenuItem[] = compact([
@@ -654,6 +637,23 @@ export function buildObjectMenu(
             label: obj?.memo ? "コメントを編集..." : "コメントを追加...",
             hint: "このカードに自由なメモを付けます。カードにマウスを乗せるとツールチップとして表示されます。",
             onClick: () => a.setMemo(targetId, obj?.memo ?? ""),
+          },
+        ]
+      : []),
+    // v1.5.12: 旧「特別 ...」の危険な2操作はここへ退避（メニュー廃止に伴う移設）。
+    // 「仮身に戻す」は origin を指す実身（外部取り込み／フォーク由来）だけに出す＝編集破棄の戻し操作。
+    ...(committed && !internalReal
+      ? [
+          {
+            label: "実身化し直す",
+            hint: "現在の編集を破棄し、取り込み時点の内容で実身化し直します。",
+            onClick: () => a.recommit(targetId),
+          },
+          {
+            label: "仮身に戻す",
+            hint: "プロジェクト内の実体を消し、元ファイルへの参照（仮身）に戻します。編集内容は破棄されます。",
+            danger: true,
+            onClick: () => a.uncommit(targetId),
           },
         ]
       : []),
@@ -795,9 +795,17 @@ export function buildObjectMenu(
         : "この仮身を指す仮身（仮身の仮身）を作ります。元の仮身が指す実身に追従します。",
       onClick: () => a.duplicate(targetId),
     },
-    // v1.3.6 変更③: 危険・低頻度の操作はまとめて「特別 ...」へ退避。
-    ...(specialItems.length
-      ? [{ label: "特別 ...", onClick: () => a.openSubmenu(specialItems) }]
+    // v1.5.12: 「特別 ...」を廃止し、常用に昇格した「クリップボードにコピー」をこの位置へ。
+    // ファイルペースト取り込み（Ctrl+V）の対＝OSとの双方向がトップメニューで揃う。
+    ...(!multi
+      ? [
+          {
+            label: "クリップボードにコピー",
+            hint: "このカードをファイルとしてOSのクリップボードへ。Explorerや他アプリ、キャンバスの Ctrl+V に貼り付けられます。未保存の仮身は自動で実身化されます。",
+            shortcut: "Ctrl+C",
+            onClick: () => a.copyFiles([targetId]),
+          },
+        ]
       : []),
     DIV,
     // ── メタ操作 ──
@@ -840,7 +848,14 @@ export function buildShapeMenu(
       ? [{ label: "上のカードをまとめて選択", onClick: () => a.shapeClickSelect(shapeId) }]
       : []),
     ...(canArrangeAbove
-      ? [{ label: "上のカードを格子状に整列", onClick: () => a.shapeAlignGrid(shapeId) }]
+      ? [
+          { label: "上のカードを格子状に整列", onClick: () => a.shapeAlignGrid(shapeId) },
+          {
+            label: "重なりを解消して配置",
+            hint: "上のカードの位置関係はそのままに、重なりだけ解消して格子に置き直し、図形を結果にフィットさせます。",
+            onClick: () => a.shapeArrangeKeep(shapeId),
+          },
+        ]
       : []),
     {
       label: "色を変更 ...",
@@ -1338,11 +1353,6 @@ export function buildCanvasMenu(
       shortcut: "Ctrl+F",
       hint: "ラベル・コメント本文・メモ・拡張子でカードを検索し、クリックでフォーカスします（複数一致はまとめて選択も可）。",
       onClick: () => a.openSearch(),
-    },
-    {
-      label: "自動レイアウト（重なり解消）",
-      hint: "重なり合ったカードを自動でずらして、重なりを解消します（Ctrl+Z で元に戻せます）。",
-      onClick: () => a.autoLayout(),
     },
     {
       label: "整理・書き出し ...",

@@ -401,6 +401,7 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
   return (
     <div
       ref={containerRef}
+      data-canvas-root
       style={{
         width: "100vw",
         height: "100vh",

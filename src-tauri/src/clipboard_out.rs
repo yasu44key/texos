@@ -12,16 +12,41 @@
 use windows::core::BOOL;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, POINT};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{CF_DIB, CF_HDROP};
-use windows::Win32::UI::Shell::DROPFILES;
+use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 
 /// True if the clipboard currently holds a file list (CF_HDROP). Used to give
 /// guidance on internal Ctrl+V instead of importing files (v1.3.4).
 pub fn clipboard_has_files() -> bool {
     unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() }
+}
+
+/// Read the clipboard file list (CF_HDROP) — set_clipboard_files の受け側。
+/// v1.5.12: ファイルのペースト＝ドラッグインと同一動作（設計合意 2026-07-10）。
+/// 列挙は drag_drop.rs の read_paths と同じ DragQueryFileW の定石。
+/// Preferred DropEffect（Explorerの切り取り=移動希望）は意図的に読まない＝常にコピー扱い。
+/// 削除は貼り付け先の責務なので、無視すれば元ファイルは誰も消さない。
+pub fn get_clipboard_files() -> Option<Vec<String>> {
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let mut paths: Vec<String> = Vec::new();
+        if let Ok(handle) = GetClipboardData(CF_HDROP.0 as u32) {
+            let hdrop = HDROP(handle.0 as _);
+            let count = DragQueryFileW(hdrop, 0xFFFFFFFF, None);
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, None) as usize;
+                let mut buf = vec![0u16; len + 1];
+                DragQueryFileW(hdrop, i, Some(&mut buf));
+                paths.push(String::from_utf16_lossy(&buf[..len]));
+            }
+        }
+        let _ = CloseClipboard();
+        (!paths.is_empty()).then_some(paths)
+    }
 }
 
 /// Replace the clipboard contents with `paths` as a CF_HDROP file list (Ctrl+C).

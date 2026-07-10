@@ -3669,12 +3669,28 @@ function App() {
 
   // --- Clipboard paste (v1.3-④) ---------------------------------------------
 
+  // Approximate footprint of each card, including its expanded panel.
+  //（整列・空き領域探索の共通ヘルパ。v1.5.12 でペースト位置決めにも使うためここへ前倒し定義。）
+  const layoutSize = useCallback(
+    (o: VirtualBodyInfo): { w: number; h: number } => {
+      if (!expanded.has(o.id)) return { w: CARD_W, h: CARD_H };
+      const isPdf = o.mime_type === "application/pdf" || (o.ext ?? "").toLowerCase() === "pdf";
+      if (o.mime_type.startsWith("image/")) return { w: 420, h: CARD_H + 8 + 480 };
+      if (o.mime_type.startsWith("audio/")) return { w: 300, h: CARD_H + 8 + 90 };
+      if (o.mime_type.startsWith("video/")) return { w: 420, h: CARD_H + 8 + 460 };
+      if (isPdf) return { w: 480, h: CARD_H + 8 + 640 };
+      if (isTextMime(o.mime_type, o.ext)) return { w: o.panel_w ?? 360, h: CARD_H + 8 + 270 };
+      return { w: CARD_W, h: CARD_H };
+    },
+    [expanded]
+  );
+
   // 画像はバックエンドで新オブジェクト化。テキストはURLならURLカード、
   // それ以外はコメント（付箋）として作成。
   const handlePaste = useCallback(
     async (canvasX: number, canvasY: number, linkFrom?: string) => {
       try {
-        const res = await invoke<{ kind: string; text: string | null; id: string | null }>(
+        const res = await invoke<{ kind: string; text: string | null; id: string | null; paths: string[] | null }>(
           "paste_clipboard",
           { x: canvasX, y: canvasY }
         );
@@ -3695,38 +3711,88 @@ function App() {
           pushUndo([{ kind: "delete", ids: [vid] }]);
           await refresh();
           if (linkFrom) await linkNewNode(linkFrom, vid);
-        } else if (res.kind === "files") {
-          // v1.3.4: クリップボードのファイルは貼り付けで取り込まない。
-          // 「実身のコピーは実身になる」のが一般原則で、キャンバスは仮身（元ファイル
-          // への窓）を置く場 — 概念が衝突する。正しい持ち込み方を案内するだけにする。
-          setConfirm({
-            title: "貼り付けについて",
-            message:
-              "ファイルはキャンバスにドラッグ&ドロップで取り込めます（仮身になります）。\n" +
-              "外部へ出すときはカードを Ctrl+C。",
-            okLabel: "OK",
-            onConfirm: () => setConfirm(null),
-          });
+        } else if (res.kind === "files" && res.paths?.length) {
+          // v1.5.12: ファイルのペースト = ドラッグインと同一動作（v1.3.4 の案内止まりを改定）。
+          // handleDropFiles がカスケード配置・ドロップポイント投入・作成UNDO・導入ハイライト
+          // まで面倒を見る＝文字通り「D&D と同じ」。切り取り（移動効果）は無視し常にコピー扱い、
+          // 元ファイルには触れない（削除は貼り付け先の責務なので、無視すれば誰も消さない）。
+          await handleDropFiles(res.paths, canvasX, canvasY);
         }
       } catch (e) {
         console.error("paste_clipboard failed", e);
       }
     },
-    [refresh, pushUndo, linkNewNode]
+    [refresh, pushUndo, linkNewNode, handleDropFiles]
   );
 
-  // Ctrl+V → ビューポート中央に貼り付け（テキスト入力中は奪わない）。
+  // v1.5.12 実機FB: Ctrl+V の貼り付け位置。従来のビューポート中央は貼ったカードが迷子になる。
+  // ①ポインタがキャンバス上 → その位置（右クリック貼り付けと同じ感覚）
+  // ②ポインタが無い/UI上 → 可視領域を上から走査して最初の空きセル（既存物と重ねない）
+  const pointerRef = useRef<{ x: number; y: number } | null>(null);
+  useEffect(() => {
+    const move = (e: MouseEvent) => { pointerRef.current = { x: e.clientX, y: e.clientY }; };
+    const leave = () => { pointerRef.current = null; }; // ウィンドウ外へ出たら「ポインタ無し」
+    window.addEventListener("mousemove", move);
+    document.documentElement.addEventListener("mouseleave", leave);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      document.documentElement.removeEventListener("mouseleave", leave);
+    };
+  }, []);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "v") return;
       const ae = document.activeElement as HTMLElement | null;
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
-      const c = screenToCanvas(transformRef.current, window.innerWidth / 2, window.innerHeight / 2);
-      handlePaste(c.x - CARD_W / 2, c.y - CARD_H / 2);
+      const p = pointerRef.current;
+      // elementFromPoint で「今キャンバス（の子）を指しているか」を判定 —
+      // メニューやパネル・ダイアログの上なら空き領域配置へフォールバック。
+      const overCanvas = p && document.elementFromPoint(p.x, p.y)?.closest("[data-canvas-root]");
+      if (p && overCanvas) {
+        const c = screenToCanvas(transformRef.current, p.x, p.y);
+        handlePaste(c.x - CARD_W / 2, c.y - CARD_H / 2);
+        return;
+      }
+      // 可視領域の左上から行優先で走査し、既存カード/付箋（実寸）と重ならない最初のセルへ。
+      const t = transformRef.current;
+      const tl = screenToCanvas(t, 0, 0);
+      const br = screenToCanvas(t, window.innerWidth, window.innerHeight);
+      const GAP = 28;
+      const pw = CARD_W + GAP;
+      const ph = CARD_H + GAP;
+      const rects = [
+        ...objectsRef.current.map((o) => {
+          const s = layoutSize(o);
+          return { x: o.pos_x, y: o.pos_y, w: s.w, h: s.h };
+        }),
+        ...notesRef.current.map((n) => {
+          const s = measuredNoteSize(n);
+          return { x: n.pos_x, y: n.pos_y, w: s.w, h: s.h };
+        }),
+      ];
+      const isFree = (x: number, y: number) =>
+        !rects.some(
+          (r) => x < r.x + r.w + GAP && x + CARD_W + GAP > r.x && y < r.y + r.h + GAP && y + CARD_H + GAP > r.y
+        );
+      const cols = Math.max(1, Math.floor((br.x - tl.x - GAP) / pw));
+      const rows = Math.max(1, Math.floor((br.y - tl.y - GAP) / ph));
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const x = tl.x + GAP + c * pw;
+          const y = tl.y + GAP + r * ph;
+          if (isFree(x, y)) {
+            handlePaste(x, y);
+            return;
+          }
+        }
+      }
+      // 可視領域に空きが無い → 従来どおり中央（最後の砦）。
+      const cc = screenToCanvas(t, window.innerWidth / 2, window.innerHeight / 2);
+      handlePaste(cc.x - CARD_W / 2, cc.y - CARD_H / 2);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handlePaste]);
+  }, [handlePaste, layoutSize, measuredNoteSize]);
 
   // --- v1.3.4 クリップボード持ち出し（出す側） -------------------------------
   // 選択カードを CF_HDROP（ファイル）として OS クリップボードへ。未コミットの
@@ -4438,19 +4504,29 @@ function App() {
 
   const alignSelected = useCallback(
     async (
-      mode: "row" | "col" | "grid" | "dist-h" | "dist-v",
+      mode: "row" | "col" | "grid" | "grid-keep" | "dist-h" | "dist-v",
       // v1.4.x: 選択ではなく明示の集合（図形スコープ等）を整列対象にできる。
-      source?: { cards: VirtualBodyInfo[]; notes: NoteInfo[] }
+      source?: { cards: VirtualBodyInfo[]; notes: NoteInfo[] },
+      // v1.5.12: 整列後にこの図形を結果の外接矩形へフィットさせる（図形スコープ整列用。
+      // ロック中図形からのはみ出しを、図形側を広げることで回収する）。undo は移動と1手に束ねる。
+      fitShapeId?: string
     ) => {
       // v1.3.5: コメント(付箋)も整列対象に含める。カードとコメントを位置だけで
       // 統一的に扱い、結果をカード／ノートの move に振り分ける（自動レイアウト＝
       // 重なり解消だけは、コメントを常時最前面の注釈として対象外のまま据え置く）。
-      type It = { id: string; x: number; y: number; note: boolean };
+      type It = { id: string; x: number; y: number; w: number; h: number; note: boolean };
+      // objects/notes は created_at 順で届く（list_objects/list_notes の ORDER BY）＝配列順が制作順。
       const selCards = source?.cards ?? objectsRef.current.filter((o) => selectedRef.current.has(o.id));
       const selNotes = source?.notes ?? notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
       const items: It[] = [
-        ...selCards.map((o) => ({ id: o.id, x: o.pos_x, y: o.pos_y, note: false })),
-        ...selNotes.map((n) => ({ id: n.id, x: n.pos_x, y: n.pos_y, note: true })),
+        ...selCards.map((o) => {
+          const s = layoutSize(o);
+          return { id: o.id, x: o.pos_x, y: o.pos_y, w: s.w, h: s.h, note: false };
+        }),
+        ...selNotes.map((n) => {
+          const s = measuredNoteSize(n);
+          return { id: n.id, x: n.pos_x, y: n.pos_y, w: s.w, h: s.h, note: true };
+        }),
       ];
       if (items.length < 2) return;
       const GAP = 28;
@@ -4464,31 +4540,115 @@ function App() {
         const x = Math.round(Math.min(...items.map((o) => o.x)));
         moved = items.map((o) => ({ ...o, x }));
       } else if (mode === "grid") {
-        // v1.3.11 #14: 現在の並びをできるだけ維持して格子にスナップする。
-        // Y が近いものを同じ「段（行）」、X が近いものを同じ「列」にクラスタリングし、
-        // 段番号・列番号を格子座標へ写す。これで横一列は各段で、縦一列は各列で
-        // それぞれ等間隔にそろう（読み順で正方形に詰め直す旧実装からの改良）。
-        const clusterRanks = (vals: number[], threshold: number): number[] => {
-          const order = vals
-            .map((v, i) => ({ v, i }))
-            .sort((a, b) => a.v - b.v);
-          const rank = new Array(vals.length).fill(0);
-          let cur = 0;
-          for (let k = 0; k < order.length; k++) {
-            if (k > 0 && order[k].v - order[k - 1].v > threshold) cur++;
-            rank[order[k].i] = cur;
+        // v1.5.12 UIの気づき３-④: 旧方式（近い段/列へのクラスタリング＝v1.3.11 #14）は、
+        // X・Y とも近い2枚が同一セルに丸められて完全に重なる欠陥があった。
+        // 「順序で重なりなく詰め直す」方式へ全面変更:
+        //   順序 = 矢印の上流→下流を優先（Kahn法。戻る矢印=閉路は制作順最小を強制的に
+        //          取り出して断つ＝「できるだけ左→右・上→下」）。同順位は制作順。
+        //   幾何 = 列幅・行高は各列/各行の最大実寸（展開パネル・付箋実測）＋GAP。
+        //          セルを実寸で確保するため重なりは構造上起きない。
+        const ids = new Set(items.map((it) => it.id));
+        const ARROW_KINDS = new Set(["link", "flow", "req"]); // group=論理所属は向きでない
+        const outEdges = new Map<string, string[]>();
+        const indeg = new Map<string, number>(items.map((it) => [it.id, 0]));
+        for (const r of relationsRef.current) {
+          if (!ARROW_KINDS.has(r.kind)) continue;
+          if (!ids.has(r.from_id) || !ids.has(r.to_id) || r.from_id === r.to_id) continue;
+          const lst = outEdges.get(r.from_id);
+          if (lst) lst.push(r.to_id);
+          else outEdges.set(r.from_id, [r.to_id]);
+          indeg.set(r.to_id, (indeg.get(r.to_id) ?? 0) + 1);
+        }
+        const remaining = new Set(items.map((it) => it.id));
+        const order: It[] = [];
+        while (remaining.size) {
+          // 上流が確定済み（入次数0）のうち制作順が最小のもの。無ければ閉路→制作順最小を強制。
+          let pick: It | undefined;
+          for (const it of items) {
+            if (remaining.has(it.id) && (indeg.get(it.id) ?? 0) <= 0) { pick = it; break; }
           }
-          return rank;
-        };
-        const rowRank = clusterRanks(items.map((o) => o.y), CARD_H * 0.6);
-        const colRank = clusterRanks(items.map((o) => o.x), CARD_W * 0.6);
+          if (!pick) for (const it of items) { if (remaining.has(it.id)) { pick = it; break; } }
+          remaining.delete(pick!.id);
+          order.push(pick!);
+          for (const nb of outEdges.get(pick!.id) ?? [])
+            if (remaining.has(nb)) indeg.set(nb, (indeg.get(nb) ?? 0) - 1);
+        }
+        const ncols = Math.ceil(Math.sqrt(order.length));
+        const nrows = Math.ceil(order.length / ncols);
+        const colW = new Array<number>(ncols).fill(CARD_W);
+        const rowH = new Array<number>(nrows).fill(CARD_H);
+        order.forEach((it, k) => {
+          colW[k % ncols] = Math.max(colW[k % ncols], it.w);
+          rowH[Math.floor(k / ncols)] = Math.max(rowH[Math.floor(k / ncols)], it.h);
+        });
         const x0 = Math.round(Math.min(...items.map((o) => o.x)));
         const y0 = Math.round(Math.min(...items.map((o) => o.y)));
-        moved = items.map((o, i) => ({
-          ...o,
-          x: x0 + colRank[i] * (CARD_W + GAP),
-          y: y0 + rowRank[i] * (CARD_H + GAP),
+        const colX: number[] = [];
+        for (let c = 0, acc = x0; c < ncols; c++) { colX[c] = acc; acc += colW[c] + GAP; }
+        const rowY: number[] = [];
+        for (let r = 0, acc = y0; r < nrows; r++) { rowY[r] = acc; acc += rowH[r] + GAP; }
+        moved = order.map((it, k) => ({
+          ...it,
+          x: colX[k % ncols],
+          y: rowY[Math.floor(k / ncols)],
         }));
+      } else if (mode === "grid-keep") {
+        // v1.5.12 UIの気づき３-③の後継: 「重なりを解消して配置」＝思考の流れを邪魔しない整列。
+        // 手作業の空間配置（フロー図の地図）はそのまま、重なりだけ解消して格子に置き直す。
+        // 各アイテムを「元位置に最も近い格子セル」へ割当て、埋まっていれば最寄りの空きセルを
+        // リング探索で確保する。旧・重なり解消（押し出し反復＝連鎖して縦暴走）と
+        // 旧・格子（近傍丸め＝同一セルに潰れて完全重なり）の両欠陥を同時に避ける決定的算法。
+        const pw = CARD_W + GAP;
+        const ph = CARD_H + GAP;
+        const x0 = Math.round(Math.min(...items.map((o) => o.x)));
+        const y0 = Math.round(Math.min(...items.map((o) => o.y)));
+        const occupied = new Set<string>();
+        // 展開パネル・大きい付箋は複数セルを占有させる（実寸で場所を取る＝重なりゼロの担保）。
+        const spanOf = (it: It) => ({
+          cw: Math.max(1, Math.ceil((it.w + GAP) / pw)),
+          ch: Math.max(1, Math.ceil((it.h + GAP) / ph)),
+        });
+        const fits = (c: number, r: number, cw: number, ch: number) => {
+          if (c < 0 || r < 0) return false;
+          for (let dc = 0; dc < cw; dc++)
+            for (let dr = 0; dr < ch; dr++) if (occupied.has(`${c + dc},${r + dr}`)) return false;
+          return true;
+        };
+        const mark = (c: number, r: number, cw: number, ch: number) => {
+          for (let dc = 0; dc < cw; dc++)
+            for (let dr = 0; dr < ch; dr++) occupied.add(`${c + dc},${r + dr}`);
+        };
+        // 空きセル探索の優先順（実機FB 2026-07-11）: あふれは右→下→右下の順で逃がす。
+        // 左・上への押し出しは最後の手段（図形の左上アンカー・読み順の期待を崩さない）。
+        const ringOffsets = (rad: number) => {
+          const cells: { dc: number; dr: number }[] = [];
+          for (let dc = -rad; dc <= rad; dc++)
+            for (let dr = -rad; dr <= rad; dr++)
+              if (Math.max(Math.abs(dc), Math.abs(dr)) === rad) cells.push({ dc, dr });
+          const score = (o: { dc: number; dr: number }) =>
+            ((o.dc < 0 ? 1 : 0) + (o.dr < 0 ? 1 : 0)) * 100 + // 負方向（左・上）は最後
+            (o.dr === 0 ? 0 : o.dc === 0 ? 10 : 20) +          // 右 → 下 → 右下（斜め）
+            Math.min(Math.abs(o.dc), Math.abs(o.dr));           // 斜め成分が小さいほど先
+          return cells.sort((a, b) => score(a) - score(b));
+        };
+        // 元位置の読み順（上→下・左→右）で確定していく＝押し退けられる方向が予測可能。
+        const byPos = [...items].sort((a, b) => a.y - b.y || a.x - b.x);
+        moved = [];
+        for (const it of byPos) {
+          const { cw, ch } = spanOf(it);
+          const tc = Math.max(0, Math.round((it.x - x0) / pw));
+          const tr = Math.max(0, Math.round((it.y - y0) / ph));
+          let cell: { c: number; r: number } | null = null;
+          search: for (let rad = 0; rad < 100 && !cell; rad++) {
+            for (const o of ringOffsets(rad)) {
+              if (fits(tc + o.dc, tr + o.dr, cw, ch)) { cell = { c: tc + o.dc, r: tr + o.dr }; break search; }
+            }
+          }
+          const c = cell?.c ?? tc;
+          const r = cell?.r ?? tr;
+          mark(c, r, cw, ch);
+          moved.push({ ...it, x: x0 + c * pw, y: y0 + r * ph });
+        }
       } else {
         // 均等配置: 両端を固定し、間を等間隔に。
         const horiz = mode === "dist-h";
@@ -4505,29 +4665,74 @@ function App() {
       }
       const cardMoves = moved.filter((m) => !m.note).map((m) => ({ id: m.id, x: m.x, y: m.y }));
       const noteMoves = moved.filter((m) => m.note).map((m) => ({ id: m.id, x: m.x, y: m.y }));
+      const fitShape = fitShapeId ? shapesRef.current.find((sh) => sh.id === fitShapeId) : undefined;
       const undo: UndoAction[] = [];
       if (cardMoves.length)
         undo.push({ kind: "objects", moves: selCards.map((o) => ({ id: o.id, x: o.pos_x, y: o.pos_y })) });
       if (noteMoves.length)
         undo.push({ kind: "notes", moves: selNotes.map((n) => ({ id: n.id, x: n.pos_x, y: n.pos_y })) });
+      if (fitShape)
+        undo.push({
+          kind: "shapes",
+          geoms: [{ id: fitShape.id, x: fitShape.pos_x, y: fitShape.pos_y, w: fitShape.width, h: fitShape.height, rot: fitShape.rotation }],
+        });
       pushUndo(undo);
       try {
         if (cardMoves.length) await applyObjectMoves(cardMoves);
         if (noteMoves.length) await applyNoteMoves(noteMoves);
+        if (fitShape) {
+          // 整列結果の外接矩形へ図形をフィット（handleShapeFitToCards と同じ余白・スナップ規則）。
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const m of moved) {
+            minX = Math.min(minX, m.x);
+            minY = Math.min(minY, m.y);
+            maxX = Math.max(maxX, m.x + m.w);
+            maxY = Math.max(maxY, m.y + m.h);
+          }
+          const PAD = 28;
+          const labelPad = fitShape.label ? 22 : 0;
+          let fx = minX - PAD, fy = minY - PAD - labelPad;
+          let fw = maxX - minX + PAD * 2, fh = maxY - minY + PAD * 2 + labelPad;
+          if (shapeSnap) {
+            const g = SHAPE_GRID;
+            const x2 = Math.ceil((fx + fw) / g) * g;
+            const y2 = Math.ceil((fy + fh) / g) * g;
+            fx = Math.floor(fx / g) * g;
+            fy = Math.floor(fy / g) * g;
+            fw = x2 - fx;
+            fh = y2 - fy;
+          }
+          await applyShapeGeoms([
+            { id: fitShape.id, x: Math.round(fx), y: Math.round(fy), w: Math.round(fw), h: Math.round(fh), rot: fitShape.rotation },
+          ]);
+        }
       } catch (e) {
         console.error("align failed", e);
       }
     },
-    [pushUndo, applyObjectMoves, applyNoteMoves]
+    [pushUndo, applyObjectMoves, applyNoteMoves, layoutSize, measuredNoteSize, applyShapeGeoms, shapeSnap]
   );
 
   // v1.4.x: 図形スコープの格子整列 = ビジュアルコマンド（空間的 foreach）の第一歩。
-  // 図形に乗っているカード/コメントだけを、読み順を保って格子に並べ直す（選択に依存しない）。
+  // 図形に乗っているカード/コメントだけを格子に並べ直す（選択に依存しない）。
+  // v1.5.12: 並び順は選択整列と同じ（矢印の上流→下流優先・同順位は制作順）。
+  // 図形スコープの整列は最後に図形を結果へフィットさせる（実機FB: ロック中図形からの
+  // はみ出しを図形側を広げて回収。「整列→フィット」で1手のundo）。
   const handleShapeAlignGrid = useCallback(
     (id: string) => {
       const s = shapesRef.current.find((sh) => sh.id === id);
       if (!s) return;
-      void alignSelected("grid", { cards: cardsOnShape(s), notes: notesOnShape(s) });
+      void alignSelected("grid", { cards: cardsOnShape(s), notes: notesOnShape(s) }, id);
+    },
+    [alignSelected, cardsOnShape, notesOnShape]
+  );
+
+  // v1.5.12: 図形右クリック「重なりを解消して配置」＝配置（思考の地図）を保つ整列＋図形フィット。
+  const handleShapeArrangeKeep = useCallback(
+    (id: string) => {
+      const s = shapesRef.current.find((sh) => sh.id === id);
+      if (!s) return;
+      void alignSelected("grid-keep", { cards: cardsOnShape(s), notes: notesOnShape(s) }, id);
     },
     [alignSelected, cardsOnShape, notesOnShape]
   );
@@ -4551,83 +4756,8 @@ function App() {
     []
   );
 
-  // --- Auto layout (重なり解消) ----------------------------------------------
-
-  // Approximate footprint of each card, including its expanded panel.
-  const layoutSize = useCallback(
-    (o: VirtualBodyInfo): { w: number; h: number } => {
-      if (!expanded.has(o.id)) return { w: CARD_W, h: CARD_H };
-      const isPdf = o.mime_type === "application/pdf" || (o.ext ?? "").toLowerCase() === "pdf";
-      if (o.mime_type.startsWith("image/")) return { w: 420, h: CARD_H + 8 + 480 };
-      if (o.mime_type.startsWith("audio/")) return { w: 300, h: CARD_H + 8 + 90 };
-      if (o.mime_type.startsWith("video/")) return { w: 420, h: CARD_H + 8 + 460 };
-      if (isPdf) return { w: 480, h: CARD_H + 8 + 640 };
-      if (isTextMime(o.mime_type, o.ext)) return { w: o.panel_w ?? 360, h: CARD_H + 8 + 270 };
-      return { w: CARD_W, h: CARD_H };
-    },
-    [expanded]
-  );
-
-  // Iteratively push overlapping cards apart along the axis of least
-  // penetration — positions stay as close to the original as possible.
-  // Notes (コメント) are obstacles: cards move out of their way instead.
-  const handleAutoLayout = useCallback(async () => {
-    const MARGIN = 24;
-    type Item = { id: string; x: number; y: number; w: number; h: number; ox: number; oy: number; fixed: boolean };
-    const items: Item[] = objectsRef.current.map((o) => {
-      const s = layoutSize(o);
-      return { id: o.id, x: o.pos_x, y: o.pos_y, w: s.w + MARGIN, h: s.h + MARGIN, ox: o.pos_x, oy: o.pos_y, fixed: false };
-    });
-    for (const n of notes) {
-      const s = measuredNoteSize(n);
-      items.push({ id: n.id, x: n.pos_x, y: n.pos_y, w: s.w + MARGIN, h: s.h + MARGIN, ox: n.pos_x, oy: n.pos_y, fixed: true });
-    }
-    for (let iter = 0; iter < 300; iter++) {
-      let any = false;
-      for (let i = 0; i < items.length; i++) {
-        for (let j = i + 1; j < items.length; j++) {
-          const a = items[i];
-          const b = items[j];
-          if (a.fixed && b.fixed) continue;
-          const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
-          const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
-          if (ox <= 0 || oy <= 0) continue;
-          any = true;
-          if (ox < oy) {
-            const dir = a.x + a.w / 2 <= b.x + b.w / 2 ? 1 : -1;
-            if (a.fixed) b.x += dir * ox;
-            else if (b.fixed) a.x -= dir * ox;
-            else {
-              a.x -= (dir * ox) / 2;
-              b.x += (dir * ox) / 2;
-            }
-          } else {
-            const dir = a.y + a.h / 2 <= b.y + b.h / 2 ? 1 : -1;
-            if (a.fixed) b.y += dir * oy;
-            else if (b.fixed) a.y -= dir * oy;
-            else {
-              a.y -= (dir * oy) / 2;
-              b.y += (dir * oy) / 2;
-            }
-          }
-        }
-      }
-      if (!any) break;
-    }
-    const moves = items
-      .filter((it) => !it.fixed && (it.x !== it.ox || it.y !== it.oy))
-      .map((it) => ({ id: it.id, x: Math.round(it.x), y: Math.round(it.y) }));
-    if (!moves.length) return;
-    const olds = items
-      .filter((it) => !it.fixed && (it.x !== it.ox || it.y !== it.oy))
-      .map((it) => ({ id: it.id, x: it.ox, y: it.oy }));
-    pushUndo([{ kind: "objects", moves: olds }]);
-    try {
-      await applyObjectMoves(moves);
-    } catch (e) {
-      console.error("auto layout failed", e);
-    }
-  }, [layoutSize, notes, pushUndo, applyObjectMoves]);
+  // v1.5.12 UIの気づき３-③: 自動レイアウト（重なり解消）は廃止。ペア毎の押し出し反復は
+  // 連鎖して縦に暴走する欠陥があり、役割は「格子状に整列」（順序で詰め直し・重なり構造ゼロ）が引き継ぐ。
 
   // Bounding box of all cards (incl. expanded panels) and notes — 全体を表示用.
   const getContentBounds = useCallback(() => {
@@ -4999,7 +5129,6 @@ function App() {
         runDrop: runDownstreamFlows,
         newSubproject: handleNewSubproject,
         linkProject: handleLinkProject,
-        autoLayout: handleAutoLayout,
         commitAll: handleCommitAll,
         openSearch: () => setSearchOpen(true),
         openTrash: () => setTrashOpen(true),
@@ -5104,6 +5233,7 @@ function App() {
         shapeRotate: handleShapeRotate,
         shapeFitToCards: handleShapeFitToCards,
         shapeAlignGrid: handleShapeAlignGrid,
+        shapeArrangeKeep: handleShapeArrangeKeep,
         shapeLabel: handleShapeLabel,
         shapeZ: handleShapeZ,
         shapeDelete: handleShapeDelete,
@@ -5230,7 +5360,6 @@ function App() {
       handleCollapse,
       handleBringToFront,
       handleSendToBack,
-      handleAutoLayout,
       handleCommitReveal,
       handleRelink,
       handleRestoreFromCas,
