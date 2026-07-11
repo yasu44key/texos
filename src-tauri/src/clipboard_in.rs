@@ -118,3 +118,43 @@ pub(crate) fn create_text_object(text: String, x: f64, y: f64, state: State<AppS
     Ok(vid)
 }
 
+/// メニュー再編（2026-07-12）: 「新規ファイルを作成」= 型（拡張子）を選んで空の仮身カード
+/// を作る（Windows の新規作成メニュー方式・テキストカード統合）。経路は create_text_object
+/// と同じ CAS 実身。label に拡張子を含めて実ファイル名を予約する（commit_object の
+/// ensure_ext は label に同じ拡張子があれば二重付与しない）。
+/// 空バイト列は全型で同一 CAS 実身を共有するため、ext/MIME は必ず仮身側に持つ
+/// （v1.3.6 と同じ理由 — 実身側だけだと先に作られた型に潰れる）。
+/// label はフロントが名前入力ダイアログから組み立てて渡す（空/None なら「新規.拡張子」）。
+#[tauri::command]
+pub(crate) fn create_empty_object(
+    ext: String,
+    label: Option<String>,
+    x: f64,
+    y: f64,
+    state: State<AppState>,
+) -> Result<String, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let ext = ext.trim().trim_start_matches('.').to_lowercase();
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("拡張子は英数字で指定してください（例: md, py, csv）".into());
+    }
+    let mime = util::mime_for_ext(&ext).unwrap_or("text/plain");
+    let hash = cas::store_bytes(&p.cas_root, b"").map_err(|e| e.to_string())?;
+    db::insert_real_body(&p.conn, &hash, mime, 0, Some(&ext)).map_err(|e| e.to_string())?;
+    let vid = uuid();
+    let label = match label.as_deref().map(str::trim) {
+        Some(l) if !l.is_empty() => l.to_string(),
+        _ => format!("新規.{ext}"),
+    };
+    p.conn
+        .execute(
+            "INSERT INTO virtual_bodies
+                (id, real_id, label, pos_x, pos_y, created_at, ext, mime_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![vid, hash, label, x, y, db::now_ms(), ext, mime],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(vid)
+}
+

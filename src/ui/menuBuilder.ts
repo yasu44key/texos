@@ -13,8 +13,13 @@ export interface MenuActions {
   openSubmenu: (items: MenuItem[]) => void;
   // 空きキャンバス
   contextPlace: (x: number, y: number) => void;
-  // v1.3.11 #8/#9: 新規ファイルをプロジェクトフォルダに作成し実身として配置。
+  // v1.3.11 #8/#9 → メニュー再編（2026-07-12）: OSの新規作成ダイアログ方式（Office等、
+  // 空だと壊れる形式の受け皿としてサブメニュー末尾に残す）。
   newFile: (x: number, y: number) => void;
+  // メニュー再編（2026-07-12）: 型（拡張子）を選んで空の仮身カードを即作る（テキストカード統合）。
+  createEmptyFile: (ext: string, x: number, y: number) => void;
+  // 同上・任意の拡張子を入力して作る。
+  createEmptyFileOther: (x: number, y: number) => void;
   addNote: (x: number, y: number) => void;
   paste: (x: number, y: number) => void;
   shapeAdd: (kind: string, x: number, y: number) => void;
@@ -57,6 +62,10 @@ export interface MenuActions {
   runDrop: (id: string) => void;
   newSubproject: (sibling: boolean, x: number, y: number) => void;
   linkProject: (x: number, y: number) => void;
+  // メニュー再編（2026-07-12）: 登録済み（最近開いた）プロジェクトの一覧から選んでリンク
+  // カードを置く（旧・矢印引き出しメニューの「既存プロジェクトへのリンク」を1階層目へ移設。
+  // フォルダ選択で新規登録する linkProject とは別の入口）。
+  linkRegisteredProject: (x: number, y: number) => void;
   commitAll: () => void;
   // v1.4.19 カードを検索: ライブ検索→フォーカス（Ctrl+F）。
   openSearch: () => void;
@@ -1047,6 +1056,297 @@ function groupBySlash(
   return [...folded, ...flat];
 }
 
+// ---------------------------------------------------------------------------
+// メニュー再編（2026-07-12）: キャンバスメニューと矢印引き出しメニューの対称化。
+// 「新規ファイルを作成」「自動化カードを追加」を共有ビルダーに切り出し、両メニューが
+// 同じ名称・同じ構造で出す。位置（と引き出し元 linkFrom）はアクション側に束縛して渡す。
+// ---------------------------------------------------------------------------
+
+/// 「新規ファイルを作成」の定番型。空のまま正式なファイルになるテキスト系に限る
+/// （docx 等の空だと壊れるバイナリ容器は OS ダイアログ項目が受け皿）。
+export const NEW_FILE_TYPES: [string, string][] = [
+  ["テキスト", "txt"],
+  ["Markdown", "md"],
+  ["CSV（表データ）", "csv"],
+  ["JSON", "json"],
+  ["HTML", "html"],
+];
+
+/// Windows の「新規作成」メニュー方式: 型（拡張子）を選び、名前を付けて空の仮身カードを作る。
+/// 名前欄は名前部分のみ（拡張子は自動で付く）・空欄なら「新規.拡張子」。
+/// 表示名「名前.拡張子」＝実ファイル名の予約（コミット時にその名で書き出し）。
+export function buildNewFileSub(a: {
+  pick: (ext: string) => void;
+  otherExt: () => void;
+  osDialog: () => void;
+}): MenuItem[] {
+  return [
+    ...NEW_FILE_TYPES.map(([name, ext]) => ({
+      label: `${name}（.${ext}）`,
+      hint: `名前を付けて空の .${ext} カードをこの場所に作ります（名前欄は名前のみ・.${ext} は自動で付きます。空欄なら「新規.${ext}」）。表示名が実ファイル名の予約になります。`,
+      onClick: () => a.pick(ext),
+    })),
+    {
+      label: "その他の拡張子...",
+      hint: "名前と拡張子を入力して空のカードを作ります（例: py, ps1, yaml）。Office文書などエラーが出る場合は「ファイルブラウザで作成」を使って新規作成をしてください。",
+      onClick: () => a.otherExt(),
+    },
+    DIV,
+    {
+      label: "ファイルブラウザで作成...",
+      hint: "空だと壊れる形式（Office文書の docx 等）向けの従来方式。ファイル選択ダイアログ内の右クリック→新規作成で正式なファイルを作って（または既存ファイルを選んで）取り込みます。",
+      onClick: () => a.osDialog(),
+    },
+  ];
+}
+
+export interface AutomationAddCtx {
+  library: string[];
+  launcherLibrary: string[];
+  moduleLibrary: string[];
+  audioDevices: string[];
+}
+
+/// 「自動化カードを追加」のアクション群。位置は呼び出し側で束縛済み（引き出しメニューは
+/// linkFrom も束縛）。manage はライブラリ管理（右クリック名前編集・削除）— 作ることに
+/// 特化する引き出しメニューでは渡さない（キャンバスメニュー専用）。
+export interface AutomationAddActions {
+  openSubmenu: (items: MenuItem[]) => void;
+  addLauncher: (builtin: string) => void;
+  addFilter: (builtin: string) => void;
+  addLibraryLauncher: (name: string) => void;
+  addLibraryFilter: (name: string) => void;
+  addLibraryModule: (name: string) => void;
+  manage?: {
+    libAlt: (kind: "launcher" | "filter" | "module", name: string) => void;
+    deleteLauncher: (name: string) => void;
+    deleteFilter: (name: string) => void;
+    deleteModule: (name: string) => void;
+  };
+}
+
+// v1.4.x ③ / v1.5.12 メニュー再編: 1段階のフラットなリストにし、ランチャー → フィルタ →
+// オペレーション → ユーザーのカード をセクション見出しで区切る（旧 buildCanvasMenu 内の
+// automationAddSub を共有ビルダー化。項目・文言・構造は据え置き）。
+export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddActions): MenuItem[] {
+  return [
+    // ── ランチャー（プログラム起動）──
+    { label: "── ランチャー ──", onClick: () => {}, disabled: true },
+    { label: "インストール済みアプリから選択...", onClick: () => a.addLauncher("installed") },
+    { label: "一般プログラム（.exe を選択）...", onClick: () => a.addLauncher("program") },
+    // シェルカード統合（2026-07-06）: シェル種別・コマンド・ウィンドウは設定ダイアログで選ぶ。
+    {
+      label: "コマンドプロンプト / PowerShell ...",
+      hint: "シェルでコマンドを実行するカードを追加します。ウィンドウを開いたまま対話・実行して閉じる・ウィンドウなしで結果をパネル表示、を設定で選べます。",
+      onClick: () => a.addFilter("shell"),
+    },
+    // ── フィルタ（データ→フィルタ→結果のパイプ）──
+    // v1.5.12 メニュー再編: 役割別（生成/テキスト/メディア）のサブメニューを第一階層に。
+    // 「生成」は t2x ファミリー（3D/音源/動画）の受け皿（docs/生成カード群企画.md）。
+    { label: "── フィルタ ──", onClick: () => {}, disabled: true },
+    {
+      label: "生成（AI・画像生成）...",
+      onClick: () =>
+        a.openSubmenu([
+          { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog") },
+          { label: "AI変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat") },
+          { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i") },
+        ]),
+    },
+    {
+      label: "テキスト ...",
+      onClick: () =>
+        a.openSubmenu([
+          { label: "grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep") },
+          { label: "置換（正規表現）...", onClick: () => a.addFilter("text_replace") },
+          // v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）。
+          { label: "先頭N行（head）...", onClick: () => a.addFilter("text_head") },
+          { label: "末尾N行（tail）...", onClick: () => a.addFilter("text_tail") },
+          { label: "並べ替え（sort）", onClick: () => a.addFilter("text_sort") },
+          { label: "行数・単語数・文字数（wc）", onClick: () => a.addFilter("text_count") },
+          { label: "列の取り出し（cut）...", onClick: () => a.addFilter("text_cut") },
+          { label: "文字コード変換（→UTF-8）", onClick: () => a.addFilter("text_convert") },
+          {
+            label: "コードブロック抽出（MD→ソース）...",
+            hint: "Markdown のコードフェンス(```)から中身を取り出します。AI出力をコンパイラ等へ渡す前段に。",
+            onClick: () => a.addFilter("md_codeblock"),
+          },
+        ]),
+    },
+    {
+      label: "メディア（画像・音声・動画）...",
+      onClick: () =>
+        a.openSubmenu([
+          { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize") },
+          { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert") },
+          // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
+          { label: "音声: 長さでクリップ...", onClick: () => a.addFilter("audio_clip") },
+          { label: "音声: ノーマライズ", onClick: () => a.addFilter("audio_norm") },
+          // v1.4.9: マイク録音（録音→「停止」で確定。デバイスはサブメニューで選ぶ）。
+          {
+            label: "音声: マイク録音（録音→停止で確定）...",
+            onClick: () =>
+              a.openSubmenu(
+                ctx.audioDevices.length
+                  ? ctx.audioDevices.map((d) => ({
+                      label: `🎙 ${d}`,
+                      onClick: () => a.addFilter(`mic_record:${d}`),
+                    }))
+                  : [
+                      {
+                        label: "（マイクが見つかりません／ffmpeg 未検出）",
+                        onClick: () => {},
+                        disabled: true,
+                      },
+                    ]
+              ),
+          },
+          // v1.4.8 ①: Whisper の入力アダプタ（m4a/動画/ステレオ → 16kHz mono WAV）と本体。
+          { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => a.addFilter("to_wav16k") },
+          { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => a.addFilter("whisper") },
+          { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip") },
+        ]),
+    },
+    // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
+    { label: "外部プログラム...", onClick: () => a.addFilter("external") },
+    // ── オペレーション（v1.5.4 WS-P2: 発行系 — フローを「起動する」カード）──
+    { label: "── オペレーション ──", onClick: () => {}, disabled: true },
+    {
+      label: "制御（セレクタ・ドロップポイント）...",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "セレクタ（最初の有データ枝を採用）",
+            hint: "入力の順に見て、最初にデータを返した枝を採用します。成功枝/失敗枝の合流点（矢印の通過条件と組み合わせて使います）。",
+            onClick: () => a.addFilter("select"),
+          },
+          {
+            label: "ドロップポイント（データ入口・自動実行）",
+            hint: "ファイルやカードを落とすと、つないだ下流フローを自動実行するデータ投入口です。",
+            onClick: () => a.addFilter("drop_point"),
+          },
+        ]),
+    },
+    {
+      label: "発行（トリガ・タイマ・ウォッチャ）...",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "トリガ（設置型▶・一括発行）",
+            hint: "▶を押すと、リクエスト矢印の先につないだフィルタを実行します。複数につなげば一括発行できます。",
+            onClick: () => a.addFilter("op_trigger"),
+          },
+          {
+            label: "タイマ（周期・時刻で発行）...",
+            hint: "指定した周期（秒）または時刻（HH:MM）に、矢印の先のフィルタを自動実行します。発火間隔の下限と累計回数の上限（ヒューズ）付き。",
+            onClick: () => a.addFilter("op_timer"),
+          },
+          {
+            label: "ウォッチャ（ファイル監視で発行）...",
+            hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
+            onClick: () => a.addFilter("op_watch"),
+          },
+        ]),
+    },
+    // v1.5.6 WS-M M1（§9.1 手動設置）: 先に入口・出口を置いて中を組む。
+    {
+      label: "モジュールの口（IN・OUT）...",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "IN（モジュールの入口）",
+            hint: "データの入口カード。外から来るフロー矢印をここに受け、中のフィルタへ流します（素通し）。モジュールの差し替え可能な口になります。",
+            onClick: () => a.addFilter("op_in"),
+          },
+          {
+            label: "OUT（モジュールの出口・▶実行）",
+            hint: "データの出口カード。▶を押すと上流をさかのぼって実行し、結果カードが横に生まれます（何度でも押せる口）。",
+            onClick: () => a.addFilter("op_out"),
+          },
+        ]),
+    },
+    // ── ユーザーのカード（ライブラリ登録済み・登録があるときだけ）──
+    ...(ctx.launcherLibrary.length || ctx.library.length
+      ? [
+          {
+            label: "── ユーザーのカード ──",
+            hint: a.manage
+              ? "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。"
+              : undefined,
+            onClick: () => {},
+            disabled: true,
+          },
+          ...groupBySlash(
+            [
+              ...ctx.launcherLibrary.map((name) => ({
+                name,
+                icon: "🚀",
+                pick: (n: string) => a.addLibraryLauncher(n),
+                alt: a.manage ? (n: string) => a.manage!.libAlt("launcher", n) : undefined,
+              })),
+              ...ctx.library.map((name) => ({
+                name,
+                icon: "⚗",
+                pick: (n: string) => a.addLibraryFilter(n),
+                alt: a.manage ? (n: string) => a.manage!.libAlt("filter", n) : undefined,
+              })),
+            ],
+            (items) => a.openSubmenu(items)
+          ),
+        ]
+      : []),
+    // ── ユーザーのモジュール（v1.5.8 WS-M M2・§10.1）──
+    ...(ctx.moduleLibrary.length
+      ? [
+          {
+            label: "── ユーザーのモジュール ──",
+            hint: a.manage
+              ? "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。"
+              : undefined,
+            onClick: () => {},
+            disabled: true,
+          },
+          ...groupBySlash(
+            ctx.moduleLibrary.map((name) => ({
+              name,
+              icon: "📦",
+              hint: "モジュール（カード・矢印・データ同梱）をこの場所にロック済み図形ごと展開します。展開後のカードは普通のカードと同等です（透過＝インライン展開）。",
+              pick: (n: string) => a.addLibraryModule(n),
+              alt: a.manage ? (n: string) => a.manage!.libAlt("module", n) : undefined,
+            })),
+            (items) => a.openSubmenu(items)
+          ),
+        ]
+      : []),
+    ...(a.manage && (ctx.launcherLibrary.length || ctx.library.length || ctx.moduleLibrary.length)
+      ? [
+          {
+            label: "ライブラリから削除 ...",
+            danger: true,
+            onClick: () =>
+              a.openSubmenu([
+                ...ctx.launcherLibrary.map((name) => ({
+                  label: `🚀 ${name} を削除`,
+                  danger: true,
+                  onClick: () => a.manage!.deleteLauncher(name),
+                })),
+                ...ctx.library.map((name) => ({
+                  label: `⚗ ${name} を削除`,
+                  danger: true,
+                  onClick: () => a.manage!.deleteFilter(name),
+                })),
+                ...ctx.moduleLibrary.map((name) => ({
+                  label: `📦 ${name} を削除`,
+                  danger: true,
+                  onClick: () => a.manage!.deleteModule(name),
+                })),
+              ]),
+          },
+        ]
+      : []),
+  ];
+}
+
 export function buildCanvasMenu(
   pos: { canvasX: number; canvasY: number },
   ctx: CanvasMenuCtx,
@@ -1087,234 +1387,32 @@ export function buildCanvasMenu(
     ]);
   };
   const userCardNames = [...ctx.launcherLibrary, ...ctx.library];
-  // v1.4.x ③: 「自動化カードを追加」のサブメニュー。1段階のフラットなリストにし、
-  // ランチャー → フィルタ・処理カード → ユーザーのカード をセクション見出しで区切る。
-  const automationAddSub: MenuItem[] = [
-    // ── ランチャー（プログラム起動）──
-    { label: "── ランチャー ──", onClick: () => {}, disabled: true },
-    { label: "インストール済みアプリから選択...", onClick: () => a.addLauncher("installed", pos.canvasX, pos.canvasY) },
-    { label: "一般プログラム（.exe を選択）...", onClick: () => a.addLauncher("program", pos.canvasX, pos.canvasY) },
-    // シェルカード統合（2026-07-06）: 旧「コマンドプロンプト/PowerShell」ランチャー2項目と
-    // ビルトインフィルタ内の「対話: …」2項目をこの1項目に統合（入口はここと矢印引き出しの2か所）。
-    // シェル種別・コマンド・ウィンドウ（開いたまま/閉じる/出さない）は設定ダイアログで選ぶ。
+  // メニュー再編（2026-07-12）: 「自動化カードを追加」は共有ビルダー（buildAutomationAddSub）
+  // で構築し、矢印引き出しメニューと名称・構造を揃える。位置はここで束縛。ライブラリ管理
+  // （右クリック名前編集・削除）はキャンバスメニュー専用なので manage で渡す。
+  const automationAddSub: MenuItem[] = buildAutomationAddSub(
     {
-      label: "コマンドプロンプト / PowerShell ...",
-      hint: "シェルでコマンドを実行するカードを追加します。ウィンドウを開いたまま対話・実行して閉じる・ウィンドウなしで結果をパネル表示、を設定で選べます。",
-      onClick: () => a.addFilter("shell", pos.canvasX, pos.canvasY),
-    },
-    // ── フィルタ（データ→フィルタ→結果のパイプ）──
-    // v1.5.12 メニュー再編: 「ビルトインフィルタ」という実装都合の分類をやめ、役割別
-    //（生成/テキスト/メディア）のサブメニューを第一階層に出す。深さは従来と同じ3段のまま
-    // 各リストが3〜9項目に収まる。「生成」は t2x ファミリー（3D/音源/動画）の受け皿
-    //（docs/生成カード群企画.md）。セレクタ・ドロップポイントはオペレーション節へ移動。
-    { label: "── フィルタ ──", onClick: () => {}, disabled: true },
-    {
-      label: "生成（AI・画像生成）...",
-      onClick: () =>
-        a.openSubmenu([
-          // v1.4.1 AI（Ollama）。矢印引き出しメニューと項目を揃える。
-          { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog", pos.canvasX, pos.canvasY) },
-          { label: "AI変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat", pos.canvasX, pos.canvasY) },
-          { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i", pos.canvasX, pos.canvasY) },
-        ]),
+      library: ctx.library,
+      launcherLibrary: ctx.launcherLibrary,
+      moduleLibrary: ctx.moduleLibrary,
+      audioDevices: ctx.audioDevices,
     },
     {
-      label: "テキスト ...",
-      onClick: () =>
-        a.openSubmenu([
-          { label: "grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
-          { label: "置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
-          // v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）。
-          { label: "先頭N行（head）...", onClick: () => a.addFilter("text_head", pos.canvasX, pos.canvasY) },
-          { label: "末尾N行（tail）...", onClick: () => a.addFilter("text_tail", pos.canvasX, pos.canvasY) },
-          { label: "並べ替え（sort）", onClick: () => a.addFilter("text_sort", pos.canvasX, pos.canvasY) },
-          { label: "行数・単語数・文字数（wc）", onClick: () => a.addFilter("text_count", pos.canvasX, pos.canvasY) },
-          { label: "列の取り出し（cut）...", onClick: () => a.addFilter("text_cut", pos.canvasX, pos.canvasY) },
-          { label: "文字コード変換（→UTF-8）", onClick: () => a.addFilter("text_convert", pos.canvasX, pos.canvasY) },
-          {
-            label: "コードブロック抽出（MD→ソース）...",
-            hint: "Markdown のコードフェンス(```)から中身を取り出します。AI出力をコンパイラ等へ渡す前段に。",
-            onClick: () => a.addFilter("md_codeblock", pos.canvasX, pos.canvasY),
-          },
-        ]),
-    },
-    {
-      label: "メディア（画像・音声・動画）...",
-      onClick: () =>
-        a.openSubmenu([
-          { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
-          { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
-          // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
-          { label: "音声: 長さでクリップ...", onClick: () => a.addFilter("audio_clip", pos.canvasX, pos.canvasY) },
-          { label: "音声: ノーマライズ", onClick: () => a.addFilter("audio_norm", pos.canvasX, pos.canvasY) },
-          // v1.4.9: マイク録音（録音→「停止」で確定。デバイスはサブメニューで選ぶ）。
-          {
-            label: "音声: マイク録音（録音→停止で確定）...",
-            onClick: () =>
-              a.openSubmenu(
-                ctx.audioDevices.length
-                  ? ctx.audioDevices.map((d) => ({
-                      label: `🎙 ${d}`,
-                      onClick: () => a.addFilter(`mic_record:${d}`, pos.canvasX, pos.canvasY),
-                    }))
-                  : [
-                      {
-                        label: "（マイクが見つかりません／ffmpeg 未検出）",
-                        onClick: () => {},
-                        disabled: true,
-                      },
-                    ]
-              ),
-          },
-          // v1.4.8 ①: Whisper の入力アダプタ（m4a/動画/ステレオ → 16kHz mono WAV）と本体。
-          { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => a.addFilter("to_wav16k", pos.canvasX, pos.canvasY) },
-          { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => a.addFilter("whisper", pos.canvasX, pos.canvasY) },
-          { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip", pos.canvasX, pos.canvasY) },
-          // シェルカード統合（2026-07-06）: 旧「対話: コマンドプロンプト/PowerShell」2項目は
-          // ランチャー節の「コマンドプロンプト / PowerShell ...」1項目に統合した。
-        ]),
-    },
-    // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
-    { label: "外部プログラム...", onClick: () => a.addFilter("external", pos.canvasX, pos.canvasY) },
-    // ── オペレーション（v1.5.4 WS-P2: 発行系 — フローを「起動する」カード。
-    //    リクエスト矢印(req)で実行したいフィルタカードへつなぐ。データレーンには乗らない）──
-    { label: "── オペレーション ──", onClick: () => {}, disabled: true },
-    // v1.5.12 メニュー再編: 7項目のフラット並びを役割別サブメニューへ（HD画面でメニューが
-    // 縦に伸びすぎる対策。フィルタ節と同じ「第一階層＝役割の言葉」）。セレクタ／ドロップ
-    // ポイントは「データを加工しない制御カード」なのでこの節（セレクタ＝オペ層 §5.4.1）。
-    {
-      label: "制御（セレクタ・ドロップポイント）...",
-      onClick: () =>
-        a.openSubmenu([
-          {
-            label: "セレクタ（最初の有データ枝を採用）",
-            hint: "入力の順に見て、最初にデータを返した枝を採用します。成功枝/失敗枝の合流点（矢印の通過条件と組み合わせて使います）。",
-            onClick: () => a.addFilter("select", pos.canvasX, pos.canvasY),
-          },
-          {
-            label: "ドロップポイント（データ入口・自動実行）",
-            hint: "ファイルやカードを落とすと、つないだ下流フローを自動実行するデータ投入口です。",
-            onClick: () => a.addFilter("drop_point", pos.canvasX, pos.canvasY),
-          },
-        ]),
-    },
-    {
-      label: "発行（トリガ・タイマ・ウォッチャ）...",
-      onClick: () =>
-        a.openSubmenu([
-          {
-            label: "トリガ（設置型▶・一括発行）",
-            hint: "▶を押すと、リクエスト矢印の先につないだフィルタを実行します。複数につなげば一括発行できます。",
-            onClick: () => a.addFilter("op_trigger", pos.canvasX, pos.canvasY),
-          },
-          {
-            label: "タイマ（周期・時刻で発行）...",
-            hint: "指定した周期（秒）または時刻（HH:MM）に、矢印の先のフィルタを自動実行します。発火間隔の下限と累計回数の上限（ヒューズ）付き。",
-            onClick: () => a.addFilter("op_timer", pos.canvasX, pos.canvasY),
-          },
-          {
-            label: "ウォッチャ（ファイル監視で発行）...",
-            hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
-            onClick: () => a.addFilter("op_watch", pos.canvasX, pos.canvasY),
-          },
-        ]),
-    },
-    // v1.5.6 WS-M M1（§9.1 手動設置）: 先に入口・出口を置いて中を組む／独立モジュールに
-    // 意図的に口を付ける。モジュール化コマンド（図形右クリック）でも自動生成される。
-    {
-      label: "モジュールの口（IN・OUT）...",
-      onClick: () =>
-        a.openSubmenu([
-          {
-            label: "IN（モジュールの入口）",
-            hint: "データの入口カード。外から来るフロー矢印をここに受け、中のフィルタへ流します（素通し）。モジュールの差し替え可能な口になります。",
-            onClick: () => a.addFilter("op_in", pos.canvasX, pos.canvasY),
-          },
-          {
-            label: "OUT（モジュールの出口・▶実行）",
-            hint: "データの出口カード。▶を押すと上流をさかのぼって実行し、結果カードが横に生まれます（何度でも押せる口）。",
-            onClick: () => a.addFilter("op_out", pos.canvasX, pos.canvasY),
-          },
-        ]),
-    },
-    // ── ユーザーのカード（ライブラリ登録済み・登録があるときだけ）──
-    // v1.5.12 メニュー再編: 登録名の「/」でサブメニューに畳める（groupBySlash）。
-    // 例: "画像/標準生成" と登録 →「📁 画像 ▸」。"/" なしは従来どおり平置き。
-    ...(ctx.launcherLibrary.length || ctx.library.length
-      ? [
-          {
-            label: "── ユーザーのカード ──",
-            hint: "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。",
-            onClick: () => {},
-            disabled: true,
-          },
-          ...groupBySlash(
-            [
-              ...ctx.launcherLibrary.map((name) => ({
-                name,
-                icon: "🚀",
-                pick: (n: string) => a.addLibraryLauncher(n, pos.canvasX, pos.canvasY),
-                alt: (n: string) => libAltMenu("launcher", n, userCardNames),
-              })),
-              ...ctx.library.map((name) => ({
-                name,
-                icon: "⚗",
-                pick: (n: string) => a.addLibraryFilter(n, pos.canvasX, pos.canvasY),
-                alt: (n: string) => libAltMenu("filter", n, userCardNames),
-              })),
-            ],
-            (items) => a.openSubmenu(items)
-          ),
-        ]
-      : []),
-    // ── ユーザーのモジュール（v1.5.8 WS-M M2・§10.1: 図形右クリック「ライブラリに登録」の展開先）──
-    ...(ctx.moduleLibrary.length
-      ? [
-          {
-            label: "── ユーザーのモジュール ──",
-            hint: "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。",
-            onClick: () => {},
-            disabled: true,
-          },
-          ...groupBySlash(
-            ctx.moduleLibrary.map((name) => ({
-              name,
-              icon: "📦",
-              hint: "モジュール（カード・矢印・データ同梱）をこの場所にロック済み図形ごと展開します。展開後のカードは普通のカードと同等です（透過＝インライン展開）。",
-              pick: (n: string) => a.addLibraryModule(n, pos.canvasX, pos.canvasY),
-              alt: (n: string) => libAltMenu("module", n, ctx.moduleLibrary),
-            })),
-            (items) => a.openSubmenu(items)
-          ),
-        ]
-      : []),
-    ...(ctx.launcherLibrary.length || ctx.library.length || ctx.moduleLibrary.length
-      ? [
-          {
-            label: "ライブラリから削除 ...",
-            danger: true,
-            onClick: () =>
-              a.openSubmenu([
-                ...ctx.launcherLibrary.map((name) => ({
-                  label: `🚀 ${name} を削除`,
-                  danger: true,
-                  onClick: () => a.deleteLibraryLauncher(name),
-                })),
-                ...ctx.library.map((name) => ({
-                  label: `⚗ ${name} を削除`,
-                  danger: true,
-                  onClick: () => a.deleteLibraryFilter(name),
-                })),
-                ...ctx.moduleLibrary.map((name) => ({
-                  label: `📦 ${name} を削除`,
-                  danger: true,
-                  onClick: () => a.deleteLibraryModule(name),
-                })),
-              ]),
-          },
-        ]
-      : []),
-  ];
+      openSubmenu: a.openSubmenu,
+      addLauncher: (builtin) => a.addLauncher(builtin, pos.canvasX, pos.canvasY),
+      addFilter: (builtin) => a.addFilter(builtin, pos.canvasX, pos.canvasY),
+      addLibraryLauncher: (name) => a.addLibraryLauncher(name, pos.canvasX, pos.canvasY),
+      addLibraryFilter: (name) => a.addLibraryFilter(name, pos.canvasX, pos.canvasY),
+      addLibraryModule: (name) => a.addLibraryModule(name, pos.canvasX, pos.canvasY),
+      manage: {
+        libAlt: (kind, name) =>
+          libAltMenu(kind, name, kind === "module" ? ctx.moduleLibrary : userCardNames),
+        deleteLauncher: a.deleteLibraryLauncher,
+        deleteFilter: a.deleteLibraryFilter,
+        deleteModule: a.deleteLibraryModule,
+      },
+    }
+  );
   // v1.4.29 ②: メニュー再整理。トップは「よく使う作成・配置＋探す・並べる」に絞り、低頻度の
   // 保守系（実身化・ゴミ箱・掃除）／プロジェクト作成／表示・設定を各1段のサブメニューへ畳む。
   // openSubmenu は「戻る」導線の無いその場差し替えなので、既に深い項目（自動化＝フィルタは
@@ -1459,10 +1557,19 @@ export function buildCanvasMenu(
       onClick: () => a.addNote(pos.canvasX, pos.canvasY),
     },
     {
-      // v1.3.11 #8/#9: プロジェクトフォルダに新規ファイルを作って実身として置く。
-      label: "新規ファイルを作成...",
-      hint: "プロジェクトフォルダに新しいファイル（拡張子つき）を作り、実身としてキャンバスに置きます。開くアプリはOSの関連付けに従います。",
-      onClick: () => a.newFile(pos.canvasX, pos.canvasY),
+      // メニュー再編（2026-07-12）: 型（拡張子）を選んで空の仮身カードを即作る方式へ
+      //（テキストカード統合・Windows の新規作成メニュー方式）。従来のOSダイアログ方式は
+      // サブメニュー末尾の「Office文書など...」に残す（空だと壊れる形式の受け皿）。
+      label: "新規ファイルを作成 ...",
+      hint: "ファイルの種類（拡張子）を選んで、空のカードをこの場所に作ります。表示名が実ファイル名の予約になります。",
+      onClick: () =>
+        a.openSubmenu(
+          buildNewFileSub({
+            pick: (ext) => a.createEmptyFile(ext, pos.canvasX, pos.canvasY),
+            otherExt: () => a.createEmptyFileOther(pos.canvasX, pos.canvasY),
+            osDialog: () => a.newFile(pos.canvasX, pos.canvasY),
+          })
+        ),
     },
     {
       label: "URLリンクを追加...",
@@ -1516,6 +1623,13 @@ export function buildCanvasMenu(
       label: "プロジェクトを作成 ...",
       hint: "サブプロジェクトの内包・分岐（フォーク）や、既存プロジェクトへのリンク配置。",
       onClick: () => a.openSubmenu(newProjectSub),
+    },
+    {
+      // メニュー再編（2026-07-12）: 旧・矢印引き出しメニューの「既存プロジェクトへのリンク」。
+      // 登録済み一覧から選ぶ＝切り替え・作成と同格の相互リンクの入口なので1階層目に並べる。
+      label: "登録プロジェクトへのリンク ...",
+      hint: "TexoSに登録済み（最近開いた）プロジェクトの一覧から選び、そこへ移動できるリンクカードをこの場所に置きます。未登録のフォルダをリンクするときは「プロジェクトを作成 ... → 既存プロジェクトへのリンクを配置...」から。",
+      onClick: () => a.linkRegisteredProject(pos.canvasX, pos.canvasY),
     },
     {
       label: "プロジェクトを切り替え...",

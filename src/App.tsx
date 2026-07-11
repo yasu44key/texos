@@ -61,8 +61,10 @@ import { useUndo, type UndoAction } from "./hooks/useUndo";
 import { useSelection } from "./hooks/useSelection";
 import {
   buildAlignItems,
+  buildAutomationAddSub,
   buildBulkItems,
   buildCanvasMenu,
+  buildNewFileSub,
   buildNoteMenu,
   buildObjectMenu,
   buildShapeMenu,
@@ -144,7 +146,10 @@ function App() {
     title: string;
     initial: string;
     allowEmpty?: boolean;
-    onConfirm: (v: string) => void;
+    // メニュー再編（2026-07-12）: 2入力欄プロンプト（新規ファイル「その他の拡張子」= 名前＋拡張子）。
+    label?: string;
+    field2?: { label: string; initial?: string };
+    onConfirm: (v: string, v2?: string) => void;
   } | null>(null);
   // v1.5.2 WS-C 背景ジョブパネル: 実行中ジョブの一覧（job:started/progress/done/failed で
   // 更新・マウント時に list_jobs で復元）。旧「フロー実行中…」1行パネルの置き換え。
@@ -263,6 +268,10 @@ function App() {
   const [moduleLibrary, setModuleLibrary] = useState<
     { name: string; created_at: number; cards: number; total_blob_bytes: number }[]
   >([]);
+  // メニュー再編（2026-07-12）: 矢印引き出しメニュー（handleStartLink 内の同期構築）からも
+  // 「自動化カードを追加」を出すため ref でも持つ（filterLibraryRef 等と同じ流儀）。
+  const moduleLibraryRef = useRef<{ name: string }[]>([]);
+  moduleLibraryRef.current = moduleLibrary;
   const reloadModuleLibrary = useCallback(async () => {
     try {
       setModuleLibrary(
@@ -927,44 +936,30 @@ function App() {
   const linkActionsRef = useRef<{
     file: (x: number, y: number, linkFrom: string) => void;
     newFile: (x: number, y: number, linkFrom: string) => void;
+    createEmpty: (ext: string, x: number, y: number, linkFrom: string) => void;
+    createEmptyOther: (x: number, y: number, linkFrom: string) => void;
     paste: (x: number, y: number, linkFrom: string) => void;
     url: (x: number, y: number, linkFrom: string) => void;
     filter: (builtin: string, x: number, y: number, linkFrom: string) => void;
     launcher: (builtin: string, x: number, y: number, linkFrom: string) => void;
     note: (x: number, y: number, linkFrom: string) => void;
-    text: (x: number, y: number, linkFrom: string) => void;
-    projectPath: (path: string, x: number, y: number, linkFrom: string) => void;
-    projectDialog: (x: number, y: number, linkFrom: string) => void;
+    libLauncher: (name: string, x: number, y: number, linkFrom: string) => void;
+    libFilter: (name: string, x: number, y: number, linkFrom: string) => void;
+    libModule: (name: string, x: number, y: number) => void;
   }>({
     file: () => {},
     newFile: () => {},
+    createEmpty: () => {},
+    createEmptyOther: () => {},
     paste: () => {},
     url: () => {},
     filter: () => {},
     launcher: () => {},
     note: () => {},
-    text: () => {},
-    projectPath: () => {},
-    projectDialog: () => {},
+    libLauncher: () => {},
+    libFilter: () => {},
+    libModule: () => {},
   });
-
-  // v1.3.10: 引き出し元カードの仮身をドロップ位置に作って繋ぐ（元々の第一案）。
-  // duplicate_virtual は window_of でその実身を指す（仮身を引き出したなら仮身の仮身）。
-  const handleDuplicateToLink = useCallback(
-    async (fromId: string, x: number, y: number) => {
-      try {
-        const newId = await invoke<string>("duplicate_virtual", { id: fromId });
-        await invoke("move_object", { id: newId, x, y });
-        setTouched((prev) => new Set(prev).add(newId));
-        pushUndo([{ kind: "delete", ids: [newId] }]);
-        await refresh();
-        await linkNewNode(fromId, newId);
-      } catch (e) {
-        console.error("duplicateToLink failed", e);
-      }
-    },
-    [refresh, pushUndo, linkNewNode]
-  );
 
   const handleStartLink = useCallback(
     (fromId: string, clientX: number, clientY: number) => {
@@ -1001,126 +996,59 @@ function App() {
         // v1.3.10: 既存ノードでなく空きキャンバスに落としたら、その場にノードを
         // 作って繋ぐメニューを出す（自分自身への落下は除く）。カードにできるものは
         // 全部その場で生やせる（図形は対象外）。
+        // メニュー再編（2026-07-12）: キャンバスメニューの「作成・配置」節と同じ名称・並び・
+        // 構造に対称化（図形と「このカードの仮身を配置」「既存プロジェクトへのリンク」は
+        // 廃止 — 後者はキャンバスメニュー「プロジェクトを作成 ...」内にある）。
         if (!toId) {
           const cp = screenToCanvas(transformRef.current, me.clientX, me.clientY);
           const la = linkActionsRef.current;
           const cx = me.clientX;
           const cy = me.clientY;
-          // 既存プロジェクトへのリンク: 最近のプロジェクト一覧＋その他（ファイル選択）。
-          // 相互リンクの礎。サブメニューは recents を取得してから開き直す。
-          const openProjectSub = async () => {
-            let recents: ProjectInfo[] = [];
-            try {
-              recents = await invoke<ProjectInfo[]>("list_recent_projects");
-            } catch (e) {
-              console.error("list_recent_projects failed", e);
-            }
-            const curPath = currentProjectRef.current?.path;
-            const items = [
-              ...recents
-                .filter((r) => r.path !== curPath)
-                .map((r) => ({
-                  label: `📁 ${r.name}`,
-                  hint: r.path,
-                  onClick: () => la.projectPath(r.path, cp.x, cp.y, fromId),
-                })),
-              { label: "その他のプロジェクト...", onClick: () => la.projectDialog(cp.x, cp.y, fromId) },
-            ];
+          // サブメニューはメニューのクリック閉じの後に開き直す（openSubmenu と同じ定石）。
+          const openSub = (items: MenuItem[]) =>
             window.setTimeout(() => setMenu({ x: cx, y: cy, items }), 0);
-          };
-          // v1.5.12 メニュー再編: 新規作成メニュー（menuBuilder）と同じ役割別グループ
-          //（生成/テキスト/メディア）。サブメニューはクリック閉じの後に開き直す定石。
-          const openFilterSub = (items: { label: string; onClick: () => void; disabled?: boolean }[]) =>
-            window.setTimeout(() => setMenu({ x: cx, y: cy, items }), 0);
-          const genSub = [
-            { label: "AI対話（チャットパネル）...", onClick: () => la.filter("ai_dialog", cp.x, cp.y, fromId) },
-            { label: "AI変換（一発・MD出力）...", onClick: () => la.filter("ai_chat", cp.x, cp.y, fromId) },
-            { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => la.filter("t2i", cp.x, cp.y, fromId) },
-          ];
-          const textSub = [
-            { label: "grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
-            { label: "置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
-            // v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）。
-            { label: "先頭N行（head）...", onClick: () => la.filter("text_head", cp.x, cp.y, fromId) },
-            { label: "末尾N行（tail）...", onClick: () => la.filter("text_tail", cp.x, cp.y, fromId) },
-            { label: "並べ替え（sort）", onClick: () => la.filter("text_sort", cp.x, cp.y, fromId) },
-            { label: "行数・単語数・文字数（wc）", onClick: () => la.filter("text_count", cp.x, cp.y, fromId) },
-            { label: "列の取り出し（cut）...", onClick: () => la.filter("text_cut", cp.x, cp.y, fromId) },
-            { label: "文字コード変換（→UTF-8）", onClick: () => la.filter("text_convert", cp.x, cp.y, fromId) },
-            { label: "コードブロック抽出（MD→ソース）...", onClick: () => la.filter("md_codeblock", cp.x, cp.y, fromId) },
-          ];
-          const mediaSub = [
-            { label: "画像: リサイズ（幅指定）...", onClick: () => la.filter("img_resize", cp.x, cp.y, fromId) },
-            { label: "画像: 形式変換...", onClick: () => la.filter("img_convert", cp.x, cp.y, fromId) },
-            { label: "音声: 長さでクリップ...", onClick: () => la.filter("audio_clip", cp.x, cp.y, fromId) },
-            { label: "音声: ノーマライズ", onClick: () => la.filter("audio_norm", cp.x, cp.y, fromId) },
+          // 「自動化カードを追加」= キャンバスメニューと同じ共有ビルダー。位置と引き出し元
+          // （linkFrom）をここで束縛。ライブラリ管理（名前編集・削除）は作ることに特化する
+          // このメニューでは出さない。モジュール展開は複数カードが生まれ繋ぎ先が一意に
+          // 定まらないため、配置のみで矢印は張らない。
+          const automationSub = buildAutomationAddSub(
             {
-              label: "音声: マイク録音（録音→停止で確定）...",
-              onClick: () => {
-                const devs = audioDevicesRef.current;
-                openFilterSub(
-                  devs.length
-                    ? devs.map((d) => ({
-                        label: `🎙 ${d}`,
-                        onClick: () => la.filter(`mic_record:${d}`, cp.x, cp.y, fromId),
-                      }))
-                    : [{ label: "（マイクが見つかりません／ffmpeg 未検出）", onClick: () => {}, disabled: true }]
-                );
-              },
+              library: filterLibraryRef.current.map((e) => e.name),
+              launcherLibrary: launcherLibraryRef.current.map((e) => e.name),
+              moduleLibrary: moduleLibraryRef.current.map((e) => e.name),
+              audioDevices: audioDevicesRef.current,
             },
-            { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => la.filter("to_wav16k", cp.x, cp.y, fromId) },
-            { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => la.filter("whisper", cp.x, cp.y, fromId) },
-            { label: "動画: 長さでクリップ...", onClick: () => la.filter("video_clip", cp.x, cp.y, fromId) },
-          ];
-          const filterSub = [
-            { label: "生成（AI・画像生成）...", onClick: () => openFilterSub(genSub) },
-            { label: "テキスト ...", onClick: () => openFilterSub(textSub) },
-            { label: "メディア（画像・音声・動画）...", onClick: () => openFilterSub(mediaSub) },
-            // 制御カード（新規作成メニューではオペレーション節。矢印引き出しでは直接並べる）。
-            { label: "セレクタ（最初の有データ枝を採用）", onClick: () => la.filter("select", cp.x, cp.y, fromId) },
-            { label: "ドロップポイント（データ入口・自動実行）", onClick: () => la.filter("drop_point", cp.x, cp.y, fromId) },
-            // シェルカード統合（2026-07-06）: 旧「対話: …」2項目を1項目に統合（設定ダイアログで
-            // シェル種別・ウィンドウ 開いたまま/閉じる/出さない を選ぶ）。{in} に引き出し元が入る。
-            { label: "コマンドプロンプト / PowerShell ...", onClick: () => la.filter("shell", cp.x, cp.y, fromId) },
-            { label: "外部プログラム...", onClick: () => la.filter("external", cp.x, cp.y, fromId) },
-          ];
+            {
+              openSubmenu: openSub,
+              addLauncher: (builtin) => la.launcher(builtin, cp.x, cp.y, fromId),
+              addFilter: (builtin) => la.filter(builtin, cp.x, cp.y, fromId),
+              addLibraryLauncher: (name) => la.libLauncher(name, cp.x, cp.y, fromId),
+              addLibraryFilter: (name) => la.libFilter(name, cp.x, cp.y, fromId),
+              addLibraryModule: (name) => la.libModule(name, cp.x, cp.y),
+            }
+          );
           setMenu({
             x: cx,
             y: cy,
             items: [
               { label: "ここに作って矢印で繋ぐ", onClick: () => {}, disabled: true },
-              {
-                label: "このカードの仮身を配置",
-                hint: "引き出し元カードの仮身（窓）をこの位置に作り、矢印で繋ぎます。",
-                onClick: () => handleDuplicateToLink(fromId, cp.x, cp.y),
-              },
-              { label: "新規ファイルを作成...", onClick: () => la.newFile(cp.x, cp.y, fromId) },
-              { label: "ファイルを配置...", onClick: () => la.file(cp.x, cp.y, fromId) },
-              { label: "テキストカード", onClick: () => la.text(cp.x, cp.y, fromId) },
-              { label: "コメント", onClick: () => la.note(cp.x, cp.y, fromId) },
               { label: "クリップボードから貼り付け", onClick: () => la.paste(cp.x, cp.y, fromId) },
-              { label: "URLリンク...", onClick: () => la.url(cp.x, cp.y, fromId) },
-              // サブメニューはメニューのクリック閉じの後に開き直す（openSubmenu と同じ定石）。
-              { label: "フィルタカード ...", onClick: () => window.setTimeout(() => setMenu({ x: cx, y: cy, items: filterSub }), 0) },
+              { label: "ファイルを配置...", onClick: () => la.file(cp.x, cp.y, fromId) },
+              { label: "コメントを追加...", onClick: () => la.note(cp.x, cp.y, fromId) },
               {
-                label: "ランチャーで開く ...",
+                label: "新規ファイルを作成 ...",
+                hint: "ファイルの種類（拡張子）を選んで、空のカードをこの場所に作り矢印で繋ぎます。",
                 onClick: () =>
-                  window.setTimeout(
-                    () =>
-                      setMenu({
-                        x: cx,
-                        y: cy,
-                        items: [
-                          { label: "一般プログラム（.exe を選択）...", onClick: () => la.launcher("program", cp.x, cp.y, fromId) },
-                          // シェルカード統合（2026-07-06）: cmd/PowerShell はフィルタカード側の
-                          // 「コマンドプロンプト / PowerShell ...」1項目に統合した。
-                          { label: "コマンドプロンプト / PowerShell ...", onClick: () => la.filter("shell", cp.x, cp.y, fromId) },
-                        ],
-                      }),
-                    0
+                  openSub(
+                    buildNewFileSub({
+                      pick: (ext) => la.createEmpty(ext, cp.x, cp.y, fromId),
+                      otherExt: () => la.createEmptyOther(cp.x, cp.y, fromId),
+                      osDialog: () => la.newFile(cp.x, cp.y, fromId),
+                    })
                   ),
               },
-              { label: "既存プロジェクトへのリンク ...", onClick: () => openProjectSub() },
+              { label: "URLリンクを追加...", onClick: () => la.url(cp.x, cp.y, fromId) },
+              { label: "自動化カードを追加 ...", onClick: () => openSub(automationSub) },
             ],
           });
         }
@@ -1128,7 +1056,7 @@ function App() {
       window.addEventListener("mousemove", onMove);
       window.addEventListener("mouseup", onUp);
     },
-    [nodeBoxOf, pushUndo, handleDuplicateToLink]
+    [nodeBoxOf, pushUndo]
   );
 
   const handleDeleteRelation = useCallback(async (id: number) => {
@@ -1672,18 +1600,20 @@ function App() {
   );
 
   const handleAddLibraryLauncher = useCallback(
-    async (name: string, x: number, y: number) => {
+    // メニュー再編（2026-07-12）: 矢印引き出しメニューからも配置できるよう linkFrom 対応。
+    async (name: string, x: number, y: number, linkFrom?: string) => {
       const entry = launcherLibraryRef.current.find((e) => e.name === name);
       if (!entry) return;
       try {
         const vid = await invoke<string>("create_launcher", { label: name, spec: entry.spec, x, y });
         pushUndo([{ kind: "delete", ids: [vid] }]);
         await refresh();
+        if (linkFrom) await linkNewNode(linkFrom, vid);
       } catch (e) {
         console.error("add library launcher failed", e);
       }
     },
-    [refresh, pushUndo]
+    [refresh, pushUndo, linkNewNode]
   );
 
   const handleDeleteLibraryLauncher = useCallback(
@@ -1997,7 +1927,8 @@ function App() {
 
   // v1.5: ライブラリのフィルタをカード化（インスタンス化）。配置時にプログラムの所在をチェック。
   const handleAddLibraryFilter = useCallback(
-    async (name: string, x: number, y: number) => {
+    // メニュー再編（2026-07-12）: 矢印引き出しメニューからも配置できるよう linkFrom 対応。
+    async (name: string, x: number, y: number, linkFrom?: string) => {
       const entry = filterLibraryRef.current.find((e) => e.name === name);
       if (!entry) return;
       try {
@@ -2009,6 +1940,7 @@ function App() {
         });
         pushUndo([{ kind: "delete", ids: [vid] }]);
         await refresh();
+        if (linkFrom) await linkNewNode(linkFrom, vid);
         try {
           const s = JSON.parse(entry.spec);
           if (s.name) {
@@ -2039,7 +1971,7 @@ function App() {
         });
       }
     },
-    [refresh, pushUndo]
+    [refresh, pushUndo, linkNewNode]
   );
 
   // v1.5.12 メニュー再編: ライブラリ登録名の変更。「カテゴリ/名前」の形にすると
@@ -2677,11 +2609,77 @@ function App() {
     [refresh, pushUndo, linkNewNode]
   );
 
+  // メニュー再編（2026-07-12）: 「新規ファイルを作成」= 型（拡張子）を選び、名前を付けて
+  // 空の仮身カードを作る（テキストカード統合・Windows の新規作成メニュー方式）。CAS 実身
+  // なので未保存でも消えない。表示名「名前.拡張子」＝実ファイル名の予約（コミット時に
+  // その名で書き出し）。名前が拡張子付きで入力されても二重にしない。
+  const createEmptyFileAt = useCallback(
+    async (ext: string, name: string, canvasX: number, canvasY: number, linkFrom?: string) => {
+      const e2 = ext.trim().replace(/^\./, "").toLowerCase();
+      if (!e2) return;
+      const base = name.trim().replace(new RegExp(`\\.${e2}$`, "i"), "");
+      const label = `${base || "新規"}.${e2}`;
+      try {
+        const vid = await invoke<string>("create_empty_object", {
+          ext: e2,
+          label,
+          x: canvasX,
+          y: canvasY,
+        });
+        setTouched((prev) => new Set(prev).add(vid));
+        pushUndo([{ kind: "delete", ids: [vid] }]);
+        await refresh();
+        if (linkFrom) await linkNewNode(linkFrom, vid);
+      } catch (e) {
+        console.error("create_empty_object failed", e);
+        setConfirm({
+          title: "新規ファイルを作成できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh, pushUndo, linkNewNode]
+  );
+
+  // 定番型（テキスト〜HTML）: 名前だけ聞いて拡張子を付けて作成。空欄OK＝「新規.拡張子」。
+  const handleCreateEmptyFile = useCallback(
+    (ext: string, canvasX: number, canvasY: number, linkFrom?: string) => {
+      setPrompt({
+        title: `新規ファイルの名前（.${ext} を付けて作成・空欄なら「新規.${ext}」）`,
+        initial: "",
+        allowEmpty: true,
+        onConfirm: (name) => void createEmptyFileAt(ext, name, canvasX, canvasY, linkFrom),
+      });
+    },
+    [createEmptyFileAt]
+  );
+
+  // 「その他の拡張子...」: 名前欄＋拡張子欄の2欄プロンプト（拡張子が空欄ならキャンセル扱い）。
+  const handleCreateEmptyFileOther = useCallback(
+    (canvasX: number, canvasY: number, linkFrom?: string) => {
+      setPrompt({
+        title: "新規ファイルを作成（その他の拡張子）",
+        label: "名前（空欄なら「新規」）",
+        initial: "",
+        allowEmpty: true,
+        field2: { label: "拡張子（例: py, ps1, yaml）", initial: "" },
+        onConfirm: (name, ext) => {
+          if (ext) void createEmptyFileAt(ext, name, canvasX, canvasY, linkFrom);
+        },
+      });
+    },
+    [createEmptyFileAt]
+  );
+
   // v1.3.11 修正（#8/#9）: 拡張子だけ指定した空ファイルは「正式なファイル」にならない
   // （docx 等は中身が無いと壊れ、実質テキスト）。そこで OS の「新規作成」を使う方式に変更:
   // プロジェクトフォルダを既定にした配置ダイアログを開き、ダイアログ内の右クリック→新規作成で
   // 正しい型のファイルを作って選ぶ（または既存ファイルを選ぶ）。選んだファイルがプロジェクト内
   // なら実身として取り込まれる（path_inside 判定）。配置位置はクリック位置を維持する。
+  // メニュー再編（2026-07-12）: この方式は「新規ファイルを作成 ...」サブメニュー末尾の
+  // 「Office文書など（OSのダイアログで作成）...」として残す（空だと壊れる形式の受け皿）。
   const handleNewFile = useCallback(
     async (canvasX: number, canvasY: number, linkFrom?: string) => {
       try {
@@ -4983,34 +4981,22 @@ function App() {
     }
   }, [refresh, pushUndo, linkNewNode]);
 
-  // v1.3.10: 空のテキストカードを作成（リンク矢印からの「その場に作って繋ぐ」用）。
-  const handleAddTextCard = useCallback(
-    async (canvasX: number, canvasY: number, linkFrom?: string) => {
-      try {
-        const vid = await invoke<string>("create_text_object", { text: "", x: canvasX, y: canvasY });
-        setTouched((prev) => new Set(prev).add(vid));
-        pushUndo([{ kind: "delete", ids: [vid] }]);
-        await refresh();
-        if (linkFrom) await linkNewNode(linkFrom, vid);
-      } catch (e) {
-        console.error("create_text_object failed", e);
-      }
-    },
-    [refresh, pushUndo, linkNewNode]
-  );
-
   // 後方定義のハンドラを ref に載せ、handleStartLink（前方）から呼べるようにする。
+  // メニュー再編（2026-07-12）: 旧「テキストカード」（handleAddTextCard）は
+  // 「新規ファイルを作成 → テキスト（.txt）」（createEmpty）に統合。
   linkActionsRef.current = {
     file: handleContextPlace,
     newFile: handleNewFile,
+    createEmpty: handleCreateEmptyFile,
+    createEmptyOther: handleCreateEmptyFileOther,
     paste: handlePaste,
     url: handleAddUrl,
     filter: handleAddFilter,
     launcher: handleAddLauncher,
     note: handleAddNote,
-    text: handleAddTextCard,
-    projectPath: linkProjectByPath,
-    projectDialog: handleLinkProject,
+    libLauncher: handleAddLibraryLauncher,
+    libFilter: handleAddLibraryFilter,
+    libModule: handleAddLibraryModule,
   };
 
   const handleNoteMove = useCallback(async (id: string, x: number, y: number) => {
@@ -5200,6 +5186,8 @@ function App() {
         openSubmenu,
         contextPlace: handleContextPlace,
         newFile: handleNewFile,
+        createEmptyFile: handleCreateEmptyFile,
+        createEmptyFileOther: handleCreateEmptyFileOther,
         addNote: handleAddNote,
         paste: handlePaste,
         shapeAdd: handleShapeAdd,
@@ -5236,6 +5224,29 @@ function App() {
         runDrop: runDownstreamFlows,
         newSubproject: handleNewSubproject,
         linkProject: handleLinkProject,
+        // メニュー再編（2026-07-12）: 登録済み（最近開いた）プロジェクトの一覧から選んで
+        // リンクカードを置く（旧・矢印引き出しメニューの「既存プロジェクトへのリンク」）。
+        // sendSelection と同じ「非同期で一覧取得→サブメニューを開き直す」定石。
+        linkRegisteredProject: async (x, y) => {
+          let recents: ProjectInfo[] = [];
+          try {
+            recents = await invoke<ProjectInfo[]>("list_recent_projects");
+          } catch (e) {
+            console.error("list_recent_projects failed", e);
+          }
+          const curPath = currentProjectRef.current?.path;
+          const items: MenuItem[] = [
+            ...recents
+              .filter((r) => r.path !== curPath)
+              .map((r) => ({
+                label: `📁 ${r.name}`,
+                hint: r.path,
+                onClick: () => void linkProjectByPath(r.path, x, y),
+              })),
+            { label: "その他のプロジェクト...", onClick: () => void handleLinkProject(x, y) },
+          ];
+          window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items }), 0);
+        },
         commitAll: handleCommitAll,
         openSearch: () => setSearchOpen(true),
         openTrash: () => setTrashOpen(true),
@@ -6195,12 +6206,14 @@ function App() {
           title={prompt.title}
           initial={prompt.initial}
           allowEmpty={prompt.allowEmpty}
-          onConfirm={(v) => {
+          label={prompt.label}
+          field2={prompt.field2}
+          onConfirm={(v, v2) => {
             // Close first, THEN run the callback — so a callback that opens
             // another prompt (e.g. URL → title) isn't immediately cleared.
             const cb = prompt.onConfirm;
             setPrompt(null);
-            cb(v);
+            cb(v, v2);
           }}
           onCancel={() => setPrompt(null)}
         />

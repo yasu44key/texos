@@ -727,6 +727,7 @@ pub fn run() {
             copy_objects_to_clipboard,
             copy_image_to_clipboard,
             create_text_object,
+            create_empty_object,
             create_launcher,
             run_launcher,
             import_new_project_files,
