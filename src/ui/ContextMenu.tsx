@@ -15,6 +15,9 @@ export interface MenuItem {
   swatch?: string;
   // v1.4.16: クリックしてもメニューを閉じない（連続で試す用。OK項目で閉じる）。
   keepOpen?: boolean;
+  // v1.5.12 メニュー再編: 項目の右クリック＝別動作（ユーザーのカード/モジュールの
+  // 「名前の編集（カテゴリ移動）」）。未設定の項目では右クリックは何もしない。
+  onAltClick?: () => void;
 }
 
 interface ContextMenuProps {
@@ -99,6 +102,15 @@ export function ContextMenu({ x, y, items, onClose, showHints = true }: ContextM
                 if (item.disabled) return;
                 item.onClick();
                 if (!item.keepOpen) onClose();
+              }}
+              onContextMenu={(e) => {
+                // v1.5.12: 右クリック別動作（onAltClick）。サブメニューを開き直す項目が
+                // 多いので、通常クリックと同じく「閉じてから setTimeout で開き直す」流儀。
+                e.preventDefault();
+                e.stopPropagation();
+                if (item.disabled || !item.onAltClick) return;
+                item.onAltClick();
+                onClose();
               }}
               style={{
                 display: "flex",

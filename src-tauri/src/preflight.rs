@@ -265,7 +265,10 @@ fn collect_ops(
 /// filterOutputMime（front model.ts）の Rust 版。外部コマンドは出力 MIME 不明で None。
 fn filter_output_mime(spec: &flow::FilterSpec) -> Option<String> {
     match spec.builtin.as_deref() {
-        Some("text_grep") | Some("text_replace") | Some("md_codeblock") => Some("text/plain".into()),
+        // v1.5.12 P1: Unix標準テキストフィルタ群（head/tail/sort/count/cut/convert）も text/plain。
+        Some("text_grep") | Some("text_replace") | Some("md_codeblock") | Some("text_head")
+        | Some("text_tail") | Some("text_sort") | Some("text_count") | Some("text_cut")
+        | Some("text_convert") => Some("text/plain".into()),
         Some("ai") => Some("text/markdown".into()),
         Some("t2i") | Some("img_resize") => Some("image/png".into()),
         Some("img_convert") => {

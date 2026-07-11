@@ -6,7 +6,8 @@ use serde::Deserialize;
 /// virtual_bodies.filter_ref に保存される JSON（V1.3後半_オートフロー設計.md 確定方針2）。
 #[derive(Deserialize, Clone)]
 pub struct FilterSpec {
-    /// 内蔵フィルタ名: text_grep | text_replace | img_resize | img_convert
+    /// 内蔵フィルタ名: text_grep | text_replace | text_head | text_tail | text_sort |
+    /// text_count | text_cut | text_convert | img_resize | img_convert | md_codeblock …
     #[serde(default)]
     pub builtin: Option<String>,
     /// 外部コマンド（{in}/{out} プレースホルダ）。builtin が無いときに使う逃げ道
@@ -27,6 +28,29 @@ pub struct FilterSpec {
     pub width: Option<u32>, // img_resize（高さはアスペクト維持）
     #[serde(default)]
     pub format: Option<String>, // img_convert: png | jpeg | webp | bmp | gif
+    // --- v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）---
+    /// text_head / text_tail: 残す行数（未指定は10）。
+    #[serde(default)]
+    pub lines: Option<u32>,
+    /// text_sort: "asc"（既定）| "desc"。
+    #[serde(default)]
+    pub order: Option<String>,
+    /// text_sort: "number" なら行頭の数値で比較（sort -n 相当）。既定は辞書順。
+    #[serde(default)]
+    pub compare: Option<String>,
+    /// text_sort: "remove" なら並べ替え後に重複行を除去（sort -u 相当）。
+    #[serde(default)]
+    pub unique: Option<String>,
+    /// text_cut: 区切り。"tab"（既定）| "comma" | "space"（連続空白）| 任意のリテラル。
+    #[serde(default)]
+    pub delimiter: Option<String>,
+    /// text_cut: 取り出す列（1始まり）。"1,3-5"・"2-"（末尾まで）・"-3"（先頭から）。
+    #[serde(default)]
+    pub fields: Option<String>,
+    /// text_convert: 入力文字コード。"auto"（既定: BOM→UTF-8厳密→推定）または
+    /// encoding_rs のラベル（shift_jis / euc-jp / iso-2022-jp / utf-16le …）。出力は常に UTF-8。
+    #[serde(default)]
+    pub encoding: Option<String>,
     /// 外部コマンドの実行上限秒（未指定は60秒）。暴走・ストール対策。
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -425,8 +449,161 @@ pub fn run_builtin(
                 .unwrap_or_else(|| lang_to_ext(&lang));
             Ok((code.into_bytes(), ext, "text/plain".into()))
         }
+        // --- v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）。
+        //     text_grep / text_replace と同型（1入力・text/plain 出力・純関数）。---
+        "text_head" => {
+            let n = spec.lines.unwrap_or(10) as usize;
+            let text = String::from_utf8_lossy(input);
+            let out = text.lines().take(n).collect::<Vec<_>>().join("\n");
+            Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
+        }
+        "text_tail" => {
+            let n = spec.lines.unwrap_or(10) as usize;
+            let text = String::from_utf8_lossy(input);
+            let all: Vec<&str> = text.lines().collect();
+            let out = all[all.len().saturating_sub(n)..].join("\n");
+            Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
+        }
+        "text_sort" => {
+            let text = String::from_utf8_lossy(input);
+            let mut lines: Vec<&str> = text.lines().collect();
+            if spec.compare.as_deref() == Some("number") {
+                // sort -n 相当: 行頭（空白除去後）の数値で比較。数値の無い行は 0 扱い。
+                lines.sort_by(|a, b| {
+                    leading_number(a)
+                        .partial_cmp(&leading_number(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                lines.sort();
+            }
+            if spec.order.as_deref() == Some("desc") {
+                lines.reverse();
+            }
+            if spec.unique.as_deref() == Some("remove") {
+                lines.dedup(); // ソート済みなので隣接 dedup = 全体の重複除去
+            }
+            let out = lines.join("\n");
+            Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
+        }
+        "text_count" => {
+            // wc 相当。mode キーは AI の動作モードと共用（builtin が違えば衝突しない）。
+            let text = String::from_utf8_lossy(input);
+            let lines = text.lines().count();
+            let words = text.split_whitespace().count();
+            let chars = text.chars().count();
+            let out = match spec.mode.as_deref().unwrap_or("all") {
+                "lines" => lines.to_string(),
+                "words" => words.to_string(),
+                "chars" => chars.to_string(),
+                _ => format!("行数: {lines}\n単語数: {words}\n文字数: {chars}"),
+            };
+            Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
+        }
+        "text_cut" => {
+            let ranges = parse_field_ranges(spec.fields.as_deref().unwrap_or(""))?;
+            let delim = spec.delimiter.as_deref().unwrap_or("tab");
+            // 出力の区切り: 入力と同じ（空白区切りは列境界が曖昧なのでタブに揃える）。
+            let sep = match delim {
+                "comma" => ",",
+                "tab" | "" | "space" => "\t",
+                other => other,
+            };
+            let text = String::from_utf8_lossy(input);
+            let mut out_lines = Vec::new();
+            for line in text.lines() {
+                let cols: Vec<&str> = match delim {
+                    "tab" | "" => line.split('\t').collect(),
+                    "comma" => line.split(',').collect(),
+                    "space" => line.split_whitespace().collect(),
+                    other => line.split(other).collect(),
+                };
+                let mut picked = Vec::new();
+                for &(start, end) in &ranges {
+                    let end = end.min(cols.len());
+                    if start < end {
+                        picked.extend_from_slice(&cols[start..end]);
+                    }
+                }
+                out_lines.push(picked.join(sep));
+            }
+            let out = out_lines.join("\n");
+            Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
+        }
+        "text_convert" => {
+            // nkf 相当（文字コード → UTF-8）。auto は閲覧ビュー（notes::decode_text_bytes）と
+            // 同じ手順（BOM → UTF-8厳密 → chardetng 推定）＝表示と変換の結果が一致する。
+            let enc_name = spec
+                .encoding
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("auto");
+            let out = if enc_name.eq_ignore_ascii_case("auto") {
+                crate::notes::decode_text_bytes(input).0
+            } else {
+                let enc = encoding_rs::Encoding::for_label(enc_name.as_bytes()).ok_or_else(
+                    || format!("未知の文字コード: {enc_name}（shift_jis / euc-jp / utf-16le 等）"),
+                )?;
+                let (cow, _, _) = enc.decode(input);
+                cow.into_owned()
+            };
+            Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
+        }
         other => Err(format!("未知の内蔵フィルタ: {other}")),
     }
+}
+
+/// text_sort の数値比較: 行頭（空白を飛ばした位置）の数値を読む（例 "12.5 kg" → 12.5）。
+/// 数値が無い・読めない行は 0 扱い（GNU sort -n と同じ流儀）。
+fn leading_number(line: &str) -> f64 {
+    let t = line.trim_start();
+    let mut end = 0;
+    for (i, c) in t.char_indices() {
+        if c.is_ascii_digit() || c == '.' || ((c == '-' || c == '+') && i == 0) {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    t[..end].parse().unwrap_or(0.0)
+}
+
+/// text_cut の列指定（1始まり・"1,3-5" / "2-" / "-3"）を 0始まり半開区間の並びへ。
+/// 出力の列順は指定順（awk 流。GNU cut はファイル順だが、並べ替えできる方が便利）。
+fn parse_field_ranges(s: &str) -> Result<Vec<(usize, usize)>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("取り出す列を指定してください（例: 1,3-5）".into());
+    }
+    let mut out = Vec::new();
+    for tok in s.split(',') {
+        let tok = tok.trim();
+        let bad = || format!("列指定が不正です: {tok}（1始まりの番号か範囲で指定）");
+        if let Some((a, b)) = tok.split_once('-') {
+            let start = if a.trim().is_empty() {
+                1
+            } else {
+                a.trim().parse::<usize>().map_err(|_| bad())?
+            };
+            let end = if b.trim().is_empty() {
+                usize::MAX
+            } else {
+                b.trim().parse::<usize>().map_err(|_| bad())?
+            };
+            if start == 0 || end < start {
+                return Err(bad());
+            }
+            out.push((start - 1, end));
+        } else {
+            let n = tok.parse::<usize>().map_err(|_| bad())?;
+            if n == 0 {
+                return Err(bad());
+            }
+            out.push((n - 1, n));
+        }
+    }
+    Ok(out)
 }
 
 /// md_codeblock: フェンスの言語トークンから出力拡張子を推定（未知はトークンをそのまま）。
@@ -1404,6 +1581,94 @@ mod tests {
     fn invalid_regex_is_a_clean_error() {
         let s = spec(r#"{"builtin":"text_grep","pattern":"("}"#);
         assert!(run_builtin(&s, "text_grep", b"x").is_err());
+    }
+
+    // --- v1.5.12 P1: Unix標準テキストフィルタ ---------------------------------
+
+    #[test]
+    fn text_head_and_tail_take_lines() {
+        let input = b"1\n2\n3\n4\n5";
+        let s = spec(r#"{"builtin":"text_head","lines":2}"#);
+        let (out, ext, mime) = run_builtin(&s, "text_head", input).unwrap();
+        assert_eq!(out, b"1\n2");
+        assert_eq!((ext.as_str(), mime.as_str()), ("txt", "text/plain"));
+        let s = spec(r#"{"builtin":"text_tail","lines":2}"#);
+        let (out, _, _) = run_builtin(&s, "text_tail", input).unwrap();
+        assert_eq!(out, b"4\n5");
+        // 行数より短い入力は全行そのまま（既定10行）
+        let s = spec(r#"{"builtin":"text_tail"}"#);
+        let (out, _, _) = run_builtin(&s, "text_tail", b"a\nb").unwrap();
+        assert_eq!(out, b"a\nb");
+    }
+
+    #[test]
+    fn text_sort_orders_lines() {
+        let s = spec(r#"{"builtin":"text_sort"}"#);
+        let (out, _, _) = run_builtin(&s, "text_sort", b"b\na\nc\na").unwrap();
+        assert_eq!(out, b"a\na\nb\nc");
+        let s = spec(r#"{"builtin":"text_sort","order":"desc","unique":"remove"}"#);
+        let (out, _, _) = run_builtin(&s, "text_sort", b"b\na\nc\na").unwrap();
+        assert_eq!(out, b"c\nb\na");
+        // 数値比較: 辞書順だと "10" < "2" になる並びが数値で正しく並ぶ
+        let s = spec(r#"{"builtin":"text_sort","compare":"number"}"#);
+        let (out, _, _) = run_builtin(&s, "text_sort", b"10 x\n2 y\n-1 z").unwrap();
+        assert_eq!(out, b"-1 z\n2 y\n10 x");
+    }
+
+    #[test]
+    fn text_count_reports_wc() {
+        let s = spec(r#"{"builtin":"text_count","mode":"lines"}"#);
+        let (out, _, _) = run_builtin(&s, "text_count", b"a b\nc\n").unwrap();
+        assert_eq!(out, b"2");
+        // 既定はまとめレポート。文字数は Unicode スカラー数（バイト数ではない）
+        let s = spec(r#"{"builtin":"text_count"}"#);
+        let (out, _, _) = run_builtin(&s, "text_count", "あい u\n".as_bytes()).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "行数: 1\n単語数: 2\n文字数: 5"
+        );
+    }
+
+    #[test]
+    fn text_cut_picks_fields() {
+        let s = spec(r#"{"builtin":"text_cut","delimiter":"comma","fields":"1,3"}"#);
+        let (out, _, _) = run_builtin(&s, "text_cut", b"a,b,c\nx,y,z").unwrap();
+        assert_eq!(out, b"a,c\nx,z");
+        // 空白区切りは連続空白をまとめ、出力はタブ区切りに揃える。"2-"=2列目から末尾
+        let s = spec(r#"{"builtin":"text_cut","delimiter":"space","fields":"2-"}"#);
+        let (out, _, _) = run_builtin(&s, "text_cut", b"one  two three").unwrap();
+        assert_eq!(out, b"two\tthree");
+        // 範囲外の列は黙って落ちる（行ごとに列数が違ってもエラーにしない）
+        let s = spec(r#"{"builtin":"text_cut","fields":"5"}"#);
+        let (out, _, _) = run_builtin(&s, "text_cut", b"a\tb").unwrap();
+        assert_eq!(out, b"");
+        // 不正な列指定はきれいなエラー
+        let s = spec(r#"{"builtin":"text_cut","fields":"0"}"#);
+        assert!(run_builtin(&s, "text_cut", b"a\tb").is_err());
+        let s = spec(r#"{"builtin":"text_cut","fields":""}"#);
+        assert!(run_builtin(&s, "text_cut", b"a\tb").is_err());
+    }
+
+    #[test]
+    fn text_convert_decodes_to_utf8() {
+        let src = "日本語のテキストです。文字コード変換のテスト。\n二行目もあります。";
+        let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode(src);
+        // auto: chardetng 推定で Shift_JIS を当てる
+        let s = spec(r#"{"builtin":"text_convert"}"#);
+        let (out, ext, mime) = run_builtin(&s, "text_convert", &sjis).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), src);
+        assert_eq!((ext.as_str(), mime.as_str()), ("txt", "text/plain"));
+        // 明示指定（encoding_rs のラベル）でも同じ結果
+        let s = spec(r#"{"builtin":"text_convert","encoding":"shift_jis"}"#);
+        let (out, _, _) = run_builtin(&s, "text_convert", &sjis).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), src);
+        // UTF-8 入力はそのまま素通し
+        let s = spec(r#"{"builtin":"text_convert"}"#);
+        let (out, _, _) = run_builtin(&s, "text_convert", src.as_bytes()).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), src);
+        // 未知のラベルはきれいなエラー
+        let s = spec(r#"{"builtin":"text_convert","encoding":"nazo"}"#);
+        assert!(run_builtin(&s, "text_convert", b"x").is_err());
     }
 
     #[test]

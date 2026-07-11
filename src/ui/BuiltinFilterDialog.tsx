@@ -38,7 +38,7 @@ interface BuiltinSchema {
   note?: string;
 }
 
-// 対象は run_builtin の match アームと一致する5種のみ（ai / t2i は各専用ダイアログ）。
+// 対象は run_builtin の match アームと一致する内蔵フィルタ（ai / t2i は各専用ダイアログ）。
 export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
   text_grep: {
     title: "grep（正規表現で行を抽出）",
@@ -65,6 +65,122 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
         optional: true,
         placeholder: "置き換える文字列（空欄=削除・$1 で後方参照）",
         hint: "マッチ部分をこの文字列に置き換えます。$1, $2 で正規表現のグループを参照できます。",
+      },
+    ],
+  },
+  // ── v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）。
+  text_head: {
+    title: "先頭N行（head）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      { key: "lines", label: "行数", type: "number", default: 10, min: 1, hint: "先頭からこの行数だけを残します。" },
+    ],
+  },
+  text_tail: {
+    title: "末尾N行（tail）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      { key: "lines", label: "行数", type: "number", default: 10, min: 1, hint: "末尾からこの行数だけを残します。" },
+    ],
+  },
+  text_sort: {
+    title: "行の並べ替え（sort）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "order",
+        label: "順序",
+        type: "select",
+        default: "asc",
+        options: [
+          { value: "asc", label: "昇順" },
+          { value: "desc", label: "降順" },
+        ],
+      },
+      {
+        key: "compare",
+        label: "比較",
+        type: "select",
+        default: "text",
+        options: [
+          { value: "text", label: "文字列（辞書順）" },
+          { value: "number", label: "数値（行頭の数値で比較・sort -n）" },
+        ],
+      },
+      {
+        key: "unique",
+        label: "重複行",
+        type: "select",
+        default: "keep",
+        options: [
+          { value: "keep", label: "残す" },
+          { value: "remove", label: "除去する（sort -u）" },
+        ],
+      },
+    ],
+  },
+  text_count: {
+    title: "行数・単語数・文字数（wc）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "mode",
+        label: "数えるもの",
+        type: "select",
+        default: "all",
+        options: [
+          { value: "all", label: "全部（行数・単語数・文字数）" },
+          { value: "lines", label: "行数だけ" },
+          { value: "words", label: "単語数だけ" },
+          { value: "chars", label: "文字数だけ" },
+        ],
+        hint: "「〜だけ」は数値のみを出力します（後段の計算・比較に使えます）。",
+      },
+    ],
+  },
+  text_cut: {
+    title: "列の取り出し（cut）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "delimiter",
+        label: "区切り",
+        type: "select",
+        default: "tab",
+        options: [
+          { value: "tab", label: "タブ（TSV）" },
+          { value: "comma", label: "カンマ（CSV）" },
+          { value: "space", label: "空白（連続空白をまとめる）" },
+        ],
+        hint: "その他の区切り文字は「JSONで編集」から delimiter に直接指定できます。",
+      },
+      {
+        key: "fields",
+        label: "取り出す列",
+        type: "text",
+        placeholder: "例: 1,3-5 / 2-（2列目から末尾）",
+        hint: "1始まり。カンマ区切りで複数、-で範囲。出力は指定した順に並びます。",
+      },
+    ],
+  },
+  text_convert: {
+    title: "文字コード変換（→ UTF-8）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "encoding",
+        label: "入力の文字コード",
+        type: "select",
+        default: "auto",
+        options: [
+          { value: "auto", label: "自動判定" },
+          { value: "shift_jis", label: "Shift_JIS（CP932）" },
+          { value: "euc-jp", label: "EUC-JP" },
+          { value: "iso-2022-jp", label: "JIS（ISO-2022-JP）" },
+          { value: "utf-16le", label: "UTF-16LE" },
+          { value: "utf-16be", label: "UTF-16BE" },
+        ],
+        hint: "出力は常に UTF-8。nkf 相当（外部プログラム不要）。",
       },
     ],
   },

@@ -584,6 +584,45 @@ pub(crate) fn delete_module_library(name: String, state: State<AppState>) -> Res
     std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())
 }
 
+/// v1.5.12 メニュー再編: モジュールの登録名を変更（「カテゴリ/名前」への移動もこれ）。
+/// module.json の name を書き換え、フォルダ名（sanitize_name）も追従して改名する。
+/// 一覧（list_module_library）は module.json の name を読むので、フォルダ改名に
+/// 失敗しても名前の変更自体は成立している（次回の改名で追従できる）。
+#[tauri::command]
+pub(crate) fn rename_module_library(
+    old: String,
+    new: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let new = new.trim().to_string();
+    if new.is_empty() {
+        return Err("新しい名前を入力してください".into());
+    }
+    let dir = modules_dir(&state.app_data);
+    let src = dir.join(sanitize_name(&old));
+    let mj = src.join("module.json");
+    if !mj.is_file() {
+        return Err(format!("「{old}」はライブラリにありません"));
+    }
+    if new == old {
+        return Ok(());
+    }
+    let dst = dir.join(sanitize_name(&new));
+    if dst != src && dst.join("module.json").is_file() {
+        return Err(format!("「{new}」は既にあります"));
+    }
+    let mut m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mj).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    m["name"] = serde_json::Value::String(new.clone());
+    let json = serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?;
+    std::fs::write(&mj, json).map_err(|e| e.to_string())?;
+    if dst != src {
+        std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub(crate) struct PlaceModuleResult {
     pub new_card_ids: Vec<String>,

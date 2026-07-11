@@ -231,6 +231,30 @@ pub(crate) fn delete_filter_library(name: String, state: State<AppState>) -> Res
     write_library(&state.app_data, &list)
 }
 
+/// v1.5.12 メニュー再編: 登録名の変更。「カテゴリ/名前」の形にするとメニューが畳まれる
+/// （groupBySlash）ので、カテゴリ移動もこの1本で済む。spec・created_at は保持。
+#[tauri::command]
+pub(crate) fn rename_filter_library(
+    old: String,
+    new: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let new = new.trim().to_string();
+    if new.is_empty() {
+        return Err("新しい名前を入力してください".into());
+    }
+    let mut list = read_library(&state.app_data);
+    if new != old && list.iter().any(|e| e.name == new) {
+        return Err(format!("「{new}」は既にあります"));
+    }
+    let Some(e) = list.iter_mut().find(|e| e.name == old) else {
+        return Err(format!("「{old}」はライブラリにありません"));
+    };
+    e.name = new;
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    write_library(&state.app_data, &list)
+}
+
 // v1.3.11 ランチャーライブラリ（一度登録→リスト化）。フィルタライブラリと同方式・別ファイル。
 pub(crate) fn launcher_library_path(app_data: &Path) -> PathBuf {
     app_data.join("launcher_library.json")
@@ -275,6 +299,30 @@ pub(crate) fn delete_launcher_library(name: String, state: State<AppState>) -> R
     if list.len() == before {
         return Err(format!("「{name}」はランチャーライブラリにありません"));
     }
+    let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+    std::fs::write(launcher_library_path(&state.app_data), json).map_err(|e| e.to_string())
+}
+
+/// v1.5.12 メニュー再編: ランチャー登録名の変更（rename_filter_library と同じ流儀）。
+#[tauri::command]
+pub(crate) fn rename_launcher_library(
+    old: String,
+    new: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let new = new.trim().to_string();
+    if new.is_empty() {
+        return Err("新しい名前を入力してください".into());
+    }
+    let mut list = read_launcher_library(&state.app_data);
+    if new != old && list.iter().any(|e| e.name == new) {
+        return Err(format!("「{new}」は既にあります"));
+    }
+    let Some(e) = list.iter_mut().find(|e| e.name == old) else {
+        return Err(format!("「{old}」はランチャーライブラリにありません"));
+    };
+    e.name = new;
+    list.sort_by(|a, b| a.name.cmp(&b.name));
     let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
     std::fs::write(launcher_library_path(&state.app_data), json).map_err(|e| e.to_string())
 }

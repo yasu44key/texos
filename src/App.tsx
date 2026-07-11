@@ -1028,15 +1028,28 @@ function App() {
             ];
             window.setTimeout(() => setMenu({ x: cx, y: cy, items }), 0);
           };
-          const filterSub = [
-            { label: "ドロップポイント（データ入口・自動実行）", onClick: () => la.filter("drop_point", cp.x, cp.y, fromId) },
-            { label: "AI: 対話（チャットパネル）...", onClick: () => la.filter("ai_dialog", cp.x, cp.y, fromId) },
-            { label: "AI: 変換（一発・MD出力）...", onClick: () => la.filter("ai_chat", cp.x, cp.y, fromId) },
-            { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => la.filter("md_codeblock", cp.x, cp.y, fromId) },
-            { label: "画像生成: Text-To-Image（テキスト→画像）...", onClick: () => la.filter("t2i", cp.x, cp.y, fromId) },
-            { label: "セレクタ（最初の有データ枝を採用）", onClick: () => la.filter("select", cp.x, cp.y, fromId) },
-            { label: "テキスト: grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
-            { label: "テキスト: 置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
+          // v1.5.12 メニュー再編: 新規作成メニュー（menuBuilder）と同じ役割別グループ
+          //（生成/テキスト/メディア）。サブメニューはクリック閉じの後に開き直す定石。
+          const openFilterSub = (items: { label: string; onClick: () => void; disabled?: boolean }[]) =>
+            window.setTimeout(() => setMenu({ x: cx, y: cy, items }), 0);
+          const genSub = [
+            { label: "AI対話（チャットパネル）...", onClick: () => la.filter("ai_dialog", cp.x, cp.y, fromId) },
+            { label: "AI変換（一発・MD出力）...", onClick: () => la.filter("ai_chat", cp.x, cp.y, fromId) },
+            { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => la.filter("t2i", cp.x, cp.y, fromId) },
+          ];
+          const textSub = [
+            { label: "grep（正規表現で抽出）...", onClick: () => la.filter("text_grep", cp.x, cp.y, fromId) },
+            { label: "置換（正規表現）...", onClick: () => la.filter("text_replace", cp.x, cp.y, fromId) },
+            // v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）。
+            { label: "先頭N行（head）...", onClick: () => la.filter("text_head", cp.x, cp.y, fromId) },
+            { label: "末尾N行（tail）...", onClick: () => la.filter("text_tail", cp.x, cp.y, fromId) },
+            { label: "並べ替え（sort）", onClick: () => la.filter("text_sort", cp.x, cp.y, fromId) },
+            { label: "行数・単語数・文字数（wc）", onClick: () => la.filter("text_count", cp.x, cp.y, fromId) },
+            { label: "列の取り出し（cut）...", onClick: () => la.filter("text_cut", cp.x, cp.y, fromId) },
+            { label: "文字コード変換（→UTF-8）", onClick: () => la.filter("text_convert", cp.x, cp.y, fromId) },
+            { label: "コードブロック抽出（MD→ソース）...", onClick: () => la.filter("md_codeblock", cp.x, cp.y, fromId) },
+          ];
+          const mediaSub = [
             { label: "画像: リサイズ（幅指定）...", onClick: () => la.filter("img_resize", cp.x, cp.y, fromId) },
             { label: "画像: 形式変換...", onClick: () => la.filter("img_convert", cp.x, cp.y, fromId) },
             { label: "音声: 長さでクリップ...", onClick: () => la.filter("audio_clip", cp.x, cp.y, fromId) },
@@ -1045,19 +1058,27 @@ function App() {
               label: "音声: マイク録音（録音→停止で確定）...",
               onClick: () => {
                 const devs = audioDevicesRef.current;
-                const items = devs.length
-                  ? devs.map((d) => ({
-                      label: `🎙 ${d}`,
-                      onClick: () => la.filter(`mic_record:${d}`, cp.x, cp.y, fromId),
-                    }))
-                  : [{ label: "（マイクが見つかりません／ffmpeg 未検出）", onClick: () => {}, disabled: true }];
-                // サブメニューはクリック閉じの後に開き直す（openSubmenu と同じ定石）。
-                window.setTimeout(() => setMenu({ x: cx, y: cy, items }), 0);
+                openFilterSub(
+                  devs.length
+                    ? devs.map((d) => ({
+                        label: `🎙 ${d}`,
+                        onClick: () => la.filter(`mic_record:${d}`, cp.x, cp.y, fromId),
+                      }))
+                    : [{ label: "（マイクが見つかりません／ffmpeg 未検出）", onClick: () => {}, disabled: true }]
+                );
               },
             },
             { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => la.filter("to_wav16k", cp.x, cp.y, fromId) },
             { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => la.filter("whisper", cp.x, cp.y, fromId) },
             { label: "動画: 長さでクリップ...", onClick: () => la.filter("video_clip", cp.x, cp.y, fromId) },
+          ];
+          const filterSub = [
+            { label: "生成（AI・画像生成）...", onClick: () => openFilterSub(genSub) },
+            { label: "テキスト ...", onClick: () => openFilterSub(textSub) },
+            { label: "メディア（画像・音声・動画）...", onClick: () => openFilterSub(mediaSub) },
+            // 制御カード（新規作成メニューではオペレーション節。矢印引き出しでは直接並べる）。
+            { label: "セレクタ（最初の有データ枝を採用）", onClick: () => la.filter("select", cp.x, cp.y, fromId) },
+            { label: "ドロップポイント（データ入口・自動実行）", onClick: () => la.filter("drop_point", cp.x, cp.y, fromId) },
             // シェルカード統合（2026-07-06）: 旧「対話: …」2項目を1項目に統合（設定ダイアログで
             // シェル種別・ウィンドウ 開いたまま/閉じる/出さない を選ぶ）。{in} に引き出し元が入る。
             { label: "コマンドプロンプト / PowerShell ...", onClick: () => la.filter("shell", cp.x, cp.y, fromId) },
@@ -1353,6 +1374,41 @@ function App() {
                 }),
             }),
         });
+      } else if (builtin === "text_head" || builtin === "text_tail") {
+        // v1.5.12 P1: Unix標準テキストフィルタ。行数だけ聞いて作成（詳細はダブルクリックで）。
+        const isHead = builtin === "text_head";
+        setPrompt({
+          title: isHead ? "head: 先頭から残す行数" : "tail: 末尾から残す行数",
+          initial: "10",
+          onConfirm: (v) => {
+            const n = Math.max(1, parseInt(v, 10) || 10);
+            create(isHead ? `先頭 ${n}行` : `末尾 ${n}行`, {
+              builtin,
+              lines: n,
+              accept_mime: "text/*",
+            });
+          },
+        });
+      } else if (builtin === "text_sort") {
+        // 既定（昇順・辞書順）で即作成。降順・数値比較・重複除去は設定ダイアログで。
+        create("並べ替え", { builtin: "text_sort", accept_mime: "text/*" });
+      } else if (builtin === "text_count") {
+        create("行数・単語数・文字数", { builtin: "text_count", accept_mime: "text/*" });
+      } else if (builtin === "text_cut") {
+        setPrompt({
+          title: "cut: 取り出す列（1始まり。例 1,3-5）",
+          initial: "1",
+          onConfirm: (f) =>
+            create(`列の取り出し: ${f.trim()}`, {
+              builtin: "text_cut",
+              delimiter: "tab",
+              fields: f.trim(),
+              accept_mime: "text/*",
+            }),
+        });
+      } else if (builtin === "text_convert") {
+        // nkf 相当。既定=自動判定→UTF-8。文字コードの明示は設定ダイアログで。
+        create("UTF-8へ変換", { builtin: "text_convert", encoding: "auto", accept_mime: "text/*" });
       } else if (builtin === "img_resize") {
         setPrompt({
           title: "リサイズ: 幅（px・高さは自動）",
@@ -1984,6 +2040,54 @@ function App() {
       }
     },
     [refresh, pushUndo]
+  );
+
+  // v1.5.12 メニュー再編: ライブラリ登録名の変更。「カテゴリ/名前」の形にすると
+  // メニューがカテゴリに畳まれる（menuBuilder groupBySlash）＝カテゴリ移動もこれ1本。
+  const renameLibraryEntry = useCallback(
+    async (kind: "launcher" | "filter" | "module", name: string, newName: string) => {
+      const nn = newName.trim();
+      if (!nn || nn === name) return;
+      const cmd =
+        kind === "launcher"
+          ? "rename_launcher_library"
+          : kind === "filter"
+          ? "rename_filter_library"
+          : "rename_module_library";
+      try {
+        await invoke(cmd, { old: name, new: nn });
+      } catch (e) {
+        setConfirm({
+          title: "名前を変更できませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+      if (kind === "launcher") await reloadLauncherLibrary();
+      else if (kind === "filter") await reloadFilterLibrary();
+      else await reloadModuleLibrary();
+    },
+    [reloadLauncherLibrary, reloadFilterLibrary, reloadModuleLibrary]
+  );
+  const handleRenameLibrary = useCallback(
+    (kind: "launcher" | "filter" | "module", name: string) => {
+      setPrompt({
+        title: "新しい名前（「カテゴリ/名前」でメニューを畳めます）",
+        initial: name,
+        onConfirm: (nn) => void renameLibraryEntry(kind, name, nn),
+      });
+    },
+    [renameLibraryEntry]
+  );
+  // 既存カテゴリへの移動: 現在のカテゴリ部分を差し替える（category="" は平置きへ）。
+  const handleMoveLibraryCategory = useCallback(
+    (kind: "launcher" | "filter" | "module", name: string, category: string) => {
+      const i = name.indexOf("/");
+      const leaf = i > 0 && i < name.length - 1 ? name.slice(i + 1).trim() : name;
+      void renameLibraryEntry(kind, name, category ? `${category}/${leaf}` : leaf);
+    },
+    [renameLibraryEntry]
   );
 
   // v1.5: ライブラリからエントリを削除（配置済みカードには影響しない）。
@@ -5119,6 +5223,9 @@ function App() {
         saveFilterToLibrary: handleSaveFilterToLibrary,
         addLibraryFilter: handleAddLibraryFilter,
         deleteLibraryFilter: handleDeleteLibraryFilter,
+        // v1.5.12 メニュー再編: ライブラリ名の編集（右クリック）とカテゴリ移動。
+        renameLibrary: handleRenameLibrary,
+        moveLibraryCategory: handleMoveLibraryCategory,
         // v1.5.8 WS-M M2: モジュールライブラリ（登録・展開・削除・全書き出し）。
         saveModuleToLibrary: handleSaveModuleToLibrary,
         addLibraryModule: handleAddLibraryModule,

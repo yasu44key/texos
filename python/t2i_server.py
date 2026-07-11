@@ -45,18 +45,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # スクリプトの版（変更ごとに上げる）。TexoS はこれを /health で照合し、古いデーモンが
 # 残っていれば停止して最新スクリプトで起動し直す（再ビルド後に確実に反映するため）。
 # Rust 側 T2I_SERVER_VERSION と一致させること。
-SERVER_VERSION = "9"
+SERVER_VERSION = "12"
 
 # --- モデルレジストリ（Ollama 流の名前付きモデル）+ 種別ごとの取得パターン -------------
 # 各モデルは "kind"（バックエンド種別）を持つ。新しい種別（sdxl / controlnet 等）は
 # BACKENDS と PATTERNS_BY_KIND に1エントリ足すだけで拡張できる（拡張点）。
 # gated=True（FLUX 公式）は HF でライセンス承諾の上、環境変数 HF_TOKEN（or huggingface-cli login）が要る。
+# v1.5.13 方針: 「なんでも対応」をやめ、動作実績のある定番だけを推奨（known）に載せる。
+# SD1.5 / SDXL / Flux-lite が3本柱。公式 FLUX dev/schnell（24GB+・gated）は known から外し、
+# 上級者が手動配置（diffusers 形式）する道だけ残す（POLICY 参照）。gated 機構自体は保持。
 MODELS: dict[str, dict] = {
-    "sd1.5":        {"repo": "stable-diffusion-v1-5/stable-diffusion-v1-5", "kind": "sd"},
+    "sd1.5":        {"repo": "stable-diffusion-v1-5/stable-diffusion-v1-5",  "kind": "sd"},
     "dreamshaper":  {"repo": "Lykon/dreamshaper-8",                          "kind": "sd"},
+    "sdxl":         {"repo": "stabilityai/stable-diffusion-xl-base-1.0",     "kind": "sdxl"},
     "flux-lite":    {"repo": "Freepik/flux.1-lite-8B",                       "kind": "flux"},
-    "flux-schnell": {"repo": "black-forest-labs/FLUX.1-schnell", "kind": "flux", "gated": True},
-    "flux-dev":     {"repo": "black-forest-labs/FLUX.1-dev",     "kind": "flux", "gated": True},
 }
 DEFAULT_MODEL = "sd1.5"
 
@@ -75,6 +77,23 @@ SD_PATTERNS_PLAIN = [  # fp16 variant が無い配布への保険
     "unet/diffusion_pytorch_model.safetensors",
     "vae/diffusion_pytorch_model.safetensors",
 ]
+# SDXL系: SD と同構造だが text_encoder_2（OpenCLIP）を持つ。fp16 variant 一式（~6.9GB）。
+# feature_extractor/safety_checker は無いので取得しない。
+SDXL_PATTERNS = [
+    "model_index.json", "scheduler/*", "tokenizer/*", "tokenizer_2/*",
+    "text_encoder/config.json", "text_encoder/*.fp16.safetensors",
+    "text_encoder_2/config.json", "text_encoder_2/*.fp16.safetensors",
+    "unet/config.json", "unet/*.fp16.safetensors",
+    "vae/config.json", "vae/*.fp16.safetensors",
+]
+SDXL_PATTERNS_PLAIN = [  # fp16 variant が無い SDXL 配布への保険
+    "model_index.json", "scheduler/*", "tokenizer/*", "tokenizer_2/*",
+    "*/config.json", "*/*.json",
+    "text_encoder/model.safetensors",
+    "text_encoder_2/model.safetensors",
+    "unet/diffusion_pytorch_model.safetensors",
+    "vae/diffusion_pytorch_model.safetensors",
+]
 # FLUX系: diffusers サブフォルダの safetensors 一式（単一ファイル版 flux1-*.safetensors /
 # ae.safetensors は除外）。transformer + T5(text_encoder_2) + CLIP + VAE で ~26〜34GB。
 FLUX_PATTERNS = [
@@ -84,7 +103,30 @@ FLUX_PATTERNS = [
     "text_encoder_2/*.safetensors", "text_encoder_2/*.json",
     "vae/*.safetensors", "vae/*.json",
 ]
-PATTERNS_BY_KIND = {"sd": SD_PATTERNS, "flux": FLUX_PATTERNS}
+PATTERNS_BY_KIND = {"sd": SD_PATTERNS, "sdxl": SDXL_PATTERNS, "flux": FLUX_PATTERNS}
+# fp16 variant が無い配布への保険（kind ごと）。無ければ fp16 のみで完結する種別。
+PLAIN_PATTERNS_BY_KIND = {"sd": SD_PATTERNS_PLAIN, "sdxl": SDXL_PATTERNS_PLAIN}
+
+# --- 対応方針（POLICY）: 種別×形式で「使えるか／使えない場合の推奨」を持つ単一の真実。--------
+# UI（手持ちモデル診断）とロード時メッセージがこれを参照する。厳密判定はしない（目安）。
+# 形式は "diffusers"（フォルダ）/ "single"（単一 .safetensors/.ckpt）。
+SUPPORTED_KINDS = ("sd", "sdxl", "flux")
+
+def model_policy(kind: str, fmt: str) -> dict:
+    """(kind, fmt) → {usable, reason, recommend}。使えないものは推奨に誘導する。"""
+    if kind == "flux" and fmt == "single":
+        return {
+            "usable": False,
+            "reason": "FLUX の単一ファイルは未対応（T5/CLIP/VAE を含む全部入り形式のため）",
+            "recommend": "flux-lite を diffusers 形式で取得するか、SDXL をご利用ください",
+        }
+    if kind not in SUPPORTED_KINDS:
+        return {
+            "usable": False,
+            "reason": "対応外または種別を判定できませんでした",
+            "recommend": "SD1.5 / SDXL / Flux-lite のいずれかを diffusers 形式で配置してください",
+        }
+    return {"usable": True, "reason": "", "recommend": ""}
 
 
 # --- サンプラー（スケジューラ）レジストリ。名前 → (diffusers クラス名, from_config kwargs) -----
@@ -161,6 +203,52 @@ def _as_name_list(v) -> list[str]:
     if isinstance(v, (list, tuple)):
         return [str(s).strip() for s in v if str(s).strip()]
     return []
+
+
+def _safetensors_header(path) -> dict | None:
+    """safetensors のヘッダ（先頭 u64 長 + JSON）だけ読む（重みは読まない＝高速）。失敗は None。"""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            if n == 0 or n > 64 * 1024 * 1024:  # 壊れ・別形式
+                return None
+            return json.loads(f.read(n).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def sniff_lora_kind(path) -> str:
+    """LoRA の対象系統を推定 → "sd" | "sdxl" | "flux" | "unknown"。
+    kohya 形式はキー名が SD1.5/SDXL 共通で名前では区別できないため、cross-attention
+    （attn2 / comfy の _1_1_）の lora_down 入力次元で判別する＝SD1.5:768 / SDXL:2048。
+    Rust 側 t2i_sniff_asset_kind と一致させること。判定不能は "unknown"（弾かない）。"""
+    if not str(path).lower().endswith(".safetensors"):
+        return "unknown"
+    h = _safetensors_header(path)
+    if not h:
+        return "unknown"
+    keys = [k for k in h.keys() if k != "__metadata__"]
+    if any(("double_blocks" in k) or ("single_blocks" in k) or k.startswith("transformer") for k in keys):
+        return "flux"
+    if any(("lora_te2" in k) or ("text_encoder_2" in k) for k in keys):
+        return "sdxl"
+    for k, v in h.items():
+        if k == "__metadata__":
+            continue
+        lk = k.lower()
+        if (("attn2" in lk) or ("_1_1_" in lk)) and (("to_k" in lk) or ("to_v" in lk)) \
+                and (("lora_down" in lk) or ("lora_a" in lk)):
+            shp = v.get("shape") if isinstance(v, dict) else None
+            if isinstance(shp, list) and len(shp) == 2:
+                if shp[1] == 768:
+                    return "sd"
+                if shp[1] == 2048:
+                    return "sdxl"
+    return "unknown"
+
+
+_KIND_JP = {"sd": "SD1.5系", "sdxl": "SDXL", "flux": "FLUX"}
 
 
 # --- バックエンド（モデル種別ごとの読み込み＋生成）。★拡張点 ------------------------
@@ -270,6 +358,15 @@ class Backend:
             return True
         return any(adapter in names for names in listed.values())
 
+    def _adapter_present(self, adapter: str) -> bool:
+        """adapter が**確実に** pipe に登録済みか。判定不能なら False（＝ロードを試みる）。
+        _adapter_registered と逆の安全側: 「確信があるときだけ True」＝再ロードのスキップ判定用。"""
+        try:
+            listed = self.pipe.get_list_adapters()
+        except Exception:
+            return False
+        return any(adapter in names for names in listed.values())
+
     def apply_loras(self, specs, resolve) -> None:
         # specs: [(name, weight), ..]。PEFT アダプタ API で毎回リコンサイル（要求集合だけ有効化）。
         if not self.supports_lora:
@@ -282,11 +379,31 @@ class Backend:
             if path is None:
                 raise ValueError(f"LoRA '{n}' が見つかりません（home/loras に置いてください）")
             adapter = _adapter_name(n)
+            # 冪等化: pipe に既に同名アダプタが居るなら再ロードしない。_loaded_loras との
+            # 不整合（前回失敗の残骸・モデル再ロード跨ぎ等）で「already in use」になるのを防ぐ。
+            if self._adapter_present(adapter):
+                self._loaded_loras[n] = adapter
+                continue
+            # 事前照合: 系統不一致（SD1.5 LoRA を SDXL へ等）は diffusers 内部で
+            # 「list index out of range」等の不親切なエラーになるので、ロード前に弾く。
+            lk = sniff_lora_kind(path)
+            if lk != "unknown" and lk != self.kind:
+                raise ValueError(
+                    f"LoRA '{n}' は{_KIND_JP.get(lk, lk)}用のため、現在のモデル"
+                    f"（{_KIND_JP.get(self.kind, self.kind)}）には適用できません。"
+                    f"モデルと同系統の LoRA を選んでください"
+                )
             try:
                 self.pipe.load_lora_weights(path, adapter_name=adapter)
             except Exception as ex:
+                # 列挙不能な環境で pipe に既存＝競合するケースは「ロード済み」として拾い、成功扱いにする。
+                if "already in use" in str(ex).lower():
+                    self._loaded_loras[n] = adapter
+                    continue
                 raise RuntimeError(
-                    f"LoRA '{n}' の適用に失敗しました（peft 未導入なら『pip install peft』が要ります）: {ex}"
+                    f"LoRA '{n}' の適用に失敗しました。モデルと LoRA の系統不一致"
+                    f"（SD1.5↔SDXL↔FLUX）か、非対応形式の可能性があります"
+                    f"（peft 未導入なら『pip install peft』）: {ex}"
                 ) from ex
             # load は通っても、キーがどの層にも一致しないと**アダプタが0層＝未登録**になる
             # （例: SD/SDXL のパイプに DiT/FLUX 用 LoRA を入れた）。この場合そのまま進むと
@@ -320,9 +437,9 @@ class Backend:
     @classmethod
     def load_single_file(cls, name, path, device, torch):
         # 既定では単一ファイル非対応（FLUX 等）。SD/SDXL がオーバーライドする。
-        raise ValueError(
-            "この種別は単一ファイル(.safetensors)読み込みに未対応です。diffusers 形式で配置してください"
-        )
+        # 通常は UI 側の「手持ちモデル診断」で事前に弾かれ、ここには到達しない（保険）。
+        p = model_policy(getattr(cls, "kind", "?"), "single")
+        raise ValueError(f"{p['reason']}。推奨: {p['recommend']}")
 
     def _img2img(self):
         if self._i2i is None:
@@ -808,12 +925,13 @@ class Engine:
                     f"②read 権限の HF トークンを設定、の両方を確認してください（{type(ex).__name__}）"
                 ) from ex
             raise
-        # SD で fp16 variant が無い配布への保険: 素の safetensors 一式を取り直す。
-        if kind == "sd":
+        # SD/SDXL で fp16 variant が無い配布への保険: 素の safetensors 一式を取り直す。
+        plain = PLAIN_PATTERNS_BY_KIND.get(kind)
+        if plain:
             import glob as _glob
             if not _glob.glob(os.path.join(self.model_path(name), "unet", "*.fp16.safetensors")):
                 on_line({"status": "fp16 が無いため標準版を取得…", "percent": 0})
-                _dl(SD_PATTERNS_PLAIN)
+                _dl(plain)
         if not self.is_available(name):
             raise RuntimeError("ダウンロードしましたが diffusers モデルとして認識できません")
         on_line({"status": "完了", "percent": 100})

@@ -17,22 +17,23 @@ pub(crate) const T2I_SERVER_PY: &str = include_str!("../../../python/t2i_server.
 
 /// 期待するデーモンの版（t2i_server.py の SERVER_VERSION と一致させること）。
 /// 稼働中デーモンの版がこれと違えば「古い」と見なして起動し直す（再ビルド反映）。
-pub(crate) const T2I_SERVER_VERSION: &str = "9";
+pub(crate) const T2I_SERVER_VERSION: &str = "12";
 
 /// 既知モデル（friendly name → 表示名）。t2i_server.py の MODELS と対応させること。
 /// (name, label, gated, hf_url)。gated=true は HF 認証（HF_TOKEN）が必要。
 /// hf_url はライセンス承諾ページ（ユーザーが開いて Agree する先）。
+// v1.5.13 方針: 定番3本柱（SD1.5 / SDXL / Flux-lite）＋ DreamShaper を推奨に。
+// 公式 FLUX dev/schnell（24GB+・gated）は known から外し、上級者の手動配置に委ねる。
+// t2i_server.py の MODELS と一致させること。
 pub(crate) const T2I_KNOWN_MODELS: &[(&str, &str, bool, &str)] = &[
     ("sd1.5", "Stable Diffusion 1.5（軽量・高速・~2GB）", false,
      "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5"),
     ("dreamshaper", "Dreamshaper 8（SD1.5系・高品質・~2GB）", false,
      "https://huggingface.co/Lykon/dreamshaper-8"),
+    ("sdxl", "Stable Diffusion XL 1.0（高解像度・~6.9GB）", false,
+     "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0"),
     ("flux-lite", "FLUX.1 Lite 8B（オープン・高品質・~26GB）", false,
      "https://huggingface.co/Freepik/flux.1-lite-8B"),
-    ("flux-schnell", "FLUX.1 schnell（公式・要HF認証・~34GB）", true,
-     "https://huggingface.co/black-forest-labs/FLUX.1-schnell"),
-    ("flux-dev", "FLUX.1 dev（公式・非商用・要HF認証・~34GB）", true,
-     "https://huggingface.co/black-forest-labs/FLUX.1-dev"),
 ];
 
 pub(crate) fn t2i_root(app_data: &Path) -> PathBuf {
@@ -685,5 +686,284 @@ pub(crate) fn t2i_delete_model(state: State<AppState>, model: String) -> Result<
         }
     }
     Ok(())
+}
+
+// --- v1.5.13 手持ちモデル診断（daemon 非依存）。エラーで弾く代わりに「使える/使えない＋推奨」を提示 ---
+// safetensors ヘッダ（先頭のキー一覧）だけ読んで形式・種別を判定＝高速・サーバー未起動でも動く。
+// LoRA/VAE の種別（sd/sdxl/flux）は目安で推定し、UI がモデルとの適合を薄く警告する（厳密ではない）。
+
+#[derive(Serialize, Clone)]
+pub(crate) struct T2iModelInfo {
+    name: String,
+    /// "diffusers" | "single"
+    format: String,
+    /// "sd" | "sdxl" | "flux" | "unknown"
+    kind: String,
+    usable: bool,
+    /// 使えない理由（usable=false のとき）
+    reason: String,
+    /// 使えない場合の推奨アクション
+    recommend: String,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct T2iAssetInfo {
+    name: String,
+    /// "sd" | "sdxl" | "flux"（目安）
+    kind: String,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct T2iInspect {
+    models: Vec<T2iModelInfo>,
+    loras: Vec<T2iAssetInfo>,
+    vae: Vec<T2iAssetInfo>,
+}
+
+/// safetensors のヘッダ（先頭 u64 長 + JSON オブジェクト）だけ読んで返す（重みは読まない＝高速）。
+/// 各テンソルは {"dtype","shape","data_offsets"} を持つので、shape 判定にも使える。
+fn t2i_safetensors_header(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut len8 = [0u8; 8];
+    f.read_exact(&mut len8).ok()?;
+    let n = u64::from_le_bytes(len8) as usize;
+    // 異常に大きい/空のヘッダは弾く（壊れ・別形式）。
+    if n == 0 || n > 64 * 1024 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; n];
+    f.read_exact(&mut buf).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&buf)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+}
+
+/// ヘッダからテンソル名一覧を返す（重みは読まない＝高速）。読取失敗は空。
+fn t2i_safetensors_keys(path: &Path) -> Vec<String> {
+    match t2i_safetensors_header(path) {
+        Some(h) => h.keys().filter(|k| k.as_str() != "__metadata__").cloned().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// 単一ファイルモデルの種別を safetensors キーから推定（daemon の _detect_kind_file と同判定）。
+fn t2i_sniff_single_kind(path: &Path) -> &'static str {
+    if !path.to_string_lossy().to_ascii_lowercase().ends_with(".safetensors") {
+        return "sd"; // .ckpt はヘッダ読み省略 → SD 既定
+    }
+    let keys = t2i_safetensors_keys(path);
+    // 実 SD/SDXL/FLUX は必ず多数のキーを持つ。空＝ヘッダ読取失敗（ロック/破損/巨大ファイル）。
+    // ここで安易に "sd"（使える扱い）へ倒すと、未知の巨大ファイルを誤って緑にする。断定しない。
+    if keys.is_empty() {
+        return "unknown";
+    }
+    if keys.iter().any(|k| k.contains("double_blocks") || k.contains("single_blocks")) {
+        return "flux";
+    }
+    if keys.iter().any(|k| k.starts_with("conditioner.embedders.1") || k.contains("add_embedding")) {
+        return "sdxl";
+    }
+    "sd"
+}
+
+/// LoRA/VAE アセットの種別を推定。kohya LoRA はキー名が SD1.5/SDXL 共通で名前では区別できない。
+/// そこで cross-attention（attn2 / comfy の _1_1_）の context 次元を見る＝SD1.5:768 / SDXL:2048。
+/// 判定不能（VAE・特殊形式・読取失敗）は "unknown"（UI は警告しない）。厳密ではないが実用十分。
+fn t2i_sniff_asset_kind(path: &Path) -> &'static str {
+    let header = match t2i_safetensors_header(path) {
+        Some(h) => h,
+        None => return "unknown",
+    };
+    let is_key = |k: &String| k.as_str() != "__metadata__";
+    if header.keys().filter(|k| is_key(k)).any(|k| {
+        k.contains("double_blocks") || k.contains("single_blocks") || k.starts_with("transformer")
+    }) {
+        return "flux";
+    }
+    // te2 が明示的にあれば SDXL 確定。
+    if header
+        .keys()
+        .filter(|k| is_key(k))
+        .any(|k| k.contains("lora_te2") || k.contains("text_encoder_2"))
+    {
+        return "sdxl";
+    }
+    // cross-attn の to_k/to_v の lora_down 入力次元（shape[1]）で SD1.5(768)/SDXL(2048) を判別。
+    for (k, v) in header.iter() {
+        let lk = k.to_ascii_lowercase();
+        let is_cross = lk.contains("attn2") || lk.contains("_1_1_");
+        let is_kv = lk.contains("to_k") || lk.contains("to_v");
+        let is_down = lk.contains("lora_down") || lk.contains("lora_a");
+        if is_cross && is_kv && is_down {
+            if let Some(dim) = v
+                .get("shape")
+                .and_then(|s| s.as_array())
+                .and_then(|a| a.get(1))
+                .and_then(|d| d.as_u64())
+            {
+                if dim == 768 {
+                    return "sd";
+                }
+                if dim == 2048 {
+                    return "sdxl";
+                }
+            }
+        }
+    }
+    "unknown"
+}
+
+/// diffusers フォルダの種別を model_index.json の _class_name から推定（daemon の _infer_kind と同判定）。
+fn t2i_infer_diffusers_kind(dir: &Path) -> &'static str {
+    let cls = std::fs::read_to_string(dir.join("model_index.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("_class_name").and_then(|c| c.as_str()).map(String::from))
+        .unwrap_or_default();
+    if cls.contains("Flux") {
+        "flux"
+    } else if cls.contains("XL") {
+        "sdxl"
+    } else {
+        "sd"
+    }
+}
+
+/// (kind, format) → (usable, reason, recommend)。t2i_server.py の model_policy と一致させること。
+fn t2i_model_policy(kind: &str, fmt: &str) -> (bool, String, String) {
+    if kind == "flux" && fmt == "single" {
+        return (
+            false,
+            "FLUX の単一ファイルは未対応（T5/CLIP/VAE を含む全部入り形式のため）".into(),
+            "flux-lite を diffusers 形式で取得するか、SDXL をご利用ください".into(),
+        );
+    }
+    if !matches!(kind, "sd" | "sdxl" | "flux") {
+        return (
+            false,
+            "対応外または種別を判定できませんでした".into(),
+            "SD1.5 / SDXL / Flux-lite のいずれかを diffusers 形式で配置してください".into(),
+        );
+    }
+    (true, String::new(), String::new())
+}
+
+/// 単一ファイルのチェックポイントを1つだけ含むフォルダから、そのファイルパスを返す。
+fn t2i_single_checkpoint_path(dir: &Path) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    let mut count = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Some(n) = e.file_name().to_str() {
+                let l = n.to_ascii_lowercase();
+                if l.ends_with(".safetensors") || l.ends_with(".ckpt") {
+                    count += 1;
+                    found = Some(e.path());
+                }
+            }
+        }
+    }
+    if count == 1 {
+        found
+    } else {
+        None
+    }
+}
+
+/// アセットフォルダ（loras/vae）を走査し、(名前, 種別) を返す。vae は diffusers フォルダも許可。
+fn t2i_scan_assets(dir: &Path, exts: &[&str], allow_dirs: bool) -> Vec<T2iAssetInfo> {
+    let mut out: Vec<T2iAssetInfo> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if allow_dirs {
+                    out.push(T2iAssetInfo { name, kind: "sd".into() });
+                }
+            } else if let Some(dot) = name.rfind('.') {
+                let ext = name[dot..].to_ascii_lowercase();
+                if exts.contains(&ext.as_str()) {
+                    out.push(T2iAssetInfo {
+                        name: name[..dot].to_string(),
+                        kind: t2i_sniff_asset_kind(&p).to_string(),
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    out
+}
+
+/// 手持ちの models/loras/vae を走査して対応状況を返す（UI の「手持ちモデル診断」用）。
+#[tauri::command(async)]
+pub(crate) fn t2i_inspect(state: State<AppState>) -> T2iInspect {
+    let app_data = state.app_data.clone();
+    let mut models: Vec<T2iModelInfo> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(t2i_models_dir(&app_data)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_dir() {
+                if p.join("model_index.json").is_file() {
+                    if !t2i_dir_complete(&p) {
+                        models.push(T2iModelInfo {
+                            name,
+                            format: "diffusers".into(),
+                            kind: "unknown".into(),
+                            usable: false,
+                            reason: "ダウンロードが不完全です".into(),
+                            recommend: "セットアップで「続きから再取得」してください".into(),
+                        });
+                        continue;
+                    }
+                    let kind = t2i_infer_diffusers_kind(&p);
+                    let (usable, reason, recommend) = t2i_model_policy(kind, "diffusers");
+                    models.push(T2iModelInfo {
+                        name,
+                        format: "diffusers".into(),
+                        kind: kind.into(),
+                        usable,
+                        reason,
+                        recommend,
+                    });
+                } else if let Some(ck) = t2i_single_checkpoint_path(&p) {
+                    let kind = t2i_sniff_single_kind(&ck);
+                    let (usable, reason, recommend) = t2i_model_policy(kind, "single");
+                    models.push(T2iModelInfo {
+                        name,
+                        format: "single".into(),
+                        kind: kind.into(),
+                        usable,
+                        reason,
+                        recommend,
+                    });
+                }
+            } else {
+                let l = name.to_ascii_lowercase();
+                if l.ends_with(".safetensors") || l.ends_with(".ckpt") {
+                    let stem = name.rsplitn(2, '.').nth(1).unwrap_or(&name).to_string();
+                    let kind = t2i_sniff_single_kind(&p);
+                    let (usable, reason, recommend) = t2i_model_policy(kind, "single");
+                    models.push(T2iModelInfo {
+                        name: stem,
+                        format: "single".into(),
+                        kind: kind.into(),
+                        usable,
+                        reason,
+                        recommend,
+                    });
+                }
+            }
+        }
+    }
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    let root = t2i_root(&app_data);
+    let loras = t2i_scan_assets(&root.join("loras"), &[".safetensors", ".pt", ".ckpt"], false);
+    let vae = t2i_scan_assets(&root.join("vae"), &[".safetensors", ".ckpt", ".pt", ".bin"], true);
+    T2iInspect { models, loras, vae }
 }
 

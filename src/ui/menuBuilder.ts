@@ -40,6 +40,11 @@ export interface MenuActions {
   saveFilterToLibrary: (id: string) => void;
   addLibraryFilter: (name: string, x: number, y: number) => void;
   deleteLibraryFilter: (name: string) => void;
+  // v1.5.12 メニュー再編: ライブラリ登録名の変更（右クリック「名前の編集」。
+  // 「カテゴリ/名前」でメニューが畳まれるので、これがカテゴリ移動も兼ねる）。
+  renameLibrary: (kind: "launcher" | "filter" | "module", name: string) => void;
+  // 既存カテゴリへの移動（category="" はカテゴリから出して平置きへ）。
+  moveLibraryCategory: (kind: "launcher" | "filter" | "module", name: string, category: string) => void;
   // v1.5.8 WS-M M2: モジュールライブラリ（AppData/modules・共有とモジュール設計 §10）
   saveModuleToLibrary: (shapeId: string) => void;
   addLibraryModule: (name: string, x: number, y: number) => void;
@@ -1001,6 +1006,47 @@ function adjustSubmenu(a: MenuActions): MenuItem[] {
   ];
 }
 
+/// v1.5.12 メニュー再編: ライブラリ登録名の「/」で1段のサブメニューに畳む
+/// （例 "画像/標準生成" → 「📁 画像 ▸ 標準生成」）。"/" の無い名前は従来どおり平置き。
+/// 並びはグループが先・平置きが後（それぞれ登録リストの順＝名前順）。
+/// onClick に渡すのは常に登録名そのもの（フルネーム）＝ライブラリ側の挙動は変わらない。
+function groupBySlash(
+  entries: {
+    name: string;
+    icon: string;
+    hint?: string;
+    pick: (name: string) => void;
+    /** v1.5.12: 右クリック＝名前の編集メニュー（onAltClick に配線）。 */
+    alt?: (name: string) => void;
+  }[],
+  openSubmenu: (items: MenuItem[]) => void
+): MenuItem[] {
+  const groups = new Map<string, MenuItem[]>();
+  const flat: MenuItem[] = [];
+  for (const e of entries) {
+    const i = e.name.indexOf("/");
+    const item = (display: string): MenuItem => ({
+      label: `${e.icon} ${display}`,
+      hint: e.hint,
+      onClick: () => e.pick(e.name),
+      onAltClick: e.alt ? () => e.alt!(e.name) : undefined,
+    });
+    // 先頭・末尾の "/" はグループ扱いしない（"a/" や "/b" は平置きのまま）。
+    if (i > 0 && i < e.name.length - 1) {
+      const g = e.name.slice(0, i).trim();
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g)!.push(item(e.name.slice(i + 1).trim()));
+    } else {
+      flat.push(item(e.name));
+    }
+  }
+  const folded: MenuItem[] = [...groups.entries()].map(([g, items]) => ({
+    label: `📁 ${g} ...`,
+    onClick: () => openSubmenu(items),
+  }));
+  return [...folded, ...flat];
+}
+
 export function buildCanvasMenu(
   pos: { canvasX: number; canvasY: number },
   ctx: CanvasMenuCtx,
@@ -1010,6 +1056,37 @@ export function buildCanvasMenu(
   // v1.3.5: フォーカス・整列はカード＋コメントの合計で判定（コメントも整列対象）。
   //         一括操作（まとめて…）はカード専用なのでカード数だけで判定。
   const selTotal = ctx.selectionCount + ctx.noteCount;
+  // v1.5.12 メニュー再編: ライブラリ項目の右クリック＝名前の編集メニュー。
+  // ①「名前を編集」（自由改名。「/」でカテゴリ分け）②「既存カテゴリへ移動」の2機能。
+  const libCat = (n: string) => {
+    const i = n.indexOf("/");
+    return i > 0 && i < n.length - 1 ? n.slice(0, i).trim() : "";
+  };
+  const libAltMenu = (kind: "launcher" | "filter" | "module", name: string, allNames: string[]) => {
+    const cur = libCat(name);
+    const cats = [...new Set(allNames.map(libCat).filter((c) => c && c !== cur))];
+    a.openSubmenu([
+      { label: name, onClick: () => {}, disabled: true },
+      {
+        label: "名前を編集 ...",
+        hint: "登録名を変更します。「カテゴリ/名前」の形にするとメニューがカテゴリに畳まれます（配置・展開済みのカードには影響しません）。",
+        onClick: () => a.renameLibrary(kind, name),
+      },
+      ...cats.map((c) => ({
+        label: `📁 ${c} へ移動`,
+        onClick: () => a.moveLibraryCategory(kind, name, c),
+      })),
+      ...(cur
+        ? [
+            {
+              label: "カテゴリから出す（平置きに戻す）",
+              onClick: () => a.moveLibraryCategory(kind, name, ""),
+            },
+          ]
+        : []),
+    ]);
+  };
+  const userCardNames = [...ctx.launcherLibrary, ...ctx.library];
   // v1.4.x ③: 「自動化カードを追加」のサブメニュー。1段階のフラットなリストにし、
   // ランチャー → フィルタ・処理カード → ユーザーのカード をセクション見出しで区切る。
   const automationAddSub: MenuItem[] = [
@@ -1025,27 +1102,46 @@ export function buildCanvasMenu(
       hint: "シェルでコマンドを実行するカードを追加します。ウィンドウを開いたまま対話・実行して閉じる・ウィンドウなしで結果をパネル表示、を設定で選べます。",
       onClick: () => a.addFilter("shell", pos.canvasX, pos.canvasY),
     },
-    // ── フィルタ・処理カード（データ→フィルタ→結果のパイプ）──
-    { label: "── フィルタ・処理カード ──", onClick: () => {}, disabled: true },
-    { label: "ドロップポイント（データ入口・自動実行）", onClick: () => a.addFilter("drop_point", pos.canvasX, pos.canvasY) },
-    // v1.3.11 #3: 内蔵フィルタは数が多いので「ビルトインフィルタ ...」サブメニューに残す。
+    // ── フィルタ（データ→フィルタ→結果のパイプ）──
+    // v1.5.12 メニュー再編: 「ビルトインフィルタ」という実装都合の分類をやめ、役割別
+    //（生成/テキスト/メディア）のサブメニューを第一階層に出す。深さは従来と同じ3段のまま
+    // 各リストが3〜9項目に収まる。「生成」は t2x ファミリー（3D/音源/動画）の受け皿
+    //（docs/生成カード群企画.md）。セレクタ・ドロップポイントはオペレーション節へ移動。
+    { label: "── フィルタ ──", onClick: () => {}, disabled: true },
     {
-      label: "ビルトインフィルタ ...",
+      label: "生成（AI・画像生成）...",
       onClick: () =>
         a.openSubmenu([
           // v1.4.1 AI（Ollama）。矢印引き出しメニューと項目を揃える。
-          { label: "AI: 対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog", pos.canvasX, pos.canvasY) },
-          { label: "AI: 変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat", pos.canvasX, pos.canvasY) },
-          { label: "AI後段: コードブロック抽出（MD→ソース）...", onClick: () => a.addFilter("md_codeblock", pos.canvasX, pos.canvasY) },
-          { label: "画像生成: Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i", pos.canvasX, pos.canvasY) },
-          // v1.5.3 WS-P1: セレクタ（オペ層 §5.4.1）。exit code 分岐の合流点。
+          { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog", pos.canvasX, pos.canvasY) },
+          { label: "AI変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat", pos.canvasX, pos.canvasY) },
+          { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i", pos.canvasX, pos.canvasY) },
+        ]),
+    },
+    {
+      label: "テキスト ...",
+      onClick: () =>
+        a.openSubmenu([
+          { label: "grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
+          { label: "置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
+          // v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）。
+          { label: "先頭N行（head）...", onClick: () => a.addFilter("text_head", pos.canvasX, pos.canvasY) },
+          { label: "末尾N行（tail）...", onClick: () => a.addFilter("text_tail", pos.canvasX, pos.canvasY) },
+          { label: "並べ替え（sort）", onClick: () => a.addFilter("text_sort", pos.canvasX, pos.canvasY) },
+          { label: "行数・単語数・文字数（wc）", onClick: () => a.addFilter("text_count", pos.canvasX, pos.canvasY) },
+          { label: "列の取り出し（cut）...", onClick: () => a.addFilter("text_cut", pos.canvasX, pos.canvasY) },
+          { label: "文字コード変換（→UTF-8）", onClick: () => a.addFilter("text_convert", pos.canvasX, pos.canvasY) },
           {
-            label: "セレクタ（最初の有データ枝を採用）",
-            hint: "入力の順に見て、最初にデータを返した枝を採用します。成功枝/失敗枝の合流点（矢印の通過条件と組み合わせて使います）。",
-            onClick: () => a.addFilter("select", pos.canvasX, pos.canvasY),
+            label: "コードブロック抽出（MD→ソース）...",
+            hint: "Markdown のコードフェンス(```)から中身を取り出します。AI出力をコンパイラ等へ渡す前段に。",
+            onClick: () => a.addFilter("md_codeblock", pos.canvasX, pos.canvasY),
           },
-          { label: "テキスト: grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep", pos.canvasX, pos.canvasY) },
-          { label: "テキスト: 置換（正規表現）...", onClick: () => a.addFilter("text_replace", pos.canvasX, pos.canvasY) },
+        ]),
+    },
+    {
+      label: "メディア（画像・音声・動画）...",
+      onClick: () =>
+        a.openSubmenu([
           { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize", pos.canvasX, pos.canvasY) },
           { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert", pos.canvasX, pos.canvasY) },
           // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
@@ -1083,56 +1179,113 @@ export function buildCanvasMenu(
     // ── オペレーション（v1.5.4 WS-P2: 発行系 — フローを「起動する」カード。
     //    リクエスト矢印(req)で実行したいフィルタカードへつなぐ。データレーンには乗らない）──
     { label: "── オペレーション ──", onClick: () => {}, disabled: true },
+    // v1.5.12 メニュー再編: 7項目のフラット並びを役割別サブメニューへ（HD画面でメニューが
+    // 縦に伸びすぎる対策。フィルタ節と同じ「第一階層＝役割の言葉」）。セレクタ／ドロップ
+    // ポイントは「データを加工しない制御カード」なのでこの節（セレクタ＝オペ層 §5.4.1）。
     {
-      label: "トリガ（設置型▶・一括発行）",
-      hint: "▶を押すと、リクエスト矢印の先につないだフィルタを実行します。複数につなげば一括発行できます。",
-      onClick: () => a.addFilter("op_trigger", pos.canvasX, pos.canvasY),
+      label: "制御（セレクタ・ドロップポイント）...",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "セレクタ（最初の有データ枝を採用）",
+            hint: "入力の順に見て、最初にデータを返した枝を採用します。成功枝/失敗枝の合流点（矢印の通過条件と組み合わせて使います）。",
+            onClick: () => a.addFilter("select", pos.canvasX, pos.canvasY),
+          },
+          {
+            label: "ドロップポイント（データ入口・自動実行）",
+            hint: "ファイルやカードを落とすと、つないだ下流フローを自動実行するデータ投入口です。",
+            onClick: () => a.addFilter("drop_point", pos.canvasX, pos.canvasY),
+          },
+        ]),
     },
     {
-      label: "タイマ（周期・時刻で発行）...",
-      hint: "指定した周期（秒）または時刻（HH:MM）に、矢印の先のフィルタを自動実行します。発火間隔の下限と累計回数の上限（ヒューズ）付き。",
-      onClick: () => a.addFilter("op_timer", pos.canvasX, pos.canvasY),
-    },
-    {
-      label: "ウォッチャ（ファイル監視で発行）...",
-      hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
-      onClick: () => a.addFilter("op_watch", pos.canvasX, pos.canvasY),
+      label: "発行（トリガ・タイマ・ウォッチャ）...",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "トリガ（設置型▶・一括発行）",
+            hint: "▶を押すと、リクエスト矢印の先につないだフィルタを実行します。複数につなげば一括発行できます。",
+            onClick: () => a.addFilter("op_trigger", pos.canvasX, pos.canvasY),
+          },
+          {
+            label: "タイマ（周期・時刻で発行）...",
+            hint: "指定した周期（秒）または時刻（HH:MM）に、矢印の先のフィルタを自動実行します。発火間隔の下限と累計回数の上限（ヒューズ）付き。",
+            onClick: () => a.addFilter("op_timer", pos.canvasX, pos.canvasY),
+          },
+          {
+            label: "ウォッチャ（ファイル監視で発行）...",
+            hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
+            onClick: () => a.addFilter("op_watch", pos.canvasX, pos.canvasY),
+          },
+        ]),
     },
     // v1.5.6 WS-M M1（§9.1 手動設置）: 先に入口・出口を置いて中を組む／独立モジュールに
     // 意図的に口を付ける。モジュール化コマンド（図形右クリック）でも自動生成される。
     {
-      label: "IN（モジュールの入口）",
-      hint: "データの入口カード。外から来るフロー矢印をここに受け、中のフィルタへ流します（素通し）。モジュールの差し替え可能な口になります。",
-      onClick: () => a.addFilter("op_in", pos.canvasX, pos.canvasY),
-    },
-    {
-      label: "OUT（モジュールの出口・▶実行）",
-      hint: "データの出口カード。▶を押すと上流をさかのぼって実行し、結果カードが横に生まれます（何度でも押せる口）。",
-      onClick: () => a.addFilter("op_out", pos.canvasX, pos.canvasY),
+      label: "モジュールの口（IN・OUT）...",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "IN（モジュールの入口）",
+            hint: "データの入口カード。外から来るフロー矢印をここに受け、中のフィルタへ流します（素通し）。モジュールの差し替え可能な口になります。",
+            onClick: () => a.addFilter("op_in", pos.canvasX, pos.canvasY),
+          },
+          {
+            label: "OUT（モジュールの出口・▶実行）",
+            hint: "データの出口カード。▶を押すと上流をさかのぼって実行し、結果カードが横に生まれます（何度でも押せる口）。",
+            onClick: () => a.addFilter("op_out", pos.canvasX, pos.canvasY),
+          },
+        ]),
     },
     // ── ユーザーのカード（ライブラリ登録済み・登録があるときだけ）──
+    // v1.5.12 メニュー再編: 登録名の「/」でサブメニューに畳める（groupBySlash）。
+    // 例: "画像/標準生成" と登録 →「📁 画像 ▸」。"/" なしは従来どおり平置き。
     ...(ctx.launcherLibrary.length || ctx.library.length
       ? [
-          { label: "── ユーザーのカード ──", onClick: () => {}, disabled: true },
-          ...ctx.launcherLibrary.map((name) => ({
-            label: `🚀 ${name}`,
-            onClick: () => a.addLibraryLauncher(name, pos.canvasX, pos.canvasY),
-          })),
-          ...ctx.library.map((name) => ({
-            label: `⚗ ${name}`,
-            onClick: () => a.addLibraryFilter(name, pos.canvasX, pos.canvasY),
-          })),
+          {
+            label: "── ユーザーのカード ──",
+            hint: "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。",
+            onClick: () => {},
+            disabled: true,
+          },
+          ...groupBySlash(
+            [
+              ...ctx.launcherLibrary.map((name) => ({
+                name,
+                icon: "🚀",
+                pick: (n: string) => a.addLibraryLauncher(n, pos.canvasX, pos.canvasY),
+                alt: (n: string) => libAltMenu("launcher", n, userCardNames),
+              })),
+              ...ctx.library.map((name) => ({
+                name,
+                icon: "⚗",
+                pick: (n: string) => a.addLibraryFilter(n, pos.canvasX, pos.canvasY),
+                alt: (n: string) => libAltMenu("filter", n, userCardNames),
+              })),
+            ],
+            (items) => a.openSubmenu(items)
+          ),
         ]
       : []),
     // ── ユーザーのモジュール（v1.5.8 WS-M M2・§10.1: 図形右クリック「ライブラリに登録」の展開先）──
     ...(ctx.moduleLibrary.length
       ? [
-          { label: "── ユーザーのモジュール ──", onClick: () => {}, disabled: true },
-          ...ctx.moduleLibrary.map((name) => ({
-            label: `📦 ${name}`,
-            hint: "モジュール（カード・矢印・データ同梱）をこの場所にロック済み図形ごと展開します。展開後のカードは普通のカードと同等です（透過＝インライン展開）。",
-            onClick: () => a.addLibraryModule(name, pos.canvasX, pos.canvasY),
-          })),
+          {
+            label: "── ユーザーのモジュール ──",
+            hint: "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。",
+            onClick: () => {},
+            disabled: true,
+          },
+          ...groupBySlash(
+            ctx.moduleLibrary.map((name) => ({
+              name,
+              icon: "📦",
+              hint: "モジュール（カード・矢印・データ同梱）をこの場所にロック済み図形ごと展開します。展開後のカードは普通のカードと同等です（透過＝インライン展開）。",
+              pick: (n: string) => a.addLibraryModule(n, pos.canvasX, pos.canvasY),
+              alt: (n: string) => libAltMenu("module", n, ctx.moduleLibrary),
+            })),
+            (items) => a.openSubmenu(items)
+          ),
         ]
       : []),
     ...(ctx.launcherLibrary.length || ctx.library.length || ctx.moduleLibrary.length

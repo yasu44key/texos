@@ -52,6 +52,33 @@ export interface T2iStatus {
   vae: string[];
 }
 
+// v1.5.13 手持ちモデル診断（daemon 非依存の t2i_inspect が返す）。
+// エラーで弾く代わりに「使える/使えない＋推奨」を提示する。
+export interface T2iModelInfo {
+  name: string;
+  /** "diffusers" | "single" */
+  format: string;
+  /** "sd" | "sdxl" | "flux" | "unknown" */
+  kind: string;
+  usable: boolean;
+  reason: string;
+  recommend: string;
+}
+export interface T2iAssetInfo {
+  name: string;
+  kind: string;
+}
+export interface T2iInspect {
+  models: T2iModelInfo[];
+  loras: T2iAssetInfo[];
+  vae: T2iAssetInfo[];
+}
+
+// 形式・種別の表示ラベル（UI 共通）。
+export const t2iFmtLabel = (f: string) => (f === "single" ? "単一ファイル" : "diffusers形式");
+export const t2iKindLabel = (k: string) =>
+  ({ sd: "SD1.5系", sdxl: "SDXL", flux: "FLUX", unknown: "不明" } as Record<string, string>)[k] || k;
+
 interface Props {
   onCancel: () => void;
   /** 準備完了（依存OK＋モデル1つ以上＋サーバー稼働）で押せる。最新 status を渡す。 */
@@ -68,6 +95,7 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
   const [token, setToken] = useState("");
   const [copied, setCopied] = useState(false);
   const [showToken, setShowToken] = useState(false); // 設定済みでも再設定パネルを開く
+  const [insp, setInsp] = useState<T2iInspect | null>(null); // 手持ちモデル診断
 
   const reload = useCallback(async () => {
     try {
@@ -88,10 +116,20 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
     }
   }, []);
 
+  // 手持ちモデル/LoRA/VAE の対応状況を（再）診断（daemon 非依存＝サーバー未起動でも動く）。
+  const refreshInspect = useCallback(async () => {
+    try {
+      setInsp(await invoke<T2iInspect>("t2i_inspect"));
+    } catch {
+      setInsp(null);
+    }
+  }, []);
+
   useEffect(() => {
     void reload();
     void refreshSpec();
-  }, [reload, refreshSpec]);
+    void refreshInspect();
+  }, [reload, refreshSpec, refreshInspect]);
 
   // ダウンロード進捗（t2i-model）と環境構築進捗（python-env）を購読。
   useEffect(() => {
@@ -181,7 +219,7 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
     setProgress(`モデル ${model} を取得中…`);
     try {
       await invoke("t2i_download_model", { model });
-      await reload();
+      await Promise.all([reload(), refreshInspect()]);
       setProgress(`モデル ${model} を取得しました。`);
     } catch (e) {
       setError(String(e));
@@ -221,7 +259,7 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
     setProgress(`${model} のローカルデータを破棄中…`);
     try {
       await invoke("t2i_delete_model", { model });
-      await reload();
+      await Promise.all([reload(), refreshInspect()]);
       setProgress(`${model} を破棄しました。もう一度ダウンロードできます。`);
     } catch (e) {
       setError(String(e));
@@ -498,13 +536,76 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
                   <button style={btnGhost} onClick={() => void openFolder()}>
                     📁 配置先フォルダを開く
                   </button>
-                  <button style={btnGhost} disabled={busy !== null} onClick={() => void reload()}>
+                  <button
+                    style={btnGhost}
+                    disabled={busy !== null}
+                    onClick={() => {
+                      void reload();
+                      void refreshInspect();
+                    }}
+                  >
                     🔄 更新（再スキャン）
                   </button>
                   <span style={{ color: "var(--panel-muted, #6b7488)" }}>置いたら「更新」で認識されます</span>
                 </div>
               </div>
             </div>
+
+            {/* 2.5 手持ちモデル診断（v1.5.13）。エラーで弾く代わりに「使える/使えない＋推奨」を提示。 */}
+            {insp && (
+              <div style={sec}>
+                <div style={secTitle}>🔎 手持ちモデルの対応状況</div>
+                {insp.models.length === 0 ? (
+                  <div style={note}>
+                    models フォルダにモデルがありません。上でダウンロードするか、手動配置してください。
+                  </div>
+                ) : (
+                  insp.models.map((m) => (
+                    <div key={m.name} style={{ marginBottom: 6 }}>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                        <span style={{ color: m.usable ? "#5fbf77" : "#d96a6a" }}>
+                          {m.usable ? "✓ 使えます" : "✗ 使えません"}
+                        </span>
+                        <b style={{ wordBreak: "break-all" }}>{m.name}</b>
+                        <span style={note}>
+                          {t2iFmtLabel(m.format)} ／ {t2iKindLabel(m.kind)}
+                        </span>
+                      </div>
+                      {!m.usable && (
+                        <div style={{ ...note, color: "#d9a06a", marginLeft: 14, lineHeight: 1.5 }}>
+                          {m.reason}
+                          {m.recommend && (
+                            <>
+                              <br />→ 推奨: {m.recommend}
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )}
+                {(insp.loras.length > 0 || insp.vae.length > 0) && (
+                  <div style={{ ...note, marginTop: 8, borderTop: "1px solid var(--panel-border, #2c3550)", paddingTop: 8, lineHeight: 1.6 }}>
+                    {insp.loras.length > 0 && (
+                      <div>
+                        LoRA: {insp.loras.map((l) => `${l.name}（${t2iKindLabel(l.kind)}）`).join(" ・ ")}
+                      </div>
+                    )}
+                    {insp.vae.length > 0 && <div>VAE: {insp.vae.map((v) => v.name).join(" ・ ")}（SD/SDXL 用）</div>}
+                    <div style={{ marginTop: 2, color: "var(--panel-muted, #6b7488)" }}>
+                      ※ LoRA はモデルと同系統（SD1.5↔SD1.5 / SDXL↔SDXL / FLUX↔FLUX）でのみ有効。VAE は SD/SDXL 用です。
+                    </div>
+                  </div>
+                )}
+                <button
+                  style={{ ...btnGhost, marginTop: 8, fontSize: 11, padding: "4px 10px" }}
+                  disabled={busy !== null}
+                  onClick={() => void refreshInspect()}
+                >
+                  🔄 再診断
+                </button>
+              </div>
+            )}
 
             {/* 3. サーバー */}
             <div style={sec}>

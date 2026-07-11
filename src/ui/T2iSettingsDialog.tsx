@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 // v1.5 Text-To-Image（builtin:"t2i"）のパラメータ設定ダイアログ。
 // AiSettingsDialog と同じ流儀＝新規作成・既存編集で共通。プロンプト本体は接続した
@@ -86,6 +87,35 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
   // セレクト候補＝実在アセット ∪ 現在値（アセットが消えても保存済みの選択は選択肢に残す）。
   const loraOptions = Array.from(new Set([...assets.loras, ...(loraName ? [loraName] : [])]));
   const vaeOptions = Array.from(new Set([...assets.vae, ...(vae ? [vae] : [])]));
+
+  // v1.5.13: モデル/LoRA/VAE の種別（sd/sdxl/flux）を診断し、不適合を薄く警告（厳密ではない目安）。
+  const [insp, setInsp] = useState<{
+    models: { name: string; kind: string }[];
+    loras: { name: string; kind: string }[];
+    vae: { name: string; kind: string }[];
+  } | null>(null);
+  useEffect(() => {
+    void invoke<typeof insp>("t2i_inspect").then(setInsp).catch(() => setInsp(null));
+  }, []);
+  // モデルの系統。診断に無い名前（未取得の既知モデル等）は名前から目安推定。
+  const familyOf = (name: string): string => {
+    const found = insp?.models.find((m) => m.name === name);
+    if (found && found.kind !== "unknown") return found.kind;
+    const n = name.toLowerCase();
+    if (n.includes("flux")) return "flux";
+    if (n.includes("xl")) return "sdxl";
+    return "sd";
+  };
+  const modelFamily = familyOf(model);
+  const loraKind = insp?.loras.find((l) => l.name === loraName)?.kind;
+  const knownFamily = (k?: string) => k === "sd" || k === "sdxl" || k === "flux";
+  // LoRA はモデルと同系統でのみ有効（SD1.5↔SD1.5 / SDXL↔SDXL / FLUX↔FLUX）。
+  // 双方の系統が確定しているときだけ警告（"unknown" では誤警告しない）。
+  const loraMismatch =
+    !!loraName && knownFamily(loraKind) && knownFamily(modelFamily) && loraKind !== modelFamily;
+  // VAE（外部）は SD/SDXL 用。FLUX は内蔵 VAE 推奨。
+  const vaeOnFlux = !!vae && modelFamily === "flux";
+  const kindJp = (k: string) => ({ sd: "SD1.5系", sdxl: "SDXL", flux: "FLUX" } as Record<string, string>)[k] || k;
 
   const save = () => {
     const to = parseInt(timeoutSecs, 10);
@@ -280,6 +310,19 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
           {assets.embeddings.length > 0 && <>（利用可: {assets.embeddings.join(", ")}）</>}。
           Clip skip はアニメ系 SD1.5 で 2 が定番。※SD/SDXL 向け。
         </div>
+
+        {/* v1.5.13: 種別不一致の軽い警告（保存は妨げない＝目安）。 */}
+        {loraMismatch && (
+          <div style={{ ...note, color: "#d9a06a", marginBottom: 4 }}>
+            ⚠ LoRA「{loraName}」は{kindJp(loraKind!)}用ですが、モデルは{kindJp(modelFamily)}系です。
+            系統が違う LoRA は効かない／崩れることがあります。
+          </div>
+        )}
+        {vaeOnFlux && (
+          <div style={{ ...note, color: "#d9a06a", marginBottom: 4 }}>
+            ⚠ FLUX は内蔵 VAE を使うため、外部 VAE「{vae}」は無視されます。
+          </div>
+        )}
 
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
           <button style={btnGhost} onClick={onCancel}>

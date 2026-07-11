@@ -189,6 +189,9 @@ export function filterOutputMime(filterRef: string | null): string | null {
   try {
     const s = JSON.parse(filterRef ?? "{}");
     if (s.builtin === "text_grep" || s.builtin === "text_replace") return "text/plain";
+    // v1.5.12 P1: Unix標準テキストフィルタ群も常に text/plain を吐く
+    if (["text_head", "text_tail", "text_sort", "text_count", "text_cut", "text_convert"].includes(s.builtin))
+      return "text/plain";
     if (s.builtin === "ai") return "text/markdown"; // v1.4.0 AIフィルタは常にMDを吐く
     if (s.builtin === "t2i") return "image/png"; // v1.5 Text-To-Image は常にPNGを吐く
     if (s.builtin === "md_codeblock") return "text/plain"; // v1.4.0 コード抽出（→gcc等）
