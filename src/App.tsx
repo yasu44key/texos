@@ -1337,6 +1337,9 @@ function App() {
       } else if (builtin === "text_convert") {
         // nkf 相当。既定=自動判定→UTF-8。文字コードの明示は設定ダイアログで。
         create("UTF-8へ変換", { builtin: "text_convert", encoding: "auto", accept_mime: "text/*" });
+      } else if (builtin === "speak") {
+        // v1.5.15 L2 OSアダプタ第1弾: OS の音声合成で読み上げ（fire-and-forget・出力なし）。
+        create("読み上げ", { builtin: "speak", accept_mime: "text/*" });
       } else if (builtin === "img_resize") {
         setPrompt({
           title: "リサイズ: 幅（px・高さは自動）",

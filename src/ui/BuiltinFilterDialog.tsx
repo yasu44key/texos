@@ -163,6 +163,13 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       },
     ],
   },
+  speak: {
+    // v1.5.15 L2 OSアダプタ・ビルトイン第1弾（標準フィルタ充実検討 §4）。
+    title: "読み上げ（speak）",
+    fixed: { accept_mime: "text/*" },
+    fields: [],
+    note: "テキストを OS の音声合成で読み上げます（Windows=SAPI / macOS=say / Linux=espeak）。読み上げるだけで完結し、出力カードは作りません。",
+  },
   text_convert: {
     title: "文字コード変換（→ UTF-8）",
     fixed: { accept_mime: "text/*" },

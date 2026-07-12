@@ -103,8 +103,19 @@ pub(crate) fn execute_node(
         NodeKind::Builtin => {
             // builtin 名は node_kind が Builtin と判定した時点で Some（"ai" 以外）。
             let b = spec.builtin.as_deref().unwrap_or("");
-            let (bytes, ext, mime) = flow::run_builtin(spec, b, inputs[0].0)?;
-            Ok(plain(bytes, ext, mime))
+            // v1.5.15 L2 OSアダプタ: speak は fire-and-forget（出力カードなし）。
+            // {out} を書かない自己完結コマンドと同じ契約 = 成功しても outputs は空。
+            if b == "speak" {
+                flow::run_speak(inputs[0].0)?;
+                Ok(NodeRun {
+                    outputs: Vec::new(),
+                    exit_code: None,
+                    stderr: String::new(),
+                })
+            } else {
+                let (bytes, ext, mime) = flow::run_builtin(spec, b, inputs[0].0)?;
+                Ok(plain(bytes, ext, mime))
+            }
         }
         NodeKind::Ai => {
             // v1.4.0 AIフィルタは builtin だがネットワークを使う別経路（同期blocking）。

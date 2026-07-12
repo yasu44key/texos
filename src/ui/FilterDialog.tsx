@@ -76,6 +76,8 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
   const [removedName, setRemovedName] = useState<string | null>(null);
   // 解除/復元の後に同じ name/path で再チェックさせるためのトリガー
   const [checkTick, setCheckTick] = useState(0);
+  // 既知ヘルパーの入手案内（未検出のときだけ表示。軽量導入支援 — 標準フィルタ充実検討 §9）
+  const [installHint, setInstallHint] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<string[]>("list_filter_programs")
@@ -94,6 +96,9 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
       invoke<string | null>("check_filter_program", { name: n, path: path.trim() || null })
         .then((r) => setResolved(r))
         .catch(() => setResolved(null));
+      invoke<string | null>("helper_install_hint", { name: n })
+        .then(setInstallHint)
+        .catch(() => setInstallHint(null));
     }, 300);
     return () => clearTimeout(t);
   }, [name, path, checkTick]);
@@ -363,6 +368,10 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
                   同梱解除
                 </button>
               )}
+            {/* 既知ヘルパーなら入手案内を一行添える（軽量導入支援） */}
+            {resolved === null && installHint && (
+              <span style={{ flexBasis: "100%", color: "#d8b87f" }}>💡 {installHint}</span>
+            )}
           </div>
         )}
         {removedName && (

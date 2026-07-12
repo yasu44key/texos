@@ -262,6 +262,11 @@ impl FilterSpec {
     /// fire-and-forget コマンドで、成功しても取り込む出力が無い（＝生成カードを作らず、
     /// 「出力がありません」をエラーにしない）。CMD に `{out` を書けば従来どおり出力必須。
     pub fn is_self_contained(&self) -> bool {
+        // v1.5.15 実機FB: speak など「呼ぶだけ」で完結する builtin も出力ゼロが正常
+        // （終端の「入力がありません」案内の対象外にする）。
+        if self.builtin.as_deref() == Some("speak") {
+            return true;
+        }
         matches!(self.node_kind(), NodeKind::Generator | NodeKind::External)
             && !self.cmd.as_deref().unwrap_or("").contains("{out")
     }
@@ -338,6 +343,96 @@ pub fn mime_matches(accept: &str, mime: &str) -> bool {
         return mime.starts_with(&format!("{prefix}/"));
     }
     accept == mime
+}
+
+/// v1.5.15 L2 OSアダプタ・ビルトイン第1弾「speak」（標準フィルタ充実検討.md §4）:
+/// テキストを OS の読み上げ機能に渡す fire-and-forget — 出力カードは作らない
+/// （{out} を書かない自己完結コマンドと同じ契約。実行アームは flow_run.rs 側で分岐）。
+/// OS 差はこの関数の内側に閉じ込める（カード定義は全 OS 共通＝プロジェクトの可搬性）。
+/// 本文はコマンドラインに載せず UTF-8 一時ファイルで渡す（引用符・長さ・文字化けを回避）。
+pub fn run_speak(input: &[u8]) -> Result<(), String> {
+    let text = String::from_utf8_lossy(input);
+    if text.trim().is_empty() {
+        return Err("読み上げるテキストが空です".into());
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path =
+        std::env::temp_dir().join(format!("texos_speak_{}_{nanos}.txt", std::process::id()));
+    std::fs::write(&path, text.as_bytes())
+        .map_err(|e| format!("読み上げ用の一時ファイルを書けません: {e}"))?;
+    if let Err(e) = spawn_speaker(&path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Windows: SAPI（COM の SpVoice）。読み上げ後の一時ファイル削除もスクリプト側で行う。
+/// 音声は Windows 設定（時刻と言語 > 音声）で選んだ既定音声に追従する（v1.5.15 実機FB）:
+/// 設定画面は OneCore 側の DefaultTokenId を書くが、SAPI/System.Speech の既定は
+/// 旧 sapi.cpl 設定を見るため切り替えが効かない。さらに Windows PowerShell 5.1 の
+/// System.Speech は Desktop 系音声しか列挙しないため名前照合も不可 —
+/// **OneCore のトークンを SpObjectToken.SetId で直接 SpVoice に挿す**のが確実
+/// （PS 5.1 実機で "Microsoft Ayumi - Japanese (Japan)" の選択を確認済み）。
+/// OneCore キーが無い等の環境では従来の既定音声のまま（try/catch で黙って続行）。
+#[cfg(windows)]
+fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let p = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$v = New-Object -ComObject SAPI.SpVoice; \
+         try {{ \
+           $id = (Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Speech_OneCore\\Voices' -ErrorAction Stop).DefaultTokenId; \
+           if ($id) {{ \
+             $tok = New-Object -ComObject SAPI.SpObjectToken; \
+             $tok.SetId($id, 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices', $false); \
+             $v.Voice = $tok \
+           }} \
+         }} catch {{}}; \
+         $t = [IO.File]::ReadAllText('{p}', [Text.Encoding]::UTF8); \
+         $v.Speak($t) | Out-Null; \
+         Remove-Item -LiteralPath '{p}'"
+    );
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW（コンソールを出さない）
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("読み上げを起動できません: {e}"))
+}
+
+/// macOS: 標準搭載の say。一時ファイルは OS の掃除に任せる（小さなテキスト）。
+#[cfg(target_os = "macos")]
+fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("say")
+        .arg("-f")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("読み上げを起動できません: {e}"))
+}
+
+/// Linux 等: espeak。未導入なら spawn 失敗がそのままエラーになる（黙って失敗しない）。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("espeak")
+        .arg("-f")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("読み上げを起動できません（espeak の導入が必要です）: {e}"))
 }
 
 /// 内蔵フィルタの実行: 入力バイト列 → (出力バイト列, 出力拡張子, 出力MIME)。
@@ -1688,6 +1783,13 @@ mod tests {
         std::sync::atomic::AtomicBool::new(false)
     }
 
+    /// speak: 空テキストは黙って失敗しない（明確なエラー）。実際の発話は実機確認で。
+    #[test]
+    fn speak_rejects_empty_text() {
+        assert!(run_speak(b"").is_err());
+        assert!(run_speak(b"  \n\t").is_err());
+    }
+
     /// プログラム解決の順序: 明示パス → .texos/filters → 環境変数PATH。
     #[cfg(windows)]
     #[test]
@@ -1904,6 +2006,8 @@ mod tests {
         // builtin/ai/t2i/invalid は外部コマンドではないので対象外
         assert!(!spec(r#"{"builtin":"text_grep"}"#).is_self_contained());
         assert!(!spec(r#"{}"#).is_self_contained());
+        // v1.5.15: speak builtin は「呼ぶだけ」= 出力ゼロが正常（終端の入力なし案内を出さない）
+        assert!(spec(r#"{"builtin":"speak","accept_mime":"text/*"}"#).is_self_contained());
     }
 
     /// shell 判定（run_flow 終端の対話シェル）。

@@ -770,6 +770,7 @@ pub fn run() {
             flow_send_stdin,
             list_audio_devices,
             check_filter_program,
+            helper_install_hint,
             list_filter_programs,
             import_filter_program,
             remove_filter_program,

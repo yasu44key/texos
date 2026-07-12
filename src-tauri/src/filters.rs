@@ -56,15 +56,56 @@ pub(crate) fn filters_dir(root: &Path) -> PathBuf {
     texos_dir(root).join("filters")
 }
 
+/// 既知ヘルパーの入手案内（軽量導入支援 — 標準フィルタ充実検討.md §9 の 2026-07-12 合意）。
+/// プログラム解決に失敗したとき、実行エラーと設定ダイアログの事前チェックに一行添える。
+/// 内容の正本は docs/外部依存プログラム一覧.md — 新しいヘルパーを使い始めたら両方に追記する。
+pub(crate) fn helper_hint(name: &str) -> Option<&'static str> {
+    let base = Path::new(name.trim())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    Some(match base.as_str() {
+        // jgawk は16bit版のみで開発停止のため辞書から削除（2026-07-12 実機知見）。
+        // 日本語対応 awk の現行入手先は外部依存プログラム一覧.md を正本とする。
+        "gawk" | "awk" => {
+            "GNU awk。MSYS2 / GnuWin 等から入手。日本語（Shift_JIS等）は前段に内蔵「文字コード変換」を挟んでUTF-8で処理してください"
+        }
+        "pandoc" => "文書変換。winget install JohnMacFarlane.Pandoc（md→PDF には別途 LaTeX が必要）",
+        "ffmpeg" => {
+            "音声・動画変換。winget install Gyan.FFmpeg（導入後は PATH 反映のため TexoS を再起動）"
+        }
+        "jq" => "JSON加工。winget install jqlang.jq",
+        "nkf" | "nkf32" => "外部導入は不要です — 内蔵の「文字コード変換」(text_convert) で代替できます",
+        "grep" => "外部導入は不要です — 内蔵の「テキスト抽出」(text_grep) で代替できます",
+        "python" | "python3" | "py" => {
+            "https://www.python.org/downloads/ から、または winget install Python.Python.3.12"
+        }
+        "gcc" => "MSYS2（pacman -S mingw-w64-x86_64-gcc）等から入手。winget install MSYS2.MSYS2",
+        _ => return None,
+    })
+}
+
+/// 既知ヘルパーの入手案内を返す（設定ダイアログの「✗ 見つかりません」に添える）。
+#[tauri::command]
+pub(crate) fn helper_install_hint(name: String) -> Option<String> {
+    helper_hint(&name).map(str::to_string)
+}
+
 /// 外部フィルタの実行コマンドラインを組み立てる。
 /// 新形式（name あり）: プログラムを解決して `"exe" + CMD書式`。旧形式: cmd をそのまま。
 pub(crate) fn build_cmdline(root: &Path, spec: &flow::FilterSpec) -> Result<String, String> {
     if let Some(name) = spec.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let exe = flow::resolve_program(name, spec.path.as_deref(), &filters_dir(root))
             .ok_or_else(|| {
-                format!(
+                let mut msg = format!(
                     "プログラム「{name}」が見つかりません（指定パス → .texos\\filters → 環境変数PATH の順で探索）"
-                )
+                );
+                if let Some(h) = helper_hint(name) {
+                    msg.push_str("\n入手のヒント: ");
+                    msg.push_str(h);
+                }
+                msg
             })?;
         Ok(format!("\"{}\" {}", exe.display(), spec.cmd.as_deref().unwrap_or(""))
             .trim()
@@ -411,3 +452,22 @@ pub(crate) fn update_filter(id: String, spec: String, state: State<AppState>) ->
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::helper_hint;
+
+    /// 既知ヘルパー辞書: 名前の正規化（.exe / 大文字小文字 / パス付き）を吸収して引ける。
+    #[test]
+    fn helper_hint_normalizes_name() {
+        assert!(helper_hint("gawk").is_some());
+        assert!(helper_hint("gawk.exe").is_some());
+        assert!(helper_hint("GAWK.EXE").is_some());
+        assert!(helper_hint(r"C:\tools\pandoc.exe").is_some());
+        // 内蔵代替の案内（nkf → text_convert）
+        assert!(helper_hint("nkf32.exe").unwrap().contains("text_convert"));
+        // 未知の名前は案内なし（エラー文は従来どおり）。jgawk は開発停止で辞書から削除済み。
+        assert!(helper_hint("jgawk.exe").is_none());
+        assert!(helper_hint("texos_no_such_helper.exe").is_none());
+    }
+}

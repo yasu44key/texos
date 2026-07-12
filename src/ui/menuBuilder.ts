@@ -1207,6 +1207,18 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
           { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip") },
         ]),
     },
+    // v1.5.15 L2 OSアダプタ・ビルトイン（標準フィルタ充実検討 §4: OS差はbuiltinの内側に閉じ込める）。
+    {
+      label: "OS機能 ...",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "読み上げ（speak）",
+            hint: "テキストを OS の音声合成で読み上げます（Windows=SAPI / macOS=say / Linux=espeak）。読み上げるだけで完結し、出力カードは作りません。",
+            onClick: () => a.addFilter("speak"),
+          },
+        ]),
+    },
     // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
     { label: "外部プログラム...", onClick: () => a.addFilter("external") },
     // ── オペレーション（v1.5.4 WS-P2: 発行系 — フローを「起動する」カード）──
