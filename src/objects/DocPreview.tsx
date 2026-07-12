@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import * as XLSX from "xlsx";
 import mammoth from "mammoth";
+import { usePanelResize, cornerHandleStyle } from "./panelResize";
 
 // HTML 化（第1階層）で扱う拡張子。それ以外の doc 系は LibreOffice→PDF（第2階層）。
 const HTML_EXTS = ["docx", "xlsx", "xls", "ods", "csv", "tsv"];
@@ -13,6 +14,10 @@ interface Props {
   ext: string;
   /** vertical offset from the card origin (card height + gap) */
   top: number;
+  /** panel size (v1.5.16, user-resizable; persisted by the parent) */
+  width?: number | null;
+  height?: number | null;
+  onResizeEnd?: (width: number, height?: number) => void;
   onClose: () => void;
 }
 
@@ -22,11 +27,21 @@ interface Props {
  * すべて読取専用・非破壊（get_media_data_url で中身を取得するだけ。CAS には焼かない）。
  * DOM に描くので他のプレビュー同様カードと一緒に動く。未対応や変換失敗は「一時的に閲覧」へ。
  */
-export function DocPreview({ objId, label, ext, top, onClose }: Props) {
+export function DocPreview({
+  objId, label, ext, top, width = null, height = null, onResizeEnd, onClose,
+}: Props) {
   const [html, setHtml] = useState<string | null>(null);
   const [pdfSrc, setPdfSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const isHtmlMode = HTML_EXTS.includes(ext);
+  // v1.5.16: 右下コーナーで幅高さリサイズ（PDF iframe / HTML表示の両モード共通）。
+  const { w, h, panelRef, startCornerDrag } = usePanelResize({
+    width: width ?? 520,
+    height: height ?? 600,
+    minW: 300,
+    minH: 220,
+    onEnd: (rw, rh) => onResizeEnd?.(rw, rh),
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -67,13 +82,14 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
 
   return (
     <div
+      ref={panelRef}
       onMouseDown={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",
         left: 0,
         top,
-        width: 520,
+        width: w,
         background: "var(--panel-bg, #0d0f16)",
         border: "1px solid var(--panel-border, #2a3a5a)",
         borderRadius: 8,
@@ -118,10 +134,17 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
           <div style={{ color: "var(--panel-muted, #9a6a6a)", fontSize: 11, marginTop: 8 }}>{failed}</div>
         </div>
       ) : pdfSrc ? (
+        // v1.5.16: 高さはコーナードラッグ中 CSS 変数でライブ反映・確定値は h
         <iframe
           src={pdfSrc}
           title={label}
-          style={{ display: "block", width: "100%", height: 600, border: "none", background: "#fff" }}
+          style={{
+            display: "block",
+            width: "100%",
+            height: `var(--preview-body-h, ${h}px)`,
+            border: "none",
+            background: "#fff",
+          }}
         />
       ) : html == null ? (
         <div style={{ color: "var(--panel-muted, #7a8aa6)", fontSize: 12, padding: 30 }}>
@@ -129,9 +152,9 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
         </div>
       ) : (
         <div
-          // 変換結果は読取専用表示。スクロールできる白背景パネル。
+          // 変換結果は読取専用表示。スクロールできる白背景パネル（高さもリサイズに追従）。
           style={{
-            maxHeight: 560,
+            maxHeight: `var(--preview-body-h, ${h}px)`,
             overflow: "auto",
             background: "#fff",
             color: "#111",
@@ -142,6 +165,7 @@ export function DocPreview({ objId, label, ext, top, onClose }: Props) {
           dangerouslySetInnerHTML={{ __html: html }}
         />
       )}
+      <div onMouseDown={startCornerDrag} title="サイズを変更" style={cornerHandleStyle} />
     </div>
   );
 }

@@ -541,7 +541,10 @@ pub struct VirtualBodyInfo {
     /// fork-cas/none. None for sentinel cards (project/url/folder).
     pub view_source: Option<String>,
     /// Width of the in-canvas text editor panel (v1.3.1, user-resizable).
+    /// v1.5.16 から画像/PDF/動画/Doc プレビューの幅も共用する。
     pub panel_w: Option<f64>,
+    /// Height of resizable previews (v1.5.16, PDF/Doc)。画像・動画はアスペクト追従なので幅のみ。
+    pub panel_h: Option<f64>,
     /// カード変種（v1.4 カード統一モデル §1）: file|url|project|folder|filter（拡張予定: note 等）
     pub kind: Option<String>,
     /// kind='filter' のフィルタ定義 JSON（v1.4 オートフロー⑤）
@@ -794,7 +797,7 @@ pub fn run() {
             list_installed_apps,
             create_drop_point,
             drop_into_point,
-            set_panel_width,
+            set_panel_size,
             create_shape,
             list_shapes,
             update_shape_geom,

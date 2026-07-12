@@ -187,6 +187,8 @@ fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN origin_path TEXT", []);
     // v1.3.1: per-object width of the in-canvas text editor panel
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN panel_w REAL", []);
+    // v1.5.16: per-object height of resizable previews (PDF/Doc — width is panel_w)
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN panel_h REAL", []);
     // v1.3.2: soft delete — 削除は deleted_at を立てるだけ（復活の呪文 Ctrl+Z 用）。
     // 物理削除（行とtrashの掃除）はメンテナンスツール「データの正規化」の仕事。
     // カードだけでなくコメント・図形・矢印リンクも同じ方式で復活できる。

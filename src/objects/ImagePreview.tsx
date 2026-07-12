@@ -1,18 +1,29 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { usePanelResize, widthHandleStyle } from "./panelResize";
 
 interface Props {
   objId: string;
   label: string;
   /** vertical offset from the card origin (card height + gap) */
   top: number;
+  /** panel width (v1.5.16, user-resizable; persisted by the parent) */
+  width?: number | null;
+  onResizeEnd?: (width: number) => void;
   onClose: () => void;
 }
 
 /** Full-image preview anchored to its card (moves with it), proper aspect ratio. */
-export function ImagePreview({ objId, label, top, onClose }: Props) {
+export function ImagePreview({ objId, label, top, width = null, onResizeEnd, onClose }: Props) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  // v1.5.16: 右端ハンドルで幅リサイズ（高さは画像のアスペクト追従）。確定時に親が永続化。
+  const { w, panelRef, startWidthDrag } = usePanelResize({
+    width: width ?? 420,
+    height: 0,
+    minW: 200,
+    onEnd: (rw) => onResizeEnd?.(rw),
+  });
 
   useEffect(() => {
     invoke<string>("get_preview", { id: objId })
@@ -22,13 +33,14 @@ export function ImagePreview({ objId, label, top, onClose }: Props) {
 
   return (
     <div
+      ref={panelRef}
       onMouseDown={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",
         left: 0,
         top,
-        width: 420,
+        width: w,
         background: "var(--panel-bg, #0d0f16)",
         border: "1px solid var(--panel-border, #2a3a5a)",
         borderRadius: 8,
@@ -86,12 +98,14 @@ export function ImagePreview({ objId, label, top, onClose }: Props) {
           <img
             src={src}
             draggable={false}
-            style={{ maxWidth: "100%", maxHeight: 520, display: "block", pointerEvents: "none" }}
+            // v1.5.16: パネル幅に追従（アスペクト比維持）。広げれば拡大・狭めれば縮小。
+            style={{ width: "100%", height: "auto", display: "block", pointerEvents: "none" }}
           />
         ) : (
           <span style={{ color: "var(--panel-muted, #7a8aa6)", fontSize: 12, padding: 30 }}>読み込み中...</span>
         )}
       </div>
+      <div onMouseDown={startWidthDrag} title="横幅を変更（高さは自動）" style={widthHandleStyle} />
     </div>
   );
 }

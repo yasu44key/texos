@@ -71,9 +71,11 @@ interface Props {
   expanded?: boolean;
   /** committed file path to edit when expanded */
   editPath?: string | null;
-  /** width of the text editor panel (v1.3.1, user-resizable) */
+  /** width of the text editor panel (v1.3.1, user-resizable)。v1.5.16 から各プレビューの幅も共用 */
   panelW?: number | null;
-  onPanelResize?: (id: string, width: number) => void;
+  /** height of resizable previews (v1.5.16, PDF/Doc のみ。画像・動画はアスペクト追従) */
+  panelH?: number | null;
+  onPanelResize?: (id: string, width: number, height?: number) => void;
   onCollapse?: (id: string) => void;
   onAfterSave?: () => void;
   /** v1.3.9: 読取専用テキスト閲覧から「編集」押下 → 実身化して編集（commit→edit）。 */
@@ -300,7 +302,7 @@ export function ObjectCard({
   isLauncher = false, launcherPath = null,
   filterRef = null,
   ext = null, memo = null, expanded = false, editPath = null,
-  panelW = null, onPanelResize,
+  panelW = null, panelH = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onCtrlClone, onSelectConnected, onSelect, onGroupDragStart,
   onMoveEnd, onDragLive, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
   onToggleOpPause,
@@ -860,6 +862,8 @@ export function ObjectCard({
           objId={id}
           label={label}
           top={CARD_H + 8}
+          width={panelW}
+          onResizeEnd={(w) => onPanelResize?.(id, w)}
           onClose={() => onCollapse?.(id)}
         />
       )}
@@ -877,6 +881,9 @@ export function ObjectCard({
           label={label}
           kind={isPdf ? "pdf" : "video"}
           top={CARD_H + 8}
+          width={panelW}
+          height={panelH}
+          onResizeEnd={(w, h) => onPanelResize?.(id, w, h)}
           onClose={() => onCollapse?.(id)}
         />
       )}
@@ -888,6 +895,9 @@ export function ObjectCard({
             label={label}
             ext={lowExt}
             top={CARD_H + 8}
+            width={panelW}
+            height={panelH}
+            onResizeEnd={(w, h) => onPanelResize?.(id, w, h)}
             onClose={() => onCollapse?.(id)}
           />
         </Suspense>

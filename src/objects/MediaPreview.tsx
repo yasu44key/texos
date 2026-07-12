@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { usePanelResize, widthHandleStyle, cornerHandleStyle } from "./panelResize";
 
 interface Props {
   objId: string;
@@ -8,13 +9,27 @@ interface Props {
   kind: "video" | "pdf";
   /** vertical offset from the card origin (card height + gap) */
   top: number;
+  /** panel size (v1.5.16, user-resizable; persisted by the parent)。height は pdf のみ使う */
+  width?: number | null;
+  height?: number | null;
+  onResizeEnd?: (width: number, height?: number) => void;
   onClose: () => void;
 }
 
 /** In-canvas PDF / video preview, served through the asset protocol. */
-export function MediaPreview({ objId, label, kind, top, onClose }: Props) {
+export function MediaPreview({
+  objId, label, kind, top, width = null, height = null, onResizeEnd, onClose,
+}: Props) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  // v1.5.16: 動画=右端ハンドル（高さはアスペクト追従）／PDF=右下コーナー（幅高さ独立）。
+  const { w, h, panelRef, startWidthDrag, startCornerDrag } = usePanelResize({
+    width: width ?? (kind === "pdf" ? 480 : 420),
+    height: height ?? 600,
+    minW: 260,
+    minH: 220,
+    onEnd: (rw, rh) => onResizeEnd?.(rw, rh),
+  });
 
   useEffect(() => {
     invoke<string>("materialize_view", { id: objId })
@@ -25,17 +40,16 @@ export function MediaPreview({ objId, label, kind, top, onClose }: Props) {
       });
   }, [objId]);
 
-  const width = kind === "pdf" ? 480 : 420;
-
   return (
     <div
+      ref={panelRef}
       onMouseDown={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",
         left: 0,
         top,
-        width,
+        width: w,
         background: "var(--panel-bg, #0d0f16)",
         border: "1px solid var(--panel-border, #2a3a5a)",
         borderRadius: 8,
@@ -81,17 +95,30 @@ export function MediaPreview({ objId, label, kind, top, onClose }: Props) {
       ) : !src ? (
         <div style={{ color: "var(--panel-muted, #7a8aa6)", fontSize: 12, padding: 30 }}>読み込み中...</div>
       ) : kind === "video" ? (
+        // v1.5.16: パネル幅に追従（アスペクト比維持）
         <video
           src={src}
           controls
-          style={{ display: "block", width: "100%", maxHeight: 420, background: "#000" }}
+          style={{ display: "block", width: "100%", height: "auto", background: "#000" }}
         />
       ) : (
+        // v1.5.16: 高さはコーナードラッグ中 CSS 変数でライブ反映・確定値は h
         <iframe
           src={src}
           title={label}
-          style={{ display: "block", width: "100%", height: 600, border: "none", background: "#fff" }}
+          style={{
+            display: "block",
+            width: "100%",
+            height: `var(--preview-body-h, ${h}px)`,
+            border: "none",
+            background: "#fff",
+          }}
         />
+      )}
+      {kind === "pdf" ? (
+        <div onMouseDown={startCornerDrag} title="サイズを変更" style={cornerHandleStyle} />
+      ) : (
+        <div onMouseDown={startWidthDrag} title="横幅を変更（高さは自動）" style={widthHandleStyle} />
       )}
     </div>
   );

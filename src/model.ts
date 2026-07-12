@@ -22,6 +22,8 @@ export interface VirtualBodyInfo {
   cur_mtime: number | null;
   view_source: string | null;
   panel_w: number | null;
+  /** v1.5.16: リサイズ可能プレビューの高さ（PDF/Doc。画像・動画はアスペクト追従で幅のみ） */
+  panel_h: number | null;
   /** カード変種（v1.4 カード統一モデル §1）: file|url|project|folder|filter */
   kind: string | null;
   /** kind='filter' のフィルタ定義 JSON（v1.4 オートフロー⑤） */

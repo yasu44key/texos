@@ -170,17 +170,34 @@ pub(crate) fn restore_note(id: String, state: State<AppState>) -> Result<(), Str
     Ok(())
 }
 
-/// Persist the in-canvas text editor panel width for an object (v1.3.1).
+/// v1.5.16: プレビューのサイズ永続化（テキスト/画像/動画=幅のみ・PDF/Doc=幅＋高さ）。
+/// v1.3.1 の set_panel_width（テキストエディタ幅）を高さ対応で置き換えた統合版。
+/// height が None のときは panel_h を触らない（幅ハンドルだけの種別が高さを潰さない）。
 #[tauri::command]
-pub(crate) fn set_panel_width(id: String, width: f64, state: State<AppState>) -> Result<(), String> {
+pub(crate) fn set_panel_size(
+    id: String,
+    width: f64,
+    height: Option<f64>,
+    state: State<AppState>,
+) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-    p.conn
-        .execute(
-            "UPDATE virtual_bodies SET panel_w = ?1 WHERE id = ?2",
-            rusqlite::params![width, id],
-        )
-        .map_err(|e| e.to_string())?;
+    match height {
+        Some(h) => p
+            .conn
+            .execute(
+                "UPDATE virtual_bodies SET panel_w = ?1, panel_h = ?2 WHERE id = ?3",
+                rusqlite::params![width, h, id],
+            )
+            .map_err(|e| e.to_string())?,
+        None => p
+            .conn
+            .execute(
+                "UPDATE virtual_bodies SET panel_w = ?1 WHERE id = ?2",
+                rusqlite::params![width, id],
+            )
+            .map_err(|e| e.to_string())?,
+    };
     Ok(())
 }
 

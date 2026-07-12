@@ -3046,12 +3046,19 @@ function App() {
   );
 
   // v1.3.1: persist the text editor panel width per object.
-  const handlePanelResize = useCallback(async (id: string, width: number) => {
+  // v1.5.16: 画像/PDF/動画/Doc プレビューも共用（height は PDF/Doc のコーナーリサイズのみ）。
+  const handlePanelResize = useCallback(async (id: string, width: number, height?: number) => {
     try {
-      await invoke("set_panel_width", { id, width });
-      setObjects((prev) => prev.map((o) => (o.id === id ? { ...o, panel_w: width } : o)));
+      await invoke("set_panel_size", { id, width, height: height ?? null });
+      setObjects((prev) =>
+        prev.map((o) =>
+          o.id === id
+            ? { ...o, panel_w: width, panel_h: height !== undefined ? height : o.panel_h }
+            : o
+        )
+      );
     } catch (e) {
-      console.error("set_panel_width failed", e);
+      console.error("set_panel_size failed", e);
     }
   }, []);
 
@@ -3780,10 +3787,18 @@ function App() {
     (o: VirtualBodyInfo): { w: number; h: number } => {
       if (!expanded.has(o.id)) return { w: CARD_W, h: CARD_H };
       const isPdf = o.mime_type === "application/pdf" || (o.ext ?? "").toLowerCase() === "pdf";
-      if (o.mime_type.startsWith("image/")) return { w: 420, h: CARD_H + 8 + 480 };
+      // v1.5.16: プレビューがリサイズ可能になったので panel_w/panel_h を反映
+      // （画像・動画の高さはアスペクト追従＝幅からの概算。従来の既定比率を維持）。
+      if (o.mime_type.startsWith("image/")) {
+        const w = o.panel_w ?? 420;
+        return { w, h: CARD_H + 8 + Math.round(w * (480 / 420)) };
+      }
       if (o.mime_type.startsWith("audio/")) return { w: 300, h: CARD_H + 8 + 90 };
-      if (o.mime_type.startsWith("video/")) return { w: 420, h: CARD_H + 8 + 460 };
-      if (isPdf) return { w: 480, h: CARD_H + 8 + 640 };
+      if (o.mime_type.startsWith("video/")) {
+        const w = o.panel_w ?? 420;
+        return { w, h: CARD_H + 8 + Math.round(w * (460 / 420)) };
+      }
+      if (isPdf) return { w: o.panel_w ?? 480, h: CARD_H + 8 + (o.panel_h ?? 600) + 40 };
       if (isTextMime(o.mime_type, o.ext)) return { w: o.panel_w ?? 360, h: CARD_H + 8 + 270 };
       return { w: CARD_W, h: CARD_H };
     },
@@ -5758,6 +5773,7 @@ function App() {
             expanded={expanded.has(obj.id)}
             editPath={obj.committed_path}
             panelW={obj.panel_w}
+            panelH={obj.panel_h}
             onPanelResize={handlePanelResize}
             zIndex={cardZ(obj.id)}
             selected={selected.has(obj.id)}
