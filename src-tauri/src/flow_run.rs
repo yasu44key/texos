@@ -82,7 +82,7 @@ pub(crate) struct NodeRun {
 ///
 /// inputs は (bytes, ext, mime) の並び:
 /// - Generator … 空（入力を取らない）
-/// - Builtin / Ai … 必ず1個
+/// - Builtin / Ai … 必ず1個（v1.5.17: 集約系 builtin＝text_concat/diff/paste は N 個）
 /// - External … ファンアウト時1個 / 集約時 N 個
 pub(crate) fn execute_node(
     root: &Path,
@@ -103,9 +103,16 @@ pub(crate) fn execute_node(
         NodeKind::Builtin => {
             // builtin 名は node_kind が Builtin と判定した時点で Some（"ai" 以外）。
             let b = spec.builtin.as_deref().unwrap_or("");
+            // v1.5.17 P2: 集約系 builtin は全入力を1回で受ける（eval_filter が集約経路で
+            // N 個渡してくる。並びは port 昇順 → 接続順）。
+            if flow::builtin_is_aggregate(b) {
+                let ins: Vec<&[u8]> = inputs.iter().map(|i| i.0).collect();
+                let (bytes, ext, mime) = flow::run_builtin_agg(spec, b, &ins)?;
+                Ok(plain(bytes, ext, mime))
+            }
             // v1.5.15 L2 OSアダプタ: speak は fire-and-forget（出力カードなし）。
             // {out} を書かない自己完結コマンドと同じ契約 = 成功しても outputs は空。
-            if b == "speak" {
+            else if b == "speak" {
                 flow::run_speak(inputs[0].0)?;
                 Ok(NodeRun {
                     outputs: Vec::new(),

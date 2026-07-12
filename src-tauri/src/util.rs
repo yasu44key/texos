@@ -98,7 +98,8 @@ pub(crate) fn unique_path(dir: &Path, filename: &str) -> PathBuf {
 /// MUST be present here so they never fall back to a text-ish guess.
 pub(crate) fn mime_for_ext(ext: &str) -> Option<&'static str> {
     Some(match ext {
-        "txt" | "log" | "ini" => "text/plain",
+        // diff/patch は v1.5.17 text_diff の出力（unified diff はプレーンテキスト）
+        "txt" | "log" | "ini" | "diff" | "patch" => "text/plain",
         "md" => "text/markdown",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",

@@ -1337,6 +1337,13 @@ function App() {
       } else if (builtin === "text_convert") {
         // nkf 相当。既定=自動判定→UTF-8。文字コードの明示は設定ダイアログで。
         create("UTF-8へ変換", { builtin: "text_convert", encoding: "auto", accept_mime: "text/*" });
+      } else if (builtin === "text_concat") {
+        // v1.5.17 P2 集約系: 複数入力を接続順に連結（cat）。区切りは設定ダイアログで。
+        create("連結（cat）", { builtin: "text_concat", accept_mime: "text/*" });
+      } else if (builtin === "text_diff") {
+        create("差分（diff）", { builtin: "text_diff", accept_mime: "text/*" });
+      } else if (builtin === "text_paste") {
+        create("行の横結合（paste）", { builtin: "text_paste", delimiter: "tab", accept_mime: "text/*" });
       } else if (builtin === "speak") {
         // v1.5.15 L2 OSアダプタ第1弾: OS の音声合成で読み上げ（fire-and-forget・出力なし）。
         create("読み上げ", { builtin: "speak", accept_mime: "text/*" });

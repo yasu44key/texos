@@ -51,6 +51,13 @@ pub struct FilterSpec {
     /// encoding_rs のラベル（shift_jis / euc-jp / iso-2022-jp / utf-16le …）。出力は常に UTF-8。
     #[serde(default)]
     pub encoding: Option<String>,
+    // --- v1.5.17 P2: 集約系テキストフィルタ（標準フィルタ充実検討 §3 第2候補）---
+    /// text_concat: 入力間の区切り。"newline"（既定: 改行境界を保証）| "none"（純cat）|
+    /// "blank"（空行を挟む）| "rule"（Markdown 区切り線 --- を挟む）。
+    /// text_paste の区切りは text_cut と同じ `delimiter` を共用。
+    /// text_diff の前後文脈行数は `lines` を共用（既定3）。
+    #[serde(default)]
+    pub separator: Option<String>,
     /// 外部コマンドの実行上限秒（未指定は60秒）。暴走・ストール対策。
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -250,11 +257,18 @@ impl FilterSpec {
         self.shell.is_some()
     }
 
-    /// External が集約実行（全入力を集めて1回）か。{in*} か {in2} 以降があれば集約、
-    /// {in}/{in1} のみなら入力ごとに実行（ファンアウト）。集約は External のときだけ意味を持つ。
+    /// 集約実行（全入力を集めて1回）か。External は CMD の書き方で決まる: {in*} か {in2}
+    /// 以降があれば集約、{in}/{in1} のみなら入力ごとに実行（ファンアウト）。
+    /// v1.5.17 P2: Builtin にも集約系（text_concat / text_diff / text_paste）を導入 —
+    /// こちらは builtin 名で静的に決まる（入力順は既存契約: port 昇順 → 接続順）。
     pub fn is_aggregate(&self) -> bool {
-        self.node_kind() == NodeKind::External
-            && cmd_is_aggregate(self.cmd.as_deref().unwrap_or(""))
+        match self.node_kind() {
+            NodeKind::External => cmd_is_aggregate(self.cmd.as_deref().unwrap_or("")),
+            NodeKind::Builtin => {
+                builtin_is_aggregate(self.builtin.as_deref().unwrap_or(""))
+            }
+            _ => false,
+        }
     }
 
     /// 出力ファイル（`{out}` / `{out_noext}`）を書かない外部コマンドか。カメラ起動
@@ -646,6 +660,87 @@ pub fn run_builtin(
             Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
         }
         other => Err(format!("未知の内蔵フィルタ: {other}")),
+    }
+}
+
+/// v1.5.17 P2: 集約実行するビルトインか（全入力を集めて1回実行）。
+/// External の cmd_is_aggregate（CMD の書き方で判定）に対し、こちらは名前で静的に決まる。
+pub fn builtin_is_aggregate(name: &str) -> bool {
+    matches!(name, "text_concat" | "text_diff" | "text_paste")
+}
+
+/// v1.5.17 P2: 集約系ビルトインの実行（標準フィルタ充実検討 §3 第2候補）。
+/// inputs は全入力のバイト列（並びは既存契約: port 昇順 → 接続順。flow_run eval_filter が保証）。
+/// run_builtin と同じ契約で (bytes, ext, mime) を返す純関数。
+pub fn run_builtin_agg(
+    spec: &FilterSpec,
+    name: &str,
+    inputs: &[&[u8]],
+) -> Result<(Vec<u8>, String, String), String> {
+    match name {
+        "text_concat" => {
+            // cat 相当。既定は「改行境界の保証」（前の入力が改行で終わらなくても行が
+            // 融合しない）。"none" が純粋な cat（バイト列をそのまま連結）。
+            let sep = spec.separator.as_deref().unwrap_or("newline");
+            let mut out = String::new();
+            for (i, b) in inputs.iter().enumerate() {
+                if i > 0 && sep != "none" {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    match sep {
+                        "blank" => out.push('\n'),
+                        // Markdown の水平線は前後に空行が要る（無いと setext 見出し化する）
+                        "rule" => out.push_str("\n---\n\n"),
+                        _ => {} // "newline" は境界保証のみ
+                    }
+                }
+                out.push_str(&String::from_utf8_lossy(b));
+            }
+            Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
+        }
+        "text_diff" => {
+            // diff -u 相当。入力1=旧・入力2=新（矢印の接続順）。同一なら出力は空
+            //（Unix diff と同じ。「差分なし」は空カードが伝える）。
+            if inputs.len() != 2 {
+                return Err(format!(
+                    "diff は入力がちょうど2つ必要です（現在 {} 個）。接続順が 入力1=旧・入力2=新 になります",
+                    inputs.len()
+                ));
+            }
+            let old = String::from_utf8_lossy(inputs[0]);
+            let new = String::from_utf8_lossy(inputs[1]);
+            let ctx = spec.lines.unwrap_or(3) as usize;
+            let out = similar::TextDiff::from_lines(old.as_ref(), new.as_ref())
+                .unified_diff()
+                .context_radius(ctx)
+                .header("入力1（旧）", "入力2（新）")
+                .to_string();
+            Ok((out.into_bytes(), "diff".into(), "text/plain".into()))
+        }
+        "text_paste" => {
+            // paste 相当: 各入力の同じ行番号を区切り文字で横に結合。行数が違う入力は
+            // 空文字で埋める（GNU paste と同じ）。区切りは text_cut と同じ delimiter を共用。
+            let sep = match spec.delimiter.as_deref().unwrap_or("tab") {
+                "tab" | "" => "\t",
+                "comma" => ",",
+                "space" => " ",
+                other => other,
+            };
+            let texts: Vec<String> =
+                inputs.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
+            let columns: Vec<Vec<&str>> = texts.iter().map(|t| t.lines().collect()).collect();
+            let rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+            let mut out_lines = Vec::with_capacity(rows);
+            for i in 0..rows {
+                let row: Vec<&str> =
+                    columns.iter().map(|c| c.get(i).copied().unwrap_or("")).collect();
+                out_lines.push(row.join(sep));
+            }
+            let out = out_lines.join("\n");
+            Ok((out.into_bytes(), "txt".into(), "text/plain".into()))
+        }
+        other => Err(format!("未知の集約ビルトイン: {other}")),
     }
 }
 
@@ -1766,6 +1861,67 @@ mod tests {
         assert!(run_builtin(&s, "text_convert", b"x").is_err());
     }
 
+    // --- v1.5.17 P2: 集約系（run_builtin_agg）---
+
+    #[test]
+    fn text_concat_joins_inputs_in_order() {
+        // 既定（newline）: 改行で終わらない入力の後ろでも行が融合しない
+        let s = spec(r#"{"builtin":"text_concat"}"#);
+        let ins: Vec<&[u8]> = vec![b"a\nb", b"c\n", b"d"];
+        let (out, ext, mime) = run_builtin_agg(&s, "text_concat", &ins).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a\nb\nc\nd");
+        assert_eq!((ext.as_str(), mime.as_str()), ("txt", "text/plain"));
+        // none = 純 cat（バイト列をそのまま連結 → 行が融合する）
+        let s = spec(r#"{"builtin":"text_concat","separator":"none"}"#);
+        let (out, _, _) = run_builtin_agg(&s, "text_concat", &ins).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a\nbc\nd");
+        // blank = 空行を挟む / rule = Markdown 区切り線（前後に空行）
+        let s = spec(r#"{"builtin":"text_concat","separator":"blank"}"#);
+        let ins2: Vec<&[u8]> = vec![b"a", b"b"];
+        let (out, _, _) = run_builtin_agg(&s, "text_concat", &ins2).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a\n\nb");
+        let s = spec(r#"{"builtin":"text_concat","separator":"rule"}"#);
+        let (out, _, _) = run_builtin_agg(&s, "text_concat", &ins2).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a\n\n---\n\nb");
+        // 入力1個はそのまま
+        let s = spec(r#"{"builtin":"text_concat"}"#);
+        let (out, _, _) = run_builtin_agg(&s, "text_concat", &[b"solo".as_slice()]).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "solo");
+    }
+
+    #[test]
+    fn text_diff_unified_two_inputs() {
+        let s = spec(r#"{"builtin":"text_diff"}"#);
+        let old = b"line1\nline2\nline3\n".as_slice();
+        let new = b"line1\nlineX\nline3\n".as_slice();
+        let (out, ext, mime) = run_builtin_agg(&s, "text_diff", &[old, new]).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("-line2"), "{text}");
+        assert!(text.contains("+lineX"), "{text}");
+        assert!(text.contains("入力1（旧）"), "{text}");
+        assert_eq!((ext.as_str(), mime.as_str()), ("diff", "text/plain"));
+        // 同一入力 → 出力は空（Unix diff と同じ）
+        let (out, _, _) = run_builtin_agg(&s, "text_diff", &[old, old]).unwrap();
+        assert!(out.is_empty());
+        // 入力が2つでなければ明確なエラー
+        assert!(run_builtin_agg(&s, "text_diff", &[old]).is_err());
+        assert!(run_builtin_agg(&s, "text_diff", &[old, new, old]).is_err());
+    }
+
+    #[test]
+    fn text_paste_joins_lines_side_by_side() {
+        // 既定はタブ区切り。行数が違えば空文字で埋める（GNU paste と同じ）
+        let s = spec(r#"{"builtin":"text_paste"}"#);
+        let ins: Vec<&[u8]> = vec![b"a1\na2\na3", b"b1\nb2"];
+        let (out, ext, mime) = run_builtin_agg(&s, "text_paste", &ins).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a1\tb1\na2\tb2\na3\t");
+        assert_eq!((ext.as_str(), mime.as_str()), ("txt", "text/plain"));
+        // カンマ区切り（CSV 組み立て）
+        let s = spec(r#"{"builtin":"text_paste","delimiter":"comma"}"#);
+        let (out, _, _) = run_builtin_agg(&s, "text_paste", &ins).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a1,b1\na2,b2\na3,");
+    }
+
     #[test]
     fn img_convert_roundtrip() {
         // 4x4 PNG を作って BMP へ変換 → デコードできること
@@ -1984,13 +2140,19 @@ mod tests {
         );
     }
 
-    /// 集約判定は External のときだけ true（builtin に {in*} があっても集約ではない）。
+    /// 集約判定: External は CMD の書き方（{in*}/{in2}〜）で決まる。builtin は名前で
+    /// 静的に決まる（v1.5.17 P2: concat/diff/paste）— {in*} を書いても関係しない。
     #[test]
-    fn is_aggregate_only_for_external() {
+    fn is_aggregate_for_external_and_builtin() {
         assert!(spec(r#"{"cmd":"{in*} -o {out}"}"#).is_aggregate());
         assert!(spec(r#"{"name":"convert","cmd":"\"{in1}\" \"{in2}\" {out}"}"#).is_aggregate());
         assert!(!spec(r#"{"cmd":"\"{in}\" {out}"}"#).is_aggregate());
         assert!(!spec(r#"{"builtin":"text_grep","cmd":"{in*}"}"#).is_aggregate());
+        // v1.5.17 P2: 集約系 builtin
+        assert!(spec(r#"{"builtin":"text_concat"}"#).is_aggregate());
+        assert!(spec(r#"{"builtin":"text_diff"}"#).is_aggregate());
+        assert!(spec(r#"{"builtin":"text_paste"}"#).is_aggregate());
+        assert!(!spec(r#"{"builtin":"text_sort"}"#).is_aggregate());
     }
 
     /// 自己完結コマンド判定: {out}/{out_noext} を書かない外部・ジェネレータは fire-and-forget

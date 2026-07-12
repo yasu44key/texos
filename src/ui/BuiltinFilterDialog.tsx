@@ -163,6 +163,60 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       },
     ],
   },
+  // --- v1.5.17 P2: 集約系（複数入力を1回で受ける。入力順=矢印の接続順）---
+  text_concat: {
+    title: "連結（cat）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "separator",
+        label: "入力の間",
+        type: "select",
+        default: "newline",
+        options: [
+          { value: "newline", label: "改行で区切る（行の融合を防ぐ）" },
+          { value: "none", label: "そのまま連結（純粋な cat）" },
+          { value: "blank", label: "空行を挟む" },
+          { value: "rule", label: "区切り線 --- を挟む（Markdown）" },
+        ],
+      },
+    ],
+    note: "接続したすべてのテキスト入力を順に連結します。順序は矢印の接続順です。",
+  },
+  text_diff: {
+    title: "差分（diff）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "lines",
+        label: "前後の文脈行数",
+        type: "number",
+        default: 3,
+        min: 0,
+        hint: "unified diff（diff -u 相当）で、変更行の前後に見せる行数。",
+      },
+    ],
+    note: "入力はちょうど2つ。接続順が 入力1=旧・入力2=新 になります。同一なら出力は空です。",
+  },
+  text_paste: {
+    title: "行の横結合（paste）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "delimiter",
+        label: "区切り",
+        type: "select",
+        default: "tab",
+        options: [
+          { value: "tab", label: "タブ（TSV）" },
+          { value: "comma", label: "カンマ（CSV）" },
+          { value: "space", label: "空白" },
+        ],
+        hint: "その他の区切り文字は「JSONで編集」から delimiter に直接指定できます。",
+      },
+    ],
+    note: "各入力の同じ行番号を横に並べて結合します（列の組み立て）。順序は矢印の接続順、行数が違う入力は空欄で埋めます。",
+  },
   speak: {
     // v1.5.15 L2 OSアダプタ・ビルトイン第1弾（標準フィルタ充実検討 §4）。
     title: "読み上げ（speak）",

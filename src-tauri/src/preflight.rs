@@ -266,9 +266,12 @@ fn collect_ops(
 fn filter_output_mime(spec: &flow::FilterSpec) -> Option<String> {
     match spec.builtin.as_deref() {
         // v1.5.12 P1: Unix標準テキストフィルタ群（head/tail/sort/count/cut/convert）も text/plain。
+        // v1.5.17 P2: 集約系（concat/diff/paste）も text/plain（diff の実体拡張子は .diff）。
         Some("text_grep") | Some("text_replace") | Some("md_codeblock") | Some("text_head")
         | Some("text_tail") | Some("text_sort") | Some("text_count") | Some("text_cut")
-        | Some("text_convert") => Some("text/plain".into()),
+        | Some("text_convert") | Some("text_concat") | Some("text_diff") | Some("text_paste") => {
+            Some("text/plain".into())
+        }
         Some("ai") => Some("text/markdown".into()),
         Some("t2i") | Some("img_resize") => Some("image/png".into()),
         Some("img_convert") => {

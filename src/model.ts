@@ -192,7 +192,9 @@ export function filterOutputMime(filterRef: string | null): string | null {
     const s = JSON.parse(filterRef ?? "{}");
     if (s.builtin === "text_grep" || s.builtin === "text_replace") return "text/plain";
     // v1.5.12 P1: Unix標準テキストフィルタ群も常に text/plain を吐く
-    if (["text_head", "text_tail", "text_sort", "text_count", "text_cut", "text_convert"].includes(s.builtin))
+    // v1.5.17 P2: 集約系（concat/diff/paste）も text/plain（diff の実体拡張子は .diff）
+    if (["text_head", "text_tail", "text_sort", "text_count", "text_cut", "text_convert",
+         "text_concat", "text_diff", "text_paste"].includes(s.builtin))
       return "text/plain";
     if (s.builtin === "ai") return "text/markdown"; // v1.4.0 AIフィルタは常にMDを吐く
     if (s.builtin === "t2i") return "image/png"; // v1.5 Text-To-Image は常にPNGを吐く

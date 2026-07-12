@@ -1166,6 +1166,22 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
           { label: "行数・単語数・文字数（wc）", onClick: () => a.addFilter("text_count") },
           { label: "列の取り出し（cut）...", onClick: () => a.addFilter("text_cut") },
           { label: "文字コード変換（→UTF-8）", onClick: () => a.addFilter("text_convert") },
+          // v1.5.17 P2: 集約系（複数入力を1回で受ける。標準フィルタ充実検討 §3 第2候補）。
+          {
+            label: "連結（cat・複数入力）",
+            hint: "接続したすべてのテキストを矢印の接続順に連結します。区切り（改行/空行/---）は設定で。",
+            onClick: () => a.addFilter("text_concat"),
+          },
+          {
+            label: "差分（diff・2入力）",
+            hint: "2つのテキストの差分を unified 形式で出します。接続順が 入力1=旧・入力2=新。",
+            onClick: () => a.addFilter("text_diff"),
+          },
+          {
+            label: "行の横結合（paste・複数入力）",
+            hint: "各入力の同じ行番号を区切り文字で横に並べます（TSV/CSV の列組み立て）。",
+            onClick: () => a.addFilter("text_paste"),
+          },
           {
             label: "コードブロック抽出（MD→ソース）...",
             hint: "Markdown のコードフェンス(```)から中身を取り出します。AI出力をコンパイラ等へ渡す前段に。",
