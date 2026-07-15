@@ -1233,6 +1233,11 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
             hint: "テキストを OS の音声合成で読み上げます（Windows=SAPI / macOS=say / Linux=espeak）。読み上げるだけで完結し、出力カードは作りません。",
             onClick: () => a.addFilter("speak"),
           },
+          {
+            label: "新規カードを登録",
+            hint: "フォルダ直下の未登録ファイルをカードとして登録します。ウォッチャのリクエスト矢印の先に置くと、アプリの書き出しやドロップされたファイルが自動でキャンバスに現れます。",
+            onClick: () => a.addFilter("import_new"),
+          },
         ]),
     },
     // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ

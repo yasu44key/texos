@@ -1347,6 +1347,9 @@ function App() {
       } else if (builtin === "speak") {
         // v1.5.15 L2 OSアダプタ第1弾: OS の音声合成で読み上げ（fire-and-forget・出力なし）。
         create("読み上げ", { builtin: "speak", accept_mime: "text/*" });
+      } else if (builtin === "import_new") {
+        // v1.6: フォルダの未登録ファイルをカード登録（対象フォルダは設定ダイアログで）。
+        create("新規カードを登録", { builtin: "import_new" });
       } else if (builtin === "img_resize") {
         setPrompt({
           title: "リサイズ: 幅（px・高さは自動）",

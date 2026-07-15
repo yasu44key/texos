@@ -67,7 +67,10 @@ pub(crate) struct FlowPayload {
 /// 情報で、現状 eval_filter は使わない — 将来の exit code 分岐（§4.3「成功時/失敗時」の
 /// flow 矢印）でここを見るための土台アンカー。
 pub(crate) struct NodeRun {
-    outputs: Vec<(Vec<u8>, String, String)>, // (bytes, ext, mime)
+    // (bytes, ext, mime, stem_override)。stem_override は v1.6 {out*} 複数出力のとき
+    // プログラムが付けたファイル名の語幹（＝カード名になる）。None なら呼び出し側の
+    // 従来命名（入力 stem / prefix / "output"）。
+    outputs: Vec<(Vec<u8>, String, String, Option<String>)>,
     #[allow(dead_code)] // §4.3 で消費予定
     exit_code: Option<i32>,
     #[allow(dead_code)] // §4.3 で消費予定
@@ -95,7 +98,7 @@ pub(crate) fn execute_node(
     let cancel = &job.cancel;
     let stdin_slot = &job.control;
     let plain = |bytes: Vec<u8>, ext: String, mime: String| NodeRun {
-        outputs: vec![(bytes, ext, mime)],
+        outputs: vec![(bytes, ext, mime, None)],
         exit_code: None,
         stderr: String::new(),
     };
@@ -218,8 +221,41 @@ pub(crate) fn execute_node(
                     return Err(o.into_bytes().unwrap_err());
                 }
                 Vec::new()
+            } else if o.multi.is_some() {
+                // v1.6 {out*}: 複数出力モード。成否ポリシーは単一出力と同じ（非0→エラー）。
+                // 各ファイルは自分の拡張子で ext/MIME を決め、ファイル名の語幹がカード名になる
+                // （ChillChordMaker の「jazz_01_1_Dm7.wav」のような意味を持つ名前を活かす）。
+                if !o.success() {
+                    return Err(o.into_bytes().unwrap_err());
+                }
+                let multi = o.multi.unwrap_or_default();
+                if multi.is_empty() {
+                    return Err(
+                        "コマンドは成功しましたが {out*} フォルダに出力がありません".into()
+                    );
+                }
+                multi
+                    .into_iter()
+                    .map(|(fname, bytes)| {
+                        let p = std::path::Path::new(&fname);
+                        let ext = p
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_ascii_lowercase())
+                            .unwrap_or_else(|| out_ext.clone());
+                        let mime = mime_for_ext(&ext)
+                            .unwrap_or("application/octet-stream")
+                            .to_string();
+                        let stem = p
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("output")
+                            .to_string();
+                        (bytes, ext, mime, Some(stem))
+                    })
+                    .collect()
             } else {
-                vec![(o.into_bytes()?, out_ext, out_mime)]
+                vec![(o.into_bytes()?, out_ext, out_mime, None)]
             };
             Ok(NodeRun {
                 outputs,
@@ -437,6 +473,93 @@ pub(crate) fn apply_edge(
 /// `visited` は評価中パスのスタックで、循環を検出したらエラー。
 /// v1.5.2 WS-C: DB 接触は**ジョブ専用接続**（p）で行う（state.current 非依存）。
 /// v1.5.3 WS-P1: 返り値を EvalOut に（when/no-data/セレクタ/メモ化はこの関数が担う）。
+/// v1.6 「新規カードを登録」の本体。spec.path のフォルダ（空=プロジェクト直下）を走査し、
+/// 未登録ファイルをカードとして登録する。プロジェクト内=実身／外部=窓仮身
+/// （import_file_into の in_project 判定）。新カードは本カードの下にグリッドで並ぶ。
+/// - 既知判定は committed_path と origin_path の**両方**（フロー出力の実身も窓仮身も重複しない）
+/// - 一時・隠しファイル（先頭 ~ / . ・拡張子 tmp/part/crdownload/bak）はスキップ
+/// - 判定は登録の直前に行い、並行発火の競合窓を最小化する
+fn run_import_new(
+    p: &Project,
+    fid: &str,
+    spec: &flow::FilterSpec,
+    report: &mut FlowReport,
+) -> Result<usize, String> {
+    let dir: PathBuf = match spec.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => PathBuf::from(s),
+        None => p.root.clone(),
+    };
+    if !dir.is_dir() {
+        return Err(format!("フォルダがありません: {}", dir.display()));
+    }
+    // 新カードの並べ先（本カードの位置を起点に下へグリッド）
+    let (fx, fy): (f64, f64) = p
+        .conn
+        .query_row(
+            "SELECT pos_x, pos_y FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![fid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let texos = texos_dir(&p.root);
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|q| q.is_file())
+        .collect();
+    files.sort(); // 登録順を安定に（ファイル名順 = {out*} と同じ順序規約）
+
+    let mut count = 0usize;
+    for q in files {
+        if path_inside(&q, &texos) {
+            continue; // .texos 配下は対象外（フラット運用の原則）
+        }
+        let name = match q.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if name.starts_with('~') || name.starts_with('.') {
+            continue; // 隠し・Office ロックファイル等
+        }
+        let ext = q
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(ext.as_str(), "tmp" | "part" | "crdownload" | "bak") {
+            continue; // 書き込み途中・一時ファイルの流儀
+        }
+        let path_str = q.to_string_lossy().to_string();
+        // 既知判定（登録直前）: 実身（committed_path）も窓仮身（origin_path）も重複させない
+        let known: bool = p
+            .conn
+            .query_row(
+                "SELECT 1 FROM virtual_bodies
+                 WHERE (committed_path = ?1 OR origin_path = ?1) AND deleted_at IS NULL",
+                rusqlite::params![path_str],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .is_some();
+        if known {
+            continue;
+        }
+        let cx = fx + (count % 5) as f64 * 170.0;
+        let cy = fy + 150.0 + (count / 5) as f64 * 140.0;
+        match objects::import_file_into(p, path_str, String::new(), cx, cy) {
+            Ok(_vid) => {
+                report.outputs.push(format!("{name}（登録）"));
+                count += 1;
+            }
+            Err(e) => report.errors.push(format!("{name}: {e}")),
+        }
+    }
+    Ok(count)
+}
+
 pub(crate) fn eval_filter(
     state: &AppState,
     app: &tauri::AppHandle,
@@ -495,16 +618,29 @@ pub(crate) fn eval_filter(
                 EvalOut::data(
                     r.outputs
                         .into_iter()
-                        .map(|(bytes, ext, mime)| FlowPayload {
+                        .map(|(bytes, ext, mime, stem_o)| FlowPayload {
                             bytes,
                             ext,
                             mime,
-                            stem: stem.clone(),
+                            stem: stem_o.unwrap_or_else(|| stem.clone()),
                         })
                         .collect(),
                     exit,
                 )
             }
+            Err(e) => EvalOut::failed(vec![e], None, vec![]),
+        };
+        return finish_eval(p, fid, visited, memo, 0, out);
+    }
+
+    // v1.6 「新規カードを登録」（builtin:"import_new"）: 入力を取らずフォルダを走査して
+    // 未登録ファイルをカード登録する（セレクタと同じ「eval 側で完結」の流儀 — 登録は
+    // プロジェクト DB への作用なので execute_node のバイト変換契約に乗せない）。
+    // ウォッチャ→本カードの req 矢印で「随時登録」パターンが成立する。
+    if spec.builtin.as_deref() == Some("import_new") {
+        emit_job_progress(app, job, Some(&node_note(p, fid)), None);
+        let out = match run_import_new(p, fid, &spec, report) {
+            Ok(_n) => EvalOut::data(vec![], None),
             Err(e) => EvalOut::failed(vec![e], None, vec![]),
         };
         return finish_eval(p, fid, visited, memo, 0, out);
@@ -758,8 +894,9 @@ pub(crate) fn eval_filter(
             match run {
                 Ok(run) => {
                     last_exit = run.exit_code;
-                    for (bytes, ext, mime) in run.outputs {
-                        produced.push(FlowPayload { bytes, ext, mime, stem: stem0.clone() });
+                    for (bytes, ext, mime, stem_o) in run.outputs {
+                        let stem = stem_o.unwrap_or_else(|| stem0.clone());
+                        produced.push(FlowPayload { bytes, ext, mime, stem });
                     }
                 }
                 Err(e) => errs.push(format!("{stem0}: {e}")),
@@ -796,12 +933,12 @@ pub(crate) fn eval_filter(
             match run {
                 Ok(run) => {
                     last_exit = run.exit_code;
-                    for (bytes, ext, mime) in run.outputs {
+                    for (bytes, ext, mime, stem_o) in run.outputs {
                         produced.push(FlowPayload {
                             bytes,
                             ext,
                             mime,
-                            stem: pl.stem.clone(),
+                            stem: stem_o.unwrap_or_else(|| pl.stem.clone()),
                         });
                     }
                 }
@@ -851,6 +988,63 @@ mod ws_p1_tests {
     }
     fn attrs(json: &str) -> flow::EdgeAttrs {
         flow::parse_edge_attrs(Some(json))
+    }
+
+    /// v1.6 「新規カードを登録」: 未登録ファイルだけ登録・一時/隠しファイルはスキップ・
+    /// 2回目は重複ゼロ（committed_path 照合）・登録カードはプロジェクト内=実身。
+    #[test]
+    fn import_new_registers_and_dedups() {
+        let root = std::env::temp_dir().join(format!("texos_import_new_{}", db::now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let p = project::open_project_at(&root).unwrap();
+        // 本カード（位置の起点になるだけ）
+        p.conn
+            .execute(
+                "INSERT INTO real_bodies (id, mime_type, size, created_at)
+                 VALUES ('filter:sentinel', 'application/vnd.texos.filter', 0, 0)",
+                [],
+            )
+            .unwrap();
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies
+                    (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+                 VALUES ('f1', 'filter:sentinel', '登録', 100.0, 100.0, 0, 'filter',
+                         '{\"builtin\":\"import_new\"}')",
+                [],
+            )
+            .unwrap();
+        // 対象2つ＋スキップ対象3つ
+        std::fs::write(root.join("a.txt"), b"A").unwrap();
+        std::fs::write(root.join("b.wav"), b"RIFFxxxxWAVE").unwrap();
+        std::fs::write(root.join("c.tmp"), b"partial").unwrap();
+        std::fs::write(root.join("~lock.docx"), b"lock").unwrap();
+        std::fs::write(root.join(".hidden"), b"dot").unwrap();
+
+        let spec = flow::parse_spec(r#"{"builtin":"import_new"}"#).unwrap();
+        let mut report = empty_report();
+        let n = run_import_new(&p, "f1", &spec, &mut report).unwrap();
+        assert_eq!(n, 2, "a.txt と b.wav のみ登録のはず: {:?}", report.outputs);
+        // プロジェクト内 → committed_path 付きの実身
+        let committed: i64 = p
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM virtual_bodies
+                 WHERE committed_path IS NOT NULL AND kind IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, 2);
+        // 2回目は既知スキップで重複ゼロ
+        let mut report2 = empty_report();
+        let n2 = run_import_new(&p, "f1", &spec, &mut report2).unwrap();
+        assert_eq!(n2, 0, "2回目に重複登録: {:?}", report2.outputs);
+        // 存在しないフォルダ指定はエラー
+        let bad = flow::parse_spec(r#"{"builtin":"import_new","path":"Q:\\no_such_dir_xyz"}"#)
+            .unwrap();
+        assert!(run_import_new(&p, "f1", &bad, &mut empty_report()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// always（既定）: 上流エラーは report へ伝搬し、payload はそのまま通る（後方互換）。

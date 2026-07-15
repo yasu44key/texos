@@ -224,6 +224,22 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     fields: [],
     note: "テキストを OS の音声合成で読み上げます（Windows=SAPI / macOS=say / Linux=espeak）。読み上げるだけで完結し、出力カードは作りません。",
   },
+  import_new: {
+    // v1.6: フォルダの未登録ファイルをカードとして登録（ウォッチャとの対で「随時登録」）。
+    title: "新規カードを登録",
+    fixed: {},
+    fields: [
+      {
+        key: "path",
+        label: "対象フォルダ",
+        type: "text",
+        optional: true,
+        placeholder: "空 = プロジェクトフォルダ直下",
+        hint: "プロジェクト内のファイルは実身、外部フォルダのファイルは窓（仮身）として登録します。ウォッチャの監視パスと同じにすると観測→登録が繋がります。",
+      },
+    ],
+    note: "フォルダ直下の未登録ファイルをカードとして登録します（登録済み・一時ファイルはスキップ・このカードの下に並びます）。ウォッチャのリクエスト矢印の先に置くと、新しいファイルが現れるたびに自動で取り込みます。出力カードは作りません。",
+  },
   text_convert: {
     title: "文字コード変換（→ UTF-8）",
     fixed: { accept_mime: "text/*" },

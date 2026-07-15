@@ -27,12 +27,25 @@ pub(crate) fn import_file(
     state: State<AppState>,
 ) -> Result<String, String> {
     let src = std::path::Path::new(&path);
+    if src.is_dir() && texos_dir(src).join("texos.db").exists() {
+        return link_project(path, x, y, state);
+    }
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    import_file_into(p, path, label, x, y)
+}
+
+/// import_file の本体（v1.6: 「新規カードを登録」ビルトインがジョブ専用接続から呼ぶため
+/// State ロックと分離。意味論はコマンド版と同一 — プロジェクト内=実身／外部=窓仮身）。
+pub(crate) fn import_file_into(
+    p: &Project,
+    path: String,
+    label: String,
+    x: f64,
+    y: f64,
+) -> Result<String, String> {
+    let src = std::path::Path::new(&path);
     if src.is_dir() {
-        if texos_dir(src).join("texos.db").exists() {
-            return link_project(path, x, y, state);
-        }
-        let guard = state.current.lock().unwrap();
-        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
         let real_id = format!("folder:{}", cas::hash_bytes(path.as_bytes()));
         p.conn
             .execute(
@@ -56,9 +69,6 @@ pub(crate) fn import_file(
             .map_err(|e| e.to_string())?;
         return Ok(vid);
     }
-
-    let guard = state.current.lock().unwrap();
-    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
 
     let mime = mime_from_path(src);
     let orig_ext = src

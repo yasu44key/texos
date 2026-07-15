@@ -278,7 +278,8 @@ impl FilterSpec {
     pub fn is_self_contained(&self) -> bool {
         // v1.5.15 実機FB: speak など「呼ぶだけ」で完結する builtin も出力ゼロが正常
         // （終端の「入力がありません」案内の対象外にする）。
-        if self.builtin.as_deref() == Some("speak") {
+        // v1.6: import_new（新規カードを登録）はカードを自分で作る＝出力ペイロードなしが正常。
+        if matches!(self.builtin.as_deref(), Some("speak") | Some("import_new")) {
             return true;
         }
         matches!(self.node_kind(), NodeKind::Generator | NodeKind::External)
@@ -1366,6 +1367,10 @@ pub struct ExternalOutput {
     pub stderr: String,
     /// {out} を読み出せた場合のみ Some（プログラムが出力を書かなければ None）。
     pub output: Option<Vec<u8>>,
+    /// v1.6 {out*}: 複数出力モードの結果（ファイル名, バイト列）。**ファイル名の辞書順**
+    /// （＝順序規約: プログラムはゼロ詰め連番等で順序を表す。ChillChordMaker の
+    /// `prefix_小節_拍_コード名.wav` が模範）。CMD に {out*} が無ければ None。
+    pub multi: Option<Vec<(String, Vec<u8>)>>,
 }
 
 impl ExternalOutput {
@@ -1492,9 +1497,21 @@ pub fn run_external_full(
     // {out} → 出力ファイル（拡張子つき）/ {out_noext} → 拡張子を除いたパス
     // （whisper.cpp の `-of <ベース名>` のように、ツール側が拡張子を自分で付ける場合に使う。
     //  output_ext を txt にしておけば whisper が書く <base>.txt が {out} と一致する）。
-    // {out_noext} を先に置換する（{out} は "{out_noext}" の部分文字列にならないが順序を明示）。
+    // v1.6 {out*} → 出力フォルダ（複数ファイル書き出し。終了後に辞書順で全ファイルを収集）。
+    // 置換順序: {out*} → {out_noext} → {out}（"{out}" は "{out*}"/"{out_noext}" の
+    // 部分文字列にはならないが、順序を明示して将来の追加に備える）。
+    let multi_mode = cmdline.contains("{out*}");
+    let outs_dir = dir.join(format!("outs_{nanos}"));
+    if multi_mode {
+        if let Err(e) = std::fs::create_dir_all(&outs_dir) {
+            cleanup_inputs(&in_paths);
+            let _ = std::fs::remove_file(&err_path);
+            return Err(format!("出力フォルダの作成に失敗: {e}"));
+        }
+    }
     let out_noext = out_path.with_extension("");
-    let mut cmd = cmdline.replace("{out_noext}", &out_noext.to_string_lossy());
+    let mut cmd = cmdline.replace("{out*}", &outs_dir.to_string_lossy());
+    cmd = cmd.replace("{out_noext}", &out_noext.to_string_lossy());
     cmd = cmd.replace("{out}", &out_path.to_string_lossy());
     if cmd.contains("{in*}") {
         let joined = in_paths
@@ -1515,6 +1532,9 @@ pub fn run_external_full(
         if let Some(m) = re.find(&cmd) {
             cleanup_inputs(&in_paths);
             let _ = std::fs::remove_file(&err_path);
+            if multi_mode {
+                let _ = std::fs::remove_dir_all(&outs_dir);
+            }
             return Err(format!(
                 "{} に対応する入力がありません（接続されている入力: {}本）",
                 m.as_str(),
@@ -1604,7 +1624,16 @@ pub fn run_external_full(
                     ));
                 }
             }
-            if std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0) > MAX_OUTPUT_BYTES {
+            let mut out_total = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+            if multi_mode {
+                // {out*} フォルダの合計も上限の対象（ファイル数は少数想定・100ms間隔の走査は軽い）
+                if let Ok(rd) = std::fs::read_dir(&outs_dir) {
+                    for e in rd.flatten() {
+                        out_total += e.metadata().map(|m| m.len()).unwrap_or(0);
+                    }
+                }
+            }
+            if out_total > MAX_OUTPUT_BYTES {
                 kill_tree(&mut child);
                 break Err("出力が上限（512MB）を超えたため強制終了しました".into());
             }
@@ -1631,17 +1660,42 @@ pub fn run_external_full(
     };
     // 完走したプロセスは exit code・stderr・出力をそのまま持ち上げる（成否判定はしない）。
     // Err は「完走しなかった」場合のみ（起動失敗・タイムアウト・中断・出力上限・監視失敗）。
+    // v1.6 {out*}: フォルダ内の全ファイルを**ファイル名の辞書順**で収集（順序規約）。
+    let collect_multi = || -> Option<Vec<(String, Vec<u8>)>> {
+        if !multi_mode {
+            return None;
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(&outs_dir)
+            .ok()?
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        Some(
+            entries
+                .into_iter()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    std::fs::read(e.path()).ok().map(|b| (name, b))
+                })
+                .collect(),
+        )
+    };
     let outcome = match status {
         Err(e) => Err(e),
         Ok(s) => Ok(ExternalOutput {
             exit_code: s.code(),
             stderr: stderr_snip(),
             output: std::fs::read(&out_path).ok(),
+            multi: collect_multi(),
         }),
     };
     cleanup_inputs(&in_paths);
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
+    if multi_mode {
+        let _ = std::fs::remove_dir_all(&outs_dir);
+    }
     outcome
 }
 
@@ -2018,6 +2072,126 @@ mod tests {
         )
         .unwrap();
         assert!(String::from_utf8_lossy(&out).starts_with('a'));
+    }
+
+    /// v1.6 {out*}: 複数ファイル書き出しモード。フォルダに書かれた全ファイルが
+    /// **ファイル名の辞書順**で multi に収まり、単一出力の output とは独立であること。
+    #[cfg(windows)]
+    #[test]
+    fn out_star_collects_files_in_lexicographic_order() {
+        let o = run_external_full(
+            // 逆順に書いても収集は辞書順（02 → 10 → aa）になることを見る
+            "(echo B> \"{out*}\\10_b.txt\") & (echo C> \"{out*}\\aa_c.txt\") & (echo A> \"{out*}\\02_a.txt\")",
+            &[],
+            "txt",
+            Some(10),
+            &no_cancel(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(o.success());
+        let multi = o.multi.expect("{out*} モードなのに multi が None");
+        let names: Vec<&str> = multi.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["02_a.txt", "10_b.txt", "aa_c.txt"]);
+        assert!(multi[0].1.starts_with(b"A"));
+        assert!(multi[2].1.starts_with(b"C"));
+        // {out} は書いていないので単一出力側は None（独立性）
+        assert!(o.output.is_none());
+    }
+
+    /// v1.6 {out*}: 従来の単一出力 {out} では multi が立たないこと（回帰）。
+    #[cfg(windows)]
+    #[test]
+    fn single_out_does_not_populate_multi() {
+        let o = run_external_full(
+            "copy \"{in}\" \"{out}\"",
+            &one(b"hello"),
+            "txt",
+            Some(10),
+            &no_cancel(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(o.multi.is_none());
+        assert_eq!(o.output.as_deref(), Some(b"hello".as_slice()));
+    }
+
+    /// v1.6 {out*}: プログラムが1つも書かなければ multi は Some(空)（成功だが出力ゼロ）。
+    /// 「出力がありません」エラー化は flow_run 側のポリシー（into_bytes と同じ層）。
+    #[cfg(windows)]
+    #[test]
+    fn out_star_empty_folder_yields_empty_multi() {
+        let o = run_external_full(
+            "echo done> nul & echo x \"{out*}\" > nul",
+            &[],
+            "txt",
+            Some(10),
+            &no_cancel(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(o.success());
+        assert_eq!(o.multi.as_deref(), Some(&[][..]));
+    }
+
+    /// v1.6 パイロット（実機）: TexoS の Generator ノードが組む cmdline で
+    /// ChillChordMaker のヘッドレスアダプタ（cli_render.py）を駆動し、
+    /// `{out}` に書かれた WAV を読み戻せること。入力なし＝`{in}`なし＝既定パッチ。
+    /// これは「`{out}` 契約は既にある／サウンドエンジン単体でカード化できる」の実証。
+    /// python + I:\ChillChordMaker + numpy/scipy が要るので既定では無視。
+    /// 実行: `cargo test --lib -- --ignored chillchord`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "実機: python + I:\\ChillChordMaker + numpy/scipy が必要"]
+    fn chillchord_generator_produces_wav() {
+        let cmd = "python \"I:\\ChillChordMaker\\cli_render.py\" --out \"{out}\"";
+        let out = run_external(cmd, &[], "wav", Some(60), &no_cancel())
+            .expect("cli_render.py が WAV を書けなかった");
+        // WAV マジック: "RIFF" .... "WAVE"（44バイトの標準ヘッダ以上）
+        assert!(out.len() > 44, "WAVヘッダ長に満たない: {}バイト", out.len());
+        assert_eq!(&out[0..4], b"RIFF", "RIFF マジックが無い");
+        assert_eq!(&out[8..12], b"WAVE", "WAVE マジックが無い");
+    }
+
+    /// v1.6 ステップ2（実機）: 進行モード＝カードの cmdline
+    /// `python cli_render.py --in {in} --outdir {out*}` で複数 WAV が
+    /// ファイル名の辞書順（＝進行順）で収集されること。Two-Five-One は
+    /// Dm7 → G7 → CM7 の3ファイルになるはず（コード名までピン留め）。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "実機: python + I:\\ChillChordMaker + numpy/scipy が必要"]
+    fn chillchord_progression_produces_multiple_wavs() {
+        let json = br#"{"progression_name":"Two-Five-One","key_note":"C","key_oct":3,
+            "bpm":120,"prefix":"t","params":{"note_duration":1.0}}"#;
+        let cmd =
+            "python \"I:\\ChillChordMaker\\cli_render.py\" --in \"{in}\" --outdir \"{out*}\"";
+        let o = run_external_full(
+            cmd,
+            &[(json.as_slice(), "json")],
+            "wav",
+            Some(120),
+            &no_cancel(),
+            None,
+            None,
+        )
+        .expect("cli_render.py 進行モードが完走しなかった");
+        assert!(o.success(), "exit {:?} stderr: {}", o.exit_code, o.stderr);
+        let multi = o.multi.expect("{out*} なのに multi が None");
+        let names: Vec<&str> = multi.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["t_01_1_Dm7.wav", "t_01_3_G7.wav", "t_02_1_CM7.wav"],
+            "Two-Five-One (C) の3コードが進行順で並ぶはず"
+        );
+        for (n, b) in &multi {
+            assert!(
+                b.len() > 44 && &b[0..4] == b"RIFF" && &b[8..12] == b"WAVE",
+                "{n} が WAV でない"
+            );
+        }
     }
 
     /// フィルタ型プログラムを引数型で誤指定（入力リダイレクトなし）してもストール
