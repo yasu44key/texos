@@ -256,6 +256,30 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     ],
     note: "ページの本文を抽出して Markdown 実身にします（タイトル=カード名・出典URLはメタに記録）。HTML 以外の直リンク（画像・CSV・JSON など）はそのままの形式で実身化します。URLカードを接続して実行すると取得系譜が残り、右クリック「更新を確認」が使えるようになります。取得は実行したときだけ（タイムアウト30秒・上限20MB）。",
   },
+  web_feed: {
+    // v1.7 P3（情報収集経路計画 §3）: RSS/Atom → 記事カード群（差分 pull・§7-2 の2段構え）。
+    title: "フィード取得（web_feed）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "url",
+        label: "フィードURL",
+        type: "text",
+        optional: true,
+        placeholder: "https://…/feed.xml（テキスト/URLカードを接続するときは空欄）",
+        hint: "RSS/Atom フィードのURL。テキストカード（1行目=URL）またはURLカードを入力に接続したときは、そちらが優先されます。",
+      },
+      {
+        key: "limit",
+        label: "最大件数",
+        type: "number",
+        default: 10,
+        min: 0,
+        hint: "新しい方からこの件数だけ取り込みます。0 = 全件。",
+      },
+    ],
+    note: "フィードの記事ごとに「タイトル＋概要＋記事リンク」の Markdown 実身を作ります（1記事=1カード・記事URLはメタに記録）。再実行すると取り込み済みの記事は増やさず、新着だけをカード化します（読んで消した記事も再取り込みしません）。本文まで読みたい記事は、そのURLを web_fetch で取得してください。",
+  },
   text_convert: {
     title: "文字コード変換（→ UTF-8）",
     fixed: { accept_mime: "text/*" },

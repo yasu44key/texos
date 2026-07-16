@@ -1,8 +1,29 @@
 # TexoS 開発引き継ぎノート
 
-## 最終更新: 2026-07-17 / 到達点: **v1.7 P2 実装済み＝URLカードの仮身昇格（未リリース・実機確認待ち）**
+## 最終更新: 2026-07-17 / 到達点: **v1.7 P3 実装済み＝web_feed（未リリース・実機確認待ち）**
 
 > **★ いまここ（2026-07-17・ブランチ feat/v1.7-web-p2）**:
+> v1.7 P3 = **web_feed（RSS/Atom→記事カード群）を実装**（回帰103件 green・tsc green・
+> 実機 live テスト=Rust公式ブログで確認）。**実機確認 → 次 = P4 web_capture**。
+> - **`web_feed` ビルトイン（feed-rs・MIT）**: フィードURL→記事ごとに「タイトル＋概要＋
+>   記事リンク」の md 実身（§7-2 の2段構え・記事URLはメタ source_url）。最大件数=
+>   新しい方から既定10・0=全件（FilterSpec.limit 新設）。入力両対応＋§4安全セットは
+>   web_fetch と同型（web.rs run_web_feed / feed_to_outs）。
+> - **ビルトイン複数出力の解禁**: run_builtin_multi は**不要だった** — NodeRun.outputs
+>   （Vec）が v1.6 {out*} で受け皿済み・execute_node の分岐1つで N 出力が通った。
+>   text_split 解禁は据え置き継続。
+> - **既読管理（差分 pull）**: guid をメタに記録→マテリアライズ時に flow_run
+>   feed_seen_guids（このフィルタの出力カードの web_meta guid 台帳・**削除済みも既読**）
+>   と照合→新着だけカード化（「既読・実身は増やしません」）。全読み直し=フィルタ作り直し。
+> - 3面整合（preflight=text/markdown・model.ts・BUILTIN_SCHEMAS〔url+limit〕）＋
+>   メニュー「Web ...」に「フィード取得」＋App.tsx 作成プロンプト（web_fetch と同型）。
+> - チップス Tip 11・更新履歴「v1.7 P3」・計画書 §3 P3 に実装記録を追記済み。
+> - **残: 実機確認**（フィード取得→N枚→再実行で既読スキップ→新着だけ増える→
+>   記事URLを web_fetch に渡して本文取得、の一巡。タイマー接続の定期チェックも試すと吉）。
+> - 次号 P4 = web_capture（v1.7.3）: Edge headless スクショ（L2）。**実機検証を号の最初に**
+>   （`msedge --headless --screenshot` の枯れ具合確認）。P4 完了後に一括リリース。
+
+> **（前回）v1.7 P2 実装済み（2026-07-17）**:
 > v1.7 P2 = **URLカードの仮身昇格（更新マーク・取得系譜）を実装**（回帰98件 green・
 > 実機 304 テスト ok〔ignored 2件も手動実行で確認〕）。**実機確認 → 次 = P3 web_feed**。
 > - **実行契約**: kind='url' 入力は url_ref を text/plain で下流へ（flow_run.rs 入力分岐・

@@ -142,6 +142,23 @@ pub(crate) fn execute_node(
                     exit_code: None,
                     stderr: String::new(),
                 })
+            }
+            // v1.7 P3: web_feed も同系のネットワーク別経路。1入力→N出力＝ビルトイン
+            // 複数出力の解禁実例（標準フィルタ充実検討 §10 で据え置いた件の実例がこれ。
+            // NodeRun.outputs が受け皿なので実行系の拡張はこの分岐だけで済む）。
+            else if b == "web_feed" {
+                let rs = web::run_web_feed(spec, inputs.first().map(|i| i.0))?;
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("中断されました".into());
+                }
+                Ok(NodeRun {
+                    outputs: rs
+                        .into_iter()
+                        .map(|r| (r.bytes, r.ext, r.mime, r.stem, Some(r.meta)))
+                        .collect(),
+                    exit_code: None,
+                    stderr: String::new(),
+                })
             } else {
                 let (bytes, ext, mime) = flow::run_builtin(spec, b, inputs[0].0)?;
                 Ok(plain(bytes, ext, mime))
@@ -367,6 +384,32 @@ fn link_fetch_source(p: &Project, fid: &str, meta: &str, target: &str) {
     for url_card in url_cards {
         crate::web::record_fetch_lineage(&p.conn, &url_card, target);
     }
+}
+
+/// v1.7 P3: このフィルタ（fid）の出力カードが持つ web_meta guid の集合（既読台帳）。
+/// web_feed の差分 pull がここと照合する — 台帳は別テーブルでなく出力カードそのもの。
+/// **削除済みカードの guid も既読に数える**（deleted_at を見ない）: 読んで消した記事が
+/// 再実行のたびに蘇らないため。全部読み直したいときはフィルタカードを作り直す（台帳が空になる）。
+fn feed_seen_guids(conn: &Connection, fid: &str) -> std::collections::HashSet<String> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT v.web_meta FROM relations rel
+         JOIN virtual_bodies v ON v.id = rel.to_id
+         WHERE rel.from_id = ?1 AND rel.kind = 'flow' AND v.web_meta IS NOT NULL",
+    ) else {
+        return Default::default();
+    };
+    stmt.query_map(rusqlite::params![fid], |r| r.get::<_, String>(0))
+        .map(|rows| {
+            rows.flatten()
+                .filter_map(|m| {
+                    serde_json::from_str::<serde_json::Value>(&m)
+                        .ok()
+                        .and_then(|v| v.get("guid").and_then(|g| g.as_str()).map(str::to_string))
+                })
+                .filter(|g| !g.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// job:progress の note 用にカード名を引く（best-effort・パネルの「いま何が走っているか」）。
@@ -975,9 +1018,12 @@ pub(crate) fn eval_filter(
             }
         }
     } else {
-        // v1.7 P1 web_fetch: 入力接続が無くてもパラメータ欄の URL だけで実行できる
-        // （t2i のパネル単独生成と同型）。入力があるときは従来のファンアウト＝1入力1URL。
-        if collected.is_empty() && spec.builtin.as_deref() == Some("web_fetch") {
+        // v1.7 P1 web_fetch / P3 web_feed: 入力接続が無くてもパラメータ欄の URL だけで
+        // 実行できる（t2i のパネル単独生成と同型）。入力があるときは従来のファンアウト
+        // ＝1入力1URL。
+        if collected.is_empty()
+            && matches!(spec.builtin.as_deref(), Some("web_fetch") | Some("web_feed"))
+        {
             let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
                 emit_job_progress(app, job, Some(&node_note(p, fid)), None);
                 execute_node(root, &spec, kind, &[], job)
@@ -1143,6 +1189,42 @@ mod ws_p1_tests {
             .unwrap();
         assert!(run_import_new(&p, "f1", &bad, &mut empty_report()).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// v1.7 P3: 既読台帳（feed_seen_guids）— このフィルタの出力カードの guid を集める。
+    /// 削除済みカードの guid も既読に数える（読んで消した記事が再実行で蘇らない）。
+    /// 他のフィルタの出力・guid 無しメタ（web_fetch）は混ざらない。
+    #[test]
+    fn feed_seen_guids_ledger() {
+        let dir = std::env::temp_dir().join(format!("texos_feed_guids_{}", db::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::open(&dir.join("texos.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO real_bodies (id, mime_type, size, created_at)
+               VALUES ('h1', 'text/markdown', 1, 1);
+             INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, web_meta, kind)
+               VALUES
+               ('e1', 'h1', 'A.md', 0, 0, 1, '{\"guid\":\"g-a\",\"source_url\":\"https://x/a\"}', 'file'),
+               ('e2', 'h1', 'B.md', 0, 0, 2, '{\"guid\":\"g-b\"}', 'file'),
+               ('e3', 'h1', 'C.md', 0, 0, 3, '{\"source_url\":\"https://x/c\"}', 'file'),
+               ('e4', 'h1', 'D.md', 0, 0, 4, '{\"guid\":\"g-other\"}', 'file');
+             -- e2 は削除済みカード（既読のまま数える）
+             UPDATE virtual_bodies SET deleted_at = 9 WHERE id = 'e2';
+             INSERT INTO relations (from_id, to_id, kind, created_at) VALUES
+               ('feed1', 'e1', 'flow', 1),
+               ('feed1', 'e2', 'flow', 2),
+               ('feed1', 'e3', 'flow', 3),
+               ('feed2', 'e4', 'flow', 4);",
+        )
+        .unwrap();
+        let seen = feed_seen_guids(&conn, "feed1");
+        assert!(seen.contains("g-a"));
+        assert!(seen.contains("g-b"), "削除済みカードの guid も既読");
+        assert!(!seen.contains("g-other"), "他フィルタの出力は混ざらない");
+        assert_eq!(seen.len(), 2, "guid 無しメタは数えない: {seen:?}");
+        assert!(feed_seen_guids(&conn, "no_such").is_empty());
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// always（既定）: 上流エラーは report へ伝搬し、payload はそのまま通る（後方互換）。
@@ -1586,7 +1668,27 @@ fn run_flow_inner(
     {
     let p = &jp;
     let mut out_i = 0usize;
+    // v1.7 P3 既読管理（差分 pull・計画 §3 P3）: guid 付きメタ（web_feed のエントリ）は、
+    // このフィルタが過去に出力した guid と照合し、取り込み済みならスキップ＝再実行は
+    // 新着だけをカード化する。台帳は最初に必要になったとき一度だけ読む。
+    let mut seen_guids: Option<std::collections::HashSet<String>> = None;
     for pl in &payloads {
+        // v1.7 P3: guid の既読チェック（内容ハッシュより先。概要の微修正で guid が同じ
+        // まま内容が変わっても「新着」扱いにはしない — 新着のみ出力の原則）。
+        if let Some(m) = &pl.meta {
+            let guid = serde_json::from_str::<serde_json::Value>(m)
+                .ok()
+                .and_then(|v| v.get("guid").and_then(|g| g.as_str()).map(str::to_string))
+                .filter(|g| !g.is_empty());
+            if let Some(g) = guid {
+                let seen = seen_guids.get_or_insert_with(|| feed_seen_guids(&p.conn, &id));
+                // insert が false = 既読（同一実行内の重複 guid もここで畳まれる）。
+                if !seen.insert(g) {
+                    report.outputs.push(format!("{}（既読・実身は増やしません）", pl.stem));
+                    continue;
+                }
+            }
+        }
         // v1.7 P2 実機FB（2026-07-17）: 取得メタ付き出力（web_fetch）は、内容が前回と
         // 同一なら実身を増やさない（計画 §1-3「内容が同一なら CAS により同一ハッシュ＝
         // 実身は増えない」の着地）。このフィルタが過去に作った生きた出力カードに同じ

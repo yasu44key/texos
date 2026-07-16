@@ -1251,6 +1251,12 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
             hint: "URLの本文を抽出して Markdown 実身にします（タイトル=カード名）。URLはパラメータ欄に直書きするか、URLを書いたテキストカードを接続します。画像・CSV などの直リンクはそのままの形式で取り込みます。",
             onClick: () => a.addFilter("web_fetch"),
           },
+          // v1.7 P3: RSS/Atom → 記事カード群（1記事=1カード・再実行は新着のみ）。
+          {
+            label: "フィード取得（RSS/Atom→記事カード）...",
+            hint: "フィードの記事ごとに「タイトル＋概要＋記事リンク」の Markdown 実身を作ります（1記事=1カード）。再実行すると新着だけを取り込みます（差分取得）。本文が欲しい記事は web_fetch で。",
+            onClick: () => a.addFilter("web_feed"),
+          },
         ]),
     },
     // v1.5.15 L2 OSアダプタ・ビルトイン（標準フィルタ充実検討 §4: OS差はbuiltinの内側に閉じ込める）。

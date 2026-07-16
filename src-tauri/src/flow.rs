@@ -186,6 +186,10 @@ pub struct FilterSpec {
     /// 出さない（「JSONで編集」で設定する機微キー）。
     #[serde(default)]
     pub allow_private: bool,
+    // --- v1.7 P3: web_feed（RSS/Atom → 記事カード群）---
+    /// web_feed: 取り込む最大件数（新しい方から。未指定は10・0 = 全件）。
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// v1.5.3 WS-P1（オペ層 §5.4.2）: フロー矢印の制御属性（relations.attrs の JSON）。

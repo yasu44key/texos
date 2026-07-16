@@ -50,6 +50,8 @@ dom_smoothie = "0.18"
 htmd = "0.5"
 # v1.7 P1: URL のホスト種別判定（url::Host の match 用。reqwest が既に同梱＝実質依存増なし）。
 url = "2"
+# v1.7 P3 web_feed: RSS/Atom パース（MIT）。ライセンス確認済み 2026-07-17（計画 §6-6）。
+feed-rs = "2"
 
 [dev-dependencies]
 # v1.4.0 AIフィルタの回帰テスト用。本番(Tauri command async)と同じ tokio 文脈を

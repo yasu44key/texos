@@ -213,6 +213,8 @@ export function filterOutputMime(filterRef: string | null): string | null {
     // v1.7 P1 web_fetch: 通常は text/markdown だが、HTML 以外の直リンクは raw のまま
     // 実身化する（画像/csv/json…）ため静的には不明＝null（チェックしない）。
     if (s.builtin === "web_fetch") return null;
+    // v1.7 P3 web_feed: 常に記事カード（Markdown）を吐く
+    if (s.builtin === "web_feed") return "text/markdown";
     if (s.builtin === "t2i") return "image/png"; // v1.5 Text-To-Image は常にPNGを吐く
     if (s.builtin === "md_codeblock") return "text/plain"; // v1.4.0 コード抽出（→gcc等）
     if (s.builtin === "img_resize") return "image/png";

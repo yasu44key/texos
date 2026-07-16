@@ -829,6 +829,152 @@ pub(crate) fn web_check_update_all(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// v1.7 P3: web_feed — RSS/Atom → 記事カード群（計画 §3 P3・§7-2 決着）。
+// 「概要＋実アドレスの2段構え」: カードは「タイトル＋概要＋記事リンク」の md で、
+// 本文が要るときは記事 URL（メタに保持）を web_fetch で叩く。
+// 1入力→N出力＝ビルトイン複数出力の解禁実例（NodeRun.outputs が受け皿）。
+// 既読管理は meta の guid をマテリアライズ側（flow_run）が照合する＝差分 pull。
+// ---------------------------------------------------------------------------
+
+/// web_feed の既定取り込み件数（新しい方から。spec.limit で変更・0 = 全件）。
+pub const WEB_FEED_DEFAULT_LIMIT: u32 = 10;
+
+/// builtin:"web_feed" 本体: フィード URL → エントリごとの Markdown 実身（N 出力）。
+/// 入力両対応は web_fetch と同型（テキスト/URL カード接続が優先・無ければ spec.url）。
+/// reqwest::blocking を素の OS スレッドに包むのも同じ流儀。
+pub fn run_web_feed(
+    spec: &FilterSpec,
+    input: Option<&[u8]>,
+) -> Result<Vec<WebFetchOut>, String> {
+    std::thread::scope(|s| {
+        s.spawn(|| run_web_feed_blocking(spec, input))
+            .join()
+            .map_err(|_| "Web取得スレッドが異常終了しました".to_string())?
+    })
+}
+
+fn run_web_feed_blocking(
+    spec: &FilterSpec,
+    input: Option<&[u8]>,
+) -> Result<Vec<WebFetchOut>, String> {
+    let url = match input {
+        Some(bytes) => url_from_text(bytes)?,
+        None => spec_url(spec)
+            .ok_or("フィードURLがありません。パラメータ欄に URL を入力するか、URL を書いたテキストカードを接続してください")?
+            .to_string(),
+    };
+    let resp = fetch_url(&url, spec.allow_private)?;
+    feed_to_outs(&resp.final_url, &resp.bytes, spec.limit)
+}
+
+/// フィードのバイト列 → エントリごとの WebFetchOut（純関数・テスト対象）。
+/// limit: None = 既定 WEB_FEED_DEFAULT_LIMIT・Some(0) = 全件。
+fn feed_to_outs(
+    feed_url: &str,
+    bytes: &[u8],
+    limit: Option<u32>,
+) -> Result<Vec<WebFetchOut>, String> {
+    let feed = feed_rs::parser::parse(bytes).map_err(|e| {
+        format!("RSS/Atom フィードとして解釈できません: {e}（URL がフィード〔feed.xml / rss 等〕を指しているか確認してください）")
+    })?;
+    let feed_title = feed
+        .title
+        .as_ref()
+        .map(|t| t.content.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let take = match limit.unwrap_or(WEB_FEED_DEFAULT_LIMIT) {
+        0 => usize::MAX,
+        n => n as usize,
+    };
+    let now = crate::db::now_ms();
+    // 概要（RSS description / Atom summary）は HTML が普通に混ざる → htmd で md 化。
+    let converter = htmd::HtmlToMarkdown::builder()
+        .skip_tags(vec!["script", "style", "noscript", "iframe"])
+        .build();
+    let mut outs = Vec::new();
+    for (i, e) in feed.entries.iter().take(take).enumerate() {
+        // 記事 URL: rel=alternate 優先 → 先頭リンク。無いエントリもあり得る（meta は null）。
+        let link = e
+            .links
+            .iter()
+            .find(|l| l.rel.as_deref() == Some("alternate"))
+            .or_else(|| e.links.first())
+            .map(|l| l.href.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let title = e
+            .title
+            .as_ref()
+            .map(|t| t.content.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // 概要: summary → 無ければ content 本文（全文配信フィード）。HTML っぽければ md 化。
+        let summary_raw = e
+            .summary
+            .as_ref()
+            .map(|t| t.content.clone())
+            .or_else(|| e.content.as_ref().and_then(|c| c.body.clone()))
+            .unwrap_or_default();
+        let summary = if summary_raw.contains('<') {
+            converter.convert(&summary_raw).unwrap_or(summary_raw)
+        } else {
+            summary_raw
+        };
+        let summary = summary.trim();
+        let published = e.published.or(e.updated);
+        // 既読管理の鍵。feed-rs の Entry.id は必須（無い RSS でも link 等から補完される）。
+        let guid = {
+            let id = e.id.trim();
+            if id.is_empty() { link.clone().unwrap_or_default() } else { id.to_string() }
+        };
+
+        // --- md 本文（単体で読めるカードにする）---
+        let mut body = format!("# {}\n", title.as_deref().unwrap_or("(無題)"));
+        let mut byline = Vec::new();
+        if let Some(d) = published {
+            byline.push(d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string());
+        }
+        if let Some(ft) = &feed_title {
+            byline.push(ft.clone());
+        }
+        if !byline.is_empty() {
+            body.push_str(&format!("\n{}\n", byline.join(" — ")));
+        }
+        if !summary.is_empty() {
+            body.push_str(&format!("\n{summary}\n"));
+        }
+        if let Some(l) = &link {
+            body.push_str(&format!("\n記事: {l}\n"));
+        }
+
+        let meta = serde_json::json!({
+            "source_url": link,       // 記事 URL（web_fetch に渡す本文の在処）
+            "feed_url": feed_url,     // どのフィード経由か（リダイレクト解決後）
+            "guid": guid,             // 既読管理の鍵（flow_run が照合・差分 pull）
+            "published": published.map(|d| d.to_rfc3339()),
+            "fetched_at": now,
+        })
+        .to_string();
+        let stem = title
+            .as_deref()
+            .and_then(sanitize_stem)
+            .or_else(|| {
+                feed_title.as_deref().and_then(|t| sanitize_stem(&format!("{t}_{}", i + 1)))
+            })
+            .unwrap_or_else(|| format!("feed_{}", i + 1));
+        outs.push(WebFetchOut {
+            bytes: body.into_bytes(),
+            ext: "md".into(),
+            mime: "text/markdown".into(),
+            stem: Some(stem),
+            meta,
+        });
+    }
+    if outs.is_empty() {
+        return Err("フィードにエントリがありません".into());
+    }
+    Ok(outs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,6 +1198,119 @@ mod tests {
         assert_eq!(live2, 1);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- v1.7 P3: web_feed ---
+
+    const RSS_SAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <title>テストブログ</title>
+  <link>https://ex.jp/blog/</link>
+  <item>
+    <title>新しい記事: A/B テスト</title>
+    <link>https://ex.jp/blog/a</link>
+    <guid>tag:ex.jp,2026:a</guid>
+    <pubDate>Thu, 16 Jul 2026 10:00:00 GMT</pubDate>
+    <description>&lt;p&gt;概要の&lt;b&gt;本文&lt;/b&gt;です。&lt;/p&gt;</description>
+  </item>
+  <item>
+    <title>二本目</title>
+    <link>https://ex.jp/blog/b</link>
+    <description>プレーンな概要</description>
+  </item>
+</channel></rss>"#;
+
+    const ATOM_SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Atomフィード</title>
+  <id>urn:uuid:feed</id>
+  <updated>2026-07-16T10:00:00Z</updated>
+  <entry>
+    <title>Atom記事</title>
+    <id>urn:uuid:entry-1</id>
+    <link rel="alternate" href="https://ex.jp/atom/1"/>
+    <updated>2026-07-16T10:00:00Z</updated>
+    <summary>要約テキスト</summary>
+  </entry>
+</feed>"#;
+
+    /// RSS: タイトル＝語幹・概要の md 化・記事リンクと guid がメタに載る・件数制限。
+    #[test]
+    fn feed_rss_entries() {
+        let outs = feed_to_outs("https://ex.jp/feed.xml", RSS_SAMPLE.as_bytes(), Some(0)).unwrap();
+        assert_eq!(outs.len(), 2);
+        let o = &outs[0];
+        assert_eq!(o.ext, "md");
+        assert_eq!(o.mime, "text/markdown");
+        // 語幹はタイトル（ファイル名に使えない文字は整形）
+        assert_eq!(o.stem.as_deref(), Some("新しい記事_ A_B テスト"));
+        let body = String::from_utf8(o.bytes.clone()).unwrap();
+        assert!(body.starts_with("# 新しい記事: A/B テスト"), "body: {body}");
+        assert!(body.contains("**本文**"), "HTML 概要は md 化: {body}");
+        assert!(body.contains("テストブログ"), "出典（フィード名）: {body}");
+        assert!(body.contains("記事: https://ex.jp/blog/a"), "実アドレス: {body}");
+        let meta: serde_json::Value = serde_json::from_str(&o.meta).unwrap();
+        assert_eq!(meta["source_url"], "https://ex.jp/blog/a");
+        assert_eq!(meta["feed_url"], "https://ex.jp/feed.xml");
+        assert_eq!(meta["guid"], "tag:ex.jp,2026:a");
+        assert!(meta["published"].as_str().unwrap().starts_with("2026-07-16"));
+        // 2本目: guid 無し → link で補完される（feed-rs の id 生成込みで空にはならない）
+        let m2: serde_json::Value = serde_json::from_str(&outs[1].meta).unwrap();
+        assert!(!m2["guid"].as_str().unwrap().is_empty());
+        // 件数制限: 新しい方（先頭）から
+        let one = feed_to_outs("https://ex.jp/feed.xml", RSS_SAMPLE.as_bytes(), Some(1)).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].stem, outs[0].stem);
+    }
+
+    /// Atom: rel=alternate リンク・summary・id。
+    #[test]
+    fn feed_atom_entries() {
+        let outs = feed_to_outs("https://ex.jp/atom.xml", ATOM_SAMPLE.as_bytes(), None).unwrap();
+        assert_eq!(outs.len(), 1);
+        let meta: serde_json::Value = serde_json::from_str(&outs[0].meta).unwrap();
+        assert_eq!(meta["source_url"], "https://ex.jp/atom/1");
+        assert_eq!(meta["guid"], "urn:uuid:entry-1");
+        let body = String::from_utf8(outs[0].bytes.clone()).unwrap();
+        assert!(body.contains("要約テキスト"), "body: {body}");
+    }
+
+    /// フィードでないもの・空フィードは明確なエラー。
+    #[test]
+    fn feed_errors_are_clear() {
+        let e = feed_to_outs("https://ex.jp/", b"<html><body>not a feed</body></html>", None)
+            .unwrap_err();
+        assert!(e.contains("フィードとして解釈できません"), "{e}");
+        let empty = r#"<?xml version="1.0"?><rss version="2.0"><channel>
+            <title>空</title></channel></rss>"#;
+        let e2 = feed_to_outs("https://ex.jp/", empty.as_bytes(), None).unwrap_err();
+        assert!(e2.contains("エントリがありません"), "{e2}");
+    }
+
+    /// run_web_feed: URL 無しの案内エラー・プライベート宛拒否（ネットに出ない失敗経路）。
+    #[test]
+    fn feed_missing_url_and_private() {
+        let s = spec(r#"{"builtin":"web_feed"}"#);
+        let e = run_web_feed(&s, None).unwrap_err();
+        assert!(e.contains("フィードURLがありません"), "{e}");
+        let s = spec(r#"{"builtin":"web_feed","url":"http://127.0.0.1:8080/feed"}"#);
+        let e = run_web_feed(&s, None).unwrap_err();
+        assert!(e.contains("プライベートアドレス"), "{e}");
+    }
+
+    /// 実機: ネットワークに出る統合テスト（実在フィード）。
+    /// 実行: `cargo test --lib -- --ignored web_live`
+    #[test]
+    #[ignore = "実機: ネットワーク接続が必要"]
+    fn web_live_feed_rust_blog() {
+        let s = spec(r#"{"builtin":"web_feed","url":"https://blog.rust-lang.org/feed.xml","limit":3}"#);
+        let outs = run_web_feed(&s, None).unwrap();
+        assert!(!outs.is_empty() && outs.len() <= 3, "len: {}", outs.len());
+        for o in &outs {
+            assert_eq!(o.mime, "text/markdown");
+            let meta: serde_json::Value = serde_json::from_str(&o.meta).unwrap();
+            assert!(!meta["guid"].as_str().unwrap_or("").is_empty());
+        }
     }
 
     /// 実機: 条件付き GET（ETag/Last-Modified → 304 は Ok(None)）。
