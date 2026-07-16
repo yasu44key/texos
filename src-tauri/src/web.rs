@@ -517,6 +517,8 @@ fn write_check_mark(conn: &rusqlite::Connection, id: &str, updated: bool) {
 
 /// 最新の取得系譜（fetched エッジの先）の比較材料。
 struct Baseline {
+    /// 取得実身カードの id（変化なしのとき web_meta の ETag を最新化する先）。
+    vid: String,
     /// 取得実身の CAS ハッシュ（= real_id。同じ変換を通した結果と比べる）。
     real_id: String,
     cond: FetchCond,
@@ -537,24 +539,28 @@ fn url_card_base(
         .map_err(|e| e.to_string())?
         .flatten();
     let url = url.ok_or("URLカードではありません")?;
-    let row: Option<(String, Option<String>)> = conn
+    let row: Option<(String, String, Option<String>)> = conn
         .query_row(
-            "SELECT v.real_id, v.web_meta FROM relations rel
+            "SELECT v.id, v.real_id, v.web_meta FROM relations rel
              JOIN virtual_bodies v ON v.id = rel.to_id AND v.deleted_at IS NULL
              WHERE rel.from_id = ?1 AND rel.kind = 'fetched' AND rel.deleted_at IS NULL
              ORDER BY rel.created_at DESC LIMIT 1",
             rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    let baseline = row.map(|(real_id, meta)| {
+    let baseline = row.map(|(vid, real_id, meta)| {
         let v: serde_json::Value = meta
             .as_deref()
             .and_then(|m| serde_json::from_str(m).ok())
             .unwrap_or(serde_json::Value::Null);
         let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-        Baseline { real_id, cond: FetchCond { etag: s("etag"), last_modified: s("last_modified") } }
+        Baseline {
+            vid,
+            real_id,
+            cond: FetchCond { etag: s("etag"), last_modified: s("last_modified") },
+        }
     });
     Ok((url, baseline))
 }
@@ -613,15 +619,28 @@ pub(crate) fn web_check_update(
     })
 }
 
-/// URLカード右クリック「再取得」。取得→新しい実身カードを作り系譜を更新する
-/// （旧実身は残る＝イミュータブル・履歴が自然に溜まる）。未取得なら初回取得になる。
-/// 戻り値は新カードの id。
+/// 「再取得」の結果（フロントの結果表示用）。
+#[derive(serde::Serialize)]
+pub struct WebRefetchOut {
+    /// 新しく作った実身カードの id。**変化なしのときは None＝実身は作らない**
+    /// （§1-3: 内容が同一なら実身は増えない。実機FB 2026-07-17）。
+    pub created: Option<String>,
+    pub message: String,
+}
+
+/// URLカード右クリック「再取得」。取得→**内容が変わっていれば**新しい実身カードを作り
+/// 系譜を更新する（旧実身は残る＝イミュータブル・履歴が自然に溜まる）。
+/// 変化がなければ実身は作らず「変化なし」を返す（304 または変換後ハッシュ一致）。
+/// 未取得なら初回取得になる。
 #[tauri::command(async)]
-pub(crate) fn web_refetch(id: String, state: tauri::State<AppState>) -> Result<String, String> {
-    let (url, x, y) = {
+pub(crate) fn web_refetch(
+    id: String,
+    state: tauri::State<AppState>,
+) -> Result<WebRefetchOut, String> {
+    let (url, x, y, baseline) = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-        let (url, _) = url_card_base(&p.conn, &id)?;
+        let (url, baseline) = url_card_base(&p.conn, &id)?;
         let (x, y): (f64, f64) = p
             .conn
             .query_row(
@@ -630,17 +649,46 @@ pub(crate) fn web_refetch(id: String, state: tauri::State<AppState>) -> Result<S
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(|e| e.to_string())?;
-        (url, x, y)
+        (url, x, y, baseline)
     };
     // ネットワークはロック外で（素の OS スレッド・run_web_fetch と同じ流儀）。
-    let out = std::thread::scope(|s| {
-        s.spawn(|| fetch_url(&url, false).map(|resp| response_to_out(&url, resp)))
+    // ベースラインがあれば条件付きGET＝変わっていなければ 304 で本文転送すら省ける。
+    let cond = baseline.as_ref().map(|b| &b.cond);
+    let resp = std::thread::scope(|s| {
+        s.spawn(|| fetch_url_cond(&url, false, cond))
             .join()
             .map_err(|_| "Web取得スレッドが異常終了しました".to_string())?
     })?;
+    let Some(resp) = resp else {
+        // 304 Not Modified: 取得済みの実身が最新のまま。
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        write_check_mark(&p.conn, &id, false);
+        return Ok(WebRefetchOut {
+            created: None,
+            message: "変化はありません（サーバ確認 304・実身は作りませんでした）".into(),
+        });
+    };
+    let out = response_to_out(&url, resp);
 
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // 変化なし判定（本命の比較・§7-3）: サーバが 304 を返さなくても、同じ変換を通した
+    // 結果がベースラインと同一ハッシュなら実身は作らない。ETag/取得日時だけ最新化して
+    // 次回の条件付きGET が効くようにする。
+    if let Some(b) = &baseline {
+        if crate::cas::hash_bytes(&out.bytes) == b.real_id {
+            let _ = p.conn.execute(
+                "UPDATE virtual_bodies SET web_meta = ?1 WHERE id = ?2",
+                rusqlite::params![out.meta, b.vid],
+            );
+            write_check_mark(&p.conn, &id, false);
+            return Ok(WebRefetchOut {
+                created: None,
+                message: "変化はありません（内容が同一・実身は作りませんでした）".into(),
+            });
+        }
+    }
     // 実ファイル＋CAS＋カード（flow 終端の実身化と同じ形＝プロジェクト直下のコミット済み実身）。
     let stem = out.stem.clone().or_else(|| stem_from_url(&url)).unwrap_or_else(|| "web".into());
     let dest = crate::objects::unique_file_path(&p.root, &format!("{stem}.{}", out.ext));
@@ -671,7 +719,10 @@ pub(crate) fn web_refetch(id: String, state: tauri::State<AppState>) -> Result<S
         )
         .map_err(|e| e.to_string())?;
     record_fetch_lineage(&p.conn, &id, &new_vid);
-    Ok(new_vid)
+    Ok(WebRefetchOut {
+        created: Some(new_vid),
+        message: format!("新しい実身「{label}」を作りました（前の実身は残っています）"),
+    })
 }
 
 /// 取得系譜を「最新のみ」に張り替える（§7-3: 最新系譜のみ表示・過去は検索で辿る）:

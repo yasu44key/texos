@@ -2809,12 +2809,23 @@ function App() {
     [refresh]
   );
 
-  // 「再取得」= 取得→新しい実身カード＋取得系譜の更新（前の実身は残る）。未取得なら初回取得。
+  // 「再取得」= 取得→内容が変わっていれば新しい実身カード＋取得系譜の更新（前の実身は
+  // 残る）。変化なしなら実身は作らない（304/同一ハッシュ・実機FB 2026-07-17）。
+  // 未取得なら初回取得。
   const handleRefetchUrl = useCallback(
     async (id: string) => {
       try {
-        await invoke<string>("web_refetch", { id });
+        const r = await invoke<{ created: string | null; message: string }>("web_refetch", { id });
         await refresh();
+        // 新カードが増えたときは画面の変化で分かる。作らなかったときだけ理由を告げる。
+        if (!r.created) {
+          setConfirm({
+            title: "再取得",
+            message: r.message,
+            okLabel: "OK",
+            onConfirm: () => setConfirm(null),
+          });
+        }
       } catch (e) {
         setConfirm({
           title: "再取得に失敗しました",

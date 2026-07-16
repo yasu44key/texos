@@ -1587,6 +1587,37 @@ fn run_flow_inner(
     let p = &jp;
     let mut out_i = 0usize;
     for pl in &payloads {
+        // v1.7 P2 実機FB（2026-07-17）: 取得メタ付き出力（web_fetch）は、内容が前回と
+        // 同一なら実身を増やさない（計画 §1-3「内容が同一なら CAS により同一ハッシュ＝
+        // 実身は増えない」の着地）。このフィルタが過去に作った生きた出力カードに同じ
+        // ハッシュがあればそれを再利用し、取得日時/ETag だけ最新化する（ファイルも書かない）。
+        if pl.meta.is_some() {
+            let hash = cas::hash_bytes(&pl.bytes);
+            let prev: Option<String> = p
+                .conn
+                .query_row(
+                    "SELECT v.id FROM relations rel
+                     JOIN virtual_bodies v ON v.id = rel.to_id AND v.deleted_at IS NULL
+                     WHERE rel.from_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                       AND v.real_id = ?2 LIMIT 1",
+                    rusqlite::params![id, hash],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            if let Some(vid) = prev {
+                let _ = p.conn.execute(
+                    "UPDATE virtual_bodies SET web_meta = ?1 WHERE id = ?2",
+                    rusqlite::params![pl.meta, vid],
+                );
+                if let Some(m) = &pl.meta {
+                    link_fetch_source(p, &id, m, &vid);
+                }
+                report.updated.push(vid);
+                report.outputs.push(format!("{}（変化なし・実身は増やしません）", pl.stem));
+                continue;
+            }
+        }
         // 結果の置き場と名前: prefix＋連番→「prefix連番.ext」（空き番号まで進める）、
         // prefixのみ（連番空欄）→「prefix.ext」固定名で毎回上書き（コンパイラ等）、
         // prefixなし→従来の「入力名_フィルタ名.ext」。out_dir指定なら外部フォルダへ。
