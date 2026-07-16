@@ -18,6 +18,36 @@
 >   メニュー統合）・venv (b)/(c) 実測・dataclass→params_schema 半自動抽出。
 > 作業ブランチ feat/v1.6-cards は main へ FF 統合済み。
 
+> **★ 次のセッション = v1.7 P1 着手指示（2026-07-16・計画確定済み）**
+> テーマ = 情報収集経路（Webの実身化）。v0.1 M1-6（URLキャッシュ・外部実身の仮身化）の宿題回収を
+> v2.0 前に行う。**正本 = `docs/V1.7_情報収集経路計画.md` — §7 の5論点は全件決着済み。
+> 必ず全文を読んでから着手すること。** ブランチは feat/v1.7-web を main から。
+>
+> **P1 = `web_fetch` ビルトイン（v1.7.0）** — URL→本文md実身:
+> - 入力両対応: パラメータ欄に URL 直書き ／ テキスト実身（中身のURL）を入力接続。
+> - 本文抽出→md（タイトル=語幹）。抽出失敗は全文 HTML→md フォールバック。
+>   content-type が text/html 以外は **raw のまま実身化**（画像/csv/json 直リンク対応）。
+> - メタ: source_url / fetched_at / etag / last_modified / final_url。
+> - 文字コードは **text_convert と分離**（§7-4）: 実身化の瞬間に一度だけ UTF-8 化
+>   （HTTPヘッダ/meta charset 準拠）。判定不能は raw 実身化→後段 text_convert で直す。
+> - **安全最小セットは共通関数化**（§4: タイムアウト30s・サイズ20MB・リダイレクト5・
+>   同一ホスト間隔2s・UA明示・プライベートIP遮断）— P2〜P4 の web_* 系で共用する。
+> - HTTP は既存 reqwest（rustls・blocking）を共用＝依存追加ほぼゼロ。html→md クレートは
+>   ライセンス確認の上で採用（MIT/Apache のみ。候補 htmd 等）。
+> - チェックリスト（計画 §6）: flow.rs run_builtin＋単体テスト / BuiltinFilterDialog
+>   BUILTIN_SCHEMAS / preflight 出力MIME＋model.ts filterOutputMime /
+>   メニュー2系統に「**Web ...**」グループ新設（「OS機能 ...」と同格）。
+>
+> **以降の号（計画 §3・使いたい順で前後可）**:
+> - P2 URLカード仮身昇格（v1.7.1）: url カードを入力接続可に・取得系譜 relations・
+>   「更新を確認」= 取得→ハッシュ比較→**破棄・マークのみ**（実身化は明示「再取得」だけ＝
+>   CAS肥大対策 §7-3）。持ち出しは「実身化したもの以外は仮身のまま」（§7-5）。
+> - P3 web_feed（v1.7.2）: 概要md＋実アドレス2段構え（§7-2 暫定・実機FBで確定）。
+>   **ビルトイン複数出力の解禁**（run_builtin_multi — 標準フィルタ充実検討 §10 split 据え置きの解除実例）。
+> - P4 web_capture（v1.7.3）: Edge headless スクショ（L2）。**実機検証を号の最初に**。
+> - web_search は (c) 見送りで決着 → `docs/V2.0課題.md` §7 に送り済み（v2.0 で再浮上見込み）。
+> - v1.6 残件（card.json 宣言化・venv 実測・schema 抽出）とは独立・並行可。
+
 ## （以下、v1.5 完結時の記録）
 
 ## 旧・最終更新: 2026-07-12 / 到達点: **v1.5.17 リリース＝v1.5系 最終号（実機確認済み）**
