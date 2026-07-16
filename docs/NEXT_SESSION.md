@@ -1,21 +1,37 @@
 # TexoS 開発引き継ぎノート
 
-## 最終更新: 2026-07-16 / 到達点: **v1.7.0 リリース＝web_fetch（Webの実身化・実機確認済み）**
+## 最終更新: 2026-07-17 / 到達点: **v1.7 P2 実装済み＝URLカードの仮身昇格（未リリース・実機確認待ち）**
 
-> **★ いまここ（2026-07-16・main へ FF 統合済み commit 38c2dcb・push 済み）**:
-> v1.7 P1 = `web_fetch` を v1.7.0 としてリリース（計画 §6 チェックリスト全項目・回帰97件
-> green・実機確認済み〔空欄作成の FB 1件を同日修正 = allowEmpty〕。
-> インストーラ = `I:\texos_1.7.0_x64-setup.exe`）。**次 = P2 URLカード仮身昇格**。
-> - 新規: `src-tauri/src/web.rs`（§4 安全最小セット共通関数 fetch_url ＝ P2〜P4 で共用）・
->   `virtual_bodies.web_meta` 列（source_url/fetched_at/etag/…。P2「更新を確認」が読む）・
->   メニュー「Web ...」グループ・BUILTIN_SCHEMAS web_fetch・ユーザーズチップス Tip 9。
-> - 実行系: FlowPayload/NodeRun に meta が通る（web_fetch → 終端カードの web_meta へ。
->   中間ノードを経ると付かない）。入力なし＋URL直書きの単独実行は t2i パネル単独生成と同型。
-> - 次号 P2 = URLカード仮身昇格（更新マーク・取得系譜）: 実行契約に手が入るため号を分ける
->   （計画 §3 P2・§7-3 CAS肥大対策＝「確認は破棄・実身化は明示再取得だけ」）。
+> **★ いまここ（2026-07-17・ブランチ feat/v1.7-web-p2）**:
+> v1.7 P2 = **URLカードの仮身昇格（更新マーク・取得系譜）を実装**（回帰98件 green・
+> 実機 304 テスト ok〔ignored 2件も手動実行で確認〕）。**実機確認 → 次 = P3 web_feed**。
+> - **実行契約**: kind='url' 入力は url_ref を text/plain で下流へ（flow_run.rs 入力分岐・
+>   接続時型チェック App.tsx／preflight.rs は text/plain 特例で3面整合）。
+> - **取得系譜 relations kind='fetched'**: 終端カード化時に source_url 一致の直結URLカード
+>   から張る（flow_run link_fetch_source→web::record_fetch_lineage）。**最新のみ生存**
+>   （旧エッジ soft-delete・§7-3）。表示=グレー点線（LinkLayer）。
+> - **コマンド3種（web.rs・#[tauri::command(async)]）**: web_check_update（条件付きGET→
+>   同じ変換 response_to_out→CASハッシュ比較→**破棄・マークのみ**。URLカードの web_meta に
+>   {checked_at, update} を書く）／web_refetch（新実身＋系譜張り替え・未取得なら初回取得）／
+>   web_check_update_all（一括・メニュー「整理・書き出し」）。ロックは読み書きの瞬間だけ
+>   （30秒のネットワーク待ちで UI を塞がない）。
+> - **UI**: URLカードに薄赤ドット＋「リンク ▸ 更新あり」（webUpdateOf(o)・ObjectCard）・
+>   右クリック「更新を確認」「再取得（新しい実身を作る）」。
+> - 付随: create_url が kind='url' を即設定・更新履歴に「v1.7 P2」・チップス Tip 10。
+> - **残: 実機確認**（URLカード→web_fetch▶→系譜点線→更新を確認→再取得→一括、の一巡）。
+> - 次号 P3 = web_feed（v1.7.2）: **ビルトイン複数出力の解禁**（run_builtin_multi）が本丸。
 > - **リリース方針（2026-07-16 ユーザー決定）: P2〜P4 は号ごとにリリースしない。**
 >   実装・コミットは号ごとに刻む（P2→P3→P4）が、**リリースは P4 完了後に一括**
 >   （バージョン番号はそのとき決める）。v1.7.0 は P1 単独で出した最初で最後の中間リリース。
+
+> **（前回）v1.7 P1 = v1.7.0 リリース済み（2026-07-16・main commit 38c2dcb・push 済み）**:
+> `web_fetch`（計画 §6 チェックリスト全項目・実機確認済み。
+> インストーラ = `I:\texos_1.7.0_x64-setup.exe`）。
+> - 新規: `src-tauri/src/web.rs`（§4 安全最小セット共通関数 fetch_url ＝ P2〜P4 で共用）・
+>   `virtual_bodies.web_meta` 列（source_url/fetched_at/etag/…）・
+>   メニュー「Web ...」グループ・BUILTIN_SCHEMAS web_fetch・ユーザーズチップス Tip 9。
+> - 実行系: FlowPayload/NodeRun に meta が通る（web_fetch → 終端カードの web_meta へ。
+>   中間ノードを経ると付かない）。入力なし＋URL直書きの単独実行は t2i パネル単独生成と同型。
 
 > **v1.6.0（リリース・2026-07-15・実機確認済み「非常に柔軟」）＝v1.6 系の開始**:
 > 静的なデータ作成プログラムをユーザーが登録できる基盤。

@@ -617,8 +617,9 @@ pub(crate) fn create_url(
     let vid = uuid();
     p.conn
         .execute(
-            "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, url_ref)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            // v1.7 P2: kind='url' を作成時に確定（従来は migrate() の後追い補正頼みだった）。
+            "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, url_ref, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'url')",
             rusqlite::params![vid, real_id, label, x, y, db::now_ms(), url],
         )
         .map_err(|e| e.to_string())?;

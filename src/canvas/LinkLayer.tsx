@@ -127,6 +127,18 @@ export function LinkLayer({
         >
           <path d="M0,0 L6,3 L0,6 Z" style={{ fill: "var(--arrow-req, #d9a05a)" }} />
         </marker>
+        {/* v1.7 P2: 取得系譜（URLカード→取得実身・fetched）— 控えめなグレーの点線 */}
+        <marker
+          id="arrowhead-fetched"
+          markerWidth="8"
+          markerHeight="8"
+          refX="6"
+          refY="3"
+          orient="auto"
+          markerUnits="strokeWidth"
+        >
+          <path d="M0,0 L6,3 L0,6 Z" style={{ fill: "var(--arrow-fetched, #8a93a6)" }} />
+        </marker>
         <marker
           id="arrowhead-bad"
           markerWidth="8"
@@ -150,12 +162,16 @@ export function LinkLayer({
         // v1.5.4 WS-P2: req 矢印は琥珀の細破線（データレーンではなく「発行の線」）。
         const isFlow = r.kind === "flow";
         const isReq = r.kind === "req";
+        // v1.7 P2: 取得系譜（fetched）はデータでも発行でもない「出自の線」— 控えめな点線。
+        const isFetched = r.kind === "fetched";
         if (isReq && !showReq) return null;
         const bad = invalidIds?.has(r.id) ?? false;
         const stroke = bad
           ? "var(--arrow-bad, #d96a6a)"
           : isReq
           ? "var(--arrow-req, #d9a05a)"
+          : isFetched
+          ? "var(--arrow-fetched, #8a93a6)"
           : isFlow
           ? "var(--arrow-flow, #57c7a3)"
           : "var(--arrow-color, #5a9fe0)";
@@ -163,6 +179,8 @@ export function LinkLayer({
           ? "arrowhead-bad"
           : isReq
           ? "arrowhead-req"
+          : isFetched
+          ? "arrowhead-fetched"
           : isFlow
           ? "arrowhead-flow"
           : "arrowhead";
@@ -199,7 +217,7 @@ export function LinkLayer({
                 stroke,
                 strokeWidth: "var(--arrow-width, 2)",
               }}
-              strokeDasharray={isReq ? "3 4" : isFlow ? "9 5" : undefined}
+              strokeDasharray={isReq ? "3 4" : isFetched ? "2 5" : isFlow ? "9 5" : undefined}
               markerEnd={`url(#${markerId})`}
             />
             {label && (

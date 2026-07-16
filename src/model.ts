@@ -30,6 +30,8 @@ export interface VirtualBodyInfo {
   filter_ref: string | null;
   /** v1.3.10 窓モデル: 内部仮身が指す実身カードの id（外部=origin_path とは別レーン） */
   window_of: string | null;
+  /** v1.7 取得メタ JSON: 取得実身={source_url,fetched_at,…}／URLカード={checked_at,update} */
+  web_meta: string | null;
 }
 
 export interface NoteInfo {
@@ -89,6 +91,17 @@ export function lostRealOf(o: VirtualBodyInfo): boolean {
 // list_objects は folder_ref が実在すれば cur_mtime を埋めるので、null＝喪失＝薄赤。
 export function lostFolderOf(o: VirtualBodyInfo): boolean {
   return !!o.folder_ref && o.cur_mtime == null;
+}
+
+// v1.7 P2 更新マーク: URLカードの「更新を確認」で内容の変化が検出された状態。
+// web_meta = {checked_at, update}（バックエンド web_check_update が書く）。
+export function webUpdateOf(o: VirtualBodyInfo): boolean {
+  if (!o.url_ref || !o.web_meta) return false;
+  try {
+    return JSON.parse(o.web_meta).update === true;
+  } catch {
+    return false;
+  }
 }
 
 // v1.3.11 ランチャー: 登録プログラムの実パス（アイコン表示用）。ターミナル/未設定は null。

@@ -6,6 +6,8 @@
 // P3 web_feed / P4 web_capture もここを共用する（個別実装にしない）。
 
 use crate::flow::FilterSpec;
+use crate::AppState;
+use rusqlite::OptionalExtension;
 use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Mutex;
@@ -94,10 +96,29 @@ fn throttle_host(host: &str) {
     }
 }
 
+/// 条件付き GET の材料（v0.1 §2.3 キャッシュモデル・P2「更新を確認」）。
+/// 取得実身の web_meta に記録した etag / last_modified をそのまま持ってくる。
+pub struct FetchCond {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
 /// §4 安全最小セットを同梱した GET（web_* 系の共通入口）。
 /// reqwest::blocking は tokio 文脈で drop するとパニックするため、呼び出し側
 /// （run_web_fetch）が素の OS スレッドに包む — run_ai と同じ流儀。
 pub fn fetch_url(url_s: &str, allow_private: bool) -> Result<WebResponse, String> {
+    fetch_url_cond(url_s, allow_private, None)?
+        .ok_or_else(|| "サーバが 304 を返しました（条件なしの取得では想定外）".into())
+}
+
+/// fetch_url の条件付き版: cond の ETag / Last-Modified を If-None-Match /
+/// If-Modified-Since として送り、304 Not Modified なら Ok(None)（＝変化なし・
+/// 本文は転送されない）。P2「更新を確認」の一次判定に使う。
+pub fn fetch_url_cond(
+    url_s: &str,
+    allow_private: bool,
+    cond: Option<&FetchCond>,
+) -> Result<Option<WebResponse>, String> {
     let url = reqwest::Url::parse(url_s).map_err(|e| format!("URL が不正です: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("http/https 以外の URL は取得できません: {}", url.scheme()));
@@ -126,11 +147,20 @@ pub fn fetch_url(url_s: &str, allow_private: bool) -> Result<WebResponse, String
         .user_agent(WEB_USER_AGENT)
         .build()
         .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
-    let resp = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("取得に失敗しました: {e}"))?;
+    let mut req = client.get(url);
+    if let Some(c) = cond {
+        if let Some(etag) = c.etag.as_deref().filter(|s| !s.is_empty()) {
+            req = req.header("if-none-match", etag);
+        }
+        if let Some(lm) = c.last_modified.as_deref().filter(|s| !s.is_empty()) {
+            req = req.header("if-modified-since", lm);
+        }
+    }
+    let resp = req.send().map_err(|e| format!("取得に失敗しました: {e}"))?;
     let status = resp.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
     if !status.is_success() {
         return Err(format!("HTTP {status}: {}", resp.url()));
     }
@@ -155,7 +185,7 @@ pub fn fetch_url(url_s: &str, allow_private: bool) -> Result<WebResponse, String
             WEB_MAX_BYTES / (1024 * 1024)
         ));
     }
-    Ok(WebResponse { bytes, final_url, content_type, etag, last_modified })
+    Ok(Some(WebResponse { bytes, final_url, content_type, etag, last_modified }))
 }
 
 /// URL のホストがプライベート宛でないことを確認する（リテラル IP → 直接判定 /
@@ -257,7 +287,8 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
 }
 
 /// カード名（＝ファイル名の語幹）に使えるようタイトルを整形する。
-fn sanitize_stem(s: &str) -> Option<String> {
+/// （P2: flow_run の URLカード入力の stem 整形にも使う＝ラベルに URL が入っていても安全）
+pub(crate) fn sanitize_stem(s: &str) -> Option<String> {
     let cleaned: String = s
         .trim()
         .chars()
@@ -355,14 +386,21 @@ fn run_web_fetch_blocking(spec: &FilterSpec, input: Option<&[u8]>) -> Result<Web
             .to_string(),
     };
     let resp = fetch_url(&url, spec.allow_private)?;
+    Ok(response_to_out(&url, resp))
+}
+
+/// 取得レスポンス → 実身の形（HTML なら本文抽出→ Markdown・それ以外は raw）。
+/// 変換は決定的なので、P2「更新を確認」は同じ変換を通した結果のハッシュを
+/// 取得実身の CAS ハッシュと比べれば「内容が変わったか」を判定できる。
+pub fn response_to_out(source_url: &str, resp: WebResponse) -> WebFetchOut {
     let (mime, header_charset) = split_content_type(&resp.content_type);
-    let meta = build_meta(&url, &resp);
+    let meta = build_meta(source_url, &resp);
 
     // --- text/html 以外: raw のまま実身化（§3 P1・変換もしない＝§7-4）---
     if !(mime == "text/html" || mime == "application/xhtml+xml") {
         // 拡張子: 汎用 MIME（text/plain 等）は URL 側の拡張子を優先（csv が text/plain で
         // 配られる等）。それ以外は MIME の正引きを優先し、無ければ URL 拡張子 → bin。
-        let url_ext = ext_from_url(&resp.final_url).or_else(|| ext_from_url(&url));
+        let url_ext = ext_from_url(&resp.final_url).or_else(|| ext_from_url(source_url));
         let generic = mime.is_empty() || mime == "text/plain" || mime == "application/octet-stream";
         let ext = if generic {
             url_ext.clone().or_else(|| ext_for_mime(&mime).map(str::to_string))
@@ -376,13 +414,13 @@ fn run_web_fetch_blocking(spec: &FilterSpec, input: Option<&[u8]>) -> Result<Web
         } else {
             mime
         };
-        return Ok(WebFetchOut {
+        return WebFetchOut {
             bytes: resp.bytes,
             ext,
             mime: out_mime,
-            stem: stem_from_url(&resp.final_url).or_else(|| stem_from_url(&url)),
+            stem: stem_from_url(&resp.final_url).or_else(|| stem_from_url(source_url)),
             meta,
-        });
+        };
     }
 
     // --- HTML: UTF-8 化 → 本文抽出 → Markdown ---
@@ -390,13 +428,13 @@ fn run_web_fetch_blocking(spec: &FilterSpec, input: Option<&[u8]>) -> Result<Web
         Some(h) => h,
         None => {
             // 文字コード判定不能 → raw の .html のまま実身化（後段 text_convert で直す）。
-            return Ok(WebFetchOut {
+            return WebFetchOut {
                 bytes: resp.bytes,
                 ext: "html".into(),
                 mime: "text/html".into(),
-                stem: stem_from_url(&resp.final_url).or_else(|| stem_from_url(&url)),
+                stem: stem_from_url(&resp.final_url).or_else(|| stem_from_url(source_url)),
                 meta,
-            });
+            };
         }
     };
     let (title, md) = html_to_markdown(&html, &resp.final_url);
@@ -404,19 +442,19 @@ fn run_web_fetch_blocking(spec: &FilterSpec, input: Option<&[u8]>) -> Result<Web
         .as_deref()
         .and_then(sanitize_stem)
         .or_else(|| stem_from_url(&resp.final_url))
-        .or_else(|| stem_from_url(&url));
+        .or_else(|| stem_from_url(source_url));
     let body = match (&title, md.starts_with('#')) {
         // タイトルが本文側に無ければ見出しとして先頭に付ける（単体で読める md にする）。
         (Some(t), false) if !t.trim().is_empty() => format!("# {}\n\n{md}", t.trim()),
         _ => md,
     };
-    Ok(WebFetchOut {
+    WebFetchOut {
         bytes: body.into_bytes(),
         ext: "md".into(),
         mime: "text/markdown".into(),
         stem,
         meta,
-    })
+    }
 }
 
 /// HTML → (タイトル, Markdown)。本文抽出（dom_smoothie）が成功すればその記事部分を、
@@ -458,6 +496,286 @@ fn html_unescape(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&nbsp;", " ")
+}
+
+// ---------------------------------------------------------------------------
+// v1.7 P2: URLカードの仮身昇格 — 更新マークと取得系譜（計画 §3 P2・§7-3 決着）。
+// 「更新を確認」= 条件付きGET → 同じ変換 → ハッシュ比較 → **破棄**（マークを付けるだけで
+// 実身は作らない）。実身が増えるのはユーザーが「再取得」を選んだ時だけ＝明示コミットと同型。
+// ---------------------------------------------------------------------------
+
+/// URLカードの web_meta（チェック状態）。取得実身の web_meta（source_url/etag/…）とは
+/// 別用途で同じ列に載る: {checked_at, update: bool}。
+fn write_check_mark(conn: &rusqlite::Connection, id: &str, updated: bool) {
+    let meta =
+        serde_json::json!({ "checked_at": crate::db::now_ms(), "update": updated }).to_string();
+    let _ = conn.execute(
+        "UPDATE virtual_bodies SET web_meta = ?1 WHERE id = ?2",
+        rusqlite::params![meta, id],
+    );
+}
+
+/// 最新の取得系譜（fetched エッジの先）の比較材料。
+struct Baseline {
+    /// 取得実身の CAS ハッシュ（= real_id。同じ変換を通した結果と比べる）。
+    real_id: String,
+    cond: FetchCond,
+}
+
+/// URLカードの URL と最新ベースラインを読む（プロジェクトロック中に呼ぶ）。
+fn url_card_base(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<(String, Option<Baseline>), String> {
+    let url: Option<String> = conn
+        .query_row(
+            "SELECT url_ref FROM virtual_bodies WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let url = url.ok_or("URLカードではありません")?;
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT v.real_id, v.web_meta FROM relations rel
+             JOIN virtual_bodies v ON v.id = rel.to_id AND v.deleted_at IS NULL
+             WHERE rel.from_id = ?1 AND rel.kind = 'fetched' AND rel.deleted_at IS NULL
+             ORDER BY rel.created_at DESC LIMIT 1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let baseline = row.map(|(real_id, meta)| {
+        let v: serde_json::Value = meta
+            .as_deref()
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        Baseline { real_id, cond: FetchCond { etag: s("etag"), last_modified: s("last_modified") } }
+    });
+    Ok((url, baseline))
+}
+
+/// 条件付きGET→同じ変換→ハッシュ比較。true = 内容が変わっている。取得物は破棄（§7-3）。
+/// reqwest::blocking を使うので素の OS スレッドで（run_web_fetch と同じ流儀）。
+fn fetch_and_compare(url: &str, base: &Baseline) -> Result<bool, String> {
+    std::thread::scope(|s| {
+        s.spawn(|| match fetch_url_cond(url, false, Some(&base.cond))? {
+            None => Ok(false), // 304 Not Modified
+            Some(resp) => {
+                let out = response_to_out(url, resp);
+                Ok(crate::cas::hash_bytes(&out.bytes) != base.real_id)
+            }
+        })
+        .join()
+        .map_err(|_| "Web取得スレッドが異常終了しました".to_string())?
+    })
+}
+
+/// 「更新を確認」の結果（フロントの結果表示用）。
+#[derive(serde::Serialize)]
+pub struct WebCheckOut {
+    pub updated: bool,
+    pub message: String,
+}
+
+/// URLカード右クリック「更新を確認」。変化があればカードに更新マーク（強制反映なし）。
+#[tauri::command(async)]
+pub(crate) fn web_check_update(
+    id: String,
+    state: tauri::State<AppState>,
+) -> Result<WebCheckOut, String> {
+    // ロックは読み書きの瞬間だけ（ネットワーク待ち 30s で UI の他操作を塞がない）。
+    let (url, baseline) = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        url_card_base(&p.conn, &id)?
+    };
+    let base = baseline.ok_or(
+        "このURLはまだ実身化されていません。「再取得（実身を作る）」か、web_fetch フィルタに接続して取得してください",
+    )?;
+    let updated = fetch_and_compare(&url, &base)?;
+    {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        write_check_mark(&p.conn, &id, updated);
+    }
+    Ok(WebCheckOut {
+        updated,
+        message: if updated {
+            "ページに更新があります。実身にするには「再取得」を選んでください（前の実身は残ります）".into()
+        } else {
+            "変化はありません（取得済みの実身が最新です）".into()
+        },
+    })
+}
+
+/// URLカード右クリック「再取得」。取得→新しい実身カードを作り系譜を更新する
+/// （旧実身は残る＝イミュータブル・履歴が自然に溜まる）。未取得なら初回取得になる。
+/// 戻り値は新カードの id。
+#[tauri::command(async)]
+pub(crate) fn web_refetch(id: String, state: tauri::State<AppState>) -> Result<String, String> {
+    let (url, x, y) = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        let (url, _) = url_card_base(&p.conn, &id)?;
+        let (x, y): (f64, f64) = p
+            .conn
+            .query_row(
+                "SELECT pos_x, pos_y FROM virtual_bodies WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        (url, x, y)
+    };
+    // ネットワークはロック外で（素の OS スレッド・run_web_fetch と同じ流儀）。
+    let out = std::thread::scope(|s| {
+        s.spawn(|| fetch_url(&url, false).map(|resp| response_to_out(&url, resp)))
+            .join()
+            .map_err(|_| "Web取得スレッドが異常終了しました".to_string())?
+    })?;
+
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // 実ファイル＋CAS＋カード（flow 終端の実身化と同じ形＝プロジェクト直下のコミット済み実身）。
+    let stem = out.stem.clone().or_else(|| stem_from_url(&url)).unwrap_or_else(|| "web".into());
+    let dest = crate::objects::unique_file_path(&p.root, &format!("{stem}.{}", out.ext));
+    std::fs::write(&dest, &out.bytes).map_err(|e| format!("書き出し失敗 ({e})"))?;
+    let hash = crate::cas::store_bytes(&p.cas_root, &out.bytes).map_err(|e| e.to_string())?;
+    crate::db::insert_real_body(&p.conn, &hash, &out.mime, out.bytes.len() as u64, Some(&out.ext))
+        .map_err(|e| e.to_string())?;
+    let label = dest.file_name().and_then(|s| s.to_str()).unwrap_or("output").to_string();
+    let dest_str = dest.to_string_lossy().into_owned();
+    let new_vid = crate::util::uuid();
+    p.conn
+        .execute(
+            "INSERT INTO virtual_bodies
+                (id, real_id, label, pos_x, pos_y, created_at,
+                 committed_path, committed_mtime, web_meta, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'file')",
+            rusqlite::params![
+                new_vid,
+                hash,
+                label,
+                x + 190.0,
+                y,
+                crate::db::now_ms(),
+                dest_str,
+                crate::util::file_mtime_ms(&dest),
+                out.meta
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    record_fetch_lineage(&p.conn, &id, &new_vid);
+    Ok(new_vid)
+}
+
+/// 取得系譜を「最新のみ」に張り替える（§7-3: 最新系譜のみ表示・過去は検索で辿る）:
+/// URLカードから出る古い fetched エッジを soft-delete → target への1本を保証 →
+/// 更新マークをクリア（いま取得したものが最新）。flow 終端（web_fetch 実行）と
+/// 「再取得」の両方がここを通る。
+pub(crate) fn record_fetch_lineage(conn: &rusqlite::Connection, url_card: &str, target: &str) {
+    let now = crate::db::now_ms();
+    let _ = conn.execute(
+        "UPDATE relations SET deleted_at = ?1
+         WHERE from_id = ?2 AND kind = 'fetched' AND to_id <> ?3 AND deleted_at IS NULL",
+        rusqlite::params![now, url_card, target],
+    );
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM relations
+             WHERE from_id = ?1 AND to_id = ?2 AND kind = 'fetched' AND deleted_at IS NULL",
+            rusqlite::params![url_card, target],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap_or(None)
+        .unwrap_or(false);
+    if !exists {
+        let _ = conn.execute(
+            "INSERT INTO relations (from_id, to_id, kind, created_at)
+             VALUES (?1, ?2, 'fetched', ?3)",
+            rusqlite::params![url_card, target, now],
+        );
+    }
+    write_check_mark(conn, url_card, false);
+}
+
+/// 一括「このプロジェクトのURLカードの更新を確認」の結果。
+#[derive(serde::Serialize)]
+pub struct WebCheckAllOut {
+    /// 確認した枚数（取得済み＝系譜を持つ URL カードだけが対象）。
+    pub checked: usize,
+    /// うち更新マークが付いた枚数。
+    pub updated: usize,
+    /// 系譜が無くスキップした URL カードの枚数。
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+/// キャンバスメニュー「URLカードの更新を確認」（明示操作なので pull 原則と矛盾しない）。
+/// 直列に確認する（同一ホスト間隔 §4-3 は fetch_url 側の共通台帳が守る）。
+#[tauri::command(async)]
+pub(crate) fn web_check_update_all(
+    state: tauri::State<AppState>,
+) -> Result<WebCheckAllOut, String> {
+    // 対象一覧はロック中に確定し、ネットワークはロック外で1枚ずつ。
+    struct Target {
+        id: String,
+        label: String,
+        url: String,
+        baseline: Option<Baseline>,
+    }
+    let targets: Vec<Target> = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        let ids: Vec<(String, String)> = {
+            let mut stmt = p
+                .conn
+                .prepare(
+                    "SELECT id, label FROM virtual_bodies
+                     WHERE url_ref IS NOT NULL AND deleted_at IS NULL AND desktop_id IS NULL
+                     ORDER BY created_at",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        ids.into_iter()
+            .filter_map(|(id, label)| {
+                let (url, baseline) = url_card_base(&p.conn, &id).ok()?;
+                Some(Target { id, label, url, baseline })
+            })
+            .collect()
+    };
+    let mut out =
+        WebCheckAllOut { checked: 0, updated: 0, skipped: 0, errors: Vec::new() };
+    for t in targets {
+        let Some(base) = t.baseline else {
+            out.skipped += 1; // 未取得（系譜なし）は対象外＝比較のしようがない
+            continue;
+        };
+        match fetch_and_compare(&t.url, &base) {
+            Ok(updated) => {
+                out.checked += 1;
+                if updated {
+                    out.updated += 1;
+                }
+                let guard = state.current.lock().unwrap();
+                if let Some(p) = guard.as_ref() {
+                    write_check_mark(&p.conn, &t.id, updated);
+                }
+            }
+            Err(e) => out.errors.push(format!("{}: {e}", t.label)),
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -616,5 +934,86 @@ mod tests {
         throttle_host("throttle-test.example");
         // 2回目は最初のスロット+2秒まで待つ＝合計でおよそ2秒以上経過している。
         assert!(t0.elapsed() >= WEB_HOST_INTERVAL, "2回目の同一ホストは間隔を空けるはず");
+    }
+
+    /// v1.7 P2: 取得系譜の張り替え（最新のみ・§7-3）とベースライン読み・更新マークの
+    /// ライフサイクル（張り替えでクリア）。
+    #[test]
+    fn lineage_and_check_mark() {
+        let dir =
+            std::env::temp_dir().join(format!("texos_web_p2_test_{}", crate::db::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::db::open(&dir.join("texos.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO real_bodies (id, mime_type, size, created_at)
+               VALUES ('url:sentinel', 'application/vnd.texos.url', 0, 1),
+                      ('hash1', 'text/markdown', 10, 1),
+                      ('hash2', 'text/markdown', 12, 1);
+             INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, url_ref, kind)
+               VALUES ('u1', 'url:sentinel', 'Example', 0, 0, 1, 'https://ex.jp/', 'url');
+             INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, web_meta, kind)
+               VALUES ('f1', 'hash1', 'Example.md', 0, 0, 2,
+                       '{\"source_url\":\"https://ex.jp/\",\"etag\":\"W/x\",\"last_modified\":\"LM\"}', 'file');
+             INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind)
+               VALUES ('f2', 'hash2', 'Example2.md', 0, 0, 3, 'file');",
+        )
+        .unwrap();
+        // 系譜なし: URL は読めるがベースラインは None（=「更新を確認」は案内エラーになる）
+        let (url, base) = url_card_base(&conn, "u1").unwrap();
+        assert_eq!(url, "https://ex.jp/");
+        assert!(base.is_none());
+        // URLカードでない id はエラー
+        assert!(url_card_base(&conn, "f1").is_err());
+        // f1 へ系譜 → ベースライン = f1 の CAS ハッシュ＋web_meta の etag/last_modified
+        record_fetch_lineage(&conn, "u1", "f1");
+        let b = url_card_base(&conn, "u1").unwrap().1.unwrap();
+        assert_eq!(b.real_id, "hash1");
+        assert_eq!(b.cond.etag.as_deref(), Some("W/x"));
+        assert_eq!(b.cond.last_modified.as_deref(), Some("LM"));
+        // 更新マーク → f2 へ張り替え → 旧エッジは soft-delete・生きた系譜は1本・マーククリア
+        write_check_mark(&conn, "u1", true);
+        record_fetch_lineage(&conn, "u1", "f2");
+        assert_eq!(url_card_base(&conn, "u1").unwrap().1.unwrap().real_id, "hash2");
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations
+                 WHERE from_id = 'u1' AND kind = 'fetched' AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1, "最新系譜のみ生存（§7-3）");
+        let meta: String = conn
+            .query_row("SELECT web_meta FROM virtual_bodies WHERE id = 'u1'", [], |r| r.get(0))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(v["update"], false, "張り替えで更新マークはクリア");
+        // 同じ target への再実行は重複エッジを作らない（冪等）
+        record_fetch_lineage(&conn, "u1", "f2");
+        let live2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations
+                 WHERE from_id = 'u1' AND kind = 'fetched' AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live2, 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 実機: 条件付き GET（ETag/Last-Modified → 304 は Ok(None)）。
+    /// 実行: `cargo test --lib -- --ignored web_live`
+    #[test]
+    #[ignore = "実機: ネットワーク接続が必要"]
+    fn web_live_conditional_get_304() {
+        let first = fetch_url("https://example.com/", false).unwrap();
+        let cond = FetchCond { etag: first.etag.clone(), last_modified: first.last_modified.clone() };
+        if cond.etag.is_none() && cond.last_modified.is_none() {
+            return; // 検証材料が無いサーバなら何も主張しない
+        }
+        let again = fetch_url_cond("https://example.com/", false, Some(&cond)).unwrap();
+        assert!(again.is_none(), "同じ条件なら 304 = Ok(None) のはず");
     }
 }

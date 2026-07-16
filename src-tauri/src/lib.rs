@@ -554,6 +554,9 @@ pub struct VirtualBodyInfo {
     /// v1.5.3 WS-P1（オペ層 §6.1）: 構造化実行記録 {at, exit, ok, nodata, skipped, message}
     /// の JSON。WS-P2 のウォッチャ・運用前評価・メタ認知カードが読む口（本号は保存と返却まで）。
     pub last_run: Option<String>,
+    /// v1.7 取得メタ JSON。取得実身では {source_url, fetched_at, etag, …}（P1）、
+    /// URLカードでは更新チェック状態 {checked_at, update}（P2 更新マーク）。
+    pub web_meta: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 pub struct ViewTransform {
@@ -776,6 +779,10 @@ pub fn run() {
             list_audio_devices,
             check_filter_program,
             helper_install_hint,
+            // v1.7 P2: URLカードの仮身昇格（更新マーク・取得系譜）
+            web::web_check_update,
+            web::web_refetch,
+            web::web_check_update_all,
             list_filter_programs,
             import_filter_program,
             remove_filter_program,

@@ -36,6 +36,8 @@ interface Props {
   isProject?: boolean;
   /** this card is a web URL link */
   isUrl?: boolean;
+  /** v1.7 P2 更新マーク: URLカードの「更新を確認」で内容の変化が検出された（強制反映なし） */
+  webUpdate?: boolean;
   /** this card is a link to an OS folder */
   isFolder?: boolean;
   /** v1.4 オートフロー: this card is a filter (pipeline processor) */
@@ -298,7 +300,7 @@ function aiConnOf(ref: string | null | undefined): { provider?: string; endpoint
 export function ObjectCard({
   id, realId, label, mimeType, x, y,
   committed = false, active = false, lost = null,
-  isProject = false, isUrl = false, isFolder = false, isFilter = false, isDrop = false,
+  isProject = false, isUrl = false, webUpdate = false, isFolder = false, isFilter = false, isDrop = false,
   isLauncher = false, launcherPath = null,
   filterRef = null,
   ext = null, memo = null, expanded = false, editPath = null,
@@ -667,7 +669,13 @@ export function ObjectCard({
               <span style={{ fontSize: 9, color: "#9a8cc4" }}>プロジェクト ▸</span>
             )}
             {isUrl && (
-              <span style={{ fontSize: 9, color: "#7fb0d8" }}>リンク ▸</span>
+              // v1.7 P2 更新マーク: 変化を検出したら控えめに知らせる（強制反映なし・
+              // 実身にするかはユーザーが右クリック「再取得」で決める）。
+              webUpdate ? (
+                <span style={{ fontSize: 9, color: "#e08a8a" }}>リンク ▸ 更新あり</span>
+              ) : (
+                <span style={{ fontSize: 9, color: "#7fb0d8" }}>リンク ▸</span>
+              )
             )}
             {isFolder && (
               <span style={{ fontSize: 9, color: "#d8c47f" }}>🔗 リンクフォルダ ▸</span>
@@ -789,6 +797,27 @@ export function ObjectCard({
           </div>
         )}
       </div>
+
+      {/* v1.7 P2: URLカードの更新マーク（窓喪失の薄赤と同系の控えめなドット・v0.1 §2.3）。
+          「更新を確認」で内容の変化を検出した状態。再取得すると消える。 */}
+      {isUrl && webUpdate && (
+        <div
+          title={showHints ? "ページに更新があります（右クリック →「再取得」で新しい実身を作れます・前の実身は残ります）" : undefined}
+          style={{
+            position: "absolute",
+            left: 7,
+            top: 7,
+            width: 9,
+            height: 9,
+            borderRadius: "50%",
+            background: "#e08a8a",
+            border: "1.5px solid #6b3a3a",
+            boxShadow: "0 0 5px #e08a8aaa",
+            zIndex: 3,
+            pointerEvents: "none",
+          }}
+        />
+      )}
 
       {/* status dot (top-left): 琥珀=仮身 / 緑=実身(今セッション変更) / グレー=実身 */}
       {/* v1.3.11 #12: 通常カードは常時。リンクフォルダ等は普段ドットを出さないが、

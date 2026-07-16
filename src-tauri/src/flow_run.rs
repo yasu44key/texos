@@ -340,6 +340,35 @@ fn acquire_node_permits(
     Ok(permits)
 }
 
+/// v1.7 P2: 取得系譜（URLカード→取得実身・relations kind='fetched'）。
+/// 終端の出力に取得メタ（web_fetch の {source_url, …}）が付いていたら、終端フィルタへ
+/// 直結している URLカードのうち url_ref が source_url と一致するものから、この実身へ
+/// 系譜を張り替える（最新のみ表示 §7-3・実処理は web::record_fetch_lineage）。
+/// 中間ノードを経た出力はメタが付かないので、ここには来ない（取得物そのものだけが系譜を持つ）。
+fn link_fetch_source(p: &Project, fid: &str, meta: &str, target: &str) {
+    let Some(src) = serde_json::from_str::<serde_json::Value>(meta)
+        .ok()
+        .and_then(|v| v.get("source_url").and_then(|s| s.as_str()).map(str::to_string))
+    else {
+        return;
+    };
+    let Ok(mut stmt) = p.conn.prepare(
+        "SELECT v.id FROM relations rel
+         JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+         WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+           AND TRIM(v.url_ref) = TRIM(?2)",
+    ) else {
+        return;
+    };
+    let url_cards: Vec<String> = stmt
+        .query_map(rusqlite::params![fid, src], |r| r.get(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    for url_card in url_cards {
+        crate::web::record_fetch_lineage(&p.conn, &url_card, target);
+    }
+}
+
 /// job:progress の note 用にカード名を引く（best-effort・パネルの「いま何が走っているか」）。
 fn node_note(p: &Project, fid: &str) -> String {
     p.conn
@@ -672,11 +701,12 @@ pub(crate) fn eval_filter(
     // v1.5.3 WS-P1（§4.3 拡張点アンカーの成立形）: rel.attrs {when, carry, port} を読み、
     // 並びは port 昇順 → created_at（attrs=NULL は従来どおり接続順）。{inN} の番号・
     // セレクタの first-match 順はこの並びに従う。
-    let mut inputs: Vec<(String, String, String, String, Option<String>, Option<String>, flow::EdgeAttrs)> = {
+    #[allow(clippy::type_complexity)]
+    let mut inputs: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, flow::EdgeAttrs)> = {
         let mut stmt = p
             .conn
             .prepare(
-                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind, rel.attrs
+                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind, v.url_ref, rel.attrs
                  FROM relations rel
                  JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
                  JOIN real_bodies r ON r.id = v.real_id
@@ -693,15 +723,16 @@ pub(crate) fn eval_filter(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
-                    r.get::<_, Option<String>>(6)?,
+                    r.get(6)?,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|(vid, rid, l, m, e, k, attrs): (String, String, String, String, Option<String>, Option<String>, Option<String>)| {
-                (vid, rid, l, m, e, k, flow::parse_edge_attrs(attrs.as_deref()))
+            .map(|(vid, rid, l, m, e, k, u, attrs): (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)| {
+                (vid, rid, l, m, e, k, u, flow::parse_edge_attrs(attrs.as_deref()))
             })
             .collect()
     };
@@ -712,7 +743,7 @@ pub(crate) fn eval_filter(
     // フェーズ1: エッジごとに上流を評価し when/carry を適用（EdgeOut の列で保持＝
     // セレクタの first-match と no-data の NULL 伝搬はエッジ単位の情報が要る）。
     let mut edges: Vec<EdgeOut> = Vec::new();
-    for (vid, real_id, vlabel, mime, ext, kind, attrs) in &inputs {
+    for (vid, real_id, vlabel, mime, ext, kind, url_ref, attrs) in &inputs {
         // 中断後は新しいプロセスを起こさない（複数入力の連鎖を断つ）
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             report.errors.push("中断されました".into());
@@ -734,6 +765,22 @@ pub(crate) fn eval_filter(
                 .skipped
                 .push(format!("{vlabel}（まだファイルが投入されていません）"));
             continue;
+        } else if let Some(u) = url_ref.as_deref() {
+            // v1.7 P2（URLカードの仮身昇格・実行契約）: kind='url' の入力は url_ref 文字列を
+            // text/plain として渡す。web_fetch の入力（1行目=URL）にそのまま乗るほか、
+            // テキスト系フィルタにも普通に繋がる。stem はラベルをファイル名安全に整形
+            // （ラベルが URL そのままでも壊れない）。
+            let stem = crate::web::sanitize_stem(vlabel).unwrap_or_else(|| "URL".into());
+            EvalOut::data(
+                vec![FlowPayload {
+                    bytes: u.as_bytes().to_vec(),
+                    ext: "txt".into(),
+                    mime: "text/plain".into(),
+                    stem,
+                    meta: None,
+                }],
+                None,
+            )
         } else if kind.as_deref() == Some("note") {
             // v1.4.17 カード統一＝定数カード: 付箋は本文をそのまま text/plain として供給する
             //（実体・CAS 非依存の読み出し専用テキスト。付箋→AI/t2i/grep がそのまま繋がる）。
@@ -1631,6 +1678,10 @@ fn run_flow_inner(
                     rusqlite::params![id, vid, db::now_ms()],
                 );
             }
+            // v1.7 P2: 取得メタ付き出力（web_fetch）は URLカード→取得実身の系譜を張り替える。
+            if let Some(m) = &pl.meta {
+                link_fetch_source(p, &id, m, &vid);
+            }
             report.updated.push(vid);
             report.outputs.push(format!("{out_label}（上書き）"));
             continue;
@@ -1673,6 +1724,10 @@ fn run_flow_inner(
              VALUES (?1, ?2, 'flow', ?3)",
             rusqlite::params![id, new_vid, db::now_ms()],
         );
+        // v1.7 P2: 取得メタ付き出力（web_fetch）は URLカード→取得実身の系譜を張る。
+        if let Some(m) = &pl.meta {
+            link_fetch_source(p, &id, m, &new_vid);
+        }
         report.created.push(new_vid);
         report.outputs.push(out_label);
         out_i += 1;

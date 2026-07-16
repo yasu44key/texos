@@ -107,7 +107,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             from_id     TEXT NOT NULL,      -- virtual_body id
             to_id       TEXT NOT NULL,      -- virtual_body id
-            kind        TEXT NOT NULL DEFAULT 'link',  -- link | sequence | group
+            kind        TEXT NOT NULL DEFAULT 'link',  -- link | sequence | group | flow | req | fetched(v1.7 P2 取得系譜)
             created_at  INTEGER NOT NULL
         );
 

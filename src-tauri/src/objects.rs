@@ -182,7 +182,7 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
             "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), v.pos_x, v.pos_y,
                     v.committed_path, v.committed_mtime, v.project_ref, COALESCE(v.ext, r.ext), v.expanded,
                     v.url_ref, v.memo, v.z_order, v.folder_ref, v.origin_path, v.panel_w,
-                    v.kind, v.filter_ref, v.window_of, v.last_run, v.panel_h
+                    v.kind, v.filter_ref, v.window_of, v.last_run, v.panel_h, v.web_meta
              FROM virtual_bodies v
              JOIN real_bodies r ON r.id = v.real_id
              WHERE v.desktop_id IS NULL AND v.deleted_at IS NULL
@@ -235,6 +235,7 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
                 window_of: row.get(19)?,
                 last_run: row.get(20)?,
                 panel_h: row.get(21)?,
+                web_meta: row.get(22)?,
             })
         })
         .map_err(|e| e.to_string())?;

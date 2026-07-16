@@ -457,7 +457,12 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
             if from.kind == "drop" && from.real_id.starts_with("drop:") {
                 continue; // 空のドロップポイント（中身が入るまで保留）
             }
-            from.mime.clone()
+            // v1.7 P2: URLカードは url_ref 文字列を text/plain で供給する（実行契約）。
+            if from.mime == crate::project::URL_MIME {
+                "text/plain".into()
+            } else {
+                from.mime.clone()
+            }
         };
         if !flow::mime_matches(&accept, &out_mime) {
             f.push(Finding {

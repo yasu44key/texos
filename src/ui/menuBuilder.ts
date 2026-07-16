@@ -131,6 +131,11 @@ export interface MenuActions {
   renameReal: (id: string, current: string) => void;
   setMemo: (id: string, current: string) => void;
   changeUrl: (id: string, current: string) => void;
+  // v1.7 P2 URLカードの仮身昇格: 更新確認（条件付きGET→マークのみ）／再取得（新実身＋系譜更新）
+  checkUrlUpdate: (id: string) => void;
+  refetchUrl: (id: string) => void;
+  // 一括「このプロジェクトのURLカードの更新を確認」（キャンバスメニュー）
+  checkAllUrlUpdates: () => void;
   deleteObject: (id: string) => void;
   requestDelete: (id: string) => void;
   bringToFront: (id: string) => void;
@@ -422,6 +427,18 @@ export function buildObjectMenu(
           invoke("open_url_with_chooser", { url: obj.url_ref! }).catch(() => {}),
       },
       { label: "URLを変更...", onClick: () => a.changeUrl(targetId, obj.url_ref!) },
+      // v1.7 P2: URLカードの仮身昇格（更新マークと取得系譜・計画 §3 P2）。
+      // 確認は「取得→比較→破棄」で実身を作らない（CAS肥大対策 §7-3）。
+      {
+        label: "更新を確認",
+        hint: "ページを取得して、取得済みの実身と内容を比べます（実身は作りません）。変化があればこのカードに更新マークが付きます。web_fetch などで一度実身化してから使えます。",
+        onClick: () => a.checkUrlUpdate(targetId),
+      },
+      {
+        label: "再取得（新しい実身を作る）",
+        hint: "ページを取得して新しい実身カードを作り、取得系譜をそちらへ更新します（前の実身は残ります）。まだ取得していないURLでは初回の取得になります。",
+        onClick: () => a.refetchUrl(targetId),
+      },
       ...zItems,
       { label: obj.memo ? "コメントを編集..." : "コメントを追加...", onClick: () => a.setMemo(targetId, obj.memo ?? "") },
       { label: "表示名を変更...", onClick: () => a.renameObject(targetId, obj.label) },
@@ -1468,6 +1485,12 @@ export function buildCanvasMenu(
       label: "すべて実身化（持ち出し）...",
       hint: "プロジェクト内のすべての仮身を実身化し、データをプロジェクトフォルダに書き出します。",
       onClick: () => a.commitAll(),
+    },
+    // v1.7 P2: 一括更新確認（明示操作なので pull 原則と矛盾しない・計画 §3 P2）。
+    {
+      label: "URLカードの更新を確認...",
+      hint: "このプロジェクトの取得済みURLカードをすべて確認し、内容が変わったカードに更新マークを付けます（実身は作りません。同じサイトへは間隔を空けて順番にアクセスします）。",
+      onClick: () => a.checkAllUrlUpdates(),
     },
     {
       label: "ゴミ箱を開く ...",

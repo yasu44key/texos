@@ -54,6 +54,7 @@ import {
   mimeMatches,
   noteSize,
   shapeCenterOn,
+  webUpdateOf,
   type NoteInfo,
   type VirtualBodyInfo,
 } from "./model";
@@ -2783,6 +2784,80 @@ function App() {
     [refresh]
   );
 
+  // v1.7 P2 URLカードの仮身昇格: 「更新を確認」= 条件付きGET→比較→破棄（マークのみ・
+  // 実身は作らない）。結果はダイアログで知らせ、更新マークは refresh で反映される。
+  const handleCheckUrlUpdate = useCallback(
+    async (id: string) => {
+      try {
+        const r = await invoke<{ updated: boolean; message: string }>("web_check_update", { id });
+        await refresh();
+        setConfirm({
+          title: r.updated ? "更新があります" : "更新を確認",
+          message: r.message,
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      } catch (e) {
+        setConfirm({
+          title: "更新の確認に失敗しました",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh]
+  );
+
+  // 「再取得」= 取得→新しい実身カード＋取得系譜の更新（前の実身は残る）。未取得なら初回取得。
+  const handleRefetchUrl = useCallback(
+    async (id: string) => {
+      try {
+        await invoke<string>("web_refetch", { id });
+        await refresh();
+      } catch (e) {
+        setConfirm({
+          title: "再取得に失敗しました",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh]
+  );
+
+  // 一括「このプロジェクトのURLカードの更新を確認」（対象=取得済みのURLカードのみ）。
+  const handleCheckAllUrlUpdates = useCallback(async () => {
+    try {
+      const r = await invoke<{
+        checked: number;
+        updated: number;
+        skipped: number;
+        errors: string[];
+      }>("web_check_update_all");
+      await refresh();
+      const lines = [
+        `確認 ${r.checked} 枚 / 更新あり ${r.updated} 枚`,
+        ...(r.skipped ? [`未取得のためスキップ: ${r.skipped} 枚（web_fetch か「再取得」で実身化すると対象になります）`] : []),
+        ...(r.errors.length ? ["", "エラー:", ...r.errors] : []),
+      ];
+      setConfirm({
+        title: "URLカードの更新を確認",
+        message: lines.join("\n"),
+        okLabel: "OK",
+        onConfirm: () => setConfirm(null),
+      });
+    } catch (e) {
+      setConfirm({
+        title: "更新の確認に失敗しました",
+        message: String(e),
+        okLabel: "OK",
+        onConfirm: () => setConfirm(null),
+      });
+    }
+  }, [refresh]);
+
   // Create a new sub/sibling project and place a project-object card.
   const handleNewSubproject = useCallback(
     (sibling: boolean, canvasX: number, canvasY: number) => {
@@ -4700,7 +4775,7 @@ function App() {
         //   幾何 = 列幅・行高は各列/各行の最大実寸（展開パネル・付箋実測）＋GAP。
         //          セルを実寸で確保するため重なりは構造上起きない。
         const ids = new Set(items.map((it) => it.id));
-        const ARROW_KINDS = new Set(["link", "flow", "req"]); // group=論理所属は向きでない
+        const ARROW_KINDS = new Set(["link", "flow", "req", "fetched"]); // group=論理所属は向きでない
         const outEdges = new Map<string, string[]>();
         const indeg = new Map<string, number>(items.map((it) => [it.id, 0]));
         for (const r of relationsRef.current) {
@@ -5385,6 +5460,9 @@ function App() {
         renameReal: handleRenameReal,
         setMemo: handleSetMemo,
         changeUrl: handleChangeUrl,
+        checkUrlUpdate: handleCheckUrlUpdate,
+        refetchUrl: handleRefetchUrl,
+        checkAllUrlUpdates: handleCheckAllUrlUpdates,
         deleteObject: handleDeleteObject,
         requestDelete: handleRequestDelete,
         bringToFront: handleBringToFront,
@@ -5518,6 +5596,9 @@ function App() {
       handleDeleteNote,
       handleAddUrl,
       handleChangeUrl,
+      handleCheckUrlUpdate,
+      handleRefetchUrl,
+      handleCheckAllUrlUpdates,
       handleSetMemo,
       handleNoteStyle,
       handleNoteColor,
@@ -5731,6 +5812,12 @@ function App() {
       continue; // 出力MIME不明（外部コマンド）はチェックしない
     }
     if (src.kind === "drop" && src.real_id.startsWith("drop:")) continue; // 空の入口
+    // v1.7 P2: URLカードは url_ref 文字列を text/plain で供給する（実行契約。
+    // バックエンド preflight.rs の型特例と同じ規則を保つこと）。
+    if (src.url_ref) {
+      if (!mimeMatches(accept, "text/plain")) invalidFlowIds.add(r.id);
+      continue;
+    }
     if (!mimeMatches(accept, src.mime_type)) invalidFlowIds.add(r.id);
   }
 
@@ -5794,6 +5881,7 @@ function App() {
             lost={lostOf(obj) ?? ((lostRealOf(obj) || lostFolderOf(obj)) ? "real" : null)}
             isProject={obj.mime_type === PROJECT_MIME || !!obj.project_ref}
             isUrl={!!obj.url_ref}
+            webUpdate={webUpdateOf(obj)}
             isFolder={!!obj.folder_ref}
             isFilter={obj.kind !== "launcher" && (obj.kind === "filter" || !!obj.filter_ref)}
             filterRef={obj.filter_ref}
