@@ -1,18 +1,16 @@
 # TexoS 開発引き継ぎノート
 
-## 最終更新: 2026-07-16 / 到達点: **v1.7 P1（web_fetch）実装完了＝実機確認待ち・リリース前**
+## 最終更新: 2026-07-16 / 到達点: **v1.7.0 リリース＝web_fetch（Webの実身化・実機確認済み）**
 
-> **★ いまここ（2026-07-16・ブランチ feat/v1.7-web）**: v1.7 P1 = `web_fetch` ビルトインの
-> 実装が完了（計画 §6 チェックリスト全項目・回帰97件 green・tsc green・example.com 実機
-> フェッチ確認済み）。**残り = アプリでの実機確認 → `docs/更新履歴.md` v1.7.0（記入済み）を
-> 確認 → `npm run release -- 1.7.0` → main へ統合**。
+> **★ いまここ（2026-07-16・main へ FF 統合済み commit 38c2dcb・push 済み）**:
+> v1.7 P1 = `web_fetch` を v1.7.0 としてリリース（計画 §6 チェックリスト全項目・回帰97件
+> green・実機確認済み〔空欄作成の FB 1件を同日修正 = allowEmpty〕。
+> インストーラ = `I:\texos_1.7.0_x64-setup.exe`）。**次 = P2 URLカード仮身昇格**。
 > - 新規: `src-tauri/src/web.rs`（§4 安全最小セット共通関数 fetch_url ＝ P2〜P4 で共用）・
 >   `virtual_bodies.web_meta` 列（source_url/fetched_at/etag/…。P2「更新を確認」が読む）・
 >   メニュー「Web ...」グループ・BUILTIN_SCHEMAS web_fetch・ユーザーズチップス Tip 9。
 > - 実行系: FlowPayload/NodeRun に meta が通る（web_fetch → 終端カードの web_meta へ。
 >   中間ノードを経ると付かない）。入力なし＋URL直書きの単独実行は t2i パネル単独生成と同型。
-> - 実機確認の観点: ①URL直書き▶（タイトル=カード名・md 中身）②付箋(URL)→web_fetch→AI要約の
->   3カード ③画像/CSV 直リンクの raw 実身化 ④SJIS ページの文字化けなし ⑤localhost 拒否の文言。
 > - 次号 P2 = URLカード仮身昇格（更新マーク・取得系譜）: 実行契約に手が入るため号を分ける
 >   （計画 §3 P2・§7-3 CAS肥大対策＝「確認は破棄・実身化は明示再取得だけ」）。
 > - **リリース方針（2026-07-16 ユーザー決定）: P2〜P4 は号ごとにリリースしない。**
