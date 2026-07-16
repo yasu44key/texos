@@ -1335,10 +1335,12 @@ function App() {
             }),
         });
       } else if (builtin === "web_fetch") {
-        // v1.7 P1: URL を聞いて作成（空欄=テキストカード接続で渡す。設定ダイアログで変更可）。
+        // v1.7 P1: URL を聞いて作成。空欄でも作る（URL はテキストカード接続 or 設定
+        // ダイアログで後から — 実機FB 2026-07-16: 空欄=キャンセルだと接続運用の入口が無い）。
         setPrompt({
           title: "Webページ取得: URL（空欄=URLを書いたテキストカードを接続）",
           initial: "",
+          allowEmpty: true,
           onConfirm: (u) => {
             const url = u.trim();
             let host = "";
