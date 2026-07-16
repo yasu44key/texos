@@ -312,6 +312,13 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     ],
     note: "ページの見た目をそのまま PNG 実身にします（OS の Edge/Chrome をヘッドレスで使用・ブラウザは同梱しません）。web_fetch の本文 Markdown と対で「テキストと見た目」の両方を保存できます。マニュアル素材・デザイン参考・文字にならないページの保存に。取得は実行したときだけ（タイムアウト30秒）。",
   },
+  to_url: {
+    // v1.7 P5(b): テキスト走査 → URLカード群（1 URL = 1リンクカード）。
+    title: "URLカード化（to_url）",
+    fixed: { accept_mime: "text/*" },
+    fields: [],
+    note: "入力テキストの中の URL（http/https）を全部拾って、1つにつき1枚の URL リンクカードにします。カード名は入力カードの名前を引き継ぎます。重複と、このフィルタが過去に出したリンク（削除済み含む）は増やしません。フィード取得と組み合わせると記事のリンク集が作れます（例: フィード取得 → 抽出 text_grep「^記事: 」 → URLカード化）。下流にフィルタを繋いだ場合は URL 文字列（テキスト）として流れます。",
+  },
   text_convert: {
     title: "文字コード変換（→ UTF-8）",
     fixed: { accept_mime: "text/*" },

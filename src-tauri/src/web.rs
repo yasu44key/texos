@@ -976,6 +976,55 @@ fn feed_to_outs(
 }
 
 // ---------------------------------------------------------------------------
+// v1.7 P5(b): to_url — URLカード化（テキスト→リンク・実機FB 2026-07-17）。
+// テキスト全文を走査して見つかった URL を**全部**カード化する（1 URL = 1カード）。
+// 「1本のリンクを保持する URL カード（P5(a) 受け皿）」と「リンクを量産するフィルタ」の
+// 役割をはっきり分ける、というユーザー設計。
+// ---------------------------------------------------------------------------
+
+/// テキスト中の http(s):// URL を出現順に全部拾う（重複は最初の1つ・末尾の約物を落とす）。
+/// 文字集合は実用 ASCII の URL 構成文字（空白・<>・引用符・括弧・全角文字で切る —
+/// Markdown の `[題](URL)` や「URLです」の直結日本語で正しく止まる）。
+pub fn scan_urls(text: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"https?://[0-9A-Za-z\-._~:/?#@!$&*+,;=%]+").unwrap()
+    });
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for m in re.find_iter(text) {
+        // 末尾の文末記号は URL の一部でないことがほとんど（「…html.」等）。
+        let u = m.as_str().trim_end_matches(['.', ',', ';', ':', '!', '?']).to_string();
+        if u.len() > "https://".len() && seen.insert(u.clone()) {
+            out.push(u);
+        }
+    }
+    out
+}
+
+/// builtin:"to_url" 本体: テキスト → URLカード化ペイロード群（1入力→N出力）。
+/// ペイロードは text/plain の URL 文字列 — **途中に置けば**下流（web_fetch 等）へ
+/// そのまま流れ、**終端なら** meta の url_card マーカーを見たマテリアライザが
+/// URL カードとして着地させる（実ファイル・CAS なし）。
+pub fn run_to_url(input: &[u8]) -> Result<Vec<WebFetchOut>, String> {
+    let text = String::from_utf8_lossy(input);
+    let urls = scan_urls(&text);
+    if urls.is_empty() {
+        return Err("テキストに URL（http:// / https://）が見つかりません".into());
+    }
+    Ok(urls
+        .into_iter()
+        .map(|u| WebFetchOut {
+            bytes: u.into_bytes(),
+            ext: "txt".into(),
+            mime: "text/plain".into(),
+            stem: None, // 入力カードの語幹を引き継ぐ（記事タイトル等がそのままカード名に）
+            meta: r#"{"url_card":true}"#.into(),
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // v1.7 P4: web_capture — ページのスクリーンショット実身（L2 OSアダプタ・計画 §3 P4）。
 // OS 搭載/汎用の Chromium 系ブラウザ（Windows=Edge 標準搭載）をヘッドレスで呼ぶ —
 // ブラウザエンジンは同梱しない（§1-5 配布ミニマム）。web_fetch の本文 md と対で
@@ -1515,6 +1564,43 @@ mod tests {
         let s = spec(r#"{"builtin":"web_feed","url":"http://127.0.0.1:8080/feed"}"#);
         let e = run_web_feed(&s, None).unwrap_err();
         assert!(e.contains("プライベートアドレス"), "{e}");
+    }
+
+    // --- v1.7 P5(b): to_url（URLカード化） ---
+
+    /// URL 走査: 出現順・重複除去・末尾約物トリム・Markdown/日本語直結で正しく切れる。
+    #[test]
+    fn scan_urls_variants() {
+        let text = "本文 https://a.jp/x?q=1&r=2 と [題](https://b.jp/y) 。\n\
+                    記事: https://a.jp/x?q=1&r=2\n\
+                    直結https://c.jp/zです。末尾 https://d.jp/w.html.";
+        let urls = scan_urls(text);
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.jp/x?q=1&r=2",
+                "https://b.jp/y",
+                "https://c.jp/z",
+                "https://d.jp/w.html",
+            ]
+        );
+        assert!(scan_urls("URL なしのテキスト").is_empty());
+        assert!(scan_urls("https:// だけ（中身なし）").is_empty());
+    }
+
+    /// run_to_url: 1入力→N出力・ペイロードは text/plain の URL・url_card マーカー付き。
+    /// URL が無いテキストは明確なエラー。
+    #[test]
+    fn to_url_payloads() {
+        let outs = run_to_url("記事: https://ex.jp/a\nおまけ https://ex.jp/b".as_bytes()).unwrap();
+        assert_eq!(outs.len(), 2);
+        assert_eq!(String::from_utf8(outs[0].bytes.clone()).unwrap(), "https://ex.jp/a");
+        assert_eq!(outs[0].mime, "text/plain");
+        assert!(outs[0].stem.is_none(), "語幹は入力カードを引き継ぐ");
+        let m: serde_json::Value = serde_json::from_str(&outs[0].meta).unwrap();
+        assert_eq!(m["url_card"], true);
+        let e = run_to_url("リンクなし".as_bytes()).unwrap_err();
+        assert!(e.contains("URL"), "{e}");
     }
 
     // --- v1.7 P4: web_capture ---

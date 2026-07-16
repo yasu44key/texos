@@ -160,6 +160,20 @@ pub(crate) fn execute_node(
                     stderr: String::new(),
                 })
             }
+            // v1.7 P5(b): to_url（URLカード化）— テキスト全文を走査して URL を全部
+            // ペイロード化（1入力→N出力）。終端ならマテリアライザが URL カードとして
+            // 着地させ、途中なら text/plain の URL として下流へ流れる（web_fetch 連鎖可）。
+            else if b == "to_url" {
+                let rs = web::run_to_url(inputs[0].0)?;
+                Ok(NodeRun {
+                    outputs: rs
+                        .into_iter()
+                        .map(|r| (r.bytes, r.ext, r.mime, r.stem, Some(r.meta)))
+                        .collect(),
+                    exit_code: None,
+                    stderr: String::new(),
+                })
+            }
             // v1.7 P4: web_capture はヘッドレスブラウザの外部起動（L2 OSアダプタ）。
             // 外部プロセスなので中断は kill が効く＝cancel を中へ渡す。
             else if b == "web_capture" {
@@ -400,6 +414,78 @@ fn link_fetch_source(p: &Project, fid: &str, meta: &str, target: &str) {
     for url_card in url_cards {
         crate::web::record_fetch_lineage(&p.conn, &url_card, target);
     }
+}
+
+/// v1.7 P5(a): 終端フィルタ（fid）から矢印が引かれた URL カード＝「リンクの受け皿」。
+/// to_url の出力矢印も URL カードを指すため、呼び出し側は to_url を対象外にすること。
+fn url_sink_ids(conn: &Connection, fid: &str) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT v.id FROM relations rel
+         JOIN virtual_bodies v ON v.id = rel.to_id AND v.deleted_at IS NULL
+         WHERE rel.from_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+           AND v.kind = 'url'
+         ORDER BY rel.created_at",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map(rusqlite::params![fid], |r| r.get(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// v1.7 P5(a): 受け皿 URL カードへ URL を流し込む。返り値は表示用ラベル。
+/// - ラベルが旧 URL のままなら新 URL に追従（タイトルを付けたカードは名前を保つ）。
+/// - URL が変わったら旧取得系譜（fetched）と更新マークは無効なので畳む。
+fn update_url_sink(conn: &Connection, sink: &str, url: &str) -> Result<String, String> {
+    let old: Option<String> = conn
+        .query_row(
+            "SELECT url_ref FROM virtual_bodies WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![sink],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    conn.execute(
+        "UPDATE virtual_bodies
+         SET label = CASE WHEN label = COALESCE(url_ref, '') THEN ?1 ELSE label END,
+             url_ref = ?1
+         WHERE id = ?2",
+        rusqlite::params![url, sink],
+    )
+    .map_err(|e| e.to_string())?;
+    if old.as_deref() != Some(url) {
+        let _ = conn.execute(
+            "UPDATE relations SET deleted_at = ?1
+             WHERE from_id = ?2 AND kind = 'fetched' AND deleted_at IS NULL",
+            rusqlite::params![db::now_ms(), sink],
+        );
+        let _ = conn.execute(
+            "UPDATE virtual_bodies SET web_meta = NULL WHERE id = ?1",
+            rusqlite::params![sink],
+        );
+    }
+    conn.query_row(
+        "SELECT label FROM virtual_bodies WHERE id = ?1",
+        rusqlite::params![sink],
+        |r| r.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// v1.7 P5(b): このフィルタ（fid）が過去に出した URL カードに url があるか（既出台帳）。
+/// guid（P3）と同じ原則: **削除済みも既出に数える**＝消したリンクは再実行で蘇らない。
+fn url_output_seen(conn: &Connection, fid: &str, url: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM relations rel
+         JOIN virtual_bodies v ON v.id = rel.to_id
+         WHERE rel.from_id = ?1 AND rel.kind = 'flow' AND v.url_ref = ?2 LIMIT 1",
+        rusqlite::params![fid, url],
+        |_| Ok(true),
+    )
+    .optional()
+    .unwrap_or(None)
+    .unwrap_or(false)
 }
 
 /// v1.7 P3: このフィルタ（fid）の出力カードが持つ web_meta guid の集合（既読台帳）。
@@ -1245,6 +1331,70 @@ mod ws_p1_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v1.7 P5: リンクの受け皿（url_sink_ids / update_url_sink）と既出台帳（url_output_seen）。
+    /// - 受け皿: フィルタ→URLカードの矢印列挙・url_ref 更新・ラベル追従（旧URL名のときだけ）・
+    ///   URL変更時に旧系譜と更新マークを畳む。
+    /// - 既出台帳: このフィルタが出した URL は削除済みでも既出（消したリンクは蘇らない）。
+    #[test]
+    fn url_sink_and_seen_ledger() {
+        let dir = std::env::temp_dir().join(format!("texos_url_sink_{}", db::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::open(&dir.join("texos.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO real_bodies (id, mime_type, size, created_at) VALUES
+               ('url:sentinel', 'application/vnd.texos.url', 0, 1),
+               ('filter:sentinel', 'application/vnd.texos.filter', 0, 1);
+             INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, url_ref, kind) VALUES
+               ('u1', 'url:sentinel', 'https://old.jp/', 0, 0, 1, 'https://old.jp/', 'url'),
+               ('u2', 'url:sentinel', '定点ページ', 0, 0, 1, 'https://old.jp/', 'url'),
+               ('u3', 'url:sentinel', 'A', 0, 0, 1, 'https://ex.jp/a', 'url');
+             INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind) VALUES
+               ('f1', 'filter:sentinel', '置換', 0, 0, 1, 'filter'),
+               ('t1', 'filter:sentinel', 'URL化', 0, 0, 1, 'filter');
+             INSERT INTO relations (from_id, to_id, kind, created_at) VALUES
+               ('f1', 'u1', 'flow', 1),
+               ('f1', 'u2', 'flow', 2),
+               ('u1', 'f0_dummy', 'fetched', 3),
+               ('t1', 'u3', 'flow', 4);
+             UPDATE virtual_bodies SET web_meta = '{\"update\":true}' WHERE id = 'u1';",
+        )
+        .unwrap();
+        // 受け皿の列挙（矢印の張られた URL カードだけ・接続順）
+        assert_eq!(url_sink_ids(&conn, "f1"), vec!["u1".to_string(), "u2".to_string()]);
+        assert!(url_sink_ids(&conn, "no_such").is_empty());
+        // 更新: u1 はラベル=旧URL → 追従。u2 はタイトル付き → 名前を保つ。
+        let l1 = update_url_sink(&conn, "u1", "https://new.jp/x").unwrap();
+        assert_eq!(l1, "https://new.jp/x");
+        let l2 = update_url_sink(&conn, "u2", "https://new.jp/x").unwrap();
+        assert_eq!(l2, "定点ページ");
+        let (url1, meta1): (String, Option<String>) = conn
+            .query_row(
+                "SELECT url_ref, web_meta FROM virtual_bodies WHERE id = 'u1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(url1, "https://new.jp/x");
+        assert!(meta1.is_none(), "URL変更で更新マークは畳む");
+        let live_fetched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations
+                 WHERE from_id = 'u1' AND kind = 'fetched' AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_fetched, 0, "URL変更で旧系譜は畳む");
+        // 既出台帳: t1 が出した https://ex.jp/a は既出。削除しても既出のまま。
+        assert!(url_output_seen(&conn, "t1", "https://ex.jp/a"));
+        assert!(!url_output_seen(&conn, "t1", "https://ex.jp/b"));
+        assert!(!url_output_seen(&conn, "f1", "https://ex.jp/a"), "フィルタ単位の台帳");
+        conn.execute("UPDATE virtual_bodies SET deleted_at = 9 WHERE id = 'u3'", []).unwrap();
+        assert!(url_output_seen(&conn, "t1", "https://ex.jp/a"), "削除済みも既出");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// v1.7 P4: link_fetch_source は capture:true メタ（web_capture）では系譜を張らない
     /// （更新確認のベースラインが png になり「常に更新あり」になる事故の防止）。
     /// 通常メタ（web_fetch）は従来どおり張る。
@@ -1726,11 +1876,97 @@ fn run_flow_inner(
     {
     let p = &jp;
     let mut out_i = 0usize;
+    // v1.7 P5(a) リンクの受け皿: 終端フィルタから URL カードへ矢印が引いてあれば、
+    // ペイロードのテキストから**最初の URL** を拾ってそのカードの url_ref を更新し、
+    // 新しいカードは作らない（固定名上書きと同型の「定点リンク」。開くのは従来どおり手動）。
+    // to_url は自分の出力矢印が URL カードを指すので対象外。
+    let url_sinks = if term_spec.builtin.as_deref() == Some("to_url") {
+        Vec::new()
+    } else {
+        url_sink_ids(&p.conn, &id)
+    };
+    let payloads: Vec<FlowPayload> = if url_sinks.is_empty() || payloads.is_empty() {
+        payloads
+    } else {
+        let first_url = payloads
+            .iter()
+            .find_map(|pl| web::scan_urls(&String::from_utf8_lossy(&pl.bytes)).into_iter().next());
+        match first_url {
+            Some(u) => {
+                for sid in &url_sinks {
+                    match update_url_sink(&p.conn, sid, &u) {
+                        Ok(label) => {
+                            report.updated.push(sid.clone());
+                            report.outputs.push(format!("リンク「{label}」→ {u}"));
+                        }
+                        Err(e) => report.errors.push(e),
+                    }
+                }
+            }
+            None => report.errors.push(
+                "リンクカードへ流せる URL がありません（テキストに http:// / https:// を含めてください）"
+                    .into(),
+            ),
+        }
+        Vec::new() // 受け皿が引き取った＝通常のカード化はしない
+    };
     // v1.7 P3 既読管理（差分 pull・計画 §3 P3）: guid 付きメタ（web_feed のエントリ）は、
     // このフィルタが過去に出力した guid と照合し、取り込み済みならスキップ＝再実行は
     // 新着だけをカード化する。台帳は最初に必要になったとき一度だけ読む。
     let mut seen_guids: Option<std::collections::HashSet<String>> = None;
     for pl in &payloads {
+        // v1.7 P5(b) URLカード化（to_url）: url_card マーカー付きペイロードはファイルでなく
+        // **URL カード**として着地する（実ファイル・CAS なし・url:sentinel 実身を共用）。
+        // このフィルタが過去に出した URL（削除済み含む・guid と同じ原則）は増やさない。
+        if let Some(m) = &pl.meta {
+            let is_url_card = serde_json::from_str::<serde_json::Value>(m)
+                .ok()
+                .and_then(|v| v.get("url_card").and_then(|b| b.as_bool()))
+                .unwrap_or(false);
+            if is_url_card {
+                let url = String::from_utf8_lossy(&pl.bytes).trim().to_string();
+                if url_output_seen(&p.conn, &id, &url) {
+                    report.outputs.push(format!("{url}（既存リンク・増やしません）"));
+                    continue;
+                }
+                let _ = p.conn.execute(
+                    "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+                     VALUES ('url:sentinel', ?1, 0, ?2)",
+                    rusqlite::params![crate::project::URL_MIME, db::now_ms()],
+                );
+                let label = if pl.stem.trim().is_empty() || pl.stem == "output" {
+                    url.clone()
+                } else {
+                    pl.stem.clone()
+                };
+                let new_vid = uuid();
+                if let Err(e) = p.conn.execute(
+                    "INSERT INTO virtual_bodies
+                        (id, real_id, label, pos_x, pos_y, created_at, url_ref, kind)
+                     VALUES (?1, 'url:sentinel', ?2, ?3, ?4, ?5, ?6, 'url')",
+                    rusqlite::params![
+                        new_vid,
+                        label,
+                        fx + 190.0,
+                        fy + (out_i as f64) * 170.0,
+                        db::now_ms(),
+                        url
+                    ],
+                ) {
+                    report.errors.push(format!("{label}: {e}"));
+                    continue;
+                }
+                let _ = p.conn.execute(
+                    "INSERT INTO relations (from_id, to_id, kind, created_at)
+                     VALUES (?1, ?2, 'flow', ?3)",
+                    rusqlite::params![id, new_vid, db::now_ms()],
+                );
+                report.created.push(new_vid);
+                report.outputs.push(format!("{label}（リンク）"));
+                out_i += 1;
+                continue;
+            }
+        }
         // v1.7 P3: guid の既読チェック（内容ハッシュより先。概要の微修正で guid が同じ
         // まま内容が変わっても「新着」扱いにはしない — 新着のみ出力の原則）。
         if let Some(m) = &pl.meta {

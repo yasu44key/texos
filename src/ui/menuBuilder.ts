@@ -1263,6 +1263,13 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
             hint: "ページの見た目をそのまま PNG 実身にします（OS 搭載の Edge/Chrome をヘッドレスで使用・同梱しません）。ページ取得が本文（テキスト）、こちらは見た目（画像）。",
             onClick: () => a.addFilter("web_capture"),
           },
+          // v1.7 P5: テキスト→URLカード群（リンクの量産）。受け皿（1枚更新）は
+          // フィルタ→URLカードへ矢印を引くだけ（フィルタ不要）。
+          {
+            label: "URLカード化（テキスト→リンク）",
+            hint: "入力テキストの中の URL を全部拾って、URL リンクカードにします（1 URL = 1カード・出したことのあるリンクは増やしません）。フィード取得と繋ぐと記事のリンク集に。1枚のリンクカードを更新し続けたいときは、フィルタから既存の URL カードへ矢印を引いてください。",
+            onClick: () => a.addFilter("to_url"),
+          },
         ]),
     },
     // v1.5.15 L2 OSアダプタ・ビルトイン（標準フィルタ充実検討 §4: OS差はbuiltinの内側に閉じ込める）。

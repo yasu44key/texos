@@ -1399,6 +1399,9 @@ function App() {
             });
           },
         });
+      } else if (builtin === "to_url") {
+        // v1.7 P5: テキスト→URLカード群。パラメータなし＝そのまま作る。
+        create("URLカード化", { builtin: "to_url", accept_mime: "text/*" });
       } else if (builtin === "text_convert") {
         // nkf 相当。既定=自動判定→UTF-8。文字コードの明示は設定ダイアログで。
         create("UTF-8へ変換", { builtin: "text_convert", encoding: "auto", accept_mime: "text/*" });

@@ -281,6 +281,9 @@ fn filter_output_mime(spec: &flow::FilterSpec) -> Option<String> {
         Some("web_feed") => Some("text/markdown".into()),
         // v1.7 P4: web_capture は常にスクリーンショット（PNG）を吐く。
         Some("web_capture") => Some("image/png".into()),
+        // v1.7 P5: to_url のペイロードは URL 文字列（text/plain）— 下流に繋げば
+        // web_fetch 等の入力になり、終端なら URL カードとして着地する。
+        Some("to_url") => Some("text/plain".into()),
         Some("img_convert") => {
             let f = spec.format.as_deref().unwrap_or("png").to_lowercase();
             Some(if f == "jpg" || f == "jpeg" {
