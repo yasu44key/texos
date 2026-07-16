@@ -605,6 +605,8 @@ mod project;
 mod runtime;
 mod shapes;
 mod util;
+// v1.7 P1: Web の実身化（web_fetch。安全最小セットの共通関数を web_* 系で共用）。
+mod web;
 pub(crate) use ai::*;
 pub(crate) use clipboard_in::*;
 pub(crate) use filters::*;

@@ -240,6 +240,22 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     ],
     note: "フォルダ直下の未登録ファイルをカードとして登録します（登録済み・一時ファイルはスキップ・このカードの下に並びます）。ウォッチャのリクエスト矢印の先に置くと、新しいファイルが現れるたびに自動で取り込みます。出力カードは作りません。",
   },
+  web_fetch: {
+    // v1.7 P1（情報収集経路計画 §3）: URL → 本文 Markdown 実身（Webの実身化）。
+    title: "Webページ取得（web_fetch）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "url",
+        label: "URL",
+        type: "text",
+        optional: true,
+        placeholder: "https://…（テキストカードを接続するときは空欄）",
+        hint: "このURLの本文を取得します。テキストカード（1行目=URL）を入力に接続したときは、そちらが優先されます。",
+      },
+    ],
+    note: "ページの本文を抽出して Markdown 実身にします（タイトル=カード名・出典URLはメタに記録）。HTML 以外の直リンク（画像・CSV・JSON など）はそのままの形式で実身化します。取得は実行したときだけ（タイムアウト30秒・上限20MB）。",
+  },
   text_convert: {
     title: "文字コード変換（→ UTF-8）",
     fixed: { accept_mime: "text/*" },

@@ -271,6 +271,7 @@ pub(crate) fn collect_context(
                             ext: ext.clone().unwrap_or_else(|| "bin".into()),
                             mime: mime.clone(),
                             stem,
+                            meta: None,
                         }],
                         None,
                     ))

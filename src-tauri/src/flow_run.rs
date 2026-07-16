@@ -60,6 +60,10 @@ pub(crate) struct FlowPayload {
     pub(crate) mime: String,
     /// 連鎖の起点データのファイル名語幹（最終出力の命名に使う）
     pub(crate) stem: String,
+    /// v1.7 P1: 取得メタ（web_fetch の {source_url, fetched_at, etag, …} JSON）。
+    /// 終端でカード化されるとき virtual_bodies.web_meta に保存される（P2 更新マークの材料）。
+    /// 中間ノードを経ると付かない（下流の出力は取得物そのものではないため）。
+    pub(crate) meta: Option<String>,
 }
 
 /// §4.1 リファクタリング: ノード1回分の実行結果。`outputs` は生成物（builtin/ai は1個、
@@ -67,10 +71,11 @@ pub(crate) struct FlowPayload {
 /// 情報で、現状 eval_filter は使わない — 将来の exit code 分岐（§4.3「成功時/失敗時」の
 /// flow 矢印）でここを見るための土台アンカー。
 pub(crate) struct NodeRun {
-    // (bytes, ext, mime, stem_override)。stem_override は v1.6 {out*} 複数出力のとき
+    // (bytes, ext, mime, stem_override, meta)。stem_override は v1.6 {out*} 複数出力のとき
     // プログラムが付けたファイル名の語幹（＝カード名になる）。None なら呼び出し側の
-    // 従来命名（入力 stem / prefix / "output"）。
-    outputs: Vec<(Vec<u8>, String, String, Option<String>)>,
+    // 従来命名（入力 stem / prefix / "output"）。meta は v1.7 web_fetch の取得メタ JSON
+    // （FlowPayload::meta へそのまま流れる。web_fetch 以外は None）。
+    outputs: Vec<(Vec<u8>, String, String, Option<String>, Option<String>)>,
     #[allow(dead_code)] // §4.3 で消費予定
     exit_code: Option<i32>,
     #[allow(dead_code)] // §4.3 で消費予定
@@ -98,7 +103,7 @@ pub(crate) fn execute_node(
     let cancel = &job.cancel;
     let stdin_slot = &job.control;
     let plain = |bytes: Vec<u8>, ext: String, mime: String| NodeRun {
-        outputs: vec![(bytes, ext, mime, None)],
+        outputs: vec![(bytes, ext, mime, None, None)],
         exit_code: None,
         stderr: String::new(),
     };
@@ -119,6 +124,21 @@ pub(crate) fn execute_node(
                 flow::run_speak(inputs[0].0)?;
                 Ok(NodeRun {
                     outputs: Vec::new(),
+                    exit_code: None,
+                    stderr: String::new(),
+                })
+            }
+            // v1.7 P1: web_fetch はネットワークを使う別経路（AI と同系・同期 blocking）。
+            // 入力なし（パラメータ欄 URL）も許すので inputs は Option で渡す。
+            // 語幹（ページタイトル）とメタ JSON を返す拡張契約のため run_builtin に乗せない。
+            else if b == "web_fetch" {
+                let r = web::run_web_fetch(spec, inputs.first().map(|i| i.0))?;
+                // AI と同じ「中断＝完走後に破棄」の契約（HTTP は途中で切れない）。
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("中断されました".into());
+                }
+                Ok(NodeRun {
+                    outputs: vec![(r.bytes, r.ext, r.mime, r.stem, Some(r.meta))],
                     exit_code: None,
                     stderr: String::new(),
                 })
@@ -251,11 +271,11 @@ pub(crate) fn execute_node(
                             .and_then(|s| s.to_str())
                             .unwrap_or("output")
                             .to_string();
-                        (bytes, ext, mime, Some(stem))
+                        (bytes, ext, mime, Some(stem), None)
                     })
                     .collect()
             } else {
-                vec![(o.into_bytes()?, out_ext, out_mime, None)]
+                vec![(o.into_bytes()?, out_ext, out_mime, None, None)]
             };
             Ok(NodeRun {
                 outputs,
@@ -460,6 +480,7 @@ pub(crate) fn apply_edge(
                 ext: "txt".into(),
                 mime: "text/plain".into(),
                 stem: format!("{vlabel}のエラー"),
+                meta: None,
             }]
         }
         "input" => up.failed_inputs.clone(),
@@ -618,11 +639,12 @@ pub(crate) fn eval_filter(
                 EvalOut::data(
                     r.outputs
                         .into_iter()
-                        .map(|(bytes, ext, mime, stem_o)| FlowPayload {
+                        .map(|(bytes, ext, mime, stem_o, meta)| FlowPayload {
                             bytes,
                             ext,
                             mime,
                             stem: stem_o.unwrap_or_else(|| stem.clone()),
+                            meta,
                         })
                         .collect(),
                     exit,
@@ -736,6 +758,7 @@ pub(crate) fn eval_filter(
                             ext: "txt".into(),
                             mime: "text/plain".into(),
                             stem,
+                            meta: None,
                         }],
                         None,
                     )
@@ -761,6 +784,7 @@ pub(crate) fn eval_filter(
                             ext: ext.clone().unwrap_or_else(|| "bin".into()),
                             mime: mime.clone(),
                             stem,
+                            meta: None,
                         }],
                         None,
                     )
@@ -794,6 +818,7 @@ pub(crate) fn eval_filter(
                             ext: "txt".into(),
                             mime: "text/plain".into(),
                             stem,
+                            meta: None,
                         }];
                     }
                 }
@@ -894,15 +919,39 @@ pub(crate) fn eval_filter(
             match run {
                 Ok(run) => {
                     last_exit = run.exit_code;
-                    for (bytes, ext, mime, stem_o) in run.outputs {
+                    for (bytes, ext, mime, stem_o, meta) in run.outputs {
                         let stem = stem_o.unwrap_or_else(|| stem0.clone());
-                        produced.push(FlowPayload { bytes, ext, mime, stem });
+                        produced.push(FlowPayload { bytes, ext, mime, stem, meta });
                     }
                 }
                 Err(e) => errs.push(format!("{stem0}: {e}")),
             }
         }
     } else {
+        // v1.7 P1 web_fetch: 入力接続が無くてもパラメータ欄の URL だけで実行できる
+        // （t2i のパネル単独生成と同型）。入力があるときは従来のファンアウト＝1入力1URL。
+        if collected.is_empty() && spec.builtin.as_deref() == Some("web_fetch") {
+            let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
+                emit_job_progress(app, job, Some(&node_note(p, fid)), None);
+                execute_node(root, &spec, kind, &[], job)
+            });
+            match run {
+                Ok(run) => {
+                    last_exit = run.exit_code;
+                    for (bytes, ext, mime, stem_o, meta) in run.outputs {
+                        produced.push(FlowPayload {
+                            bytes,
+                            ext,
+                            mime,
+                            stem: stem_o.unwrap_or_else(|| "web".into()),
+                            meta,
+                        });
+                    }
+                }
+                // URL 未設定の案内（run_web_fetch のエラー文言）もここを通って表示される。
+                Err(e) => errs.push(e),
+            }
+        }
         for pl in &collected {
             if !flow::mime_matches(&accept, &pl.mime) {
                 report
@@ -933,12 +982,13 @@ pub(crate) fn eval_filter(
             match run {
                 Ok(run) => {
                     last_exit = run.exit_code;
-                    for (bytes, ext, mime, stem_o) in run.outputs {
+                    for (bytes, ext, mime, stem_o, meta) in run.outputs {
                         produced.push(FlowPayload {
                             bytes,
                             ext,
                             mime,
                             stem: stem_o.unwrap_or_else(|| pl.stem.clone()),
+                            meta,
                         });
                     }
                 }
@@ -974,6 +1024,7 @@ mod ws_p1_tests {
             ext: "txt".into(),
             mime: "text/plain".into(),
             stem: stem.into(),
+            meta: None,
         }
     }
     fn empty_report() -> FlowReport {
@@ -1550,11 +1601,14 @@ fn run_flow_inner(
             .optional()
             .unwrap_or(None);
         if let Some(vid) = existing {
+            // v1.7 P1: 再取得の上書きは取得メタも更新（None は既存値を保持）。
             let _ = p.conn.execute(
-                "UPDATE virtual_bodies SET real_id = ?1, committed_mtime = ?2 WHERE id = ?3",
+                "UPDATE virtual_bodies SET real_id = ?1, committed_mtime = ?2,
+                        web_meta = COALESCE(?3, web_meta) WHERE id = ?4",
                 rusqlite::params![
                     hash,
                     if external_out { None } else { file_mtime_ms(&dest) },
+                    pl.meta,
                     vid
                 ],
             );
@@ -1595,8 +1649,8 @@ fn run_flow_inner(
         if let Err(e) = p.conn.execute(
             "INSERT INTO virtual_bodies
                 (id, real_id, label, pos_x, pos_y, created_at,
-                 committed_path, committed_mtime, origin_path, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'file')",
+                 committed_path, committed_mtime, origin_path, web_meta, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'file')",
             rusqlite::params![
                 new_vid,
                 hash,
@@ -1606,7 +1660,8 @@ fn run_flow_inner(
                 db::now_ms(),
                 committed_path,
                 committed_mtime,
-                origin_path
+                origin_path,
+                pl.meta
             ],
         ) {
             report.errors.push(format!("{}: {e}", pl.stem));

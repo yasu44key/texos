@@ -44,6 +44,12 @@ chardetng = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # v1.5.17 P2集約系: text_diff（unified diff）。自前実装せず定番に乗る（MIT/Apache）。
 similar = "2"
+# v1.7 P1 web_fetch: 本文抽出（readability 相当・MIT）と HTML→Markdown（Apache-2.0）。
+# ライセンス確認済み 2026-07-16（V1.7_情報収集経路計画.md §6-6）。HTTP は既存 reqwest を共用。
+dom_smoothie = "0.18"
+htmd = "0.5"
+# v1.7 P1: URL のホスト種別判定（url::Host の match 用。reqwest が既に同梱＝実質依存増なし）。
+url = "2"
 
 [dev-dependencies]
 # v1.4.0 AIフィルタの回帰テスト用。本番(Tauri command async)と同じ tokio 文脈を

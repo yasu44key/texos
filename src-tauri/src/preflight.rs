@@ -274,6 +274,9 @@ fn filter_output_mime(spec: &flow::FilterSpec) -> Option<String> {
         }
         Some("ai") => Some("text/markdown".into()),
         Some("t2i") | Some("img_resize") => Some("image/png".into()),
+        // v1.7 P1: web_fetch は通常 text/markdown だが、text/html 以外の直リンクは
+        // raw のまま実身化する（画像/csv/json…）ため静的には不明＝チェックしない。
+        Some("web_fetch") => None,
         Some("img_convert") => {
             let f = spec.format.as_deref().unwrap_or("png").to_lowercase();
             Some(if f == "jpg" || f == "jpeg" {
@@ -356,6 +359,10 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
             let needs_input = match kind {
                 flow::NodeKind::Generator | flow::NodeKind::Invalid => false,
                 flow::NodeKind::T2i => spec.own_prompt().is_none(),
+                // v1.7 P1: web_fetch はパラメータ欄の URL 直書きで単独実行できる。
+                flow::NodeKind::Builtin if spec.builtin.as_deref() == Some("web_fetch") => {
+                    crate::web::spec_url(&spec).is_none()
+                }
                 flow::NodeKind::External => {
                     !spec.is_shell() && spec.cmd.as_deref().map(|c| c.contains("{in")).unwrap_or(false)
                 }

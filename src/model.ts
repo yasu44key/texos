@@ -197,6 +197,9 @@ export function filterOutputMime(filterRef: string | null): string | null {
          "text_concat", "text_diff", "text_paste"].includes(s.builtin))
       return "text/plain";
     if (s.builtin === "ai") return "text/markdown"; // v1.4.0 AIフィルタは常にMDを吐く
+    // v1.7 P1 web_fetch: 通常は text/markdown だが、HTML 以外の直リンクは raw のまま
+    // 実身化する（画像/csv/json…）ため静的には不明＝null（チェックしない）。
+    if (s.builtin === "web_fetch") return null;
     if (s.builtin === "t2i") return "image/png"; // v1.5 Text-To-Image は常にPNGを吐く
     if (s.builtin === "md_codeblock") return "text/plain"; // v1.4.0 コード抽出（→gcc等）
     if (s.builtin === "img_resize") return "image/png";

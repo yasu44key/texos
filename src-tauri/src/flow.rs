@@ -178,6 +178,14 @@ pub struct FilterSpec {
     /// "absorb"＝欠けは欠けたまま、返ってきたものだけで実行（統合系）。
     #[serde(default)]
     pub nodata: Option<String>,
+    // --- v1.7 P1: web_fetch（Webの実身化。V1.7_情報収集経路計画.md §3）---
+    /// web_fetch: パラメータ欄の URL 直書き。テキスト実身を入力接続したときは入力が優先。
+    #[serde(default)]
+    pub url: Option<String>,
+    /// web_fetch: プライベートアドレス遮断（§4-5）の開発者向け解除。ダイアログには
+    /// 出さない（「JSONで編集」で設定する機微キー）。
+    #[serde(default)]
+    pub allow_private: bool,
 }
 
 /// v1.5.3 WS-P1（オペ層 §5.4.2）: フロー矢印の制御属性（relations.attrs の JSON）。

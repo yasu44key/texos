@@ -1223,6 +1223,19 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
           { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip") },
         ]),
     },
+    // v1.7 P1 情報収集経路（Webの実身化）。「OS機能 ...」と同格のグループ。
+    // P3 web_feed（RSS）・P4 web_capture（スクショ）はこのサブメニューに追記していく。
+    {
+      label: "Web ...",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: "ページ取得（URL→Markdown実身）...",
+            hint: "URLの本文を抽出して Markdown 実身にします（タイトル=カード名）。URLはパラメータ欄に直書きするか、URLを書いたテキストカードを接続します。画像・CSV などの直リンクはそのままの形式で取り込みます。",
+            onClick: () => a.addFilter("web_fetch"),
+          },
+        ]),
+    },
     // v1.5.15 L2 OSアダプタ・ビルトイン（標準フィルタ充実検討 §4: OS差はbuiltinの内側に閉じ込める）。
     {
       label: "OS機能 ...",

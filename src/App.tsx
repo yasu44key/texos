@@ -1334,6 +1334,26 @@ function App() {
               accept_mime: "text/*",
             }),
         });
+      } else if (builtin === "web_fetch") {
+        // v1.7 P1: URL を聞いて作成（空欄=テキストカード接続で渡す。設定ダイアログで変更可）。
+        setPrompt({
+          title: "Webページ取得: URL（空欄=URLを書いたテキストカードを接続）",
+          initial: "",
+          onConfirm: (u) => {
+            const url = u.trim();
+            let host = "";
+            try {
+              host = url ? new URL(url).host : "";
+            } catch {
+              /* 不正なURLでもカードは作る（設定ダイアログで直せる） */
+            }
+            create(host ? `Web取得: ${host}` : "Webページ取得", {
+              builtin: "web_fetch",
+              ...(url ? { url } : {}),
+              accept_mime: "text/*",
+            });
+          },
+        });
       } else if (builtin === "text_convert") {
         // nkf 相当。既定=自動判定→UTF-8。文字コードの明示は設定ダイアログで。
         create("UTF-8へ変換", { builtin: "text_convert", encoding: "auto", accept_mime: "text/*" });
