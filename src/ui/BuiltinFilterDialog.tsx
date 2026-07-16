@@ -280,6 +280,38 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     ],
     note: "フィードの記事ごとに「タイトル＋概要＋記事リンク」の Markdown 実身を作ります（1記事=1カード・記事URLはメタに記録）。再実行すると取り込み済みの記事は増やさず、新着だけをカード化します（読んで消した記事も再取り込みしません）。本文まで読みたい記事は、そのURLを web_fetch で取得してください。",
   },
+  web_capture: {
+    // v1.7 P4（情報収集経路計画 §3）: ページのスクリーンショット実身（L2 OSアダプタ）。
+    title: "ページキャプチャ（web_capture）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "url",
+        label: "URL",
+        type: "text",
+        optional: true,
+        placeholder: "https://…（テキスト/URLカードを接続するときは空欄）",
+        hint: "このページの見た目を撮ります。テキストカード（1行目=URL）またはURLカードを入力に接続したときは、そちらが優先されます。",
+      },
+      {
+        key: "width",
+        label: "幅(px)",
+        type: "number",
+        default: 1280,
+        min: 320,
+        hint: "表示領域の幅。",
+      },
+      {
+        key: "height",
+        label: "高さ(px)",
+        type: "number",
+        default: 1600,
+        min: 320,
+        hint: "表示領域の高さ。縦長にするとページの下の方まで写ります（ページ全体の自動計測はしません）。",
+      },
+    ],
+    note: "ページの見た目をそのまま PNG 実身にします（OS の Edge/Chrome をヘッドレスで使用・ブラウザは同梱しません）。web_fetch の本文 Markdown と対で「テキストと見た目」の両方を保存できます。マニュアル素材・デザイン参考・文字にならないページの保存に。取得は実行したときだけ（タイムアウト30秒）。",
+  },
   text_convert: {
     title: "文字コード変換（→ UTF-8）",
     fixed: { accept_mime: "text/*" },

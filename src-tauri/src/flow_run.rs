@@ -159,6 +159,16 @@ pub(crate) fn execute_node(
                     exit_code: None,
                     stderr: String::new(),
                 })
+            }
+            // v1.7 P4: web_capture はヘッドレスブラウザの外部起動（L2 OSアダプタ）。
+            // 外部プロセスなので中断は kill が効く＝cancel を中へ渡す。
+            else if b == "web_capture" {
+                let r = web::run_web_capture(spec, inputs.first().map(|i| i.0), Some(cancel))?;
+                Ok(NodeRun {
+                    outputs: vec![(r.bytes, r.ext, r.mime, r.stem, Some(r.meta))],
+                    exit_code: None,
+                    stderr: String::new(),
+                })
             } else {
                 let (bytes, ext, mime) = flow::run_builtin(spec, b, inputs[0].0)?;
                 Ok(plain(bytes, ext, mime))
@@ -363,10 +373,16 @@ fn acquire_node_permits(
 /// 系譜を張り替える（最新のみ表示 §7-3・実処理は web::record_fetch_lineage）。
 /// 中間ノードを経た出力はメタが付かないので、ここには来ない（取得物そのものだけが系譜を持つ）。
 fn link_fetch_source(p: &Project, fid: &str, meta: &str, target: &str) {
-    let Some(src) = serde_json::from_str::<serde_json::Value>(meta)
-        .ok()
-        .and_then(|v| v.get("source_url").and_then(|s| s.as_str()).map(str::to_string))
-    else {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(meta) else {
+        return;
+    };
+    // v1.7 P4: キャプチャ（png）は取得系譜・「更新を確認」の対象外 — 更新確認の比較基準は
+    // 本文変換（md）のハッシュで、png とは比較が成立しないため（系譜を張ると URL カードの
+    // ベースラインが png になり「常に更新あり」になってしまう）。
+    if v.get("capture").and_then(|c| c.as_bool()).unwrap_or(false) {
+        return;
+    }
+    let Some(src) = v.get("source_url").and_then(|s| s.as_str()).map(str::to_string) else {
         return;
     };
     let Ok(mut stmt) = p.conn.prepare(
@@ -1018,11 +1034,13 @@ pub(crate) fn eval_filter(
             }
         }
     } else {
-        // v1.7 P1 web_fetch / P3 web_feed: 入力接続が無くてもパラメータ欄の URL だけで
-        // 実行できる（t2i のパネル単独生成と同型）。入力があるときは従来のファンアウト
-        // ＝1入力1URL。
+        // v1.7 P1/P3/P4 web_*: 入力接続が無くてもパラメータ欄の URL だけで実行できる
+        // （t2i のパネル単独生成と同型）。入力があるときは従来のファンアウト＝1入力1URL。
         if collected.is_empty()
-            && matches!(spec.builtin.as_deref(), Some("web_fetch") | Some("web_feed"))
+            && matches!(
+                spec.builtin.as_deref(),
+                Some("web_fetch") | Some("web_feed") | Some("web_capture")
+            )
         {
             let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
                 emit_job_progress(app, job, Some(&node_note(p, fid)), None);
@@ -1225,6 +1243,46 @@ mod ws_p1_tests {
         assert!(feed_seen_guids(&conn, "no_such").is_empty());
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1.7 P4: link_fetch_source は capture:true メタ（web_capture）では系譜を張らない
+    /// （更新確認のベースラインが png になり「常に更新あり」になる事故の防止）。
+    /// 通常メタ（web_fetch）は従来どおり張る。
+    #[test]
+    fn capture_meta_skips_lineage() {
+        let root = std::env::temp_dir().join(format!("texos_cap_lineage_{}", db::now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let p = project::open_project_at(&root).unwrap();
+        p.conn
+            .execute_batch(
+                "INSERT INTO real_bodies (id, mime_type, size, created_at) VALUES
+                   ('url:sentinel', 'application/vnd.texos.url', 0, 1),
+                   ('h1', 'image/png', 1, 1);
+                 INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, url_ref, kind)
+                   VALUES ('u1', 'url:sentinel', 'Example', 0, 0, 1, 'https://ex.jp/', 'url');
+                 INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind) VALUES
+                   ('f1', 'h1', 'キャプチャ', 0, 0, 1, 'filter'),
+                   ('o1', 'h1', 'shot.png', 0, 0, 2, 'file');
+                 INSERT INTO relations (from_id, to_id, kind, created_at)
+                   VALUES ('u1', 'f1', 'flow', 1);",
+            )
+            .unwrap();
+        let fetched_count = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM relations WHERE kind = 'fetched' AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // capture メタ → 張らない
+        link_fetch_source(&p, "f1", r#"{"source_url":"https://ex.jp/","capture":true}"#, "o1");
+        assert_eq!(fetched_count(&p.conn), 0, "capture は系譜対象外");
+        // 通常メタ（web_fetch）→ 張る
+        link_fetch_source(&p, "f1", r#"{"source_url":"https://ex.jp/"}"#, "o1");
+        assert_eq!(fetched_count(&p.conn), 1);
+        drop(p);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// always（既定）: 上流エラーは report へ伝搬し、payload はそのまま通る（後方互換）。

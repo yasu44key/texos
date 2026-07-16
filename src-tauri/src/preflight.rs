@@ -279,6 +279,8 @@ fn filter_output_mime(spec: &flow::FilterSpec) -> Option<String> {
         Some("web_fetch") => None,
         // v1.7 P3: web_feed は常に記事カード（Markdown）を吐く。
         Some("web_feed") => Some("text/markdown".into()),
+        // v1.7 P4: web_capture は常にスクリーンショット（PNG）を吐く。
+        Some("web_capture") => Some("image/png".into()),
         Some("img_convert") => {
             let f = spec.format.as_deref().unwrap_or("png").to_lowercase();
             Some(if f == "jpg" || f == "jpeg" {
@@ -361,11 +363,11 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
             let needs_input = match kind {
                 flow::NodeKind::Generator | flow::NodeKind::Invalid => false,
                 flow::NodeKind::T2i => spec.own_prompt().is_none(),
-                // v1.7 P1/P3: web_fetch / web_feed はパラメータ欄の URL 直書きで単独実行できる。
+                // v1.7 P1/P3/P4: web_* はパラメータ欄の URL 直書きで単独実行できる。
                 flow::NodeKind::Builtin
                     if matches!(
                         spec.builtin.as_deref(),
-                        Some("web_fetch") | Some("web_feed")
+                        Some("web_fetch") | Some("web_feed") | Some("web_capture")
                     ) =>
                 {
                     crate::web::spec_url(&spec).is_none()

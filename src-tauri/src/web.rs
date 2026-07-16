@@ -975,6 +975,225 @@ fn feed_to_outs(
     Ok(outs)
 }
 
+// ---------------------------------------------------------------------------
+// v1.7 P4: web_capture — ページのスクリーンショット実身（L2 OSアダプタ・計画 §3 P4）。
+// OS 搭載/汎用の Chromium 系ブラウザ（Windows=Edge 標準搭載）をヘッドレスで呼ぶ —
+// ブラウザエンジンは同梱しない（§1-5 配布ミニマム）。web_fetch の本文 md と対で
+// 「テキストと見た目」の両方が実身化できる。
+//
+// 実機検証（2026-07-17・Edge 150 / Windows 11）:
+// - **--user-data-dir が必須**。無指定だと既存の Edge プロセスに合流して起動側が
+//   即終了し、スクリーンショットが出力されない（exit=0 なのにファイル無し）。
+// - 専用プロファイルなら安定（cold 7.4s / warm 2.8s）。同一プロファイルの並行起動は
+//   2本目が1本目に合流して同じ症状になるため、プロセス内で直列化する（CAPTURE_LOCK）。
+// - JS ページは --virtual-time-budget で描画を待てる（Yahoo!ニュース完全描画を確認）。
+// ---------------------------------------------------------------------------
+
+/// キャプチャの既定ビューポート。縦長既定＝「ページの保存」用途（設定 width/height で変更可）。
+pub const WEB_CAPTURE_DEFAULT_WIDTH: u32 = 1280;
+pub const WEB_CAPTURE_DEFAULT_HEIGHT: u32 = 1600;
+/// JS 描画の仮想時間予算（ms）。レンダラの仮想時計を進めるので実時間はこれより短いことが多い。
+const WEB_CAPTURE_TIME_BUDGET_MS: u32 = 8000;
+
+/// ヘッドレス実行できる Chromium 系ブラウザを探す（L2: OS 差はこの関数に閉じ込める）。
+/// Windows = Edge（標準搭載）→ Chrome。macOS/Linux = Chrome/Chromium/Edge を検出。
+/// 未検出は導入ヒント付きの明確なエラー（speak の espeak と同じ扱い）。
+pub fn find_headless_browser() -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_default();
+        let pf = std::env::var("ProgramFiles").unwrap_or_default();
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let candidates = [
+            format!(r"{pf86}\Microsoft\Edge\Application\msedge.exe"),
+            format!(r"{pf}\Microsoft\Edge\Application\msedge.exe"),
+            format!(r"{pf}\Google\Chrome\Application\chrome.exe"),
+            format!(r"{pf86}\Google\Chrome\Application\chrome.exe"),
+            format!(r"{local}\Google\Chrome\Application\chrome.exe"),
+        ];
+        for c in candidates {
+            let p = std::path::PathBuf::from(&c);
+            if !c.is_empty() && p.is_file() {
+                return Ok(p);
+            }
+        }
+        Err("ヘッドレス実行できるブラウザが見つかりません。💡 Windows には Microsoft Edge が標準搭載のはずです（標準の場所に msedge.exe がありません）。Edge か Google Chrome をインストールしてください".into())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ];
+        for c in candidates {
+            let p = std::path::PathBuf::from(c);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+        Err("ヘッドレス実行できるブラウザが見つかりません。💡 Google Chrome / Chromium / Microsoft Edge のいずれかをインストールしてください".into())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let names = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge"];
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                for n in names {
+                    let p = dir.join(n);
+                    if p.is_file() {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+        Err("ヘッドレス実行できるブラウザが見つかりません。💡 chromium / google-chrome をインストールしてください（例: sudo apt install chromium-browser）".into())
+    }
+}
+
+/// builtin:"web_capture" 本体: URL → ページのスクリーンショット PNG 実身。
+/// 入力両対応（テキスト/URL カード接続が優先・無ければ spec.url）は web_fetch と同型。
+/// cancel が立つとブラウザを kill して中断する（外部プロセスなので途中で切れる）。
+pub fn run_web_capture(
+    spec: &FilterSpec,
+    input: Option<&[u8]>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<WebFetchOut, String> {
+    let url_s = match input {
+        Some(bytes) => url_from_text(bytes)?,
+        None => spec_url(spec)
+            .ok_or("URL がありません。パラメータ欄に URL を入力するか、URL を書いたテキストカードを接続してください")?
+            .to_string(),
+    };
+    // §4 と同じ入口チェック。ネットに出るのはブラウザだが、行き先の検査は同じ基準で行う。
+    let url = reqwest::Url::parse(&url_s).map_err(|e| format!("URL が不正です: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("http/https 以外の URL は取得できません: {}", url.scheme()));
+    }
+    if !spec.allow_private {
+        url_check_public(&url)?;
+    }
+    if let Some(host) = url.host_str() {
+        throttle_host(host);
+    }
+    let browser = find_headless_browser()?;
+    let w = spec.width.unwrap_or(WEB_CAPTURE_DEFAULT_WIDTH).clamp(320, 4096);
+    let h = spec.height.unwrap_or(WEB_CAPTURE_DEFAULT_HEIGHT).clamp(320, 8192);
+    // 同一プロファイルの並行起動は2本目が合流して出力ゼロになる（実機検証）→ 直列化。
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    let _serial = CAPTURE_LOCK.lock().unwrap();
+    let tmp = std::env::temp_dir()
+        .join(format!("texos_webcap_{}_{}.png", std::process::id(), crate::db::now_ms()));
+    // プロファイルは使い回す（warm start 2.8s）。temp なので OS の掃除に任せてよい。
+    let profile = std::env::temp_dir().join("texos_webcap_profile");
+    let mut cmd = std::process::Command::new(&browser);
+    cmd.arg("--headless")
+        .arg("--disable-gpu")
+        .arg("--hide-scrollbars")
+        .arg("--no-first-run")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg(format!("--virtual-time-budget={WEB_CAPTURE_TIME_BUDGET_MS}"))
+        .arg(format!("--screenshot={}", tmp.display()))
+        .arg(format!("--window-size={w},{h}"))
+        .arg(url.as_str())
+        // stderr を piped にしない: 初期プロセスが切り離した子がハンドルを持ち続けると
+        // read が固まる（下記の分離挙動）。診断は終了コードとファイル有無で足りる。
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("ブラウザを起動できません（{}）: {e}", browser.display()))?;
+    // 完了条件は「プロセス終了」ではなく**ファイルの出現＋サイズ安定**（実機検証 2026-07-17）:
+    // Rust（CreateProcess 直）から起動すると初期 msedge が即 exit 0 で戻り、切り離された
+    // 子プロセスが数秒後にスクリーンショットを書き上げる。PowerShell Start-Process 経由では
+    // 初期プロセスが完走まで生きる — 起動元により分離挙動が変わるため、どちらでも成立する
+    // 条件で待つ。タイムアウト（§4-2 と同じ 30s）と中断はポーリングで見る（100ms 刻み）。
+    let deadline = Instant::now() + Duration::from_secs(WEB_TIMEOUT_SECS);
+    let mut status: Option<std::process::ExitStatus> = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait().map_err(|e| e.to_string())?;
+        }
+        // ファイルが現れ、200ms サイズが変わらなければ書き上がりとみなす。
+        if let Ok(m) = std::fs::metadata(&tmp) {
+            let sz = m.len();
+            if sz > 0 {
+                std::thread::sleep(Duration::from_millis(200));
+                if std::fs::metadata(&tmp).map(|m2| m2.len() == sz).unwrap_or(false) {
+                    break;
+                }
+                continue;
+            }
+        }
+        let cancelled =
+            cancel.map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false);
+        if cancelled || Instant::now() >= deadline {
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return Err(if cancelled {
+                "中断されました".into()
+            } else if let Some(st) = status {
+                format!(
+                    "スクリーンショットが出力されませんでした（ブラウザ終了コード {:?}）。URL とネットワークを確認してください: {url_s}",
+                    st.code()
+                )
+            } else {
+                format!("キャプチャが {WEB_TIMEOUT_SECS} 秒以内に終わりませんでした: {url_s}")
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // 初期プロセスがまだ生きていれば軽く待って畳む（スクリーンショットは確保済み）。
+    if status.is_none() {
+        let grace = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < grace {
+            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if child.try_wait().map_err(|e| e.to_string())?.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    let bytes = std::fs::read(&tmp)
+        .map_err(|e| format!("スクリーンショットを読み込めませんでした: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if bytes.is_empty() {
+        return Err(format!("スクリーンショットが空でした: {url_s}"));
+    }
+    if bytes.len() > WEB_MAX_BYTES {
+        return Err(format!(
+            "サイズが上限 {}MB を超えています: {url_s}",
+            WEB_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+    // capture:true = 取得系譜（fetched）と「更新を確認」の対象外 — 比較基準は本文変換
+    // （md）のハッシュであり、png とは比較が成立しないため（link_fetch_source が見る）。
+    let meta = serde_json::json!({
+        "source_url": url_s,
+        "fetched_at": crate::db::now_ms(),
+        "capture": true,
+    })
+    .to_string();
+    Ok(WebFetchOut {
+        bytes,
+        ext: "png".into(),
+        mime: "image/png".into(),
+        stem: stem_from_url(&url_s),
+        meta,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,6 +1515,48 @@ mod tests {
         let s = spec(r#"{"builtin":"web_feed","url":"http://127.0.0.1:8080/feed"}"#);
         let e = run_web_feed(&s, None).unwrap_err();
         assert!(e.contains("プライベートアドレス"), "{e}");
+    }
+
+    // --- v1.7 P4: web_capture ---
+
+    /// run_web_capture: URL 無し・不正スキーム・プライベート宛は**ブラウザ起動前に**
+    /// 拒否される（ネットにもプロセスにも出ない失敗経路）。
+    #[test]
+    fn capture_missing_url_and_private() {
+        let s = spec(r#"{"builtin":"web_capture"}"#);
+        let e = run_web_capture(&s, None, None).unwrap_err();
+        assert!(e.contains("URL がありません"), "{e}");
+        let s = spec(r#"{"builtin":"web_capture","url":"http://127.0.0.1:7860/"}"#);
+        let e = run_web_capture(&s, None, None).unwrap_err();
+        assert!(e.contains("プライベートアドレス"), "{e}");
+        let s = spec(r#"{"builtin":"web_capture","url":"file:///C:/x"}"#);
+        let e = run_web_capture(&s, None, None).unwrap_err();
+        assert!(e.contains("http/https 以外"), "{e}");
+    }
+
+    /// ブラウザ検出: 見つかれば実在パス・見つからなければ導入ヒント付きのエラー。
+    #[test]
+    fn browser_detection_is_actionable() {
+        match find_headless_browser() {
+            Ok(p) => assert!(p.is_file(), "検出パスが実在しない: {}", p.display()),
+            Err(e) => assert!(e.contains("💡"), "導入ヒントが無い: {e}"),
+        }
+    }
+
+    /// 実機: ヘッドレスブラウザで実キャプチャ（PNG マジック・メタ・語幹）。
+    /// 実行: `cargo test --lib -- --ignored web_live`
+    #[test]
+    #[ignore = "実機: ブラウザとネットワーク接続が必要"]
+    fn web_live_capture_example_com() {
+        let s = spec(r#"{"builtin":"web_capture","url":"https://example.com/","width":800,"height":600}"#);
+        let out = run_web_capture(&s, None, None).unwrap();
+        assert_eq!(out.ext, "png");
+        assert_eq!(out.mime, "image/png");
+        assert!(out.bytes.starts_with(&[0x89, b'P', b'N', b'G']), "PNG マジック不一致");
+        let meta: serde_json::Value = serde_json::from_str(&out.meta).unwrap();
+        assert_eq!(meta["source_url"], "https://example.com/");
+        assert_eq!(meta["capture"], true);
+        assert!(out.stem.as_deref().unwrap_or("").contains("example"), "stem: {:?}", out.stem);
     }
 
     /// 実機: ネットワークに出る統合テスト（実在フィード）。

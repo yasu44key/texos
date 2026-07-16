@@ -1257,6 +1257,12 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
             hint: "フィードの記事ごとに「タイトル＋概要＋記事リンク」の Markdown 実身を作ります（1記事=1カード）。再実行すると新着だけを取り込みます（差分取得）。本文が欲しい記事は web_fetch で。",
             onClick: () => a.addFilter("web_feed"),
           },
+          // v1.7 P4: ページのスクリーンショット（L2・OS の Edge/Chrome をヘッドレスで使用）。
+          {
+            label: "ページキャプチャ（URL→PNG実身）...",
+            hint: "ページの見た目をそのまま PNG 実身にします（OS 搭載の Edge/Chrome をヘッドレスで使用・同梱しません）。ページ取得が本文（テキスト）、こちらは見た目（画像）。",
+            onClick: () => a.addFilter("web_capture"),
+          },
         ]),
     },
     // v1.5.15 L2 OSアダプタ・ビルトイン（標準フィルタ充実検討 §4: OS差はbuiltinの内側に閉じ込める）。
