@@ -329,7 +329,7 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
           { value: "image", label: "画像" },
           { value: "media", label: "音声・動画・ファイル（PDF など）" },
         ],
-        hint: "URL 末尾の拡張子で分類します。拡張子のない URL は「ページ」扱いです。",
+        hint: "拡張子で分かる URL は即判定します。拡張子のない URL（CDN の画像・記事ページなど）は、リンク先の種類（Content-Type）を軽く確認して振り分けます（先頭だけ・本文は取り込みません）。",
       },
       {
         key: "titles",

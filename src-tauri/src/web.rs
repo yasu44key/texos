@@ -1014,11 +1014,12 @@ pub fn scan_urls(text: &str) -> Vec<String> {
     out
 }
 
-/// v1.7 P5 実機FB: URL の種類（拡張子ベースの粗い分類）。「全部拾うととんでもない
-/// 枚数になる」ため、to_url は種類で絞れるようにする（ユーザー提案 2026-07-17）。
-/// 判定は URL パス末尾の拡張子のみ（HEAD は打たない＝ネットに出ない純関数）。
-/// 未知の拡張子・拡張子なし・動的ページ（.php 等）は "page" に倒す。
-pub fn url_link_kind(url: &str) -> &'static str {
+/// v1.7 P5 実機FB: URL の種類（第1段=拡張子で**確定できるものだけ**判定する純関数）。
+/// 「全部拾うととんでもない枚数になる」ため to_url は種類で絞れる（ユーザー提案 2026-07-17）。
+/// None = 不確定（拡張子なし・未知の拡張子）— CDN 画像（yimg 等の拡張子なし URL）や
+/// `/pickup/6588181` のようなページを拡張子では切り分けられないので、第2段として
+/// リンク先の Content-Type に聞く（probe_url。同日FB第2弾）。
+pub fn url_link_kind_by_ext(url: &str) -> Option<&'static str> {
     const IMAGE: &[&str] = &[
         "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "ico", "tif", "tiff",
     ];
@@ -1029,21 +1030,39 @@ pub fn url_link_kind(url: &str) -> &'static str {
         "pdf", "zip", "7z", "rar", "tar", "gz", "csv", "tsv", "json", "xml", "txt", "md",
         "doc", "docx", "xls", "xlsx", "ppt", "pptx",
     ];
-    let ext = ext_from_url(url).unwrap_or_default();
+    const PAGE: &[&str] = &["html", "htm", "shtml", "xhtml", "php", "asp", "aspx", "jsp", "cgi"];
+    let ext = ext_from_url(url)?;
     if IMAGE.contains(&ext.as_str()) {
-        "image"
+        Some("image")
     } else if MEDIA.contains(&ext.as_str()) {
-        "media"
+        Some("media")
+    } else if PAGE.contains(&ext.as_str()) {
+        Some("page")
     } else {
-        "page"
+        None
     }
 }
 
-/// ページタイトルの軽量取得（v1.7 P5 実機FB「全カード同名で意味不明」対策）。
-/// 先頭 64KB だけ読んで <title> を拾う — 本文は取り込まない・失敗は None（非致命・
-/// 呼び出し側が URL 由来の名前へフォールバック）。§4 の入口（スキーム/プライベート遮断/
-/// 同一ホスト間隔/UA/リダイレクト上限）は fetch_url と同じ関数を通る。
-pub fn fetch_title(url_s: &str, allow_private: bool) -> Option<String> {
+/// Content-Type → 種類（第2段の判定表。拡張子表と同じ区分に揃える）。
+fn kind_for_mime(mime: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "image"
+    } else if mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml" {
+        "page"
+    } else {
+        // audio/video/application/pdf/zip/octet-stream/text-plain 直リンク等はファイル扱い
+        "media"
+    }
+}
+
+/// リンク先への軽量照会（先頭 64KB の GET・1回で Content-Type と HTML なら <title> を
+/// 両取りする）。失敗は None（非致命）。§4 の入口（url_precheck / web_client）を通る。
+struct UrlProbe {
+    mime: String,
+    title: Option<String>,
+}
+
+fn probe_url(url_s: &str, allow_private: bool) -> Option<UrlProbe> {
     let url = url_precheck(url_s, allow_private).ok()?;
     let client = web_client(allow_private).ok()?;
     let resp = client.get(url).send().ok()?;
@@ -1057,16 +1076,24 @@ pub fn fetch_title(url_s: &str, allow_private: bool) -> Option<String> {
         .unwrap_or_default()
         .to_string();
     let (mime, charset) = split_content_type(&raw_ct);
-    if !(mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml") {
-        return None;
-    }
-    let mut buf = Vec::new();
-    resp.take(64 * 1024).read_to_end(&mut buf).ok()?;
-    // 64KB で切ると多バイト文字が欠けて厳密デコードが失敗し得る → lossy にフォールバック
-    // （タイトルは通常先頭にあるので実害なし）。
-    let html = decode_html(&buf, charset.as_deref())
-        .unwrap_or_else(|| String::from_utf8_lossy(&buf).into_owned());
-    sniff_title(&html)
+    let title = if mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml" {
+        let mut buf = Vec::new();
+        resp.take(64 * 1024).read_to_end(&mut buf).ok()?;
+        // 64KB で切ると多バイト文字が欠けて厳密デコードが失敗し得る → lossy にフォール
+        // バック（タイトルは通常先頭にあるので実害なし）。
+        let html = decode_html(&buf, charset.as_deref())
+            .unwrap_or_else(|| String::from_utf8_lossy(&buf).into_owned());
+        sniff_title(&html)
+    } else {
+        None // 画像・ファイルは本文を読まない（ヘッダだけで判定が済む）
+    };
+    Some(UrlProbe { mime, title })
+}
+
+/// ページタイトルの軽量取得（v1.7 P5 実機FB「全カード同名で意味不明」対策）。
+/// probe_url の title 側だけを使う便宜関数（失敗は None＝非致命）。
+pub fn fetch_title(url_s: &str, allow_private: bool) -> Option<String> {
+    probe_url(url_s, allow_private).and_then(|p| p.title)
 }
 
 /// builtin:"to_url" 本体: テキスト → URLカード化ペイロード群（1入力→N出力）。
@@ -1089,40 +1116,52 @@ pub fn run_to_url(
     }
     let want = spec.links.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("all");
     let total = all.len();
-    let urls: Vec<String> = if want == "all" {
-        all
-    } else {
-        all.into_iter().filter(|u| url_link_kind(u) == want).collect()
-    };
-    if urls.is_empty() {
-        let name = match want {
-            "page" => "ページ（HTML）",
-            "image" => "画像",
-            "media" => "音声・動画・ファイル",
-            other => other,
-        };
-        return Err(format!(
-            "URL は {total} 件見つかりましたが、指定の種類（{name}）に該当するものがありません"
-        ));
-    }
     let fetch_titles = spec.titles.as_deref().unwrap_or("fetch") != "none";
     // 単一 URL なら入力カードの語幹を引き継ぐのが最良（フィードの記事タイトル等）。
     // 複数 URL は全カード同名になるため、URL 由来の名前（タイトル/ファイル名）を付ける。
-    let single = urls.len() == 1;
-    std::thread::scope(|s| {
+    let single = total == 1;
+    let outs = std::thread::scope(|s| {
         s.spawn(|| {
             let mut outs = Vec::new();
-            for u in urls {
+            for u in all {
                 if cancel.map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false)
                 {
                     return Err("中断されました".to_string());
                 }
-                let kind = url_link_kind(&u);
-                let title = if fetch_titles && kind == "page" {
-                    fetch_title(&u, spec.allow_private).as_deref().and_then(sanitize_stem)
-                } else {
-                    None
+                // 2段判定（実機FB第2弾）: 拡張子で確定 → 即決（ネット不要）。
+                // 不確定（CDN 画像・/pickup/123 型ページ等）は、種類で絞るとき／タイトルが
+                // 要るときだけリンク先に軽く聞く（probe = 64KB GET・Content-Type と
+                // <title> を1回で両取り）。照会失敗は「ページ」に倒す（黙って捨てない）。
+                let ext_kind = url_link_kind_by_ext(&u);
+                if want != "all" {
+                    if let Some(k) = ext_kind {
+                        if k != want {
+                            continue; // 確定していて対象外 → 照会せず除外
+                        }
+                    }
+                }
+                let mut title = None;
+                let kind = match ext_kind {
+                    Some(k) => {
+                        if fetch_titles && k == "page" {
+                            title = fetch_title(&u, spec.allow_private)
+                                .as_deref()
+                                .and_then(sanitize_stem);
+                        }
+                        k
+                    }
+                    None if want != "all" || fetch_titles => match probe_url(&u, spec.allow_private) {
+                        Some(p) => {
+                            title = p.title.as_deref().and_then(sanitize_stem);
+                            kind_for_mime(&p.mime)
+                        }
+                        None => "page",
+                    },
+                    None => "page", // 絞りもタイトルも不要ならネットに出ない
                 };
+                if want != "all" && kind != want {
+                    continue;
+                }
                 let stem = title.or_else(|| if single { None } else { stem_from_url(&u) });
                 outs.push(WebFetchOut {
                     bytes: u.into_bytes(),
@@ -1136,7 +1175,19 @@ pub fn run_to_url(
         })
         .join()
         .map_err(|_| "URLカード化スレッドが異常終了しました".to_string())?
-    })
+    })?;
+    if outs.is_empty() {
+        let name = match want {
+            "page" => "ページ（HTML）",
+            "image" => "画像",
+            "media" => "音声・動画・ファイル",
+            other => other,
+        };
+        return Err(format!(
+            "URL は {total} 件見つかりましたが、指定の種類（{name}）に該当するものがありません"
+        ));
+    }
+    Ok(outs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,33 +1777,55 @@ mod tests {
         assert!(e.contains("URL"), "{e}");
     }
 
-    /// v1.7 P5 実機FB: リンク種類の分類（拡張子ベース）と to_url の種類フィルタ。
+    /// v1.7 P5 実機FB: リンク種類の2段判定 — 第1段（拡張子で確定・純関数）。
+    /// 拡張子なし・未知の拡張子は None＝不確定（CDN 画像や /pickup/123 型ページは
+    /// 拡張子では切り分けられない → 第2段 probe が Content-Type で判定する）。
     #[test]
     fn to_url_link_kinds() {
-        assert_eq!(url_link_kind("https://ex.jp/photo.JPG?x=1"), "image");
-        assert_eq!(url_link_kind("https://ex.jp/doc.pdf"), "media");
-        assert_eq!(url_link_kind("https://ex.jp/song.mp3"), "media");
-        assert_eq!(url_link_kind("https://ex.jp/news.html"), "page");
-        assert_eq!(url_link_kind("https://ex.jp/articles/abc123"), "page");
-        assert_eq!(url_link_kind("https://ex.jp/"), "page");
-        let text = "https://ex.jp/a.png https://ex.jp/b.pdf https://ex.jp/c.html https://ex.jp/d";
+        assert_eq!(url_link_kind_by_ext("https://ex.jp/photo.JPG?x=1"), Some("image"));
+        assert_eq!(url_link_kind_by_ext("https://ex.jp/doc.pdf"), Some("media"));
+        assert_eq!(url_link_kind_by_ext("https://ex.jp/song.mp3"), Some("media"));
+        assert_eq!(url_link_kind_by_ext("https://ex.jp/news.html"), Some("page"));
+        assert_eq!(url_link_kind_by_ext("https://ex.jp/articles/abc123"), None);
+        assert_eq!(url_link_kind_by_ext("https://ex.jp/"), None);
+        // yimg 型（拡張子なしの CDN 画像 URL）も不確定 → probe 行き
+        assert_eq!(
+            url_link_kind_by_ext("https://news-pctr.c.yimg.jp/uUzvQ3lML_bkIqyakc1vFlbR=="),
+            None
+        );
+        // 第2段の判定表（Content-Type → 種類）
+        assert_eq!(kind_for_mime("image/jpeg"), "image");
+        assert_eq!(kind_for_mime("text/html"), "page");
+        assert_eq!(kind_for_mime(""), "page");
+        assert_eq!(kind_for_mime("video/mp4"), "media");
+        assert_eq!(kind_for_mime("application/pdf"), "media");
+        assert_eq!(kind_for_mime("application/octet-stream"), "media");
+
+        // 種類フィルタ（拡張子で確定する URL のみ＝ネットに出ない純テスト）
+        let text = "https://ex.jp/a.png https://ex.jp/b.pdf https://ex.jp/c.html";
         let s = spec(r#"{"builtin":"to_url","links":"image","titles":"none"}"#);
         let outs = run_to_url(&s, text.as_bytes(), None).unwrap();
         assert_eq!(outs.len(), 1);
         assert_eq!(String::from_utf8(outs[0].bytes.clone()).unwrap(), "https://ex.jp/a.png");
         let s = spec(r#"{"builtin":"to_url","links":"page","titles":"none"}"#);
-        assert_eq!(run_to_url(&s, text.as_bytes(), None).unwrap().len(), 2);
+        assert_eq!(run_to_url(&s, text.as_bytes(), None).unwrap().len(), 1);
         // 該当なしは件数入りの明確なエラー
         let s = spec(r#"{"builtin":"to_url","links":"media","titles":"none"}"#);
         let e = run_to_url(&s, b"https://ex.jp/x.png", None).unwrap_err();
         assert!(e.contains("1 件") && e.contains("音声・動画・ファイル"), "{e}");
+        // 不確定 URL の照会失敗（ここではプライベート遮断）は「ページ」に倒す＝
+        // image 絞りでは除外される（黙って通さない・ネットには出ない決定的テスト）。
+        let s = spec(r#"{"builtin":"to_url","links":"image","titles":"none"}"#);
+        let e = run_to_url(&s, b"http://127.0.0.1:9999/blob", None).unwrap_err();
+        assert!(e.contains("該当するものがありません"), "{e}");
     }
 
-    /// 実機: リンク先タイトルの軽量取得（64KB・<title> のみ）。
+    /// 実機: リンク先タイトルの軽量取得（64KB・<title> のみ）と、拡張子なし URL の
+    /// Content-Type 判定（第2段 probe）。
     /// 実行: `cargo test --lib -- --ignored web_live`
     #[test]
     #[ignore = "実機: ネットワーク接続が必要"]
-    fn web_live_fetch_title() {
+    fn web_live_fetch_title_and_probe() {
         let t = fetch_title("https://example.com/", false).unwrap();
         assert!(t.contains("Example"), "{t}");
         // to_url 既定（titles=fetch）でページタイトルがカード名になる
@@ -1760,6 +1833,14 @@ mod tests {
         let outs =
             run_to_url(&s, b"https://example.com/ and https://example.org/", None).unwrap();
         assert!(outs[0].stem.as_deref().unwrap_or("").contains("Example"), "{:?}", outs[0].stem);
+        // 拡張子なしの画像 URL（GitHub アバター）が probe で image と判定される
+        let p = probe_url("https://avatars.githubusercontent.com/u/1", false).unwrap();
+        assert_eq!(kind_for_mime(&p.mime), "image", "mime: {}", p.mime);
+        let s = spec(r#"{"builtin":"to_url","links":"image","titles":"none"}"#);
+        let outs =
+            run_to_url(&s, b"https://avatars.githubusercontent.com/u/1 https://example.com/x.html", None)
+                .unwrap();
+        assert_eq!(outs.len(), 1, "拡張子なし画像だけが image に該当するはず");
     }
 
     // --- v1.7 P4: web_capture ---
