@@ -190,6 +190,16 @@ pub struct FilterSpec {
     /// web_feed: 取り込む最大件数（新しい方から。未指定は10・0 = 全件）。
     #[serde(default)]
     pub limit: Option<u32>,
+    /// v1.7 P5 to_url: カード化するリンクの種類（実機FB: 全部拾うととんでもない枚数になる）。
+    /// "all"（既定）| "page"（HTMLページ）| "image"（画像直リンク）| "media"（音声・動画・
+    /// PDF などのファイル直リンク）。分類は URL 末尾の拡張子ベース。
+    #[serde(default)]
+    pub links: Option<String>,
+    /// v1.7 P5 to_url: カード名の付け方（実機FB: 全カード同名で意味不明になる）。
+    /// "fetch"（既定: ページはリンク先の <title> を軽量取得・画像等はURLのファイル名）|
+    /// "none"（取得しない: URLのファイル名／単一URLなら入力カード名を引き継ぐ）。
+    #[serde(default)]
+    pub titles: Option<String>,
 }
 
 /// v1.5.3 WS-P1（オペ層 §5.4.2）: フロー矢印の制御属性（relations.attrs の JSON）。

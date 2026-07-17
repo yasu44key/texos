@@ -163,8 +163,9 @@ pub(crate) fn execute_node(
             // v1.7 P5(b): to_url（URLカード化）— テキスト全文を走査して URL を全部
             // ペイロード化（1入力→N出力）。終端ならマテリアライザが URL カードとして
             // 着地させ、途中なら text/plain の URL として下流へ流れる（web_fetch 連鎖可）。
+            // タイトル取得（既定）はネットワークに出るため cancel を渡す（URL 境界で中断）。
             else if b == "to_url" {
-                let rs = web::run_to_url(inputs[0].0)?;
+                let rs = web::run_to_url(spec, inputs[0].0, Some(cancel))?;
                 Ok(NodeRun {
                     outputs: rs
                         .into_iter()

@@ -119,34 +119,8 @@ pub fn fetch_url_cond(
     allow_private: bool,
     cond: Option<&FetchCond>,
 ) -> Result<Option<WebResponse>, String> {
-    let url = reqwest::Url::parse(url_s).map_err(|e| format!("URL が不正です: {e}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(format!("http/https 以外の URL は取得できません: {}", url.scheme()));
-    }
-    if !allow_private {
-        url_check_public(&url)?;
-    }
-    if let Some(host) = url.host_str() {
-        throttle_host(host);
-    }
-    // リダイレクトも§4に従う: 上限5・各ホップでプライベート宛を遮断。
-    let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() > WEB_MAX_REDIRECTS {
-            return attempt.error(format!("リダイレクトが{WEB_MAX_REDIRECTS}回を超えました"));
-        }
-        if !allow_private {
-            if let Err(e) = url_check_public(attempt.url()) {
-                return attempt.error(e);
-            }
-        }
-        attempt.follow()
-    });
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(WEB_TIMEOUT_SECS))
-        .redirect(policy)
-        .user_agent(WEB_USER_AGENT)
-        .build()
-        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
+    let url = url_precheck(url_s, allow_private)?;
+    let client = web_client(allow_private)?;
     let mut req = client.get(url);
     if let Some(c) = cond {
         if let Some(etag) = c.etag.as_deref().filter(|s| !s.is_empty()) {
@@ -186,6 +160,44 @@ pub fn fetch_url_cond(
         ));
     }
     Ok(Some(WebResponse { bytes, final_url, content_type, etag, last_modified }))
+}
+
+/// §4 の入口チェック共通化（v1.7 P5 実機FB でタイトル取得と共用）:
+/// スキーム http/https・プライベート宛遮断・同一ホスト間隔の予約、を一度に通す。
+fn url_precheck(url_s: &str, allow_private: bool) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(url_s).map_err(|e| format!("URL が不正です: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("http/https 以外の URL は取得できません: {}", url.scheme()));
+    }
+    if !allow_private {
+        url_check_public(&url)?;
+    }
+    if let Some(host) = url.host_str() {
+        throttle_host(host);
+    }
+    Ok(url)
+}
+
+/// §4 準拠の HTTP クライアント（タイムアウト30s・UA明示・リダイレクト上限5＋
+/// 各ホップのプライベート宛遮断）。fetch_url 系とタイトル取得で共用する。
+fn web_client(allow_private: bool) -> Result<reqwest::blocking::Client, String> {
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > WEB_MAX_REDIRECTS {
+            return attempt.error(format!("リダイレクトが{WEB_MAX_REDIRECTS}回を超えました"));
+        }
+        if !allow_private {
+            if let Err(e) = url_check_public(attempt.url()) {
+                return attempt.error(e);
+            }
+        }
+        attempt.follow()
+    });
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(WEB_TIMEOUT_SECS))
+        .redirect(policy)
+        .user_agent(WEB_USER_AGENT)
+        .build()
+        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))
 }
 
 /// URL のホストがプライベート宛でないことを確認する（リテラル IP → 直接判定 /
@@ -1002,26 +1014,129 @@ pub fn scan_urls(text: &str) -> Vec<String> {
     out
 }
 
+/// v1.7 P5 実機FB: URL の種類（拡張子ベースの粗い分類）。「全部拾うととんでもない
+/// 枚数になる」ため、to_url は種類で絞れるようにする（ユーザー提案 2026-07-17）。
+/// 判定は URL パス末尾の拡張子のみ（HEAD は打たない＝ネットに出ない純関数）。
+/// 未知の拡張子・拡張子なし・動的ページ（.php 等）は "page" に倒す。
+pub fn url_link_kind(url: &str) -> &'static str {
+    const IMAGE: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "ico", "tif", "tiff",
+    ];
+    const MEDIA: &[&str] = &[
+        // 音声・動画
+        "mp3", "wav", "ogg", "oga", "m4a", "flac", "aac", "mp4", "webm", "mov", "avi", "mkv",
+        "wmv", // 文書・アーカイブ・データ
+        "pdf", "zip", "7z", "rar", "tar", "gz", "csv", "tsv", "json", "xml", "txt", "md",
+        "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    ];
+    let ext = ext_from_url(url).unwrap_or_default();
+    if IMAGE.contains(&ext.as_str()) {
+        "image"
+    } else if MEDIA.contains(&ext.as_str()) {
+        "media"
+    } else {
+        "page"
+    }
+}
+
+/// ページタイトルの軽量取得（v1.7 P5 実機FB「全カード同名で意味不明」対策）。
+/// 先頭 64KB だけ読んで <title> を拾う — 本文は取り込まない・失敗は None（非致命・
+/// 呼び出し側が URL 由来の名前へフォールバック）。§4 の入口（スキーム/プライベート遮断/
+/// 同一ホスト間隔/UA/リダイレクト上限）は fetch_url と同じ関数を通る。
+pub fn fetch_title(url_s: &str, allow_private: bool) -> Option<String> {
+    let url = url_precheck(url_s, allow_private).ok()?;
+    let client = web_client(allow_private).ok()?;
+    let resp = client.get(url).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let raw_ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let (mime, charset) = split_content_type(&raw_ct);
+    if !(mime.is_empty() || mime == "text/html" || mime == "application/xhtml+xml") {
+        return None;
+    }
+    let mut buf = Vec::new();
+    resp.take(64 * 1024).read_to_end(&mut buf).ok()?;
+    // 64KB で切ると多バイト文字が欠けて厳密デコードが失敗し得る → lossy にフォールバック
+    // （タイトルは通常先頭にあるので実害なし）。
+    let html = decode_html(&buf, charset.as_deref())
+        .unwrap_or_else(|| String::from_utf8_lossy(&buf).into_owned());
+    sniff_title(&html)
+}
+
 /// builtin:"to_url" 本体: テキスト → URLカード化ペイロード群（1入力→N出力）。
 /// ペイロードは text/plain の URL 文字列 — **途中に置けば**下流（web_fetch 等）へ
 /// そのまま流れ、**終端なら** meta の url_card マーカーを見たマテリアライザが
 /// URL カードとして着地させる（実ファイル・CAS なし）。
-pub fn run_to_url(input: &[u8]) -> Result<Vec<WebFetchOut>, String> {
+/// - spec.links: カード化する種類（"all"=既定 / "page" / "image" / "media"）。
+/// - spec.titles: カード名（"fetch"=既定: ページは <title> を軽量取得 / "none"）。
+///   タイトル取得はネットワークに出るため reqwest::blocking を OS スレッドに包む
+///   （run_web_fetch と同じ流儀）。cancel で URL ごとの境界で中断できる。
+pub fn run_to_url(
+    spec: &FilterSpec,
+    input: &[u8],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<WebFetchOut>, String> {
     let text = String::from_utf8_lossy(input);
-    let urls = scan_urls(&text);
-    if urls.is_empty() {
+    let all = scan_urls(&text);
+    if all.is_empty() {
         return Err("テキストに URL（http:// / https://）が見つかりません".into());
     }
-    Ok(urls
-        .into_iter()
-        .map(|u| WebFetchOut {
-            bytes: u.into_bytes(),
-            ext: "txt".into(),
-            mime: "text/plain".into(),
-            stem: None, // 入力カードの語幹を引き継ぐ（記事タイトル等がそのままカード名に）
-            meta: r#"{"url_card":true}"#.into(),
+    let want = spec.links.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("all");
+    let total = all.len();
+    let urls: Vec<String> = if want == "all" {
+        all
+    } else {
+        all.into_iter().filter(|u| url_link_kind(u) == want).collect()
+    };
+    if urls.is_empty() {
+        let name = match want {
+            "page" => "ページ（HTML）",
+            "image" => "画像",
+            "media" => "音声・動画・ファイル",
+            other => other,
+        };
+        return Err(format!(
+            "URL は {total} 件見つかりましたが、指定の種類（{name}）に該当するものがありません"
+        ));
+    }
+    let fetch_titles = spec.titles.as_deref().unwrap_or("fetch") != "none";
+    // 単一 URL なら入力カードの語幹を引き継ぐのが最良（フィードの記事タイトル等）。
+    // 複数 URL は全カード同名になるため、URL 由来の名前（タイトル/ファイル名）を付ける。
+    let single = urls.len() == 1;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut outs = Vec::new();
+            for u in urls {
+                if cancel.map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false)
+                {
+                    return Err("中断されました".to_string());
+                }
+                let kind = url_link_kind(&u);
+                let title = if fetch_titles && kind == "page" {
+                    fetch_title(&u, spec.allow_private).as_deref().and_then(sanitize_stem)
+                } else {
+                    None
+                };
+                let stem = title.or_else(|| if single { None } else { stem_from_url(&u) });
+                outs.push(WebFetchOut {
+                    bytes: u.into_bytes(),
+                    ext: "txt".into(),
+                    mime: "text/plain".into(),
+                    stem,
+                    meta: r#"{"url_card":true}"#.into(),
+                });
+            }
+            Ok(outs)
         })
-        .collect())
+        .join()
+        .map_err(|_| "URLカード化スレッドが異常終了しました".to_string())?
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1589,18 +1704,62 @@ mod tests {
     }
 
     /// run_to_url: 1入力→N出力・ペイロードは text/plain の URL・url_card マーカー付き。
-    /// URL が無いテキストは明確なエラー。
+    /// URL が無いテキストは明確なエラー。複数 URL のカード名は URL 由来（全カード同名の
+    /// 実機FB対策）・単一 URL は入力カードの語幹を引き継ぐ（フィードの記事タイトル）。
     #[test]
     fn to_url_payloads() {
-        let outs = run_to_url("記事: https://ex.jp/a\nおまけ https://ex.jp/b".as_bytes()).unwrap();
+        let s = spec(r#"{"builtin":"to_url","titles":"none"}"#);
+        let outs =
+            run_to_url(&s, "記事: https://ex.jp/aaa\nおまけ https://ex.jp/bbb".as_bytes(), None)
+                .unwrap();
         assert_eq!(outs.len(), 2);
-        assert_eq!(String::from_utf8(outs[0].bytes.clone()).unwrap(), "https://ex.jp/a");
+        assert_eq!(String::from_utf8(outs[0].bytes.clone()).unwrap(), "https://ex.jp/aaa");
         assert_eq!(outs[0].mime, "text/plain");
-        assert!(outs[0].stem.is_none(), "語幹は入力カードを引き継ぐ");
+        assert_eq!(outs[0].stem.as_deref(), Some("aaa"), "複数URLは URL 由来の名前");
+        assert_eq!(outs[1].stem.as_deref(), Some("bbb"));
         let m: serde_json::Value = serde_json::from_str(&outs[0].meta).unwrap();
         assert_eq!(m["url_card"], true);
-        let e = run_to_url("リンクなし".as_bytes()).unwrap_err();
+        // 単一 URL は入力カードの語幹を引き継ぐ（stem = None）
+        let one = run_to_url(&s, b"https://ex.jp/only", None).unwrap();
+        assert!(one[0].stem.is_none());
+        let e = run_to_url(&s, "リンクなし".as_bytes(), None).unwrap_err();
         assert!(e.contains("URL"), "{e}");
+    }
+
+    /// v1.7 P5 実機FB: リンク種類の分類（拡張子ベース）と to_url の種類フィルタ。
+    #[test]
+    fn to_url_link_kinds() {
+        assert_eq!(url_link_kind("https://ex.jp/photo.JPG?x=1"), "image");
+        assert_eq!(url_link_kind("https://ex.jp/doc.pdf"), "media");
+        assert_eq!(url_link_kind("https://ex.jp/song.mp3"), "media");
+        assert_eq!(url_link_kind("https://ex.jp/news.html"), "page");
+        assert_eq!(url_link_kind("https://ex.jp/articles/abc123"), "page");
+        assert_eq!(url_link_kind("https://ex.jp/"), "page");
+        let text = "https://ex.jp/a.png https://ex.jp/b.pdf https://ex.jp/c.html https://ex.jp/d";
+        let s = spec(r#"{"builtin":"to_url","links":"image","titles":"none"}"#);
+        let outs = run_to_url(&s, text.as_bytes(), None).unwrap();
+        assert_eq!(outs.len(), 1);
+        assert_eq!(String::from_utf8(outs[0].bytes.clone()).unwrap(), "https://ex.jp/a.png");
+        let s = spec(r#"{"builtin":"to_url","links":"page","titles":"none"}"#);
+        assert_eq!(run_to_url(&s, text.as_bytes(), None).unwrap().len(), 2);
+        // 該当なしは件数入りの明確なエラー
+        let s = spec(r#"{"builtin":"to_url","links":"media","titles":"none"}"#);
+        let e = run_to_url(&s, b"https://ex.jp/x.png", None).unwrap_err();
+        assert!(e.contains("1 件") && e.contains("音声・動画・ファイル"), "{e}");
+    }
+
+    /// 実機: リンク先タイトルの軽量取得（64KB・<title> のみ）。
+    /// 実行: `cargo test --lib -- --ignored web_live`
+    #[test]
+    #[ignore = "実機: ネットワーク接続が必要"]
+    fn web_live_fetch_title() {
+        let t = fetch_title("https://example.com/", false).unwrap();
+        assert!(t.contains("Example"), "{t}");
+        // to_url 既定（titles=fetch）でページタイトルがカード名になる
+        let s = spec(r#"{"builtin":"to_url"}"#);
+        let outs =
+            run_to_url(&s, b"https://example.com/ and https://example.org/", None).unwrap();
+        assert!(outs[0].stem.as_deref().unwrap_or("").contains("Example"), "{:?}", outs[0].stem);
     }
 
     // --- v1.7 P4: web_capture ---

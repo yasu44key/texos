@@ -314,10 +314,36 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
   },
   to_url: {
     // v1.7 P5(b): テキスト走査 → URLカード群（1 URL = 1リンクカード）。
+    // 実機FB: 種類フィルタ（全部拾うととんでもない枚数）とタイトル取得（全カード同名対策）。
     title: "URLカード化（to_url）",
     fixed: { accept_mime: "text/*" },
-    fields: [],
-    note: "入力テキストの中の URL（http/https）を全部拾って、1つにつき1枚の URL リンクカードにします。カード名は入力カードの名前を引き継ぎます。重複と、このフィルタが過去に出したリンク（削除済み含む）は増やしません。フィード取得と組み合わせると記事のリンク集が作れます（例: フィード取得 → 抽出 text_grep「^記事: 」 → URLカード化）。下流にフィルタを繋いだ場合は URL 文字列（テキスト）として流れます。",
+    fields: [
+      {
+        key: "links",
+        label: "対象リンク",
+        type: "select",
+        default: "all",
+        options: [
+          { value: "all", label: "すべて" },
+          { value: "page", label: "ページ（HTML）" },
+          { value: "image", label: "画像" },
+          { value: "media", label: "音声・動画・ファイル（PDF など）" },
+        ],
+        hint: "URL 末尾の拡張子で分類します。拡張子のない URL は「ページ」扱いです。",
+      },
+      {
+        key: "titles",
+        label: "カード名",
+        type: "select",
+        default: "fetch",
+        options: [
+          { value: "fetch", label: "リンク先のタイトルを取得（ページのみ）" },
+          { value: "none", label: "取得しない（URL のファイル名）" },
+        ],
+        hint: "取得はページ先頭の一部だけ読む軽量版です。同一サイトへは間隔を空けるため、件数が多いと時間がかかります（30件で1分ほど）。画像・ファイルは常に URL のファイル名を使います。",
+      },
+    ],
+    note: "入力テキストの中の URL（http/https）を拾って、1つにつき1枚の URL リンクカードにします。重複と、このフィルタが過去に出したリンク（削除済み含む）は増やしません。フィード取得と組み合わせると記事のリンク集が作れます（例: フィード取得 → 抽出 text_grep「^記事: 」 → URLカード化）。下流にフィルタを繋いだ場合は URL 文字列（テキスト）として流れます。",
   },
   text_convert: {
     title: "文字コード変換（→ UTF-8）",
