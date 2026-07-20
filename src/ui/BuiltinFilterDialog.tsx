@@ -22,6 +22,8 @@ interface FieldSchema {
   options?: { value: string; label: string }[];
   /** number の最小値。 */
   min?: number;
+  /** v2.0 t23d: number を小数として保存する（例 guidance 5.5。既定は整数）。 */
+  float?: boolean;
   /** v1.5.4 WS-P2: カンマ区切りの値を文字列配列として保存する（例 events）。 */
   asList?: boolean;
 }
@@ -563,6 +565,72 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       },
     ],
   },
+  // ── v2.0 t23d: Image-To-3D（Hunyuan3D-2。V2.0_t23d設計.md）。バックエンドは
+  // flow.rs run_t23d が読む（model/steps/guidance/octree/seed）。
+  t23d: {
+    title: "3D生成 Image-To-3D（画像→3Dモデル）",
+    fixed: { accept_mime: "image/*", output_ext: "glb" },
+    fields: [
+      {
+        key: "model",
+        label: "モデル",
+        type: "select",
+        default: "hunyuan3d-2",
+        options: [
+          { value: "hunyuan3d-2", label: "Hunyuan3D-2 標準（品質重視）" },
+          { value: "hunyuan3d-2-turbo", label: "Hunyuan3D-2 Turbo（蒸留版・高速）" },
+        ],
+      },
+      {
+        key: "texture",
+        label: "テクスチャ",
+        type: "select",
+        default: "off",
+        options: [
+          { value: "off", label: "形状のみ（白メッシュ・速い）" },
+          { value: "on", label: "テクスチャ付き（きれい・時間と VRAM を食う）" },
+        ],
+        hint: "テクスチャ付きは光影除去＋6視点生成＋ベイクが加わります（VRAM 合計 ~16GB・数分）。",
+      },
+      {
+        key: "steps",
+        label: "ステップ数",
+        type: "number",
+        default: 30,
+        min: 1,
+        hint: "多いほど形状が安定しますが時間がかかります（Turbo は少なめでも可）。",
+      },
+      {
+        key: "guidance",
+        label: "ガイダンス",
+        type: "number",
+        float: true,
+        default: 5.5,
+        min: 0,
+        hint: "入力画像への忠実度（CFG）。大きいほど画像に忠実・小さいほど自由。",
+      },
+      {
+        key: "octree",
+        label: "メッシュ解像度",
+        type: "number",
+        default: 256,
+        min: 64,
+        hint: "octree 解像度（256/384/512 目安）。大きいほど細部が出ますが重くなります。",
+      },
+      {
+        key: "seed",
+        label: "シード",
+        type: "number",
+        optional: true,
+        placeholder: "空欄=毎回ランダム",
+        hint: "再現したいとき数値で固定します。",
+      },
+    ],
+    note:
+      "接続した画像カード（t2i の出力など）から 3D モデル（.glb）を生成します。" +
+      "テクスチャ時の面数上限（face_count・既定 40000）は「JSONで編集」から。" +
+      "エンジン: Hunyuan3D-2（ローカル実行・商用可 / EU・英国・韓国は使用不可）。",
+  },
 };
 
 /** この builtin がダイアログ対応か（未対応なら呼び出し側で従来の JSON 編集へフォールバック）。 */
@@ -632,7 +700,7 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
         if (list.length) spec[f.key] = list;
         else delete spec[f.key];
       } else if (f.type === "number") {
-        const n = parseInt(raw, 10);
+        const n = f.float ? parseFloat(raw) : parseInt(raw, 10);
         if (Number.isFinite(n)) spec[f.key] = Math.max(f.min ?? 0, n);
         else if (f.default !== undefined) spec[f.key] = f.default;
         else delete spec[f.key];
@@ -788,6 +856,7 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
                   <input
                     style={f.type === "number" ? { ...inputStyle(), width: 120 } : inputStyle()}
                     type={f.type === "number" ? "number" : "text"}
+                    step={f.float ? 0.1 : undefined}
                     min={f.min}
                     value={vals[f.key] ?? ""}
                     onChange={(e) => setVal(f.key, e.target.value)}

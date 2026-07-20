@@ -200,6 +200,18 @@ pub struct FilterSpec {
     /// "none"（取得しない: URLのファイル名／単一URLなら入力カード名を引き継ぐ）。
     #[serde(default)]
     pub titles: Option<String>,
+    // --- v2.0 t23d（builtin:"t23d"）: Image-To-3D（V2.0_t23d設計.md）。
+    //     model/steps/guidance/seed/timeout_secs は t2i と共用。以下は t23d 専用。---
+    /// t23d: octree 解像度（メッシュの細かさ。未指定は 256）。
+    #[serde(default)]
+    pub octree: Option<u32>,
+    /// t23d: "on" でテクスチャ付き生成（既定=形状のみ）。文字列なのはフォーム select の
+    /// 値をそのまま保存するため（bool にすると select 由来の "on"/"off" が読めない）。
+    #[serde(default)]
+    pub texture: Option<String>,
+    /// t23d: テクスチャ時の面数削減（FaceReducer）上限。未指定は 40000。
+    #[serde(default)]
+    pub face_count: Option<u32>,
 }
 
 /// v1.5.3 WS-P1（オペ層 §5.4.2）: フロー矢印の制御属性（relations.attrs の JSON）。
@@ -241,6 +253,8 @@ pub enum NodeKind {
     Ai,
     /// builtin:"t2i" — 常駐 diffusers デーモン経由の画像生成（テキスト→PNG・別経路）。
     T2i,
+    /// builtin:"t23d" — 常駐 Hunyuan3D-2 デーモン経由の 3D 生成（画像→glb・v2.0 前倒し）。
+    T23d,
     /// builtin:"select" — セレクタ（v1.5.3 WS-P1・オペ層 §5.4.1）。実行はせず port 順の
     /// first-match で「最初に有データを返した枝」を採用する。no-data 吸収を内包。
     /// eval_filter 側で完結し execute_node には到達しない。
@@ -264,6 +278,7 @@ impl FilterSpec {
             return match b {
                 "ai" => NodeKind::Ai,
                 "t2i" => NodeKind::T2i,
+                "t23d" => NodeKind::T23d,
                 "select" => NodeKind::Select,
                 _ => NodeKind::Builtin,
             };
@@ -1147,6 +1162,121 @@ fn run_t2i_blocking(
         return Err("画像生成サーバーが空の応答を返しました".into());
     }
     Ok((bytes, "png".into(), "image/png".into()))
+}
+
+// --- v2.0 t23d（builtin:"t23d"）: Image-To-3D。Hunyuan3D-2 常駐デーモン（t23d_server.py・
+//     runtime/t23d.rs が起動管理）へ画像を送り glb を得る。t2i と同じ流儀の別ポート別プロセス。
+
+/// t23d デーモン（t23d_server.py）の待受ポート。t2i（8765）の隣＝固定ポートで環境非依存。
+pub const T23D_PORT: u16 = 8766;
+
+/// 3D生成の既定タイムアウト。shape のみ＝600秒（初回はモデルロードを含む）・テクスチャ付き＝
+/// 900秒（delight＋6視点拡散＋ベイクが乗る。初回は paint パイプラインのロードも）。
+const T23D_DEFAULT_TIMEOUT_SECS: u64 = 600;
+const T23D_TEXTURE_TIMEOUT_SECS: u64 = 900;
+
+/// 実行中の 3D 生成をデーモンに中断させる（best-effort・短時間）。
+pub fn t23d_post_cancel() {
+    let url = format!("http://127.0.0.1:{T23D_PORT}/cancel");
+    let _ = std::thread::scope(|s| {
+        s.spawn(|| {
+            if let Ok(c) = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+            {
+                let _ = c.post(&url).send();
+            }
+        })
+        .join()
+    });
+}
+
+/// builtin:"t23d": 入力画像を Hunyuan3D-2 デーモンに送り、glb（白メッシュ）を得る。
+/// run_t2i と同じ理由で reqwest::blocking を tokio 文脈外の素の OS スレッドで実行する。
+pub fn run_t23d(spec: &FilterSpec, image: &[u8]) -> Result<(Vec<u8>, String, String), String> {
+    std::thread::scope(|s| {
+        s.spawn(|| run_t23d_blocking(spec, image))
+            .join()
+            .map_err(|_| "3D生成スレッドが異常終了しました".to_string())?
+    })
+}
+
+fn run_t23d_blocking(spec: &FilterSpec, image: &[u8]) -> Result<(Vec<u8>, String, String), String> {
+    if image.is_empty() {
+        return Err("入力画像が空です".into());
+    }
+    let texture = spec.texture.as_deref() == Some("on");
+    // タイムアウト: Some(0)=無制限 / 未指定=shape 600秒・テクスチャ付き 900秒。
+    let timeout = match spec.timeout_secs {
+        Some(0) => None,
+        Some(s) => Some(std::time::Duration::from_secs(s)),
+        None => Some(std::time::Duration::from_secs(if texture {
+            T23D_TEXTURE_TIMEOUT_SECS
+        } else {
+            T23D_DEFAULT_TIMEOUT_SECS
+        })),
+    };
+    let mut cb = reqwest::blocking::Client::builder();
+    if let Some(t) = timeout {
+        cb = cb.timeout(t);
+    }
+    let client = cb
+        .build()
+        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
+
+    use base64::Engine as _;
+    let mut body = serde_json::json!({
+        "image": base64::engine::general_purpose::STANDARD.encode(image),
+    });
+    if let Some(m) = spec.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["model"] = serde_json::json!(m);
+    }
+    if let Some(v) = spec.steps {
+        body["steps"] = serde_json::json!(v);
+    }
+    if let Some(v) = spec.guidance {
+        body["guidance"] = serde_json::json!(v);
+    }
+    if let Some(v) = spec.octree {
+        body["octree"] = serde_json::json!(v);
+    }
+    if let Some(v) = spec.seed {
+        body["seed"] = serde_json::json!(v);
+    }
+    if texture {
+        body["texture"] = serde_json::json!(true);
+        if let Some(v) = spec.face_count {
+            body["face_count"] = serde_json::json!(v);
+        }
+    }
+
+    let url = format!("http://127.0.0.1:{T23D_PORT}/generate");
+    let resp = client.post(&url).json(&body).send().map_err(|e| {
+        if e.is_connect() {
+            "3D生成サーバーに接続できません。3D生成カードの作成からエンジン（Hunyuan3D-2 WinPortable）の場所を設定してください"
+                .to_string()
+        } else if e.is_timeout() {
+            // タイムアウトしてもデーモン側の生成は走り続ける → /cancel で止めて GPU を解放。
+            t23d_post_cancel();
+            "3D生成がタイムアウトしました。ステップ数か octree 解像度を下げるか、制限時間を延ばしてください（生成は中断しました）".to_string()
+        } else {
+            format!("3D生成リクエストに失敗: {e}")
+        }
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let v: serde_json::Value = resp.json().unwrap_or_else(|_| serde_json::json!({}));
+        let msg = v["error"].as_str().unwrap_or("不明なエラー");
+        return Err(format!("3D生成エラー ({status}): {msg}"));
+    }
+    let bytes = resp
+        .bytes()
+        .map_err(|e| format!("3Dモデルの受信に失敗: {e}"))?
+        .to_vec();
+    if bytes.is_empty() {
+        return Err("3D生成サーバーが空の応答を返しました".into());
+    }
+    Ok((bytes, "glb".into(), "model/gltf-binary".into()))
 }
 
 /// v1.4.1 チャット: ストリーミング応答。messages は system を含む会話履歴全体。
@@ -2325,6 +2455,7 @@ mod tests {
         assert_eq!(spec(r#"{"type":"generator","name":"rec.exe"}"#).node_kind(), NodeKind::Generator);
         assert_eq!(spec(r#"{"builtin":"ai","model":"x"}"#).node_kind(), NodeKind::Ai);
         assert_eq!(spec(r#"{"builtin":"t2i","model":"sd1.5"}"#).node_kind(), NodeKind::T2i);
+        assert_eq!(spec(r#"{"builtin":"t23d","model":"hunyuan3d-2"}"#).node_kind(), NodeKind::T23d);
         assert_eq!(spec(r#"{"builtin":"text_grep"}"#).node_kind(), NodeKind::Builtin);
         assert_eq!(spec(r#"{"name":"sp2tab.exe"}"#).node_kind(), NodeKind::External);
         assert_eq!(spec(r#"{"cmd":"sort < {in} > {out}"}"#).node_kind(), NodeKind::External);

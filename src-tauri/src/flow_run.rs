@@ -245,6 +245,31 @@ pub(crate) fn execute_node(
             }
             Ok(plain(bytes, ext, mime))
         }
+        NodeKind::T23d => {
+            // v2.0 t23d: 入力から最初の画像を採る（画像実身のみ・テキストピン無し＝設計 §4。
+            // 「文→(ai)→画→(t2i)→(t23d)→3D」のカード連結が正道）。集約ノード扱いで全入力が来る。
+            let mut image: Option<&[u8]> = None;
+            for (bytes, _ext, mime) in inputs {
+                if mime.starts_with("image/") && image.is_none() {
+                    image = Some(*bytes);
+                }
+            }
+            let image = image.ok_or(
+                "入力画像がありません。画像カード（t2i の出力など）を接続してください",
+            )?;
+            // t2i と同じ契約: 生成 HTTP 中だけ点灯 — break_flow はこれを見てデーモンへ
+            // /cancel を送る（並行時に他ジョブの生成を誤って止めない）。
+            job.t23d_active.store(true, std::sync::atomic::Ordering::Relaxed);
+            let run = flow::run_t23d(spec, image);
+            job.t23d_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            let (bytes, ext, mime) = run?;
+            // 中断時は部分出力を破棄してエラー化（t2i と同じ既存契約。t23d デーモンは例外
+            // 方式なので通常こちらへは来ないが、cancel 直後の完走を拾う保険）。
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("中断されました".into());
+            }
+            Ok(plain(bytes, ext, mime))
+        }
         NodeKind::Generator | NodeKind::External => {
             // 出力拡張子: output_ext 指定 > 最初の入力の拡張子 > "bin"
             //（ジェネレータは入力が無いので "bin"、外部は入力拡張子に追従）。
@@ -360,6 +385,7 @@ fn acquire_node_permits(
     let endpoint = match kind {
         NodeKind::Ai => Some(flow::effective_ai_endpoint(spec)),
         NodeKind::T2i => Some(format!("http://127.0.0.1:{}", flow::T2I_PORT)),
+        NodeKind::T23d => Some(format!("http://127.0.0.1:{}", flow::T23D_PORT)),
         _ => None,
     };
     if let Some(ep) = endpoint {
@@ -369,6 +395,15 @@ fn acquire_node_permits(
             format!(
                 "AIエンドポイント（{key}）は使用中です。実行中のAI処理・画像生成の完了を待つか中断してください"
             )
+        })?);
+    }
+    // 2.5) gpu（v1.7.2 t23d）: t2i / t23d は単一 VRAM を取り合うため生成を直列化する
+    //（生成カード群企画 §3 の GPU 資源・粒度は「生成中だけロック」。texture 込みの t23d は
+    // 16GB 常駐なので、SDXL 等との同時実行は共倒れになる）。超過は ai と同じ即拒否。
+    if matches!(kind, NodeKind::T2i | NodeKind::T23d) {
+        permits.push(state.resources.gpu.try_acquire().ok_or_else(|| {
+            "GPU は使用中です。実行中の画像生成・3D生成の完了を待つか中断してください"
+                .to_string()
         })?);
     }
     // 3) heavy（外部プロセス）: 上限まで並行・超過は順番待ち。録音ジェネレータは
@@ -1073,8 +1108,8 @@ pub(crate) fn eval_filter(
     let mut errs: Vec<String> = Vec::new();
     let mut skips: u32 = 0;
     let mut last_exit: Option<i32> = None;
-    // T2i は集約ノード（プロンプト＋元画像など全入力を集めて1回実行＝1枚生成）。
-    if spec.is_aggregate() || kind == flow::NodeKind::T2i {
+    // T2i / T23d は集約ノード（プロンプト＋元画像など全入力を集めて1回実行＝1つ生成）。
+    if spec.is_aggregate() || kind == flow::NodeKind::T2i || kind == flow::NodeKind::T23d {
         // 集約実行は引数の位置・本数が意味を持つ → 合わない入力はスキップではなくエラー
         let mut bad = Vec::new();
         for pl in &collected {
@@ -1651,6 +1686,10 @@ fn run_flow_inner(
     if term_spec.node_kind() == flow::NodeKind::T2i {
         let _ = t2i_ensure_server(&state.app_data, state.inner());
     }
+    // v2.0 t23d: 同じく終端が t23d ならデーモンを先に起こす（best-effort）。
+    if term_spec.node_kind() == flow::NodeKind::T23d {
+        let _ = t23d_ensure_server(&state.app_data, state.inner());
+    }
 
     // v1.3.11 対話シェル: cmd/PowerShell で一行目（cmd）を実行。
     // シェルカード統合（2026-07-06）: window="keep"（既定・開いたまま）/"close"（実行して閉じる）は
@@ -2206,6 +2245,9 @@ pub(crate) fn break_flow(job_id: u64, state: State<AppState>) {
         if job.t2i_active.load(std::sync::atomic::Ordering::Relaxed) {
             flow::t2i_post_cancel();
         }
+        if job.t23d_active.load(std::sync::atomic::Ordering::Relaxed) {
+            flow::t23d_post_cancel();
+        }
     }
 }
 
@@ -2222,5 +2264,6 @@ pub(crate) fn list_jobs(state: State<AppState>) -> Vec<JobInfo> {
 pub(crate) fn cancel_all(state: State<AppState>) {
     state.jobs.cancel_all();
     flow::t2i_post_cancel();
+    flow::t23d_post_cancel();
 }
 

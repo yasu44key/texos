@@ -220,6 +220,7 @@ export function filterOutputMime(filterRef: string | null): string | null {
     // v1.7 P5 to_url: URL 文字列（text/plain）— 下流接続可・終端なら URL カード着地
     if (s.builtin === "to_url") return "text/plain";
     if (s.builtin === "t2i") return "image/png"; // v1.5 Text-To-Image は常にPNGを吐く
+    if (s.builtin === "t23d") return "model/gltf-binary"; // v2.0 Image-To-3D は常にglbを吐く
     if (s.builtin === "md_codeblock") return "text/plain"; // v1.4.0 コード抽出（→gcc等）
     if (s.builtin === "img_resize") return "image/png";
     if (s.builtin === "img_convert") {

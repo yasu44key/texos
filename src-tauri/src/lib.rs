@@ -40,6 +40,8 @@ pub struct AppState {
     /// v1.5 Text-To-Image: TexoS が起動・管理する diffusers 常駐デーモン（t2i_server.py）の
     /// 子プロセスハンドル。t2i_stop_server で明示停止できるよう保持する。
     pub t2i_server: Mutex<Option<std::process::Child>>,
+    /// v2.0 t23d: Hunyuan3D-2 常駐デーモン（t23d_server.py）の子プロセスハンドル。
+    pub t23d_server: Mutex<Option<std::process::Child>>,
 }
 
 /// プロジェクトルート単位の書き込み直列化ロックを取得（無ければ作る）。
@@ -91,6 +93,9 @@ pub struct Job {
     /// t2i 生成の HTTP を投げている間だけ true。break_flow がデーモンへ /cancel を送るか
     /// の判定（並行時に他ジョブの生成を誤って止めない）。
     pub t2i_active: std::sync::atomic::AtomicBool,
+    /// t23d 版（同上）。t2v/t2a を足すときに gen_active(kind) へ一般化する予定
+    /// （生成カード群企画 §3）。
+    pub t23d_active: std::sync::atomic::AtomicBool,
     /// job:progress のスロットル（~10/s・凍結 §11.6）用の最終 emit 時刻。
     pub progress_at: Mutex<std::time::Instant>,
 }
@@ -135,6 +140,7 @@ impl Jobs {
             control: Mutex::new(None),
             project_root: project_root.to_string(),
             t2i_active: std::sync::atomic::AtomicBool::new(false),
+            t23d_active: std::sync::atomic::AtomicBool::new(false),
             progress_at: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)),
         })
     }
@@ -363,6 +369,9 @@ pub struct ResourceLimits {
     ai: Mutex<std::collections::HashMap<String, std::sync::Arc<FairSemaphore>>>,
     /// 入力デバイス単位（排他=1）。超過は即拒否。
     device: Mutex<std::collections::HashMap<String, std::sync::Arc<FairSemaphore>>>,
+    /// v1.7.2 t23d: ローカル GPU（VRAM）の排他=1。t2i / t23d の生成を直列化する
+    /// （生成カード群企画 §3 の「GPU 資源」。粒度は「生成中だけロック」＝初版方針）。
+    pub gpu: std::sync::Arc<FairSemaphore>,
 }
 
 impl ResourceLimits {
@@ -375,6 +384,7 @@ impl ResourceLimits {
             heavy: FairSemaphore::new(n),
             ai: Mutex::new(std::collections::HashMap::new()),
             device: Mutex::new(std::collections::HashMap::new()),
+            gpu: FairSemaphore::new(1),
         }
     }
     /// エンドポイントのセマフォ（無ければ許可数1で作る）。key は正規化済み URL を渡すこと。
@@ -503,6 +513,13 @@ struct Config {
     /// システム Python）。None は自動（管理 env → システムの順で解決）。
     #[serde(default)]
     python_env: Option<String>,
+    /// v2.0 t23d: Hunyuan3D-2 エンジンの場所（WinPortable ルート or Hunyuan3D-2 フォルダの
+    /// 絶対パス）。⚠️ パスのトークン化宿題の対象（V2.0_マルチプラットフォーム検討）。
+    #[serde(default)]
+    t23d_engine: Option<String>,
+    /// v2.0 t23d: 現在選択中の 3D モデル名（既定 hunyuan3d-2）。
+    #[serde(default)]
+    t23d_model: Option<String>,
 }
 #[derive(Serialize)]
 pub struct ProjectInfo {
@@ -654,6 +671,7 @@ pub fn run() {
                 resources: ResourceLimits::new(),
                 write_locks: Mutex::new(std::collections::HashMap::new()),
                 t2i_server: std::sync::Mutex::new(None),
+                t23d_server: std::sync::Mutex::new(None),
             });
             // v1.5.4 WS-P2: オペ層スケジューラ（タイマ/ウォッチャの発火判定・tick 1秒・
             // 現在開いているプロジェクトの op カードだけが対象）。
@@ -772,6 +790,12 @@ pub fn run() {
             t2i_reveal_model_dir,
             t2i_delete_model,
             t2i_inspect,
+            save_card_thumbnail,
+            t23d_status,
+            t23d_set_engine,
+            t23d_start_server,
+            t23d_stop_server,
+            t23d_set_model,
             python_build_env,
             python_set_env_mode,
             detect_spec,

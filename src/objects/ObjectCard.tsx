@@ -11,6 +11,10 @@ import { MediaPreview } from "./MediaPreview";
 const DocPreview = lazy(() =>
   import("./DocPreview").then((m) => ({ default: m.DocPreview }))
 );
+// v2.0 t23d Phase 2: three.js は重いので遅延読み込み（3Dプレビューを開いた時だけ取得）。
+const GlbPreview = lazy(() =>
+  import("./GlbPreview").then((m) => ({ default: m.GlbPreview }))
+);
 import { isTextMime } from "../model";
 
 // Fixed card geometry so link endpoints are predictable from (x, y) alone.
@@ -336,6 +340,8 @@ export function ObjectCard({
     "docx", "xlsx", "xls", "ods", "csv", "tsv",
     "pptx", "ppt", "doc", "odt", "odp",
   ].includes(lowExt);
+  // v2.0 t23d Phase 2: glb/gltf は three.js のインライン 3D ビューア（汎用・出所不問）。
+  const isGlb = ["glb", "gltf"].includes(lowExt) || mimeType.startsWith("model/gltf");
 
   useEffect(() => {
     let alive = true;
@@ -351,15 +357,18 @@ export function ObjectCard({
     return () => { alive = false; };
   }, [ext, editPath, isProject, isUrl, isLauncher, launcherPath]);
 
+  // v2.0 t23d Phase 2: thumbNonce = 3Dプレビューの「サムネイル更新」後にカード面を再取得する。
+  const [thumbNonce, setThumbNonce] = useState(0);
   useEffect(() => {
-    if (!isImage) return;
+    if (!isImage && !isGlb) return;
     invoke<string>("get_thumbnail", { id })
       .then(setThumbnail)
       .catch((e) => {
-        console.error("get_thumbnail failed", id, e);
+        // glb はサムネイル未作成が普通の状態（アイコン表示のまま）＝エラーにしない。
+        if (isImage) console.error("get_thumbnail failed", id, e);
         setThumbnail(null);
       });
-  }, [id, realId, isImage]);
+  }, [id, realId, isImage, isGlb, thumbNonce]);
 
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -931,10 +940,25 @@ export function ObjectCard({
           />
         </Suspense>
       )}
+      {/* v2.0 t23d Phase 2: glb/gltf のインライン 3D ビューア（遅延読込・three.js）。 */}
+      {expanded && isGlb && (
+        <Suspense fallback={null}>
+          <GlbPreview
+            objId={id}
+            label={label}
+            top={CARD_H + 8}
+            width={panelW}
+            height={panelH}
+            onResizeEnd={(w, h) => onPanelResize?.(id, w, h)}
+            onClose={() => onCollapse?.(id)}
+            onThumbnailSaved={() => setThumbNonce((n) => n + 1)}
+          />
+        </Suspense>
+      )}
       {/* v1.3.9: text panel. editPath present → editable (実身); otherwise
           read-only 閲覧 of the LIVE content, with an 「編集」 button that
           commits→edits via onRequestEdit. */}
-      {expanded && !isImage && !mimeType.startsWith("audio/") && !isVideo && !isPdf && !isDoc &&
+      {expanded && !isImage && !mimeType.startsWith("audio/") && !isVideo && !isPdf && !isDoc && !isGlb &&
         (editPath || isText) && (
         <InlineTextEditor
           path={editPath}

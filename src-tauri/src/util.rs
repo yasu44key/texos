@@ -107,6 +107,9 @@ pub(crate) fn mime_for_ext(ext: &str) -> Option<&'static str> {
         "webp" => "image/webp",
         "bmp" => "image/bmp",
         "svg" => "image/svg+xml",
+        // glb は v2.0 t23d（Image-To-3D）の出力。gltf はその JSON 版（手動配置・Blender 書き出し）。
+        "glb" => "model/gltf-binary",
+        "gltf" => "model/gltf+json",
         "mp4" => "video/mp4",
         "webm" => "video/webm",
         "avi" => "video/x-msvideo",

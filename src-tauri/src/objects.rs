@@ -368,6 +368,55 @@ pub(crate) fn get_preview(id: String, state: State<AppState>) -> Result<String, 
     Ok(format!("data:image/png;base64,{}", b64))
 }
 
+/// v2.0 t23d Phase 2: カード面サムネイルの保存（3Dプレビューの「サムネイル更新」）。
+/// フロントの canvas.toDataURL（PNG data URL）を受け、画像カードと同じキャッシュ
+/// （.texos/thumbs/<real_id>.jpg）へ JPEG で書く。get_thumbnail がそのまま配信する
+/// ＝カード面の表示機構は画像カードと完全共用（glb 専用の表示コードを持たない）。
+#[tauri::command]
+pub(crate) fn save_card_thumbnail(
+    id: String,
+    data_url: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let cache_path = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        let real_id: String = p
+            .conn
+            .query_row(
+                "SELECT real_id FROM virtual_bodies WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        texos_dir(&p.root)
+            .join("thumbs")
+            .join(format!("{}.jpg", real_id))
+    };
+    let b64 = data_url
+        .split_once("base64,")
+        .map(|(_, b)| b)
+        .ok_or("data URL の形式が不正です")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("data URL のデコードに失敗: {e}"))?;
+    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    // カード面（150×115）表示用。少し大きめに残してズーム時も荒れないように。
+    let thumb = image::DynamicImage::ImageRgb8(img.thumbnail(400, 400).to_rgb8());
+    let mut buf: Vec<u8> = Vec::new();
+    thumb
+        .write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Jpeg,
+        )
+        .map_err(|e| e.to_string())?;
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&cache_path, &buf).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) fn move_object(id: String, x: f64, y: f64, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();

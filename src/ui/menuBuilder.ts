@@ -1168,6 +1168,12 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
           { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog") },
           { label: "AI変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat") },
           { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i") },
+          // v2.0 t23d: G層2例目（Hunyuan3D-2・V2.0_t23d設計.md）。
+          {
+            label: "3D生成 Image-To-3D（画像→3Dモデル）...",
+            hint: "接続した画像から 3D モデル（.glb）を生成します。エンジンは Hunyuan3D-2 WinPortable（初回に場所を設定）。",
+            onClick: () => a.addFilter("t23d"),
+          },
         ]),
     },
     {

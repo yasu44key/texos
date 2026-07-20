@@ -198,6 +198,11 @@ fn collect_requires(specs: &[String]) -> ModRequires {
                     req.builtins.push("t2i".into());
                 }
             }
+            flow::NodeKind::T23d => {
+                if seen_builtin.insert("t23d") {
+                    req.builtins.push("t23d".into());
+                }
+            }
             flow::NodeKind::Builtin => {
                 if spec.builtin.as_deref() == Some("whisper") && seen_builtin.insert("whisper") {
                     req.builtins.push("whisper".into());
@@ -242,6 +247,11 @@ fn check_requires(req: &ModRequires, app_data: &Path, filters_dir: &Path) -> Vec
             "whisper" => {
                 if !whisper_cli_path(app_data).is_file() {
                     missing.push("Whisper（文字起こし）が未導入です（カードのセットアップから導入）".into());
+                }
+            }
+            "t23d" => {
+                if let Err(e) = crate::runtime::t23d::t23d_resolve_engine(app_data) {
+                    missing.push(format!("3D生成(t23d): {e}"));
                 }
             }
             _ => {}

@@ -274,6 +274,8 @@ fn filter_output_mime(spec: &flow::FilterSpec) -> Option<String> {
         }
         Some("ai") => Some("text/markdown".into()),
         Some("t2i") | Some("img_resize") => Some("image/png".into()),
+        // v2.0 t23d は常に glb を吐く
+        Some("t23d") => Some("model/gltf-binary".into()),
         // v1.7 P1: web_fetch は通常 text/markdown だが、text/html 以外の直リンクは
         // raw のまま実身化する（画像/csv/json…）ため静的には不明＝チェックしない。
         Some("web_fetch") => None,
@@ -621,6 +623,7 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
 fn inspect_dependencies(g: &Graph, app_data: &Path, filters_dir: &Path, f: &mut Vec<Finding>) {
     let mut checked_endpoints: HashSet<String> = HashSet::new();
     let mut t2i_checked = false;
+    let mut t23d_checked = false;
     for n in g.nodes.values() {
         let Some(spec) = n.spec() else { continue };
         match spec.node_kind() {
@@ -670,6 +673,18 @@ fn inspect_dependencies(g: &Graph, app_data: &Path, filters_dir: &Path, f: &mut 
                             level: Level::Warning,
                             category: "依存未解決",
                             message: "画像生成(t2i)の Python 環境が未構築です（依存が揃っていません）".into(),
+                        });
+                    }
+                }
+            }
+            flow::NodeKind::T23d => {
+                if !t23d_checked {
+                    t23d_checked = true;
+                    if let Err(e) = crate::runtime::t23d::t23d_resolve_engine(app_data) {
+                        f.push(Finding {
+                            level: Level::Warning,
+                            category: "依存未解決",
+                            message: format!("3D生成(t23d): {e}"),
                         });
                     }
                 }

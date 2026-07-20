@@ -19,6 +19,20 @@ import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
 import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
 import { T2iSetupDialog, type T2iStatus } from "./ui/T2iSetupDialog";
+
+// v2.0 t23d: t23d_status（runtime/t23d.rs）の返却形。専用セットアップ画面は持たず、
+// エンジン未設定時のパス入力（プロンプト）だけで足りるためここに置く。
+interface T23dStatus {
+  engine_set: boolean;
+  engine_ok: boolean;
+  engine_path: string;
+  engine_error: string;
+  server_running: boolean;
+  gpu: boolean;
+  models: string[];
+  known: { name: string; label: string }[];
+  current_model: string;
+}
 import { JobsPanel, type JobRow } from "./ui/JobsPanel";
 import { InputOrderDialog } from "./ui/InputOrderDialog";
 
@@ -1256,6 +1270,55 @@ function App() {
           } catch (e) {
             console.error("t2i_status failed", e);
             setT2iSetup({ x: canvasX, y: canvasY, linkFrom });
+          }
+        })();
+        return;
+      }
+      if (builtin === "t23d") {
+        // v2.0 t23d: エンジン（Hunyuan3D-2 WinPortable）が未設定なら先に場所を聞く。
+        // 設定済みならスキーマフォーム（BuiltinFilterDialog）で作成。
+        const openDlg = (currentModel: string) => {
+          setBuiltinDlg({
+            id: null,
+            builtin: "t23d",
+            label: "3D生成",
+            spec: JSON.stringify({ model: currentModel }),
+            create: { x: canvasX, y: canvasY, linkFrom },
+          });
+        };
+        void (async () => {
+          try {
+            const s = await invoke<T23dStatus>("t23d_status");
+            if (s.engine_ok) {
+              openDlg(s.current_model);
+              return;
+            }
+            setPrompt({
+              title:
+                "3D生成エンジンの場所（Hunyuan3D-2 WinPortable のフォルダを絶対パスで。例 F:\\Hunyuan3D2_WinPortable\\Hunyuan3D2_WinPortable）",
+              initial: s.engine_path || "",
+              onConfirm: async (path) => {
+                try {
+                  await invoke("t23d_set_engine", { path });
+                  openDlg("hunyuan3d-2");
+                } catch (e) {
+                  setConfirm({
+                    title: "エンジンを認識できませんでした",
+                    message: String(e),
+                    okLabel: "OK",
+                    onConfirm: () => setConfirm(null),
+                  });
+                }
+              },
+            });
+          } catch (e) {
+            console.error("t23d_status failed", e);
+            setConfirm({
+              title: "3D生成の状態を取得できませんでした",
+              message: String(e),
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
           }
         })();
         return;
@@ -2602,6 +2665,9 @@ function App() {
           obj.mime_type === "application/pdf" ||
           (obj.ext ?? "").toLowerCase() === "pdf" ||
           DOC_PREVIEW_EXTS.includes((obj.ext ?? "").toLowerCase()) ||
+          // v2.0 t23d Phase 2: glb/gltf は three.js のインライン 3D ビューア。
+          ["glb", "gltf"].includes((obj.ext ?? "").toLowerCase()) ||
+          obj.mime_type.startsWith("model/gltf") ||
           isTextMime(obj.mime_type, obj.ext))
       ) {
         // v1.3.10: ダブルクリックはプレビューのトグル（再度ダブルクリックで閉じる）。
