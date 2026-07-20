@@ -14,7 +14,7 @@ use tauri::State;
 pub(crate) const T23D_SERVER_PY: &str = include_str!("../../../python/t23d_server.py");
 
 /// 期待するデーモンの版（t23d_server.py の SERVER_VERSION と一致させること）。
-pub(crate) const T23D_SERVER_VERSION: &str = "2";
+pub(crate) const T23D_SERVER_VERSION: &str = "3";
 
 /// 既知モデル（name, 表示ラベル）。t23d_server.py の MODELS と一致させること。
 /// ライセンス: Tencent Hunyuan 3D 2.0 Community License（商用可・EU/英国/韓国は使用不可・

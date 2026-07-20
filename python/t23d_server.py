@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # スクリプトの版（変更ごとに上げる）。TexoS はこれを /health で照合し、古いデーモンが
 # 残っていれば停止して最新スクリプトで起動し直す。Rust 側 T23D_SERVER_VERSION と一致させること。
-SERVER_VERSION = "2"
+SERVER_VERSION = "3"
 
 # --- モデルレジストリ（定番限定・POLICY）。name → (HF repo, スナップショット内サブフォルダ) ---
 # Tencent Hunyuan 3D 2.0 Community License: 商用可（月間1億MAU未満）・EU/英国/韓国は使用不可・
@@ -164,6 +164,7 @@ class Engine:
                     f"設定から取得してください"
                 )
             ckpt = _find_ckpt(d)
+            self._ensure_turbo_compat()  # turbo（蒸留版）対応（スケジューラ＋guidance 埋め込み注入）
             from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
             # 旧モデルを確実に解放してからロード。
@@ -213,6 +214,200 @@ class Engine:
         if resolve_model_dir(name) is None:
             raise RuntimeError("ダウンロードしましたが shape モデルとして認識できません")
         on_line({"status": "完了", "percent": 100})
+
+    # --- turbo 対応の互換パッチ ----------------------------------------------------------
+    @classmethod
+    def _ensure_turbo_compat(cls):
+        """turbo（ステップ蒸留版）を WinPortable 同梱の古い hy3dgen で動かすための2点パッチ
+        （いずれも upstream Tencent-Hunyuan/Hunyuan3D-2 main から移植・実機エラーで確認）:
+        ① スケジューラ: config.yaml が要求する ConsistencyFlowMatchEulerDiscreteScheduler が
+           無い（AttributeError）→ 同名クラスをモジュールへ注入。
+        ② DiT 本体: guidance_embed（蒸留版のガイダンス埋め込み）非対応で、チェックポイントの
+           guidance_in.* が Unexpected key(s) になる → __init__/forward をラップして
+           guidance_in（MLPEmbedder）と埋め込み加算を追加。
+        エンジン側が更新されて本物が入ったら hasattr / フラグ判定で何もしない。"""
+        cls._ensure_consistency_scheduler()
+        cls._ensure_guidance_embed()
+
+    @staticmethod
+    def _ensure_consistency_scheduler():
+        import hy3dgen.shapegen.schedulers as sch
+
+        if hasattr(sch, "ConsistencyFlowMatchEulerDiscreteScheduler"):
+            return
+
+        from dataclasses import dataclass
+        from typing import List, Optional, Tuple, Union
+
+        import numpy as np
+        import torch
+        from diffusers.configuration_utils import ConfigMixin, register_to_config
+        from diffusers.schedulers.scheduling_utils import SchedulerMixin
+        from diffusers.utils import BaseOutput
+
+        @dataclass
+        class ConsistencyFlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
+            prev_sample: torch.FloatTensor
+            pred_original_sample: torch.FloatTensor
+
+        class ConsistencyFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
+            _compatibles: list = []
+            order = 1
+
+            @register_to_config
+            def __init__(self, num_train_timesteps: int = 1000, pcm_timesteps: int = 50):
+                sigmas = np.linspace(0, 1, num_train_timesteps)
+                step_ratio = num_train_timesteps // pcm_timesteps
+                euler_timesteps = (np.arange(1, pcm_timesteps) * step_ratio).round().astype(np.int64) - 1
+                euler_timesteps = np.asarray([0] + euler_timesteps.tolist())
+                self.euler_timesteps = euler_timesteps
+                self.sigmas = sigmas[self.euler_timesteps]
+                self.sigmas = torch.from_numpy((self.sigmas.copy())).to(dtype=torch.float32)
+                self.timesteps = self.sigmas * num_train_timesteps
+                self._step_index = None
+                self._begin_index = None
+                self.sigmas = self.sigmas.to("cpu")
+
+            @property
+            def step_index(self):
+                return self._step_index
+
+            @property
+            def begin_index(self):
+                return self._begin_index
+
+            def set_begin_index(self, begin_index: int = 0):
+                self._begin_index = begin_index
+
+            def _sigma_to_t(self, sigma):
+                return sigma * self.config.num_train_timesteps
+
+            def set_timesteps(
+                self,
+                num_inference_steps: int = None,
+                device=None,
+                sigmas: "Optional[List[float]]" = None,
+            ):
+                self.num_inference_steps = (
+                    num_inference_steps if num_inference_steps is not None else len(sigmas)
+                )
+                inference_indices = np.linspace(
+                    0, self.config.pcm_timesteps, num=self.num_inference_steps, endpoint=False
+                )
+                inference_indices = np.floor(inference_indices).astype(np.int64)
+                inference_indices = torch.from_numpy(inference_indices).long()
+                self.sigmas_ = self.sigmas[inference_indices]
+                timesteps = self.sigmas_ * self.config.num_train_timesteps
+                self.timesteps = timesteps.to(device=device)
+                self.sigmas_ = torch.cat(
+                    [self.sigmas_, torch.ones(1, device=self.sigmas_.device)]
+                )
+                self._step_index = None
+                self._begin_index = None
+
+            def index_for_timestep(self, timestep, schedule_timesteps=None):
+                if schedule_timesteps is None:
+                    schedule_timesteps = self.timesteps
+                indices = (schedule_timesteps == timestep).nonzero()
+                pos = 1 if len(indices) > 1 else 0
+                return indices[pos].item()
+
+            def _init_step_index(self, timestep):
+                if self.begin_index is None:
+                    if isinstance(timestep, torch.Tensor):
+                        timestep = timestep.to(self.timesteps.device)
+                    self._step_index = self.index_for_timestep(timestep)
+                else:
+                    self._step_index = self._begin_index
+
+            def step(
+                self,
+                model_output: torch.FloatTensor,
+                timestep,
+                sample: torch.FloatTensor,
+                generator=None,
+                return_dict: bool = True,
+            ):
+                if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
+                    raise ValueError(
+                        "Passing integer indices as timesteps to step() is not supported."
+                    )
+                if self.step_index is None:
+                    self._init_step_index(timestep)
+                sample = sample.to(torch.float32)
+                sigma = self.sigmas_[self.step_index]
+                sigma_next = self.sigmas_[self.step_index + 1]
+                prev_sample = sample + (sigma_next - sigma) * model_output
+                prev_sample = prev_sample.to(model_output.dtype)
+                pred_original_sample = sample + (1.0 - sigma) * model_output
+                pred_original_sample = pred_original_sample.to(model_output.dtype)
+                self._step_index += 1
+                if not return_dict:
+                    return (prev_sample,)
+                return ConsistencyFlowMatchEulerDiscreteSchedulerOutput(
+                    prev_sample=prev_sample, pred_original_sample=pred_original_sample
+                )
+
+            def __len__(self):
+                return self.config.num_train_timesteps
+
+        sch.ConsistencyFlowMatchEulerDiscreteSchedulerOutput = (
+            ConsistencyFlowMatchEulerDiscreteSchedulerOutput
+        )
+        sch.ConsistencyFlowMatchEulerDiscreteScheduler = ConsistencyFlowMatchEulerDiscreteScheduler
+
+    @staticmethod
+    def _ensure_guidance_embed():
+        import torch
+        import hy3dgen.shapegen.models.hunyuan3ddit as hdit
+
+        DiT = hdit.Hunyuan3DDiT
+        if getattr(DiT, "_texos_guidance_patch", False):
+            return
+        # エンジンが更新済み（本物が guidance_embed 対応）なら何もしない。
+        import inspect
+
+        if "guidance_embed" in inspect.signature(DiT.__init__).parameters:
+            return
+
+        orig_init = DiT.__init__
+        orig_forward = DiT.forward
+
+        def patched_init(self, *args, guidance_embed: bool = False, **kw):
+            orig_init(self, *args, **kw)
+            self.guidance_embed = guidance_embed
+            if guidance_embed:
+                # upstream: MLPEmbedder(in_dim=256, hidden_dim=hidden_size)。
+                self.guidance_in = hdit.MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
+
+        def patched_forward(self, x, t, contexts, **kw):
+            if not getattr(self, "guidance_embed", False):
+                return orig_forward(self, x, t, contexts, **kw)
+            # upstream の forward と同処理（time 埋め込みに guidance 埋め込みを加算）。
+            cond = contexts["main"]
+            latent = self.latent_in(x)
+            vec = self.time_in(
+                hdit.timestep_embedding(t, 256, self.time_factor).to(dtype=latent.dtype)
+            )
+            guidance = kw.get("guidance", None)
+            if guidance is None:
+                raise ValueError("Didn't get guidance strength for guidance distilled model.")
+            vec = vec + self.guidance_in(
+                hdit.timestep_embedding(guidance, 256, self.time_factor).to(dtype=latent.dtype)
+            )
+            cond = self.cond_in(cond)
+            pe = None
+            for block in self.double_blocks:
+                latent, cond = block(img=latent, txt=cond, vec=vec, pe=pe)
+            latent = torch.cat((cond, latent), 1)
+            for block in self.single_blocks:
+                latent = block(latent, vec=vec, pe=pe)
+            latent = latent[:, cond.shape[1]:, ...]
+            return self.final_layer(latent, vec)
+
+        DiT.__init__ = patched_init
+        DiT.forward = patched_forward
+        DiT._texos_guidance_patch = True
 
     # --- テクスチャパイプライン（遅延ロード・VRAM 常駐）--------------------------------
     def _load_paint(self) -> None:
