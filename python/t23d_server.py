@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # スクリプトの版（変更ごとに上げる）。TexoS はこれを /health で照合し、古いデーモンが
 # 残っていれば停止して最新スクリプトで起動し直す。Rust 側 T23D_SERVER_VERSION と一致させること。
-SERVER_VERSION = "3"
+SERVER_VERSION = "4"
 
 # --- モデルレジストリ（定番限定・POLICY）。name → (HF repo, スナップショット内サブフォルダ) ---
 # Tencent Hunyuan 3D 2.0 Community License: 商用可（月間1億MAU未満）・EU/英国/韓国は使用不可・
