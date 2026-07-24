@@ -121,14 +121,22 @@ pub(crate) fn run_launcher(id: String, state: State<AppState>) -> Result<(), Str
         s
     };
 
+    // 起動する GUI アプリに「今のプロジェクト直下」を伝える。作業ディレクトリを
+    // プロジェクトにし、環境変数 TEXOS_PROJECT_DIR にも入れる。これで「保存」する
+    // アプリの書き出しがプロジェクトへ向き、戻ったとき import_new_project_files で
+    // 自動回収される（ChillChordMaker の 3 書き出しがこれで手動登録不要になる）。
+    // 汎用の契約なので他のランチャーカードにも効く。cmd/powershell は自前で cd 済み。
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         // run_flow と同じ定石: cmd /C "<cmdline>" を raw_arg で素のまま渡す。
         // CREATE_NO_WINDOW で親 cmd のコンソールを出さない（start が本体の窓を出す）。
+        // start の子は親 cmd の cwd/環境を継ぐので、cmd 側に積めば本体アプリに届く。
         std::process::Command::new("cmd")
             .raw_arg(format!("/C \"{cmdline}\""))
             .creation_flags(0x0800_0000)
+            .current_dir(&root)
+            .env("TEXOS_PROJECT_DIR", &root_disp)
             .spawn()
             .map_err(|e| format!("起動に失敗しました: {e}"))?;
     }
@@ -143,6 +151,8 @@ pub(crate) fn run_launcher(id: String, state: State<AppState>) -> Result<(), Str
         .ok_or("登録されたプログラムが見つかりません")?;
         std::process::Command::new(exe)
             .args(inputs.iter().map(|p| p.as_os_str()))
+            .current_dir(&root)
+            .env("TEXOS_PROJECT_DIR", &root_disp)
             .spawn()
             .map_err(|e| format!("起動に失敗しました: {e}"))?;
     }

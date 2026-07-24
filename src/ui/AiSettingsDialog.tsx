@@ -12,6 +12,56 @@ interface Props {
   onCancel: () => void;
 }
 
+// v1.7.3 サーバー選択を3択に。"lmstudio" と "openai" はワイヤ形式が同じ（バックエンドの
+// is_openai_compat）で、違うのは既定エンドポイントと案内文、到達確認の可否だけ。
+// ドキュメント戦略（ツールチップ＋エラーメッセージによる自己文書化）に従い、外部側で
+// 何を設定すべきかは全部ここに書く — 別マニュアルを読ませない。
+type Server = "ollama" | "lmstudio" | "openai";
+
+const SERVERS: { id: Server; label: string; tip: string }[] = [
+  {
+    id: "ollama",
+    label: "Ollama",
+    tip:
+      "ローカルの Ollama（既定 http://localhost:11434）。ネイティブ /api/chat で話します。\n" +
+      "未導入でも、対話カードのパネルから導入・サーバ起動・モデル取得まで TexoS が案内します。\n" +
+      "モデル名は「gemma3:latest」のようなタグ形式。",
+  },
+  {
+    id: "lmstudio",
+    label: "LM Studio",
+    tip:
+      "LM Studio のローカルサーバ（既定 http://localhost:1234/v1）。OpenAI互換APIで話します。\n" +
+      "LM Studio でダウンロード済みのモデル（My Models）をそのまま使えます＝Ollama 側へ\n" +
+      "取り込み直す必要はありません。LM Studio 側で「Developer」タブを開き、\n" +
+      "Status を Running にしておくこと（手順は下の「LM Studio の準備」参照）。",
+  },
+  {
+    id: "openai",
+    label: "OpenAI互換（その他）",
+    tip:
+      "OpenAI互換API（POST /v1/chat/completions）を持つ任意のサーバ。\n" +
+      "llama.cpp の server、vLLM、text-generation-webui など。\n" +
+      "エンドポイントには /v1 まで含む URL を入れてください。\n" +
+      "※ TexoS は認証ヘッダを送りません — APIキーが必要なサーバには接続できません。",
+  },
+];
+
+const DEFAULT_ENDPOINT: Record<Server, string> = {
+  ollama: "http://localhost:11434",
+  lmstudio: "http://localhost:1234/v1",
+  openai: "http://localhost:1234/v1",
+};
+
+/// 既定エンドポイントのいずれか（＝ユーザーが自分で決めた宛先ではない）か。
+/// サーバー切替時にこれを消して既定に戻す＝「LM Studio にしたのに宛先は 11434 のまま」を防ぐ。
+const isDefaultEndpoint = (v: string) =>
+  Object.values(DEFAULT_ENDPOINT).includes(v.trim().replace(/\/+$/, ""));
+
+function parseServer(v: unknown): Server {
+  return v === "openai" || v === "lmstudio" ? v : "ollama";
+}
+
 export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }: Props) {
   const base = useMemo<Record<string, unknown>>(() => {
     try {
@@ -23,10 +73,15 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   const s = (k: string, d = "") => (typeof base[k] === "string" ? (base[k] as string) : d);
 
   const [title, setTitle] = useState(initialLabel);
-  const [provider, setProvider] = useState<"ollama" | "openai">(
-    base.provider === "openai" ? "openai" : "ollama"
-  );
+  const [provider, setProvider] = useState<Server>(parseServer(base.provider));
   const [endpoint, setEndpoint] = useState(s("endpoint"));
+
+  // サーバーを替えたら、宛先が「前のサーバーの既定」のままなら空に戻す（＝新しい既定が効く）。
+  // 手で入れた宛先（遠隔・別ポート）は尊重して残す。
+  const changeServer = (next: Server) => {
+    setProvider(next);
+    setEndpoint((cur) => (isDefaultEndpoint(cur) ? "" : cur));
+  };
   const [model, setModel] = useState(s("model", "gemma3:latest"));
   const [system, setSystem] = useState(s("system"));
   const [temperature, setTemperature] = useState(
@@ -70,14 +125,20 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider]);
 
-  const endpointPlaceholder =
-    provider === "openai"
-      ? "空欄 = http://localhost:1234/v1（LM Studio）"
-      : "空欄 = http://localhost:11434（Ollama）";
+  const endpointPlaceholder = `空欄 = ${DEFAULT_ENDPOINT[provider]}${
+    provider === "openai" ? "（/v1 まで含むURLを指定）" : ""
+  }`;
+
+  // 手入力のモデル名が接続先の一覧に無い＝サーバー切替後の取り残しが最頻（Ollama の
+  // 「gemma3:latest」は LM Studio には無い）。送信前にここで気づけるようにする。
+  const modelUnknown =
+    modelsState === "idle" && models.length > 0 && !!model.trim() && !models.includes(model.trim());
 
   const save = () => {
     const spec: Record<string, unknown> = { ...base, builtin: "ai", provider, mode };
-    spec.model = model.trim() || "gemma3:latest";
+    // 空欄時の既定: Ollama は導入案内が gemma3 を入れるのでそれに合わせる。
+    // 他サーバーは既定名が存在しないので、取得済み一覧の先頭を使う。
+    spec.model = model.trim() || (provider === "ollama" ? "gemma3:latest" : models[0] ?? "");
     if (endpoint.trim()) spec.endpoint = endpoint.trim();
     else delete spec.endpoint;
     if (system.trim()) spec.system = system;
@@ -154,19 +215,28 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
         )}
 
         {row(
-          "プロバイダ",
-          <div style={{ display: "flex", gap: 18 }}>
-            {(
-              [
-                ["ollama", "Ollama（ネイティブ）"],
-                ["openai", "OpenAI準拠"],
-              ] as ["ollama" | "openai", string][]
-            ).map(([p, label]) => (
-              <label key={p} style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
-                <input type="radio" checked={provider === p} onChange={() => setProvider(p)} />
-                {label}
-              </label>
-            ))}
+          "サーバー",
+          <div>
+            <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+              {SERVERS.map((sv) => (
+                <label
+                  key={sv.id}
+                  title={sv.tip}
+                  style={{ display: "flex", alignItems: "center", gap: 5, cursor: "help" }}
+                >
+                  <input
+                    type="radio"
+                    checked={provider === sv.id}
+                    onChange={() => changeServer(sv.id)}
+                    style={{ cursor: "pointer" }}
+                  />
+                  {sv.label}
+                </label>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginTop: 3 }}>
+              各項目にマウスを重ねると説明が出ます（同じPCで Ollama と LM Studio を併用可）
+            </div>
           </div>
         )}
 
@@ -177,8 +247,11 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             value={endpoint}
             onChange={(e) => setEndpoint(e.target.value)}
             placeholder={endpointPlaceholder}
+            title={SERVERS.find((sv) => sv.id === provider)!.tip}
           />
         )}
+
+        {provider !== "ollama" && setupHint(provider)}
 
         {row(
           "モデル",
@@ -188,7 +261,13 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
                 style={{ ...inp(), flex: 1 }}
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
-                placeholder="gemma3:latest"
+                placeholder={provider === "ollama" ? "gemma3:latest" : "例: gemma-4-e4b-it"}
+                title={
+                  provider === "ollama"
+                    ? "Ollama のモデルタグ（例: gemma3:latest / qwen2.5:3b）"
+                    : "サーバーが公開しているモデルID（LM Studio なら My Models の識別子）。\n" +
+                      "「↻ 取得」で接続先から実際の一覧を引けます。"
+                }
               />
               {models.length > 0 && (
                 <select
@@ -211,11 +290,24 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
                 ↻ 取得
               </button>
             </div>
-            <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginTop: 3 }}>
+            <div
+              style={{
+                fontSize: 11,
+                marginTop: 3,
+                color: modelsState === "error" || modelUnknown ? "#e0a35c" : "var(--panel-muted, #8a93a8)",
+              }}
+            >
               {modelsState === "loading"
                 ? "取得中…"
                 : modelsState === "error"
-                ? "一覧を取得できません（接続先が起動しているか確認）"
+                ? // v1.7.3 サーバー別に「次に何をするか」まで言う（自己文書化の3本柱＝エラーメッセージ）
+                  provider === "lmstudio"
+                  ? "一覧を取得できません — LM Studio の「Developer」タブで Status を Running にしてください"
+                  : provider === "openai"
+                  ? "一覧を取得できません — サーバの起動と、URLに /v1 まで含まれているか確認してください"
+                  : "一覧を取得できません（Ollama が起動しているか確認）"
+                : modelUnknown
+                ? `「${model.trim()}」はこのサーバーの一覧にありません — 「候補▼」から選び直してください`
                 : models.length
                 ? `${models.length}件取得 — 「候補▼」から選択・手入力も可`
                 : "「↻取得」で候補を表示（手入力も可）"}
@@ -299,6 +391,50 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             保存
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/// v1.7.3 OpenAI互換サーバー側で何を設定すべきかの案内。ダイアログ内に常設する
+/// （ツールチップは「重ねないと読めない」ので、初回に必ず要る手順はこちらへ出す）。
+function setupHint(provider: Exclude<Server, "ollama">) {
+  const lines =
+    provider === "lmstudio"
+      ? [
+          "① LM Studio 左のサイドバーから「Developer」タブを開く",
+          "② 左上のトグルを Status: Running に（既定ポート 1234・URLは /v1 付き）",
+          "③ Settings の「Just-in-Time model loading」をON → ここで選んだモデルが自動で読み込まれます",
+          "④ 初回のモデル読み込みは数十秒かかることがあります。下の「制限時間」は 0（無制限）推奨",
+        ]
+      : [
+          "① サーバ側で OpenAI互換API（POST /v1/chat/completions）を有効にする",
+          "② 上のエンドポイントに /v1 まで含むベースURLを入れる（例: http://192.168.1.10:8080/v1）",
+          "③ 「↻ 取得」でモデル一覧が引ければ接続成功です",
+          "※ 認証ヘッダは送りません — APIキーが必要なサーバには接続できません",
+        ];
+  return (
+    <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+      <div style={{ width: 92, flex: "none" }} />
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          fontSize: 11,
+          lineHeight: 1.7,
+          color: "var(--panel-muted, #8a93a8)",
+          background: "var(--panel-input-bg, #0e121c)",
+          border: "1px solid var(--panel-border, #38445e)",
+          borderRadius: 6,
+          padding: "7px 10px",
+        }}
+      >
+        <div style={{ color: "var(--panel-text, #d6dded)", marginBottom: 2 }}>
+          💡 {provider === "lmstudio" ? "LM Studio の準備" : "OpenAI互換サーバーの準備"}
+        </div>
+        {lines.map((l) => (
+          <div key={l}>{l}</div>
+        ))}
       </div>
     </div>
   );

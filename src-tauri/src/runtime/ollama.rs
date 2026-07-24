@@ -78,6 +78,28 @@ pub(crate) fn ollama_running(base: &str) -> bool {
     })
 }
 
+/// v1.7.3 LM Studio のローカルサーバが応答するか。無認証の GET /v1/models を health
+/// 代わりに使う（LM Studio は専用の version エンドポイントを持たない）。JITロードが
+/// 有効なら一覧が返る＝そのまま推論に使える、という意味まで含んだ確認になる。
+/// 汎用の provider="openai" には使わない — 遠隔・認証付きだと 401 が正常応答であり、
+/// 「未起動」と区別できないため（preflight は従来どおり Info で未検査と報告する）。
+pub(crate) fn lmstudio_running(base: &str) -> bool {
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .ok()
+                .and_then(|c| c.get(&url).send().ok())
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        })
+        .join()
+        .unwrap_or(false)
+    })
+}
+
 /// AIパネル起動時の状態確認。
 #[tauri::command(async)]
 pub(crate) fn ai_ollama_status(endpoint: Option<String>) -> OllamaStatus {

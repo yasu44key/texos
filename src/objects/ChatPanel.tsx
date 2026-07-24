@@ -26,7 +26,9 @@ const PANEL_W = 380;
 
 export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Props) {
   // v1.4.6 Ollama 未導入PC向けのセットアップ案内（OpenAI準拠カードはスキップ）。
-  const isOllama = (provider ?? "ollama") !== "openai";
+  // v1.7.3 "lmstudio" も OpenAI準拠側 — ここを外すと LM Studio カードに Ollama の
+  // 導入ボタンが出てしまう（案内先が違うので実害）。
+  const isOllama = !["openai", "lmstudio"].includes(provider ?? "ollama");
   const [ollama, setOllama] = useState<"checking" | "ready" | "setup">(
     isOllama ? "checking" : "ready"
   );

@@ -460,7 +460,7 @@ fn ai_chat_send_inner(
         let provider = spec.provider.as_deref().unwrap_or("ollama");
         if let Some(last) = messages.last_mut() {
             if last.get("role").and_then(|v| v.as_str()) == Some("user") {
-                if provider == "openai" {
+                if flow::is_openai_compat(provider) {
                     let text = last
                         .get("content")
                         .and_then(|v| v.as_str())

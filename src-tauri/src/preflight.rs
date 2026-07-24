@@ -642,27 +642,43 @@ fn inspect_dependencies(g: &Graph, app_data: &Path, filters_dir: &Path, f: &mut 
             flow::NodeKind::Ai => {
                 let provider = spec.provider.as_deref().unwrap_or("ollama");
                 let endpoint = flow::effective_ai_endpoint(&spec);
-                // ollama のみ到達確認（openai 準拠は health 規約が異なるので誤検知を避け保留）。
-                if provider == "ollama" && checked_endpoints.insert(endpoint.clone()) {
-                    if !ollama_running(&endpoint) {
-                        f.push(Finding {
-                            level: Level::Warning,
-                            category: "依存未解決",
-                            message: format!("AI エンドポイント {} に接続できません（Ollama 未起動）", endpoint),
-                        });
+                // ollama と lmstudio は到達確認できる（無認証のローカルサーバ）。汎用の
+                // openai 準拠は health 規約が定まらず 401 と未起動も区別できないので保留。
+                if checked_endpoints.insert(endpoint.clone()) {
+                    match provider {
+                        "ollama" => {
+                            if !ollama_running(&endpoint) {
+                                f.push(Finding {
+                                    level: Level::Warning,
+                                    category: "依存未解決",
+                                    message: format!("AI エンドポイント {} に接続できません（Ollama 未起動）", endpoint),
+                                });
+                            }
+                        }
+                        // v1.7.3 LM Studio も無認証ローカルサーバなので到達確認できる。
+                        "lmstudio" => {
+                            if !lmstudio_running(&endpoint) {
+                                f.push(Finding {
+                                    level: Level::Warning,
+                                    category: "依存未解決",
+                                    message: format!(
+                                        "AI エンドポイント {} に接続できません（LM Studio のローカルサーバ未起動 — Developer タブで Status: Running に）",
+                                        endpoint
+                                    ),
+                                });
+                            }
+                        }
+                        // v1.5.5 検証修正#4: 検査していないものは「検査していない」と報告する
+                        // （無言スキップはユーザーが検査済みと誤解する）。
+                        _ => f.push(Finding {
+                            level: Level::Info,
+                            category: "未検査",
+                            message: format!(
+                                "「{}」の {} 準拠エンドポイント（{}）は自動検査の対象外です（起動は手動で確認してください）",
+                                n.label, provider, endpoint
+                            ),
+                        }),
                     }
-                }
-                // v1.5.5 検証修正#4: 検査していないものは「検査していない」と報告する
-                // （無言スキップはユーザーが検査済みと誤解する）。
-                if provider != "ollama" && checked_endpoints.insert(endpoint.clone()) {
-                    f.push(Finding {
-                        level: Level::Info,
-                        category: "未検査",
-                        message: format!(
-                            "「{}」の {} 準拠エンドポイント（{}）は自動検査の対象外です（起動は手動で確認してください）",
-                            n.label, provider, endpoint
-                        ),
-                    });
                 }
             }
             flow::NodeKind::T2i => {

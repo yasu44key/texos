@@ -228,13 +228,20 @@ fn check_requires(req: &ModRequires, app_data: &Path, filters_dir: &Path) -> Vec
     }
     let mut checked = std::collections::HashSet::new();
     for dep in &req.ai {
-        if dep.provider == "ollama" && checked.insert(dep.endpoint.clone()) {
-            if !ollama_running(&dep.endpoint) {
-                missing.push(format!(
-                    "AI エンドポイント {} に接続できません（Ollama 未起動・モデル: {}）",
-                    dep.endpoint, dep.model
-                ));
-            }
+        if !checked.insert(dep.endpoint.clone()) {
+            continue;
+        }
+        match dep.provider.as_str() {
+            "ollama" if !ollama_running(&dep.endpoint) => missing.push(format!(
+                "AI エンドポイント {} に接続できません（Ollama 未起動・モデル: {}）",
+                dep.endpoint, dep.model
+            )),
+            // v1.7.3 LM Studio も到達確認の対象（汎用 openai 準拠は従来どおり対象外）。
+            "lmstudio" if !lmstudio_running(&dep.endpoint) => missing.push(format!(
+                "AI エンドポイント {} に接続できません（LM Studio のローカルサーバ未起動・モデル: {}）",
+                dep.endpoint, dep.model
+            )),
+            _ => {}
         }
     }
     for b in &req.builtins {

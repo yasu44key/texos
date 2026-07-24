@@ -104,10 +104,14 @@ pub struct FilterSpec {
     #[serde(default)]
     pub window: Option<String>,
     // --- v1.4.0 AIフィルタ（builtin:"ai"）。デュアルプロバイダ設計 ---
-    /// "ollama"（既定・ネイティブ /api/chat）| "openai"（OpenAI準拠 /v1/chat/completions）
+    /// "ollama"（既定・ネイティブ /api/chat）| "lmstudio"（v1.7.3・LM Studio のローカル
+    /// サーバ）| "openai"（OpenAI準拠 /v1/chat/completions・任意のサーバ）。
+    /// lmstudio と openai はワイヤ形式が同一（is_openai_compat）— 違うのは既定
+    /// エンドポイントと案内文、そして到達確認を自動でやるか否かだけ。
     #[serde(default)]
     pub provider: Option<String>,
-    /// API ベースURL。空=provider既定（ollama: http://localhost:11434 / openai: http://localhost:1234/v1）
+    /// API ベースURL。空=provider既定（ollama: http://localhost:11434 /
+    /// lmstudio・openai: http://localhost:1234/v1）
     #[serde(default)]
     pub endpoint: Option<String>,
     /// モデル名（例: qwen2.5:3b）
@@ -868,7 +872,7 @@ const AI_DEFAULT_TIMEOUT_SECS: u64 = 180;
 
 /// v1.4.0 AIフィルタ（builtin:"ai"）: 入力テキストをユーザープロンプトとしてLLMに送り、
 /// 応答 Markdown を返す。provider="ollama"（既定・ネイティブ /api/chat）または
-/// "openai"（OpenAI準拠 /v1/chat/completions）。
+/// "lmstudio" / "openai"（OpenAI準拠 /v1/chat/completions・is_openai_compat）。
 /// Phase 1 は単発変換（履歴なし）。
 ///
 /// 重要: reqwest::blocking は内部で tokio ランタイムを生成・破棄する。run_flow は
@@ -879,6 +883,15 @@ const AI_DEFAULT_TIMEOUT_SECS: u64 = 180;
 /// tokio 文脈を持たない素の OS スレッドに逃がして実行する（scope で借用は安全）。
 /// v1.5.2 WS-C: この spec が実際に叩く AI エンドポイント（資源セマフォのキー導出用）。
 /// run_ai / run_ai_chat_stream の既定値と一致させること（ここが実体の写し）。
+/// v1.7.3 OpenAI 準拠 API（POST /chat/completions・SSE / GET /models）で話す provider か。
+/// "lmstudio" は LM Studio のローカルサーバで、ワイヤ形式は OpenAI 準拠そのまま。
+/// 別名を立てたのは (1) 未起動時に「Developer タブでサーバを起動」と正しく案内でき、
+/// (2) preflight で到達確認できる（LM Studio は無認証の /models が health 代わりになる）
+/// ため — 汎用 "openai" は認証付き遠隔サーバもあり得るのでどちらも安全にはできない。
+pub fn is_openai_compat(provider: &str) -> bool {
+    matches!(provider, "openai" | "lmstudio")
+}
+
 pub fn effective_ai_endpoint(spec: &FilterSpec) -> String {
     let provider = spec.provider.as_deref().unwrap_or("ollama");
     let explicit = spec
@@ -888,7 +901,7 @@ pub fn effective_ai_endpoint(spec: &FilterSpec) -> String {
         .filter(|s| !s.is_empty());
     match (provider, explicit) {
         (_, Some(e)) => e.to_string(),
-        ("openai", None) => "http://localhost:1234/v1".to_string(),
+        (p, None) if is_openai_compat(p) => "http://localhost:1234/v1".to_string(),
         (_, None) => "http://localhost:11434".to_string(),
     }
 }
@@ -947,7 +960,7 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
     }
     messages.push(serde_json::json!({ "role": "user", "content": user }));
 
-    let content = if provider == "openai" {
+    let content = if is_openai_compat(provider) {
         let endpoint = spec
             .endpoint
             .as_deref()
@@ -1311,7 +1324,7 @@ pub fn run_ai_chat_stream(
     };
 
     let mut full = String::new();
-    if provider == "openai" {
+    if is_openai_compat(provider) {
         // OpenAI準拠: SSE（"data: {...}" 行、終端は [DONE]）
         let endpoint = spec
             .endpoint
@@ -1422,7 +1435,7 @@ fn list_models_blocking(provider: &str, endpoint: &str) -> Result<Vec<String>, S
         .build()
         .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
     let ep = endpoint.trim().trim_end_matches('/');
-    let (url, is_openai) = if provider == "openai" {
+    let (url, is_openai) = if is_openai_compat(provider) {
         let base = if ep.is_empty() { "http://localhost:1234/v1" } else { ep };
         (format!("{base}/models"), true)
     } else {
@@ -1461,10 +1474,17 @@ fn list_models_blocking(provider: &str, endpoint: &str) -> Result<Vec<String>, S
     Ok(out)
 }
 
-/// AI接続失敗を日本語で分かりやすく（Ollama未起動が最頻なので最優先で案内）。
+/// AI接続失敗を日本語で分かりやすく（サーバ未起動が最頻なので最優先で案内）。
+/// v1.7.3: 案内文を provider 別に — 従来は provider に関わらず「Ollama が起動しているか」と
+/// 出ていて、LM Studio 運用では誤誘導だった（次に押すべきボタンが違う）。
 fn ai_conn_err(provider: &str, endpoint: &str, e: &reqwest::Error) -> String {
     if e.is_connect() {
-        format!("{provider} に接続できません（{endpoint}）。Ollama が起動しているか確認してください")
+        let hint = match provider {
+            "lmstudio" => "LM Studio の「Developer」タブでローカルサーバを起動（Status: Running）しているか確認してください",
+            p if is_openai_compat(p) => "サーバが起動しているか、エンドポイントのURL（/v1 まで含む）が正しいか確認してください",
+            _ => "Ollama が起動しているか確認してください",
+        };
+        format!("{provider} に接続できません（{endpoint}）。{hint}")
     } else if e.is_timeout() {
         format!("AI応答がタイムアウトしました（{endpoint}）。制限時間を延ばすか軽いモデルを試してください")
     } else {
@@ -1874,6 +1894,40 @@ mod tests {
         assert_eq!(mime, "text/markdown");
         assert!(!text.trim().is_empty(), "空の応答が返った");
         eprintln!("AI応答: {text}");
+    }
+
+    // v1.7.3 LM Studio 実機検証。ライブの LM Studio(localhost:1234) と gemma-4-e4b-it が
+    // 要るので既定では無視。実行: `cargo test --lib -- --ignored ai_live_lmstudio`
+    // 見ているのは「provider=lmstudio が OpenAI準拠の経路に乗り、既定エンドポイントで
+    // 疎通し、ストリーミングの SSE を最後まで畳める」こと。
+    #[test]
+    #[ignore = "ライブLM Studioが必要"]
+    fn ai_live_lmstudio_roundtrip() {
+        let s = spec(
+            r#"{"builtin":"ai","provider":"lmstudio","model":"gemma-4-e4b-it","system":"地名だけを一語で答えよ。","timeout_secs":0}"#,
+        );
+        let (out, ext, mime) = run_ai(&s, "日本の首都は？".as_bytes()).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(ext, "md");
+        assert_eq!(mime, "text/markdown");
+        assert!(!text.trim().is_empty(), "空の応答が返った");
+        eprintln!("AI応答(非ストリーム): {text}");
+
+        // チャット側（SSE）も同じ spec で通ること。
+        let msgs = vec![serde_json::json!({ "role": "user", "content": "日本の首都は？" })];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut toks = 0usize;
+        let full = run_ai_chat_stream(&s, &msgs, &cancel, &mut |_| toks += 1).unwrap();
+        assert!(!full.trim().is_empty(), "ストリームが空だった");
+        assert!(toks > 0, "トークンが1つも配信されなかった");
+        eprintln!("AI応答(ストリーム/{toks}トークン): {full}");
+
+        // モデル一覧＝設定ダイアログの「↻取得」と同じ経路。
+        let models = list_models("lmstudio", "").unwrap();
+        assert!(
+            models.iter().any(|m| m == "gemma-4-e4b-it"),
+            "一覧にモデルが見当たらない: {models:?}"
+        );
     }
 
     // 回帰テスト: 本番(Tauri #[command(async)])と同じく tokio ランタイム文脈の中から
@@ -2523,6 +2577,22 @@ mod tests {
             )),
             "http://192.168.1.5:11434"
         );
+        // v1.7.3 lmstudio は openai と同じ既定（ワイヤ形式が同一・別名は案内と検査のため）。
+        assert_eq!(
+            effective_ai_endpoint(&spec(r#"{"builtin":"ai","model":"x","provider":"lmstudio"}"#)),
+            "http://localhost:1234/v1"
+        );
+        // 明示エンドポイントは provider に関わらず優先（遠隔の LM Studio を指せる）。
+        assert_eq!(
+            effective_ai_endpoint(&spec(
+                r#"{"builtin":"ai","model":"x","provider":"lmstudio","endpoint":"http://192.168.1.9:1234/v1"}"#
+            )),
+            "http://192.168.1.9:1234/v1"
+        );
+        assert!(is_openai_compat("openai") && is_openai_compat("lmstudio"));
+        assert!(!is_openai_compat("ollama"));
+        // 未知の provider は Ollama 扱いに落ちる（既存カードの挙動を変えない）。
+        assert!(!is_openai_compat("anthropic"));
     }
 
     /// v1.5.3 WS-P1: エッジ属性のパース（NULL/壊れたJSON=既定＝従来）とセレクタ判定。
