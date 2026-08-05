@@ -87,7 +87,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   const [temperature, setTemperature] = useState(
     typeof base.temperature === "number" ? String(base.temperature) : ""
   );
-  // v1.4.12 制限時間（秒）。空欄=既定（変換180秒/対話無制限）・0=無制限。
+  // v1.4.12 制限時間（秒）。v1.7.4: 生成系共通契約に統一 — 空欄=0=無制限（変換も対話も）。
   const [timeoutSecs, setTimeoutSecs] = useState(
     typeof base.timeout_secs === "number" ? String(base.timeout_secs) : ""
   );
@@ -363,11 +363,11 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
               style={{ ...inp(), width: 100 }}
               value={timeoutSecs}
               onChange={(e) => setTimeoutSecs(e.target.value)}
-              placeholder={mode === "chat" ? "空欄=無制限" : "空欄=180"}
+              placeholder="空欄=無制限"
               inputMode="numeric"
             />
             <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
-              秒で打ち切り（0=無制限）。応答が遅い時は延ばすか 0 に
+              秒で打ち切り（空欄・0=無制限＝中断ボタンで停止）。暴走が怖いときだけ秒数を入れる
             </span>
           </div>
         )}
@@ -405,7 +405,7 @@ function setupHint(provider: Exclude<Server, "ollama">) {
           "① LM Studio 左のサイドバーから「Developer」タブを開く",
           "② 左上のトグルを Status: Running に（既定ポート 1234・URLは /v1 付き）",
           "③ Settings の「Just-in-Time model loading」をON → ここで選んだモデルが自動で読み込まれます",
-          "④ 初回のモデル読み込みは数十秒かかることがあります。下の「制限時間」は 0（無制限）推奨",
+          "④ 初回のモデル読み込みは数十秒かかることがあります。下の「制限時間」は空欄（＝無制限）のままで可",
         ]
       : [
           "① サーバ側で OpenAI互換API（POST /v1/chat/completions）を有効にする",

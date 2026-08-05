@@ -625,6 +625,15 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
         placeholder: "空欄=毎回ランダム",
         hint: "再現したいとき数値で固定します。",
       },
+      {
+        key: "timeout_secs",
+        label: "制限時間(秒)",
+        type: "number",
+        optional: true,
+        min: 0,
+        placeholder: "空欄=無制限",
+        hint: "生成がこれを超えたら中断します（空欄／0=無制限＝中断ボタンで停止）。テクスチャ付きは数分〜十数分かかります。",
+      },
     ],
     note:
       "接続した画像カード（t2i の出力など）から 3D モデル（.glb）を生成します。" +

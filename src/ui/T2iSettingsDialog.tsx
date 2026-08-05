@@ -213,13 +213,13 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
             <input
               style={cellInp}
               value={timeoutSecs}
-              placeholder="0=無制限"
+              placeholder="空欄=無制限"
               onChange={(e) => setTimeoutSecs(e.target.value)}
             />
           </label>
         </div>
         <div style={{ ...note, marginBottom: 4 }}>
-          制限時間: 生成がこれを超えると中断（GPUも解放）。FLUXは初回ロードで数分かかるため長め推奨・0=無制限。
+          制限時間: 生成がこれを超えると中断（GPUも解放）。FLUXは初回ロードで数分かかるため長め推奨・空欄／0=無制限（中断ボタンで停止）。
         </div>
 
         <div style={cellRow}>

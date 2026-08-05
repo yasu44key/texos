@@ -867,8 +867,34 @@ fn lang_to_ext(lang: &str) -> String {
     .to_string()
 }
 
-/// AI応答の既定タイムアウト（生成は外部コマンドより長くかかるため別値）。
-const AI_DEFAULT_TIMEOUT_SECS: u64 = 180;
+/// v1.7.4 生成系（ai/t2i/t23d）の制限時間の共通契約:
+///   未指定（未記入）＝0 と同じ＝**無制限**。0 でも未記入でも同じ挙動にする
+///   （「空欄＝無制限」という UI 表記と実装が食い違っていた実機バグの修正）。
+/// 無制限でも止められる: t2i/t23d は中断ボタン →デーモンへ /cancel、AI は接続不能を
+/// `GEN_CONNECT_TIMEOUT_SECS` で早期に切る（生成中の停止は中断ボタン＝出力破棄）。
+const GEN_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// 生成系の制限時間を Duration に落とす（None/Some(0) = 無制限）。
+fn gen_timeout(timeout_secs: Option<u64>) -> Option<std::time::Duration> {
+    match timeout_secs {
+        None | Some(0) => None,
+        Some(s) => Some(std::time::Duration::from_secs(s)),
+    }
+}
+
+/// 生成系の HTTP クライアント生成（制限時間の共通契約＋接続タイムアウト）。
+///
+/// **落とし穴**: `reqwest::blocking::ClientBuilder` は **timeout の既定が 30 秒**
+/// （async の Client は無制限だが blocking だけ違う）。`.timeout()` を呼ばなければ
+/// 無制限、ではなく 30 秒で切れる。無制限にするには **`None` を明示的に渡す**必要がある。
+/// そのため常に `Option` を渡す（v1.7.4 実機バグ — 空欄でも 30 秒で切れた原因）。
+fn gen_client(timeout_secs: Option<u64>) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(GEN_CONNECT_TIMEOUT_SECS))
+        .timeout(gen_timeout(timeout_secs)) // None = 無制限（既定 30 秒を明示的に外す）
+        .build()
+        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))
+}
 
 /// v1.4.0 AIフィルタ（builtin:"ai"）: 入力テキストをユーザープロンプトとしてLLMに送り、
 /// 応答 Markdown を返す。provider="ollama"（既定・ネイティブ /api/chat）または
@@ -940,19 +966,8 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    // タイムアウト: Some(0)=無制限 / 未指定=180秒。
-    let timeout = match spec.timeout_secs {
-        Some(0) => None,
-        Some(s) => Some(std::time::Duration::from_secs(s)),
-        None => Some(std::time::Duration::from_secs(AI_DEFAULT_TIMEOUT_SECS)),
-    };
-    let mut cb = reqwest::blocking::Client::builder();
-    if let Some(t) = timeout {
-        cb = cb.timeout(t);
-    }
-    let client = cb
-        .build()
-        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
+    // タイムアウト: 未指定/0 = 無制限（生成系共通契約 — gen_client）。
+    let client = gen_client(spec.timeout_secs)?;
 
     let mut messages = Vec::new();
     if let Some(s) = system {
@@ -1043,9 +1058,6 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
 /// 起動・管理する（Ollama 相当の常駐サーバー）。固定ポート＝接続先は環境非依存。
 pub const T2I_PORT: u16 = 8765;
 
-/// 画像生成の既定タイムアウト（初回はモデルロードを含むため AI より長め）。
-const T2I_DEFAULT_TIMEOUT_SECS: u64 = 300;
-
 /// 実行中の生成をデーモンに中断させる（best-effort・短時間）。タイムアウトや中断ボタンで使う。
 /// tokio 文脈から呼ばれても安全なよう素の OS スレッドで実行する。
 pub fn t2i_post_cancel() {
@@ -1088,19 +1100,8 @@ fn run_t2i_blocking(
     if prompt.is_empty() {
         return Err("入力テキスト（プロンプト）が空です".into());
     }
-    // タイムアウト: Some(0)=無制限 / 未指定=300秒。
-    let timeout = match spec.timeout_secs {
-        Some(0) => None,
-        Some(s) => Some(std::time::Duration::from_secs(s)),
-        None => Some(std::time::Duration::from_secs(T2I_DEFAULT_TIMEOUT_SECS)),
-    };
-    let mut cb = reqwest::blocking::Client::builder();
-    if let Some(t) = timeout {
-        cb = cb.timeout(t);
-    }
-    let client = cb
-        .build()
-        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
+    // タイムアウト: 未指定/0 = 無制限（生成系共通契約 — gen_client）。
+    let client = gen_client(spec.timeout_secs)?;
 
     let mut body = serde_json::json!({ "prompt": prompt });
     if let Some(m) = spec.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -1183,11 +1184,6 @@ fn run_t2i_blocking(
 /// t23d デーモン（t23d_server.py）の待受ポート。t2i（8765）の隣＝固定ポートで環境非依存。
 pub const T23D_PORT: u16 = 8766;
 
-/// 3D生成の既定タイムアウト。shape のみ＝600秒（初回はモデルロードを含む）・テクスチャ付き＝
-/// 900秒（delight＋6視点拡散＋ベイクが乗る。初回は paint パイプラインのロードも）。
-const T23D_DEFAULT_TIMEOUT_SECS: u64 = 600;
-const T23D_TEXTURE_TIMEOUT_SECS: u64 = 900;
-
 /// 実行中の 3D 生成をデーモンに中断させる（best-effort・短時間）。
 pub fn t23d_post_cancel() {
     let url = format!("http://127.0.0.1:{T23D_PORT}/cancel");
@@ -1219,23 +1215,9 @@ fn run_t23d_blocking(spec: &FilterSpec, image: &[u8]) -> Result<(Vec<u8>, String
         return Err("入力画像が空です".into());
     }
     let texture = spec.texture.as_deref() == Some("on");
-    // タイムアウト: Some(0)=無制限 / 未指定=shape 600秒・テクスチャ付き 900秒。
-    let timeout = match spec.timeout_secs {
-        Some(0) => None,
-        Some(s) => Some(std::time::Duration::from_secs(s)),
-        None => Some(std::time::Duration::from_secs(if texture {
-            T23D_TEXTURE_TIMEOUT_SECS
-        } else {
-            T23D_DEFAULT_TIMEOUT_SECS
-        })),
-    };
-    let mut cb = reqwest::blocking::Client::builder();
-    if let Some(t) = timeout {
-        cb = cb.timeout(t);
-    }
-    let client = cb
-        .build()
-        .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?;
+    // タイムアウト: 未指定/0 = 無制限（生成系共通契約 — gen_client）。テクスチャ付きは
+    // 数分〜十数分かかるため、既定で打ち切らないことが特に効く。
+    let client = gen_client(spec.timeout_secs)?;
 
     use base64::Engine as _;
     let mut body = serde_json::json!({
@@ -1311,17 +1293,8 @@ pub fn run_ai_chat_stream(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or("AIフィルタにモデルが指定されていません")?;
-    // ストリーミングは長時間。timeout 指定があれば全体上限、無指定/0 は無制限（cancelで停止）。
-    let client = {
-        let mut cb = reqwest::blocking::Client::builder();
-        if let Some(s) = spec.timeout_secs {
-            if s > 0 {
-                cb = cb.timeout(std::time::Duration::from_secs(s));
-            }
-        }
-        cb.build()
-            .map_err(|e| format!("HTTPクライアントの生成に失敗: {e}"))?
-    };
+    // ストリーミングは長時間。生成系共通契約（未指定/0 = 無制限・cancel で停止）。
+    let client = gen_client(spec.timeout_secs)?;
 
     let mut full = String::new();
     if is_openai_compat(provider) {
@@ -1877,6 +1850,22 @@ mod tests {
 
     fn spec(json: &str) -> FilterSpec {
         parse_spec(json).unwrap()
+    }
+
+    /// v1.7.4 生成系の制限時間の契約: 未記入（None）も 0 も**無制限**。
+    /// 併せて gen_client が「無制限のとき timeout(None) を明示的に渡す」ことを守る
+    /// —— reqwest の blocking ClientBuilder は timeout 既定が 30 秒で、呼ばなければ
+    /// 無制限ではなく 30 秒になる（実機で空欄でも 30 秒で切れたバグの原因）。
+    #[test]
+    fn gen_timeout_treats_blank_and_zero_as_unlimited() {
+        use std::time::Duration;
+        assert_eq!(gen_timeout(None), None, "未記入は無制限");
+        assert_eq!(gen_timeout(Some(0)), None, "0 は無制限");
+        assert_eq!(gen_timeout(Some(600)), Some(Duration::from_secs(600)));
+        // 無制限でもクライアントは作れる（timeout(None) が有効な引数であること）。
+        assert!(gen_client(None).is_ok());
+        assert!(gen_client(Some(0)).is_ok());
+        assert!(gen_client(Some(600)).is_ok());
     }
 
     // v1.4.0 AIフィルタの実機検証。ライブの Ollama(localhost:11434) と qwen2.5:3b が要るので

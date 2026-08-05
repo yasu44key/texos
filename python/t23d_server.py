@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # スクリプトの版（変更ごとに上げる）。TexoS はこれを /health で照合し、古いデーモンが
 # 残っていれば停止して最新スクリプトで起動し直す。Rust 側 T23D_SERVER_VERSION と一致させること。
-SERVER_VERSION = "4"
+SERVER_VERSION = "7"
 
 # --- モデルレジストリ（定番限定・POLICY）。name → (HF repo, スナップショット内サブフォルダ) ---
 # Tencent Hunyuan 3D 2.0 Community License: 商用可（月間1億MAU未満）・EU/英国/韓国は使用不可・
@@ -173,11 +173,26 @@ class Engine:
                 self.model_name = None
                 if self.device == "cuda":
                     self.torch.cuda.empty_cache()
+            # 更新版の from_single_file は **use_safetensors が真のときだけ** safetensors として
+            # 読み、それ以外は torch.load(weights_only=True) に流す（拡張子を見ない）。
+            # _find_ckpt は .safetensors を優先するので、渡すファイルに合わせて明示する
+            # —— 指定しないと safetensors を pickle として読んで落ちる（実機エラー:
+            # "Weights only load failed ... Unsupported operand 3"）。
+            # 引数を持たない旧エンジンでは渡さない（拡張子で判定する実装だったため）。
+            import inspect
+
+            kw = {}
+            if (
+                "use_safetensors"
+                in inspect.signature(Hunyuan3DDiTFlowMatchingPipeline.from_single_file).parameters
+            ):
+                kw["use_safetensors"] = bool(ckpt) and ckpt.endswith(".safetensors")
             self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
                 ckpt,
                 os.path.join(d, "config.yaml"),
                 device=self.device,
                 dtype=self.torch.float16 if self.device == "cuda" else self.torch.float32,
+                **kw,
             )
             self.model_name = name
 
@@ -225,7 +240,10 @@ class Engine:
         ② DiT 本体: guidance_embed（蒸留版のガイダンス埋め込み）非対応で、チェックポイントの
            guidance_in.* が Unexpected key(s) になる → __init__/forward をラップして
            guidance_in（MLPEmbedder）と埋め込み加算を追加。
-        エンジン側が更新されて本物が入ったら hasattr / フラグ判定で何もしない。"""
+        エンジン側が更新されて本物が入ったら hasattr / フラグ判定で何もしない。
+        ⚠️ エンジンの版でモジュールの置き場所自体が変わる（更新版は DiT が
+        models/denoisers/ 配下）。決め打ち import はしないこと（実機で
+        ModuleNotFoundError: hy3dgen.shapegen.models.hunyuan3ddit）。"""
         cls._ensure_consistency_scheduler()
         cls._ensure_guidance_embed()
 
@@ -358,8 +376,24 @@ class Engine:
 
     @staticmethod
     def _ensure_guidance_embed():
+        import importlib
+
         import torch
-        import hy3dgen.shapegen.models.hunyuan3ddit as hdit
+
+        # DiT の置き場所はエンジンの版で変わる（更新版は models/denoisers/ 配下へ移動した）。
+        # 決め打ち import は ModuleNotFoundError で落ちるので、新旧の両方を試す。
+        hdit = None
+        for mod in (
+            "hy3dgen.shapegen.models.denoisers.hunyuan3ddit",  # 更新版レイアウト
+            "hy3dgen.shapegen.models.hunyuan3ddit",  # 旧 WinPortable 同梱レイアウト
+        ):
+            try:
+                hdit = importlib.import_module(mod)
+                break
+            except ModuleNotFoundError:
+                continue
+        if hdit is None or not hasattr(hdit, "Hunyuan3DDiT"):
+            return  # 置き場所が分からない＝素の実装に任せる（更新版なら本物が対応済み）
 
         DiT = hdit.Hunyuan3DDiT
         if getattr(DiT, "_texos_guidance_patch", False):
@@ -422,7 +456,17 @@ class Engine:
         from hy3dgen.texgen import Hunyuan3DPaintPipeline
         from hy3dgen.texgen.pipelines import Hunyuan3DTexGenConfig
 
-        cfg = Hunyuan3DTexGenConfig(dirs[0], dirs[1])
+        # 同梱 hy3dgen の版差を吸収（turbo 対応版で TexGenConfig の引数が増えた）:
+        # 新しい版は第3引数 subfolder_name（= paint サブフォルダ名）を要求し、
+        # pipe_dict で内部パイプライン（hunyuanpaint / hunyuanpaint-turbo）を選ぶ。
+        # 上流の from_pretrained と同じ渡し方にする。古い2引数版もそのまま動かす。
+        import inspect
+
+        paint_subfolder = os.path.basename(os.path.normpath(dirs[1]))
+        if "subfolder_name" in inspect.signature(Hunyuan3DTexGenConfig.__init__).parameters:
+            cfg = Hunyuan3DTexGenConfig(dirs[0], dirs[1], paint_subfolder)
+        else:
+            cfg = Hunyuan3DTexGenConfig(dirs[0], dirs[1])
         cfg.device = self.device
         paint = Hunyuan3DPaintPipeline(cfg)
         # ポータブル版の texgen は mmgp オフロード前提で .to(device) がコメントアウトされて
