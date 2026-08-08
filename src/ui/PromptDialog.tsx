@@ -11,14 +11,17 @@ interface PromptDialogProps {
   /// 指定時は onConfirm の第2引数で値が返る。2欄目が空欄の OK はキャンセル扱い
   ///（1欄目の空欄=キャンセルと同じ流儀。allowEmpty は1欄目にだけ効く）。
   field2?: { label: string; initial?: string };
+  /// v1.8: 複数行入力（JSON など）。等幅・折り返しなしの textarea になり、
+  /// Enter は改行、確定は Ctrl+Enter（または OK）。
+  multiline?: boolean;
   onConfirm: (value: string, value2?: string) => void;
   onCancel: () => void;
 }
 
-export function PromptDialog({ title, initial, allowEmpty, label, field2, onConfirm, onCancel }: PromptDialogProps) {
+export function PromptDialog({ title, initial, allowEmpty, label, field2, multiline, onConfirm, onCancel }: PromptDialogProps) {
   const [value, setValue] = useState(initial);
   const [value2, setValue2] = useState(field2?.initial ?? "");
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
 
   // プロンプトを連鎖させる（onConfirm 内で次の setPrompt）とダイアログは
   // 再マウントされないため、props の変化で値を初期化し直す。
@@ -40,7 +43,8 @@ export function PromptDialog({ title, initial, allowEmpty, label, field2, onConf
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") confirm();
+    // 複数行では Enter は改行。確定は Ctrl+Enter（JSON を書くのに Enter が確定だと使えない）。
+    if (e.key === "Enter" && (!multiline || e.ctrlKey || e.metaKey)) confirm();
     if (e.key === "Escape") onCancel();
   };
 
@@ -82,7 +86,8 @@ export function PromptDialog({ title, initial, allowEmpty, label, field2, onConf
           border: "1px solid var(--panel-border, #38445e)",
           borderRadius: 10,
           padding: 20,
-          minWidth: 320,
+          minWidth: multiline ? 560 : 320,
+          maxWidth: "90vw",
           boxShadow: "0 8px 32px #000000aa",
           fontFamily: "sans-serif",
           color: "var(--panel-text, #d6dded)",
@@ -90,13 +95,39 @@ export function PromptDialog({ title, initial, allowEmpty, label, field2, onConf
       >
         <div style={{ fontSize: 14, marginBottom: 12 }}>{title}</div>
         {label && <div style={{ ...fieldLabelStyle, marginTop: 0 }}>{label}</div>}
-        <input
-          ref={inputRef}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={onKeyDown}
-          style={inputStyle}
-        />
+        {multiline ? (
+          <textarea
+            ref={inputRef as React.RefObject<HTMLTextAreaElement>}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={onKeyDown}
+            spellCheck={false}
+            rows={12}
+            style={{
+              ...inputStyle,
+              fontFamily: "monospace",
+              fontSize: 13,
+              lineHeight: 1.5,
+              whiteSpace: "pre",
+              overflowWrap: "normal",
+              overflowX: "auto",
+              resize: "vertical",
+            }}
+          />
+        ) : (
+          <input
+            ref={inputRef as React.RefObject<HTMLInputElement>}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={onKeyDown}
+            style={inputStyle}
+          />
+        )}
+        {multiline && (
+          <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6 }}>
+            Enter は改行・Ctrl+Enter で OK・Esc でキャンセル
+          </div>
+        )}
         {field2 && (
           <>
             <div style={fieldLabelStyle}>{field2.label}</div>

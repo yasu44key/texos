@@ -1572,12 +1572,21 @@ fn loop_should_stop(spec: &flow::FilterSpec, payloads: &[FlowPayload]) -> Result
     let Some(mode) = spec.until.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(false);
     };
+    let pattern = spec.pattern.as_deref().unwrap_or("");
+    // 語・正規表現を要るモードでパターンが空だと、`contains("")` も `regex("")` も
+    // **常に真**＝1周で止まる。設定の書き落としが「なぜか繰り返さない」に化けるので、
+    // 判定する前にエラーにする（反復カードの last_run とレポートに理由が出る）。
+    if pattern.is_empty()
+        && matches!(mode, "contains" | "not_contains" | "regex" | "not_regex")
+    {
+        return Err(format!("停止条件（{mode}）に語・正規表現が設定されていません"));
+    }
     let text = payloads
         .iter()
         .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
         .collect::<Vec<_>>()
         .join("\n");
-    flow::judge_text(mode, spec.pattern.as_deref().unwrap_or(""), &text)
+    flow::judge_text(mode, pattern, &text)
 }
 
 /// 反復カードの上流サブグラフ（周ごとにメモを捨てる範囲）を後ろ向きに集める。
@@ -2813,6 +2822,15 @@ mod loop_tests {
         // 判定器が壊れているときは黙って回し続けない（止まらない反復になるため）。
         let bad = flow::parse_spec(r#"{"builtin":"loop","until":"regex","pattern":"("}"#).unwrap();
         assert!(loop_should_stop(&bad, &[payload("x")]).is_err());
+        // 語の書き落とし: contains("") も regex("") も常に真＝1周で止まる。設定ダイアログで
+        // 停止条件だけ選んでパターンを空にできるので、静かに「繰り返さない」に化ける前に落とす。
+        for m in ["contains", "not_contains", "regex", "not_regex"] {
+            let s = flow::parse_spec(&format!(r#"{{"builtin":"loop","until":"{m}"}}"#)).unwrap();
+            assert!(loop_should_stop(&s, &[payload("x")]).is_err(), "{m}");
+        }
+        // 「空」系はパターンを見ないので、空欄のままで正しく動く。
+        let e = flow::parse_spec(r#"{"builtin":"loop","until":"empty"}"#).unwrap();
+        assert_eq!(loop_should_stop(&e, &[payload("  ")]), Ok(true));
     }
 
     /// 引き直す範囲＝上流サブグラフ。戻り矢印（role:"previous"）を辿ってはいけない

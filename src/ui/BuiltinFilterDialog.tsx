@@ -22,6 +22,8 @@ interface FieldSchema {
   options?: { value: string; label: string }[];
   /** number の最小値。 */
   min?: number;
+  /** number の最大値（バックエンドが丸める上限はここに書く＝黙って値が変わるのを防ぐ）。 */
+  max?: number;
   /** v2.0 t23d: number を小数として保存する（例 guidance 5.5。既定は整数）。 */
   float?: boolean;
   /** v1.5.4 WS-P2: カンマ区切りの値を文字列配列として保存する（例 events）。 */
@@ -448,6 +450,90 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       },
     ],
   },
+  // ── v1.8 記法カード（V1.8_記法カード計画.md）。どちらも素通し系＝入力は何本でもよく、
+  //    ファンアウトしない。制御の仲間なのでセレクタの隣に置く。
+  tap: {
+    title: "記録（途中を残す・素通し）",
+    fixed: { accept_mime: "*/*" },
+    note:
+      "矢印の途中に置きます。データはそのまま下流へ通しながら、通った中身をファイルに" +
+      "書き出してカードにします（同じ名前で毎回上書き＝カードは増えません）。" +
+      "入力が複数のときは2本目以降に _2, _3 が付きます。" +
+      "反復カードが繰り返す範囲の中に置くと、各周_1・各周_2 … と周ごとに残ります。",
+    fields: [
+      {
+        key: "prefix",
+        label: "記録の名前",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=このカードの名前を使う（例: 途中_判定）",
+        hint: "この名前で毎回上書き保存します。拡張子は通ったデータに合わせて決まります。",
+      },
+      {
+        key: "out_dir",
+        label: "出力先フォルダ",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=プロジェクトフォルダ直下",
+        hint: "指定するとそこへ書き出します（プロジェクト外なら窓＝仮身として登録されます）。試走の記録をまとめて置きたいときに。",
+      },
+    ],
+  },
+  loop: {
+    title: "反復（納得するまで繰り返す）",
+    fixed: { accept_mime: "*/*" },
+    note:
+      "入力につないだ流れを、条件を満たすまで何度もたどり直します。" +
+      "前周の結果を戻すには、このカードから戻したい上流のカードへ矢印を引き、" +
+      "その矢印を右クリックして「役割＝前周の結果」にしてください（1周目だけは空が流れます）。" +
+      "戻し先は連結カードにするのが定石です（AIカードへ直接戻すと入力が2本になり、" +
+      "入力ごとに別々に実行されてしまいます）。途中の周を読みたいときは、" +
+      "繰り返す範囲の中に記録カードを置いてください。",
+    fields: [
+      {
+        key: "max_rounds",
+        label: "最大周回数",
+        type: "number",
+        default: 3,
+        min: 1,
+        max: 50,
+        hint: "暴走止めです。停止条件を満たさなくても、必ずこの回数で止まります（上限50周）。",
+      },
+      {
+        key: "until",
+        label: "停止条件",
+        type: "select",
+        optional: true,
+        default: "",
+        options: [
+          { value: "", label: "回数だけで止める" },
+          { value: "contains", label: "その周の出力に語が現れたら止める" },
+          { value: "not_contains", label: "その周の出力から語が消えたら止める" },
+          { value: "regex", label: "正規表現に一致したら止める" },
+          { value: "not_regex", label: "正規表現に一致しなくなったら止める" },
+          { value: "empty", label: "出力が空になったら止める" },
+          { value: "not_empty", label: "出力が空でなくなったら止める" },
+        ],
+        hint: "その周の出力テキスト全体を見て判定します（入力が複数なら連結してから判定）。",
+      },
+      {
+        key: "pattern",
+        label: "語・正規表現",
+        type: "text",
+        optional: true,
+        placeholder: "例: 合格（停止条件が「空」系のときは不要）",
+        hint: "停止条件が「語」なら含まれるかどうか、「正規表現」なら Rust の regex 構文で判定します。書き間違えると反復はエラーで止まります（黙って回り続けないようにしてあります）。",
+      },
+      {
+        key: "prefix",
+        label: "出力名",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=入力の名前をそのまま通す（例: 結論）",
+        hint: "最後の周の結果をこの名前で下流へ送ります。このカードが終端なら、この名前でファイルになります。",
+      },
+    ],
+  },
   // ── v1.5.4 WS-P2 オペレーション（op カード・kind='op'）。builtin ではないが、
   //    「スキーマからフォームを自動生成して update_filter/create_filter で保存」という
   //    仕組みは同じなのでここに同居させる（キーは "op_<種別>"）。
@@ -710,7 +796,8 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
         else delete spec[f.key];
       } else if (f.type === "number") {
         const n = f.float ? parseFloat(raw) : parseInt(raw, 10);
-        if (Number.isFinite(n)) spec[f.key] = Math.max(f.min ?? 0, n);
+        if (Number.isFinite(n))
+          spec[f.key] = Math.min(f.max ?? Number.MAX_SAFE_INTEGER, Math.max(f.min ?? 0, n));
         else if (f.default !== undefined) spec[f.key] = f.default;
         else delete spec[f.key];
       } else if (f.optional && raw === "") {
@@ -867,6 +954,7 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
                     type={f.type === "number" ? "number" : "text"}
                     step={f.float ? 0.1 : undefined}
                     min={f.min}
+                    max={f.max}
                     value={vals[f.key] ?? ""}
                     onChange={(e) => setVal(f.key, e.target.value)}
                     placeholder={f.placeholder}

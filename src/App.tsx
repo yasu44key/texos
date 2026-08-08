@@ -39,6 +39,16 @@ import { InputOrderDialog } from "./ui/InputOrderDialog";
 // v1.4.8 ①: Whisper 文字起こしカードの spec（外部コマンドフィルタ）。
 // whisper-cli は app_data 共有・絶対パス参照。-of {out_noext} が <base>.txt を書き {out} と一致。
 // 言語は日本語既定（-l ja）。前段に「Whisper用WAVに変換」を繋げば m4a/動画も扱える。
+/// v1.8: 生 JSON を読める形（2スペース整形）にする。壊れた JSON はそのまま返す
+/// —— 直しに来た人から元の文字列を取り上げないため。
+function prettyJson(s: string): string {
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2);
+  } catch {
+    return s;
+  }
+}
+
 function whisperSpec(st: WhisperStatus) {
   return {
     name: "whisper-cli.exe",
@@ -164,6 +174,8 @@ function App() {
     // メニュー再編（2026-07-12）: 2入力欄プロンプト（新規ファイル「その他の拡張子」= 名前＋拡張子）。
     label?: string;
     field2?: { label: string; initial?: string };
+    /// v1.8: 複数行入力（生JSONの編集など）。Enter は改行・Ctrl+Enter で確定。
+    multiline?: boolean;
     onConfirm: (v: string, v2?: string) => void;
   } | null>(null);
   // v1.5.2 WS-C 背景ジョブパネル: 実行中ジョブの一覧（job:started/progress/done/failed で
@@ -2077,10 +2089,13 @@ function App() {
         setBuiltinDlg({ id, builtin, label, spec: current });
         return;
       }
-      // スキーマ未定義の builtin（将来追加分）は従来の JSON 直編集にフォールバック。
+      // スキーマ未定義の builtin（将来追加分）は生 JSON の直編集にフォールバック。
+      // v1.8: 1行の入力欄だと中身が読めず編集もできないので、整形して複数行で開く
+      //（フォームのある builtin の「JSONで編集」と同じ見え方に揃える）。
       setPrompt({
         title: "フィルタ定義（JSON）",
-        initial: current,
+        initial: prettyJson(current),
+        multiline: true,
         onConfirm: async (spec) => {
           try {
             await invoke("update_filter", { id, spec });
@@ -6527,6 +6542,7 @@ function App() {
           allowEmpty={prompt.allowEmpty}
           label={prompt.label}
           field2={prompt.field2}
+          multiline={prompt.multiline}
           onConfirm={(v, v2) => {
             // Close first, THEN run the callback — so a callback that opens
             // another prompt (e.g. URL → title) isn't immediately cleared.
