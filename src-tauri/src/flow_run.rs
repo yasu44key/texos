@@ -1741,6 +1741,7 @@ fn create_answer_note(
         s.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
     };
     let mut text = quote(question);
+    let mut guide = String::new();
     // 届いていた材料（テキストのものだけ）を引用で添える。付箋として読める長さに切る
     // ——全文は記録カードや実身で読めるので、ここは「何の話か思い出せる」量でよい。
     let material = collected
@@ -1762,6 +1763,15 @@ fn create_answer_note(
         if trimmed {
             text.push_str("\n> …（以下略）");
         }
+        guide.push_str("（上の引用は、聞かれたときに届いていた材料の控えです）");
+    }
+    // 使い方の注釈もこの付箋に置く。実機フィードバック（2026-08-08）＝「答えはここに書く」
+    // 「自分で用意した付箋を答えにしてもよい」が、面のどこにも書いていなかった。
+    // **引用行に混ぜる**のがこの設計の効くところ: `>` 行は答えとして読まないので、
+    // 案内を書いても「答えたこと」にならず、書かれたまま残って次に見る人にも読める。
+    text.push_str("\n>\n> ── ここから下に答えを書いてください（「>」で始まる行は答えになりません）");
+    if !guide.is_empty() {
+        text.push_str(&format!("\n> {guide}"));
     }
     let id = crate::util::uuid();
     let style = serde_json::json!({ "width": 300.0, "font_size": 13.0 }).to_string();
@@ -3013,7 +3023,12 @@ mod ask_tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(text, "> この案でよいですか？", "質問は引用で書き、答え欄は空のまま");
+        assert!(text.starts_with("> この案でよいですか？"), "質問は引用で書く: {text}");
+        assert!(
+            text.contains("ここから下に答えを書いてください"),
+            "使い方の注釈も付箋に置く（面のどこにも書いていなかった・実機FB）: {text}"
+        );
+        assert!(text.lines().all(|l| l.starts_with('>')), "案内も引用行にする: {text}");
         assert_eq!(
             flow::answer_text(&text),
             "",
