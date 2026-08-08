@@ -1153,6 +1153,15 @@ function App() {
               "この矢印は入力に数えません（AI カードが入力ごとに何度も走るのを避けるため）。",
             onClick: () => setAttrs({ role: "system" }),
           },
+          {
+            label: check(role === "previous", "役割＝前周の結果（反復の戻り）"),
+            hint:
+              "反復カードから上流へ引き戻す矢印に付けます。実行中は「1周前の出力」がここを" +
+              "流れ、1周目だけは空です。\n" +
+              "この矢印をたどって上流を評価することはありません（絵は輪に見えますが、" +
+              "実行は行き止まりのない一方向のままです）。",
+            onClick: () => setAttrs({ role: "previous" }),
+          },
           { label: "", onClick: () => {}, divider: true },
           {
             label: "矢印を削除",
@@ -1366,6 +1375,29 @@ function App() {
           onConfirm: (name) => {
             const stem = name.trim() || "記録";
             create(stem, { builtin: "tap", accept_mime: "*/*", prefix: stem });
+          },
+        });
+      } else if (builtin === "loop") {
+        // v1.8 反復カード: 上流をもう一度引き直す。最大周回数＝ヒューズ（必須）、
+        // 停止条件は「出力にこの語が入っていたら終わり」の1段目（決定的ルール）。
+        setPrompt({
+          title: "反復: 最大何周まで繰り返しますか（暴走止め）",
+          initial: "3",
+          onConfirm: (times) => {
+            const n = Math.max(1, Math.min(50, parseInt(times, 10) || 3));
+            setPrompt({
+              title: "反復: 出力にこの語が現れたら終わり（空欄＝回数だけで止める）",
+              initial: "",
+              onConfirm: (word) => {
+                const w = word.trim();
+                create(w ? `反復: ${w}まで（最大${n}周）` : `反復: 最大${n}周`, {
+                  builtin: "loop",
+                  accept_mime: "*/*",
+                  max_rounds: n,
+                  ...(w ? { until: "contains", pattern: w } : {}),
+                });
+              },
+            });
           },
         });
       } else if (builtin === "text_grep") {

@@ -151,10 +151,17 @@ fn collect(p: &Project, terminal: &str) -> Result<Graph, String> {
             .filter_map(|r| r.ok())
             .collect();
         for (from, attrs) in ins {
+            let attrs = flow::parse_edge_attrs(attrs.as_deref());
+            // v1.8 ④反復カードの戻り矢印（role:"previous"）は**評価で遡らない**辺なので、
+            // 到達グラフにも入れない。入れると「反復＝循環」として毎回エラー報告になるが、
+            // 実行は DAG のままで循環していない（eval_filter は前周の値を文脈から取る）。
+            if attrs.role.as_deref() == Some("previous") {
+                continue;
+            }
             edges.push(Edge {
                 from: from.clone(),
                 to: cur.clone(),
-                attrs: flow::parse_edge_attrs(attrs.as_deref()),
+                attrs,
             });
             if !nodes.contains_key(&from) {
                 if let Some(n) = load_node(p, &from) {

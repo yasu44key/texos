@@ -602,6 +602,35 @@ impl EvalOut {
 /// 副作用のある上流（録音・AI 呼び出し）の二重実行を防ぐ。run_flow / チャット1ターンごと。
 pub(crate) type EvalMemo = std::collections::HashMap<String, EvalOut>;
 
+/// v1.8 ④反復カード（`builtin:"loop"`）の実行文脈。ジョブ内で持ち回る揮発情報で、
+/// **反復の外では空**＝従来の評価に一切影響しない。
+///
+/// 計画 §4 案B（DAG を保つ）の要: グラフに循環を作らずに「前周の結果」を上流へ届けるため、
+/// 値をエッジではなくここへ置く。戻り矢印（`role:"previous"`）は評価で遡らず、この表を引く。
+#[derive(Default)]
+pub(crate) struct LoopCtx {
+    /// 反復カード id → 前周の出力。`role:"previous"` の矢印がここから材料を取る。
+    prev: std::collections::HashMap<String, Vec<FlowPayload>>,
+    /// 入れ子の周回番号（外側から順・1始まり）。反復の外では空。
+    /// 記録カード（tap）はこれを名前の接尾辞にするので、各周の途中経過が上書きで消えない。
+    rounds: Vec<u32>,
+}
+
+impl LoopCtx {
+    /// 記録カードなどが使う周回の接尾辞（`_2` / 入れ子なら `_2_3`）。反復の外では空文字。
+    fn round_suffix(&self) -> String {
+        if self.rounds.is_empty() {
+            return String::new();
+        }
+        let mut s = String::new();
+        for r in &self.rounds {
+            s.push('_');
+            s.push_str(&r.to_string());
+        }
+        s
+    }
+}
+
 /// 構造化実行記録 last_run の保存（§6.1: {at, exit, ok, nodata, skipped, message}）。
 /// message = このノードで起きたエラー文言（一級の語彙 — メタ認知カードの入力になる）。
 fn write_last_run(p: &Project, fid: &str, out: &EvalOut, skipped: u32) {
@@ -799,11 +828,16 @@ fn run_import_new(
 ///
 /// 2回目以降は同じ実ファイルを指す生きたカードを探して**中身だけ差し替える**
 /// （毎回 import すると同じ実体に2枚目のカードができてしまう＝v1.3.9 の根幹原則違反）。
+///
+/// v1.8 ④: `round_suffix` は反復カードの中にいるときの周回番号（`_2` / 入れ子なら `_2_3`）。
+/// 固定名で上書きする設計のままだと**反復の各周が次の周に消される**ので、周ごとに別名にする。
+/// 反復の外では空文字＝従来どおりの固定名。
 fn write_tap_record(
     p: &Project,
     fid: &str,
     spec: &flow::FilterSpec,
     payloads: &[FlowPayload],
+    round_suffix: &str,
 ) -> Result<Vec<String>, String> {
     let (label, fx, fy): (String, f64, f64) = p
         .conn
@@ -820,6 +854,7 @@ fn write_tap_record(
         .filter(|s| !s.is_empty())
         .unwrap_or(&label);
     let base = crate::web::sanitize_stem(base).unwrap_or_else(|| "記録".into());
+    let base = format!("{base}{round_suffix}");
     let dir: PathBuf = match spec.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => PathBuf::from(s),
         None => p.root.clone(),
@@ -875,6 +910,7 @@ fn write_tap_record(
     Ok(names)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_filter(
     state: &AppState,
     app: &tauri::AppHandle,
@@ -884,13 +920,14 @@ pub(crate) fn eval_filter(
     memo: &mut EvalMemo,
     report: &mut FlowReport,
     job: &Job,
+    ctx: &mut LoopCtx,
 ) -> Result<EvalOut, String> {
     // メモ化（§5.1-5）: 同一ジョブ内の再 pull は実行せず前回結果を配る。
     if let Some(hit) = memo.get(fid) {
         return Ok(hit.clone());
     }
     let root: &Path = &p.root;
-    let cancel = &job.cancel;
+    // 中断フラグは入力収集（collect_input_edges）が見る。v1.8 ④の切り出しでこちらは不要に。
     if !visited.insert(fid.to_string()) {
         return Err("フローに循環があります".into());
     }
@@ -962,171 +999,20 @@ pub(crate) fn eval_filter(
         return finish_eval(p, fid, visited, memo, 0, out);
     }
 
-    // 入力: このフィルタへ入る flow 矢印（生きているカードのみ）。
-    // v1.5.3 WS-P1（§4.3 拡張点アンカーの成立形）: rel.attrs {when, carry, port} を読み、
-    // 並びは port 昇順 → created_at（attrs=NULL は従来どおり接続順）。{inN} の番号・
-    // セレクタの first-match 順はこの並びに従う。
-    #[allow(clippy::type_complexity)]
-    let mut inputs: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, flow::EdgeAttrs)> = {
-        let mut stmt = p
-            .conn
-            .prepare(
-                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind, v.url_ref, rel.attrs
-                 FROM relations rel
-                 JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
-                 JOIN real_bodies r ON r.id = v.real_id
-                 WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
-                 ORDER BY rel.created_at",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![fid], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get::<_, Option<String>>(7)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|(vid, rid, l, m, e, k, u, attrs): (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)| {
-                (vid, rid, l, m, e, k, u, flow::parse_edge_attrs(attrs.as_deref()))
-            })
-            .collect()
-    };
-    // 安定ソート: port 指定なしは末尾（created_at 順を保つ＝完全後方互換）。
-    inputs.sort_by_key(|(.., a)| a.port.unwrap_or(i64::MAX));
+    // v1.8 ④反復カード（builtin:"loop"）: 上流サブグラフを条件が満たされるまで引き直す。
+    // **入力の収集より手前**に置くのが要: 収集は反復カードが周回番号つきで自分で呼ぶ。
+    // ここで先に1回収集してしまうと、その周は番号が付かず、上流の記録カード（tap）が
+    // 1周目を番号なしの名前で書いてしまう。
+    if spec.builtin.as_deref() == Some("loop") {
+        let out = run_loop_node(state, app, p, fid, &spec, visited, memo, report, job, ctx)?;
+        return finish_eval(p, fid, visited, memo, 0, out);
+    }
+
+    // フェーズ1: 入力エッジの収集（v1.8 ④で切り出し — 反復カードが同じ収集を何周も呼ぶ）。
+    let (edges, role_system) =
+        collect_input_edges(state, app, p, fid, visited, memo, report, job, ctx)?;
 
     let mut produced = Vec::new();
-    // フェーズ1: エッジごとに上流を評価し when/carry を適用（EdgeOut の列で保持＝
-    // セレクタの first-match と no-data の NULL 伝搬はエッジ単位の情報が要る）。
-    let mut edges: Vec<EdgeOut> = Vec::new();
-    // v1.8 役割ポート: role="system" の矢印が運んできたテキスト（AI のシステムプロンプト）。
-    let mut role_system: Option<String> = None;
-    for (vid, real_id, vlabel, mime, ext, kind, url_ref, attrs) in &inputs {
-        // 中断後は新しいプロセスを起こさない（複数入力の連鎖を断つ）
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            report.errors.push("中断されました".into());
-            break;
-        }
-        // 上流の評価結果（EvalOut）を得る: フィルタ＝再帰評価（メモ化）／データカード＝窓の今
-        // v1.5.6: 上流が IN/OUT バーチャルカード（kind='op'）なら再帰評価＝透過。
-        // req レーンの op（トリガ等）は flow 矢印を持たないのでここには現れない。
-        let up: EvalOut = if matches!(kind.as_deref(), Some("filter") | Some("op")) {
-            match eval_filter(state, app, p, vid, visited, memo, report, job) {
-                Ok(v) => v,
-                // 構造エラー（循環・カード不明）も「失敗」として一級化 — when=failure で拾える。
-                Err(e) => EvalOut::failed(vec![format!("{vlabel}: {e}")], None, vec![]),
-            }
-        } else if real_id.starts_with("drop:") {
-            // ドロップポイント未投入は従来どおり「スキップ」（no-data にはしない＝後方互換。
-            // 伝搬型ノードを止めたければ将来 no-data 化を検討 — 申し送り参照）。
-            report
-                .skipped
-                .push(format!("{vlabel}（まだファイルが投入されていません）"));
-            continue;
-        } else if let Some(u) = url_ref.as_deref() {
-            // v1.7 P2（URLカードの仮身昇格・実行契約）: kind='url' の入力は url_ref 文字列を
-            // text/plain として渡す。web_fetch の入力（1行目=URL）にそのまま乗るほか、
-            // テキスト系フィルタにも普通に繋がる。stem はラベルをファイル名安全に整形
-            // （ラベルが URL そのままでも壊れない）。
-            let stem = crate::web::sanitize_stem(vlabel).unwrap_or_else(|| "URL".into());
-            EvalOut::data(
-                vec![FlowPayload {
-                    bytes: u.as_bytes().to_vec(),
-                    ext: "txt".into(),
-                    mime: "text/plain".into(),
-                    stem,
-                    meta: None,
-                }],
-                None,
-            )
-        } else if kind.as_deref() == Some("note") {
-            // v1.4.17 カード統一＝定数カード: 付箋は本文をそのまま text/plain として供給する
-            //（実体・CAS 非依存の読み出し専用テキスト。付箋→AI/t2i/grep がそのまま繋がる）。
-            match p
-                .conn
-                .query_row(
-                    "SELECT note_text FROM virtual_bodies WHERE id = ?1",
-                    rusqlite::params![vid],
-                    |r| Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default()),
-                )
-                .map_err(|e| e.to_string())
-            {
-                Ok(text) => {
-                    let stem = if vlabel.trim().is_empty() {
-                        "コメント".to_string()
-                    } else {
-                        vlabel.clone()
-                    };
-                    EvalOut::data(
-                        vec![FlowPayload {
-                            bytes: text.into_bytes(),
-                            ext: "txt".into(),
-                            mime: "text/plain".into(),
-                            stem,
-                            meta: None,
-                        }],
-                        None,
-                    )
-                }
-                Err(e) => EvalOut::failed(vec![format!("{vlabel}: {e}")], None, vec![]),
-            }
-        } else {
-            // 窓の今を解決（snapshot 更新＋ビューパス）— ジョブ専用接続なのでロック不要。
-            let path = {
-                refresh_origin_snapshot(p, vid);
-                resolve_view_path(p, vid, real_id)
-            };
-            match std::fs::read(&path) {
-                Ok(d) => {
-                    let stem = std::path::Path::new(vlabel)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("output")
-                        .to_string();
-                    EvalOut::data(
-                        vec![FlowPayload {
-                            bytes: d,
-                            ext: ext.clone().unwrap_or_else(|| "bin".into()),
-                            mime: mime.clone(),
-                            stem,
-                            meta: None,
-                        }],
-                        None,
-                    )
-                }
-                Err(e) => {
-                    EvalOut::failed(vec![format!("{vlabel}: 読み込み失敗 ({e})")], None, vec![])
-                }
-            }
-        };
-        // v1.8 役割ポート: role 付きの矢印は「入力」ではなく「設定」を運ぶ。通常入力の列
-        // （edges）に入れないので、AI カードのファンアウト（入力ごとに1回実行）を起こさない。
-        // when/carry は適用しない — 役割は条件分岐する対象ではなく直結の配線だから。
-        if let Some(role) = attrs.role.as_deref() {
-            if role == "system" {
-                let text = up
-                    .payloads
-                    .iter()
-                    .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.trim().is_empty() {
-                    role_system = Some(text);
-                }
-            }
-            continue;
-        }
-        edges.push(apply_edge(&up, attrs, vlabel, report));
-    }
 
     // セレクタ（§5.4.1）: 実行せず「最初に有データを返した枝」を採用。no-data 吸収を内包し、
     // 全滅なら自分が no-data（エラーではない — 下流やレポートが no-data として扱う）。
@@ -1228,7 +1114,7 @@ pub(crate) fn eval_filter(
         let out = if collected.is_empty() {
             EvalOut::nodata_out()
         } else {
-            match write_tap_record(p, fid, &spec, &collected) {
+            match write_tap_record(p, fid, &spec, &collected, &ctx.round_suffix()) {
                 Ok(names) => {
                     for n in names {
                         report.outputs.push(format!("{n}（記録）"));
@@ -1388,6 +1274,352 @@ pub(crate) fn eval_filter(
         }
     };
     finish_eval(p, fid, visited, memo, skips, out)
+}
+
+
+/// フェーズ1（入力の収集）: このノードへ入る flow 矢印を順に評価し、when/carry を適用した
+/// `EdgeOut` の列と、役割ポート（`role:"system"`）が運んできたテキストを返す。
+///
+/// v1.8 ④で eval_filter の本体から切り出した。**反復カードが同じ収集を何周も呼ぶ**ため
+/// （周ごとにメモを消して引き直す＝計画 §4 案B）、1か所に閉じている必要がある。
+/// 切り出しにあたって挙動は変えていない。
+#[allow(clippy::too_many_arguments)]
+fn collect_input_edges(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    p: &Project,
+    fid: &str,
+    visited: &mut std::collections::HashSet<String>,
+    memo: &mut EvalMemo,
+    report: &mut FlowReport,
+    job: &Job,
+    ctx: &mut LoopCtx,
+) -> Result<(Vec<EdgeOut>, Option<String>), String> {
+    let cancel = &job.cancel;
+    // 入力: このフィルタへ入る flow 矢印（生きているカードのみ）。
+    // v1.5.3 WS-P1（§4.3 拡張点アンカーの成立形）: rel.attrs {when, carry, port} を読み、
+    // 並びは port 昇順 → created_at（attrs=NULL は従来どおり接続順）。{inN} の番号・
+    // セレクタの first-match 順はこの並びに従う。
+    #[allow(clippy::type_complexity)]
+    let mut inputs: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, flow::EdgeAttrs)> = {
+        let mut stmt = p
+            .conn
+            .prepare(
+                "SELECT v.id, v.real_id, v.label, COALESCE(v.mime_type, r.mime_type), COALESCE(v.ext, r.ext), v.kind, v.url_ref, rel.attrs
+                 FROM relations rel
+                 JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+                 JOIN real_bodies r ON r.id = v.real_id
+                 WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+                 ORDER BY rel.created_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![fid], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(vid, rid, l, m, e, k, u, attrs): (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>)| {
+                (vid, rid, l, m, e, k, u, flow::parse_edge_attrs(attrs.as_deref()))
+            })
+            .collect()
+    };
+    // 安定ソート: port 指定なしは末尾（created_at 順を保つ＝完全後方互換）。
+    inputs.sort_by_key(|(.., a)| a.port.unwrap_or(i64::MAX));
+
+    // エッジごとに上流を評価し when/carry を適用（EdgeOut の列で保持＝セレクタの
+    // first-match と no-data の NULL 伝搬はエッジ単位の情報が要る）。
+    let mut edges: Vec<EdgeOut> = Vec::new();
+    // v1.8 役割ポート: role="system" の矢印が運んできたテキスト（AI のシステムプロンプト）。
+    let mut role_system: Option<String> = None;
+    for (vid, real_id, vlabel, mime, ext, kind, url_ref, attrs) in &inputs {
+        // 中断後は新しいプロセスを起こさない（複数入力の連鎖を断つ）
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            report.errors.push("中断されました".into());
+            break;
+        }
+        // v1.8 ④反復カードの戻り矢印（role:"previous"）: **上流を評価しない**のがこの分岐の
+        // 全部。値は反復カードが文脈へ置いた前周の出力から取る。ここで遡らないから、
+        // キャンバスに輪が描いてあっても評価は DAG のまま（循環判定にも pull にも触らない）。
+        // 1周目は前周が無いので空を運ぶ — no-data にすると伝搬型の下流が丸ごと止まり、
+        // 1周目が実行されずに反復そのものが始まらなくなる。
+        if attrs.role.as_deref() == Some("previous") {
+            let payloads = ctx.prev.get(vid).cloned().unwrap_or_default();
+            edges.push(EdgeOut { payloads, nodata: false, failure: false });
+            continue;
+        }
+        // 上流の評価結果（EvalOut）を得る: フィルタ＝再帰評価（メモ化）／データカード＝窓の今
+        // v1.5.6: 上流が IN/OUT バーチャルカード（kind='op'）なら再帰評価＝透過。
+        // req レーンの op（トリガ等）は flow 矢印を持たないのでここには現れない。
+        let up: EvalOut = if matches!(kind.as_deref(), Some("filter") | Some("op")) {
+            match eval_filter(state, app, p, vid, visited, memo, report, job, ctx) {
+                Ok(v) => v,
+                // 構造エラー（循環・カード不明）も「失敗」として一級化 — when=failure で拾える。
+                Err(e) => EvalOut::failed(vec![format!("{vlabel}: {e}")], None, vec![]),
+            }
+        } else if real_id.starts_with("drop:") {
+            // ドロップポイント未投入は従来どおり「スキップ」（no-data にはしない＝後方互換。
+            // 伝搬型ノードを止めたければ将来 no-data 化を検討 — 申し送り参照）。
+            report
+                .skipped
+                .push(format!("{vlabel}（まだファイルが投入されていません）"));
+            continue;
+        } else if let Some(u) = url_ref.as_deref() {
+            // v1.7 P2（URLカードの仮身昇格・実行契約）: kind='url' の入力は url_ref 文字列を
+            // text/plain として渡す。web_fetch の入力（1行目=URL）にそのまま乗るほか、
+            // テキスト系フィルタにも普通に繋がる。stem はラベルをファイル名安全に整形
+            // （ラベルが URL そのままでも壊れない）。
+            let stem = crate::web::sanitize_stem(vlabel).unwrap_or_else(|| "URL".into());
+            EvalOut::data(
+                vec![FlowPayload {
+                    bytes: u.as_bytes().to_vec(),
+                    ext: "txt".into(),
+                    mime: "text/plain".into(),
+                    stem,
+                    meta: None,
+                }],
+                None,
+            )
+        } else if kind.as_deref() == Some("note") {
+            // v1.4.17 カード統一＝定数カード: 付箋は本文をそのまま text/plain として供給する
+            //（実体・CAS 非依存の読み出し専用テキスト。付箋→AI/t2i/grep がそのまま繋がる）。
+            match p
+                .conn
+                .query_row(
+                    "SELECT note_text FROM virtual_bodies WHERE id = ?1",
+                    rusqlite::params![vid],
+                    |r| Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default()),
+                )
+                .map_err(|e| e.to_string())
+            {
+                Ok(text) => {
+                    let stem = if vlabel.trim().is_empty() {
+                        "コメント".to_string()
+                    } else {
+                        vlabel.clone()
+                    };
+                    EvalOut::data(
+                        vec![FlowPayload {
+                            bytes: text.into_bytes(),
+                            ext: "txt".into(),
+                            mime: "text/plain".into(),
+                            stem,
+                            meta: None,
+                        }],
+                        None,
+                    )
+                }
+                Err(e) => EvalOut::failed(vec![format!("{vlabel}: {e}")], None, vec![]),
+            }
+        } else {
+            // 窓の今を解決（snapshot 更新＋ビューパス）— ジョブ専用接続なのでロック不要。
+            let path = {
+                refresh_origin_snapshot(p, vid);
+                resolve_view_path(p, vid, real_id)
+            };
+            match std::fs::read(&path) {
+                Ok(d) => {
+                    let stem = std::path::Path::new(vlabel)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("output")
+                        .to_string();
+                    EvalOut::data(
+                        vec![FlowPayload {
+                            bytes: d,
+                            ext: ext.clone().unwrap_or_else(|| "bin".into()),
+                            mime: mime.clone(),
+                            stem,
+                            meta: None,
+                        }],
+                        None,
+                    )
+                }
+                Err(e) => {
+                    EvalOut::failed(vec![format!("{vlabel}: 読み込み失敗 ({e})")], None, vec![])
+                }
+            }
+        };
+        // v1.8 役割ポート: role 付きの矢印は「入力」ではなく「設定」を運ぶ。通常入力の列
+        // （edges）に入れないので、AI カードのファンアウト（入力ごとに1回実行）を起こさない。
+        // when/carry は適用しない — 役割は条件分岐する対象ではなく直結の配線だから。
+        if let Some(role) = attrs.role.as_deref() {
+            if role == "system" {
+                let text = up
+                    .payloads
+                    .iter()
+                    .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.trim().is_empty() {
+                    role_system = Some(text);
+                }
+            }
+            continue;
+        }
+        edges.push(apply_edge(&up, attrs, vlabel, report));
+    }
+    Ok((edges, role_system))
+}
+
+/// v1.8 ④反復カード（`builtin:"loop"`）の実行（計画 §4 案B — DAG を保つ反復）。
+///
+/// 上流サブグラフを最大 `max_rounds` 周まで**引き直す**。周と周のあいだにやることは2つだけ:
+/// ①上流のメモを消す（消さないと同じ結果が配られて2周目が実行されない）
+/// ②前周の出力を文脈へ置く（戻り矢印 `role:"previous"` がそこから材料を取る）。
+///
+/// 反復は「1枚のカードの内部実装」に閉じており、グラフは DAG のまま＝可視性・再現性を
+/// 崩さない。停止判定も**このカードの内部制御**であって「グラフの分岐」ではないので、
+/// V2.0課題 §8-1（AI は判定器・分岐は push 側・pull は分岐と相性が悪い）と衝突しない。
+#[allow(clippy::too_many_arguments)]
+fn run_loop_node(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    p: &Project,
+    fid: &str,
+    spec: &flow::FilterSpec,
+    visited: &mut std::collections::HashSet<String>,
+    memo: &mut EvalMemo,
+    report: &mut FlowReport,
+    job: &Job,
+    ctx: &mut LoopCtx,
+) -> Result<EvalOut, String> {
+    let label = node_label(p, fid);
+    // ヒューズ（§8-3「反復は max_fires 相当必須」）: 未指定=3。0 や巨大値は丸める。
+    let max = spec.max_rounds.unwrap_or(3).clamp(1, flow::LOOP_MAX_ROUNDS);
+    // 引き直しの範囲＝この反復カードの上流サブグラフ。戻り矢印は辿らない（辿ると
+    // 反復カード自身が「自分の上流」に見えてしまう）。
+    let upstream = upstream_ids(p, fid);
+
+    let mut cur: Vec<FlowPayload> = Vec::new();
+    let mut done = 0u32;
+    let mut reason = "上限まで回りました";
+    for round in 1..=max {
+        if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            reason = "中断されました";
+            break;
+        }
+        if round > 1 {
+            // 前周の結果を戻り矢印へ渡してから、上流のメモを捨てて引き直す。
+            ctx.prev.insert(fid.to_string(), cur.clone());
+            for id in &upstream {
+                memo.remove(id);
+            }
+        }
+        emit_job_progress(app, job, Some(&format!("{label}: {round}周目")), None);
+        ctx.rounds.push(round);
+        let collected = collect_input_edges(state, app, p, fid, visited, memo, report, job, ctx)
+            .map(|(edges, _role_system)| {
+                // 材料が全滅した周は「そこで打ち切り」。1周目なら反復そのものが no-data。
+                if edges.is_empty() || edges.iter().all(|e| e.nodata) {
+                    None
+                } else {
+                    Some(
+                        edges
+                            .into_iter()
+                            .filter(|e| !e.nodata)
+                            .flat_map(|e| e.payloads)
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            });
+        ctx.rounds.pop();
+        let collected = match collected? {
+            Some(v) => v,
+            None => {
+                if round == 1 {
+                    ctx.prev.remove(fid);
+                    return Ok(EvalOut::nodata_out());
+                }
+                reason = "材料が尽きました";
+                break;
+            }
+        };
+        cur = collected;
+        done = round;
+        // 停止判定（§8-2 の判定2段のうち①決定的ルール）。判定対象はその周の出力テキスト全体。
+        match loop_should_stop(spec, &cur) {
+            Ok(true) => {
+                reason = "停止条件を満たしました";
+                break;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // 判定器が壊れている（正規表現が不正など）。黙って回し続けない。
+                ctx.prev.remove(fid);
+                return Ok(EvalOut::failed(vec![format!("{label}: {e}")], None, vec![]));
+            }
+        }
+    }
+    ctx.prev.remove(fid);
+    report.outputs.push(format!("{label}: {done}周（{reason}）"));
+    Ok(EvalOut::data(cur, None))
+}
+
+/// 反復の停止判定。`until` 未指定なら回数だけで止める（＝常に false）。
+fn loop_should_stop(spec: &flow::FilterSpec, payloads: &[FlowPayload]) -> Result<bool, String> {
+    let Some(mode) = spec.until.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    let text = payloads
+        .iter()
+        .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    flow::judge_text(mode, spec.pattern.as_deref().unwrap_or(""), &text)
+}
+
+/// 反復カードの上流サブグラフ（周ごとにメモを捨てる範囲）を後ろ向きに集める。
+/// 戻り矢印（`role:"previous"`）は辿らない＝ここも DAG として歩く。
+fn upstream_ids(p: &Project, fid: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack = vec![fid.to_string()];
+    let mut out = Vec::new();
+    while let Some(cur) = stack.pop() {
+        let Ok(mut stmt) = p.conn.prepare(
+            "SELECT rel.from_id, rel.attrs FROM relations rel
+             JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+             WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL",
+        ) else {
+            break;
+        };
+        let ins: Vec<(String, Option<String>)> = stmt
+            .query_map(rusqlite::params![cur], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default();
+        for (from, attrs) in ins {
+            if flow::parse_edge_attrs(attrs.as_deref()).role.as_deref() == Some("previous") {
+                continue;
+            }
+            if seen.insert(from.clone()) {
+                out.push(from.clone());
+                stack.push(from);
+            }
+        }
+    }
+    out
+}
+
+/// カードのラベル（進捗・レポートの文言用。見つからなければ id）。
+fn node_label(p: &Project, fid: &str) -> String {
+    p.conn
+        .query_row(
+            "SELECT label FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![fid],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| fid.to_string())
 }
 
 #[cfg(test)]
@@ -1892,6 +2124,7 @@ fn run_flow_inner(
                 None => {
                     let mut visited = std::collections::HashSet::new();
                     let mut memo = EvalMemo::new();
+                    let mut ctx = LoopCtx::default();
                     let out = eval_filter(
                         state.inner(),
                         app,
@@ -1901,6 +2134,7 @@ fn run_flow_inner(
                         &mut memo,
                         &mut report,
                         job,
+                        &mut ctx,
                     )?;
                     report.errors.extend(out.errors.clone());
                     if out.nodata {
@@ -2014,6 +2248,7 @@ fn run_flow_inner(
     // 評価フェーズ: DB 接触はジョブ専用接続（jp）＝ UI の state.current とは独立。
     // 実行（外部/AI/録音）中も UI・他フローが固まらない。資源の取り合いはセマフォが調停。
     // 中断フラグ・stdin 制御はこのジョブのもの（ジョブ別＝毎回新品なのでリセット不要）。
+    let mut ctx = LoopCtx::default();
     let out = eval_filter(
         state.inner(),
         app,
@@ -2023,6 +2258,7 @@ fn run_flow_inner(
         &mut memo,
         &mut report,
         job,
+        &mut ctx,
     )?;
     // v1.5.3 WS-P1: 終端ノード自身の失敗は常に報告（エッジによる格下げは中間ノードの話）。
     report.errors.extend(out.errors.clone());
@@ -2451,7 +2687,7 @@ mod tap_tests {
             .unwrap();
         let spec = flow::parse_spec(r#"{"builtin":"tap","prefix":"途中"}"#).unwrap();
 
-        let names = write_tap_record(&p, "tap1", &spec, &[payload("一回目")]).unwrap();
+        let names = write_tap_record(&p, "tap1", &spec, &[payload("一回目")], "").unwrap();
         assert_eq!(names, vec!["途中.md".to_string()]);
         let path = dir.join("途中.md");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "一回目");
@@ -2477,7 +2713,7 @@ mod tap_tests {
             .unwrap();
 
         // 2回目: 中身が変わってもカードは増えず、実身だけ差し替わる。
-        write_tap_record(&p, "tap1", &spec, &[payload("二回目")]).unwrap();
+        write_tap_record(&p, "tap1", &spec, &[payload("二回目")], "").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "二回目");
         assert_eq!(count(&p), 1, "2回目でカードが増えてはいけない");
         let second_real: String = p
@@ -2492,9 +2728,138 @@ mod tap_tests {
         assert!(cas::object_path(&cas_root, &second_real).exists(), "CAS に載っている");
 
         // 入力が複数のときは _2, _3 を付けて全部残す（素通し＝ファンアウトしない）。
-        let names = write_tap_record(&p, "tap1", &spec, &[payload("A"), payload("B")]).unwrap();
+        let names = write_tap_record(&p, "tap1", &spec, &[payload("A"), payload("B")], "").unwrap();
         assert_eq!(names, vec!["途中.md".to_string(), "途中_2.md".to_string()]);
         assert_eq!(std::fs::read_to_string(dir.join("途中_2.md")).unwrap(), "B");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1.8 ④: 反復の中の記録カードは周ごとに別名で残る（固定名のままだと各周が消える）。
+    /// 反復の外（接尾辞なし）では従来の固定名を1文字も変えない。
+    #[test]
+    fn tap_names_are_per_round_inside_a_loop() {
+        let dir = std::env::temp_dir().join(format!("texos_tap_round_{}", db::now_ms()));
+        let cas_root = dir.join(".texos").join("cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
+        let p = Project { conn, root: dir.clone(), cas_root };
+        p.conn
+            .execute(
+                "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+                 VALUES ('filter:sentinel','application/vnd.texos.filter',0,?1)",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+                 VALUES ('tap1','filter:sentinel','記録',10.0,20.0,?1,'filter','{\"builtin\":\"tap\",\"prefix\":\"途中\"}')",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        let spec = flow::parse_spec(r#"{"builtin":"tap","prefix":"途中"}"#).unwrap();
+
+        let r1 = write_tap_record(&p, "tap1", &spec, &[payload("1周目")], "_1").unwrap();
+        let r2 = write_tap_record(&p, "tap1", &spec, &[payload("2周目")], "_2").unwrap();
+        assert_eq!(r1, vec!["途中_1.md".to_string()]);
+        assert_eq!(r2, vec!["途中_2.md".to_string()]);
+        assert_eq!(std::fs::read_to_string(dir.join("途中_1.md")).unwrap(), "1周目");
+        assert_eq!(std::fs::read_to_string(dir.join("途中_2.md")).unwrap(), "2周目");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// v1.8 ④反復カード。実行そのもの（AI を何周も回す）は実機の仕事だが、**反復を成り立たせて
+/// いる約束**＝停止判定・引き直す範囲・周回番号は純関数／DB だけで確かめられる。
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    fn payload(text: &str) -> FlowPayload {
+        FlowPayload {
+            bytes: text.as_bytes().to_vec(),
+            ext: "md".into(),
+            mime: "text/markdown".into(),
+            stem: "x".into(),
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn round_suffix_is_empty_outside_a_loop_and_nests() {
+        let mut ctx = LoopCtx::default();
+        assert_eq!(ctx.round_suffix(), "", "反復の外では従来どおり固定名");
+        ctx.rounds.push(2);
+        assert_eq!(ctx.round_suffix(), "_2");
+        ctx.rounds.push(3);
+        assert_eq!(ctx.round_suffix(), "_2_3", "入れ子は外側から順に並べる");
+    }
+
+    #[test]
+    fn stop_condition_reads_the_round_output() {
+        let none = flow::parse_spec(r#"{"builtin":"loop"}"#).unwrap();
+        assert_eq!(
+            loop_should_stop(&none, &[payload("なんでも")]),
+            Ok(false),
+            "until 未指定＝回数だけで止める"
+        );
+        let ok = flow::parse_spec(r#"{"builtin":"loop","until":"contains","pattern":"合格"}"#).unwrap();
+        assert_eq!(loop_should_stop(&ok, &[payload("判定: 合格")]), Ok(true));
+        assert_eq!(loop_should_stop(&ok, &[payload("判定: 不足")]), Ok(false));
+        // 複数入力は連結して判定する（束カードを挟まなくても意味が変わらない）。
+        assert_eq!(loop_should_stop(&ok, &[payload("不足"), payload("合格")]), Ok(true));
+        // 判定器が壊れているときは黙って回し続けない（止まらない反復になるため）。
+        let bad = flow::parse_spec(r#"{"builtin":"loop","until":"regex","pattern":"("}"#).unwrap();
+        assert!(loop_should_stop(&bad, &[payload("x")]).is_err());
+    }
+
+    /// 引き直す範囲＝上流サブグラフ。戻り矢印（role:"previous"）を辿ってはいけない
+    /// （辿ると反復カード自身が「自分の上流」に見え、無関係なノードのメモまで捨てる）。
+    #[test]
+    fn upstream_ids_walks_back_but_never_through_the_feedback_edge() {
+        let dir = std::env::temp_dir().join(format!("texos_loop_up_{}", db::now_ms()));
+        std::fs::create_dir_all(dir.join(".texos")).unwrap();
+        let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
+        let p = Project { conn, root: dir.clone(), cas_root: dir.join(".texos").join("cas") };
+        p.conn
+            .execute(
+                "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+                 VALUES ('filter:sentinel','application/vnd.texos.filter',0,?1)",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        for id in ["note", "cat", "ai", "loop", "sink"] {
+            p.conn
+                .execute(
+                    "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind)
+                     VALUES (?1,'filter:sentinel',?1,0.0,0.0,?2,'filter')",
+                    rusqlite::params![id, db::now_ms()],
+                )
+                .unwrap();
+        }
+        let mut edge = |from: &str, to: &str, attrs: Option<&str>| {
+            p.conn
+                .execute(
+                    "INSERT INTO relations (from_id, to_id, kind, attrs, created_at)
+                     VALUES (?1, ?2, 'flow', ?3, ?4)",
+                    rusqlite::params![from, to, attrs, db::now_ms()],
+                )
+                .unwrap();
+        };
+        // note → cat → ai → loop → sink、そして loop → cat が戻り矢印。
+        edge("note", "cat", None);
+        edge("cat", "ai", None);
+        edge("ai", "loop", None);
+        edge("loop", "sink", None);
+        edge("loop", "cat", Some(r#"{"role":"previous"}"#));
+
+        let mut up = upstream_ids(&p, "loop");
+        up.sort();
+        assert_eq!(up, vec!["ai".to_string(), "cat".to_string(), "note".to_string()]);
+        assert!(!up.contains(&"loop".to_string()), "戻り矢印を辿って自分に戻ってはいけない");
+        assert!(!up.contains(&"sink".to_string()), "下流は引き直しの対象外");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

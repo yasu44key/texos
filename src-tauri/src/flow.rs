@@ -216,6 +216,44 @@ pub struct FilterSpec {
     /// t23d: テクスチャ時の面数削減（FaceReducer）上限。未指定は 40000。
     #[serde(default)]
     pub face_count: Option<u32>,
+    // --- v1.8 ④反復カード（builtin:"loop"）: 上流サブグラフを条件が満たされるまで
+    //     引き直す（V1.8_記法カード計画.md §4 案B＝DAG を保つ）。---
+    /// 反復の上限周回数＝**ヒューズ**（V2.0課題 §8-3「反復は max_fires 相当必須」）。
+    /// 未指定は3。1〜`LOOP_MAX_ROUNDS` に丸めるので、壊れた値でも暴走しない。
+    #[serde(default)]
+    pub max_rounds: Option<u32>,
+    /// 停止条件の判定モード（`judge_text` の mode）。未指定＝回数だけで止める。
+    /// 判定対象はその周の出力テキスト全体、パターンは `pattern` を共用（text_grep と同じ欄）。
+    #[serde(default)]
+    pub until: Option<String>,
+}
+
+/// 反復カードのヒューズ上限（spec の `max_rounds` はこの値に丸められる）。
+/// AI を何周も回すので、設定ミスや壊れた JSON で無限に走らせないための天井。
+pub const LOOP_MAX_ROUNDS: u32 = 50;
+
+/// v1.8: テキスト1本に対する**決定的な判定**（V2.0課題 §8-2 の判定2段のうち①）。
+///
+/// 反復カード（`until`）の停止判定に使い、将来のルーターカード（`builtin:"route"`）の
+/// 枝選択にもそのまま使えるように、spec にもノードにも依存しない純関数にしてある。
+/// ②の AI 分類は「同じ入口・違う判定器」として後から足す（§8-2）。
+///
+/// mode: `"contains"` | `"not_contains"` | `"regex"` | `"not_regex"` | `"empty"` | `"not_empty"`。
+/// `empty` 系はパターンを見ない（空白のみも空とみなす）。未知のモードはエラー
+/// （黙って false にすると「止まらない反復」になり、原因が見えないため）。
+pub fn judge_text(mode: &str, pattern: &str, text: &str) -> Result<bool, String> {
+    match mode.trim() {
+        "contains" => Ok(text.contains(pattern)),
+        "not_contains" => Ok(!text.contains(pattern)),
+        "regex" | "not_regex" => {
+            let re = regex::Regex::new(pattern).map_err(|e| format!("正規表現が不正です: {e}"))?;
+            let hit = re.is_match(text);
+            Ok(if mode.trim() == "regex" { hit } else { !hit })
+        }
+        "empty" => Ok(text.trim().is_empty()),
+        "not_empty" => Ok(!text.trim().is_empty()),
+        other => Err(format!("未知の判定モード: {other}")),
+    }
 }
 
 /// v1.5.3 WS-P1（オペ層 §5.4.2）: フロー矢印の制御属性（relations.attrs の JSON）。
@@ -236,6 +274,12 @@ pub struct EdgeAttrs {
     /// `"system"` = 上流の中身を AI カードの**システムプロンプト**として渡す。
     /// 役割つきの矢印は通常入力に数えられない（＝ファンアウトを起こさない）。
     /// 狙いは「AI カードの一番重要な中身＝役割を、面から見える付箋にする」こと。
+    ///
+    /// `"previous"` = v1.8 ④反復カードの**戻り矢印**（反復カード → 上流のどれか）。
+    /// これは通常入力に数える（材料だから）が、**評価では絶対に遡らない**——値は実行時に
+    /// 反復カードが文脈へ置いた「前周の出力」から取る。おかげでキャンバスには輪が見えるのに
+    /// 評価は DAG のまま＝循環判定にも pull 解決にも触らない（計画 §4 案B）。
+    /// 1周目は前周が無いので**空**を運ぶ（no-data ではない＝下流を止めない）。
     #[serde(default)]
     pub role: Option<String>,
 }
@@ -1856,6 +1900,36 @@ mod tests {
 
     fn spec(json: &str) -> FilterSpec {
         parse_spec(json).unwrap()
+    }
+
+    /// v1.8: 決定的な判定（V2.0課題 §8-2 の判定2段のうち①）。反復の停止条件がこれで、
+    /// 将来のルーターカードの枝選択も同じ関数を使う——判定機構を1つにしておくのが狙い。
+    #[test]
+    fn judge_text_covers_the_deterministic_rules() {
+        assert_eq!(judge_text("contains", "合格", "判定: 合格"), Ok(true));
+        assert_eq!(judge_text("contains", "合格", "判定: 不足"), Ok(false));
+        assert_eq!(judge_text("not_contains", "要修正", "判定: 良好"), Ok(true));
+        assert_eq!(judge_text("regex", r"^\s*OK\b", "  OK です"), Ok(true));
+        assert_eq!(judge_text("not_regex", r"\d+", "数字はない"), Ok(true));
+        assert_eq!(judge_text("empty", "", "   \n "), Ok(true), "空白だけも空とみなす");
+        assert_eq!(judge_text("not_empty", "", "x"), Ok(true));
+        // 不正な正規表現・未知のモードはエラー。false を返すと「止まらない反復」になり、
+        // しかも原因が画面のどこにも出ない。
+        assert!(judge_text("regex", "(", "x").is_err());
+        assert!(judge_text("いつか", "", "x").is_err());
+    }
+
+    /// ヒューズ（§8-3「反復は max_fires 相当必須」）: spec の値をそのまま信じない。
+    #[test]
+    fn loop_rounds_are_clamped_to_the_fuse() {
+        let clamp = |s: &FilterSpec| s.max_rounds.unwrap_or(3).clamp(1, LOOP_MAX_ROUNDS);
+        assert_eq!(clamp(&spec(r#"{"builtin":"loop"}"#)), 3, "未指定は3周");
+        assert_eq!(clamp(&spec(r#"{"builtin":"loop","max_rounds":0}"#)), 1, "0周は成立しない");
+        assert_eq!(
+            clamp(&spec(r#"{"builtin":"loop","max_rounds":100000}"#)),
+            LOOP_MAX_ROUNDS,
+            "巨大値でも天井で止まる"
+        );
     }
 
     /// v1.7.4 生成系の制限時間の契約: 未記入（None）も 0 も**無制限**。

@@ -244,13 +244,15 @@ pub(crate) fn collect_context(
     };
     let mut visited = std::collections::HashSet::new();
     let mut memo = EvalMemo::new(); // メモ化は1ターン単位（§5.1-5）
+    let mut ctx = crate::flow_run::LoopCtx::default(); // 反復の文脈（チャット経路では常に空）
     for (vid, real_id, vlabel, mime, ext, kind, attrs) in &inputs {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
         // 上流の評価結果を得て when/carry を適用（flow_run と同じ意味論・簡略版）。
         let up: Option<EvalOut> = if kind.as_deref() == Some("filter") {
-            eval_filter(state, app, p, vid, &mut visited, &mut memo, &mut report, job).ok()
+            eval_filter(state, app, p, vid, &mut visited, &mut memo, &mut report, job, &mut ctx)
+                .ok()
         } else if real_id.starts_with("drop:") {
             None
         } else {

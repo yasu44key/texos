@@ -15,6 +15,8 @@ function edgeLabel(attrs?: string | null): string | null {
     const parts: string[] = [];
     // v1.8 役割ポート: 役割つきの矢印は「入力ではない」ことが一目で分かる必要がある。
     if (a.role === "system") parts.push("役割");
+    // v1.8 ④反復: 戻り矢印。これが「上流へ戻っているが評価は遡らない線」だと分かる目印。
+    else if (a.role === "previous") parts.push("前周");
     if (a.when === "success") parts.push("成功時");
     else if (a.when === "failure") parts.push("失敗時");
     if (a.carry === "none") parts.push("信号のみ");

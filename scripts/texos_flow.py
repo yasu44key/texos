@@ -73,7 +73,7 @@ CREATE INDEX IF NOT EXISTS idx_rel_from ON relations(from_id);
 # 集約ノード（全入力を1回で受け取る）。これ以外の builtin は入力ごとにファンアウトする。
 AGGREGATE_BUILTINS = {"text_concat", "text_diff", "text_paste"}
 # 素通し系（入力を何本受けてもファンアウトしない）。
-PASSTHROUGH_BUILTINS = {"tap"}
+PASSTHROUGH_BUILTINS = {"tap", "loop"}
 
 MIME_BY_EXT = {
     "md": "text/markdown", "txt": "text/plain", "csv": "text/csv",
@@ -166,6 +166,24 @@ class Project:
         spec = {"builtin": "tap", "accept_mime": "*/*", "prefix": prefix or label}
         return self._filter(label, spec, x, y, memo)
 
+    def loop(self, label: str, x: float, y: float, *, max_rounds: int = 3,
+             until_contains: str | None = None, memo: str | None = None) -> str:
+        """反復カード。上流のサブグラフを、条件を満たすまで引き直す。
+
+        入力にはループさせたい流れの出口を繋ぐ。前周の結果を上流へ戻すには、
+        このカードから戻したいカードへ `flow(loop_id, 戻し先, role="previous")`。
+        戻り矢印は**評価では遡らない**ので、絵は輪に見えても pull は DAG のまま。
+
+        max_rounds は暴走止め（ヒューズ・1〜50）。until_contains を指定すると、
+        その周の出力にその語が現れた時点で止まる。
+        """
+        n = max(1, min(50, int(max_rounds)))
+        spec: dict = {"builtin": "loop", "accept_mime": "*/*", "max_rounds": n}
+        if until_contains:
+            spec["until"] = "contains"
+            spec["pattern"] = until_contains
+        return self._filter(label, spec, x, y, memo)
+
     def builtin(self, label: str, x: float, y: float, *, name: str,
                 memo: str | None = None, **params) -> str:
         """任意の内蔵フィルタ（text_grep / text_sort / md_codeblock ...）。"""
@@ -190,8 +208,8 @@ class Project:
         for c in (src, dst):
             if c not in self._cards:
                 raise BuildError(f"未知のカードid: {c}")
-        if role is not None and role != "system":
-            raise BuildError(f'role は "system" のみ対応しています（指定: {role}）')
+        if role is not None and role not in ("system", "previous"):
+            raise BuildError(f'role は "system" / "previous" のみ対応しています（指定: {role}）')
         self._edges.append((src, dst, role))
 
     def shape(self, x, y, w, h, label="", fill="#4a90d9", opacity=0.15) -> None:
@@ -202,10 +220,15 @@ class Project:
 
     # ---------------------------------------------------------------- 検証
     def _inputs_of(self) -> dict[str, list[str]]:
-        """通常入力だけ。役割つきの矢印は「設定」であって入力ではない（数に入れない）。"""
+        """入力に数える矢印。
+
+        role="system" は「設定」であって入力ではない（数に入れない）。
+        role="previous"（反復の戻り）は**材料なので入力に数える** — 数えないと
+        「AIカードに前周と資料の2本が入る＝ファンアウト」を見逃す。
+        """
         d: dict[str, list[str]] = {}
         for f, t, role in self._edges:
-            if role is None:
+            if role != "system":
                 d.setdefault(t, []).append(f)
         return d
 
@@ -257,12 +280,35 @@ class Project:
             if cid not in outs and cid not in ins:
                 warns.append(f"[{c['label']}] どこにも繋がっていません")
 
-        # 循環（pull 評価が無限再帰する）
+        # 反復（v1.8 ④）: 戻り矢印は反復カードからしか出せない。ここを間違えると
+        # 「前周の結果」が永遠に空のまま静かに回り続ける（気づけない失敗になる）。
+        for f, t, role in self._edges:
+            if role != "previous":
+                continue
+            src = self._cards[f]
+            if src["kind"] != "filter" or src["spec"].get("builtin") != "loop":
+                errs.append(
+                    f"[{src['label']}] 役割（previous）の矢印は反復カードからだけ引けます"
+                )
+        for cid, c in self._cards.items():
+            if c["kind"] != "filter" or c["spec"].get("builtin") != "loop":
+                continue
+            if not any(f == cid and r == "previous" for f, _, r in self._edges):
+                warns.append(
+                    f"[{c['label']}] 反復カードから戻り矢印（role=\"previous\"）が出ていません。"
+                    f"前周の結果が上流に届かないので、同じ処理を繰り返すだけになります"
+                )
+
+        # 循環（pull 評価が無限再帰する）。戻り矢印は評価で遡らないので辿らない
+        # ＝反復は循環として検出されない（これが「DAG を保つ反復」の意味）。
+        back = {(f, t) for f, t, r in self._edges if r == "previous"}
         color: dict[str, int] = {}
 
         def walk(n: str) -> bool:
             color[n] = 1
             for m in ins.get(n, []):
+                if (m, n) in back:
+                    continue
                 if color.get(m) == 1 or (color.get(m, 0) == 0 and walk(m)):
                     return True
             color[n] = 2

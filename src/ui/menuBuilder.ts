@@ -1322,6 +1322,16 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
               "読み返したいところに置いてください。",
             onClick: () => a.addFilter("tap"),
           },
+          {
+            label: "反復（納得するまで繰り返す）",
+            hint:
+              "上流のカードをもう一度たどり直します。判定 → 直して判定、のように" +
+              "「練り直す」流れが描けます。\n" +
+              "作り方: ①このカードの入力に、繰り返したい流れの出口をつなぐ ②このカードから" +
+              "戻したい上流のカードへ矢印を引き、その矢印を「役割＝前周の結果」にする。\n" +
+              "止まり方は、最大周回数（暴走止め・必須）と、出力に現れたら終わりにする語です。",
+            onClick: () => a.addFilter("loop"),
+          },
         ]),
     },
     {
