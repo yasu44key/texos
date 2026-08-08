@@ -226,6 +226,24 @@ pub struct FilterSpec {
     /// 判定対象はその周の出力テキスト全体、パターンは `pattern` を共用（text_grep と同じ欄）。
     #[serde(default)]
     pub until: Option<String>,
+    // --- v1.8 ③問い合わせカード（builtin:"ask"）---
+    /// 人に聞くこと。答え付箋の頭に `>` 引用で書き込まれ、キャンバスから読める。
+    #[serde(default)]
+    pub question: Option<String>,
+}
+
+/// v1.8 ③: 答え付箋の「質問行」の目印。`>` で始まる行は**質問であって答えではない**ので、
+/// 答えを読むときに落とす。Markdown の引用と同じ記号なので、付箋のまま読んでも自然に見える。
+pub const ASK_QUOTE: &str = ">";
+
+/// 答え付箋の本文から**人が書いた答えだけ**を取り出す（`>` 行＝質問を落として trim）。
+pub fn answer_text(note: &str) -> String {
+    note.lines()
+        .filter(|l| !l.trim_start().starts_with(ASK_QUOTE))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// 反復カードのヒューズ上限（spec の `max_rounds` はこの値に丸められる）。
@@ -280,6 +298,9 @@ pub struct EdgeAttrs {
     /// 反復カードが文脈へ置いた「前周の出力」から取る。おかげでキャンバスには輪が見えるのに
     /// 評価は DAG のまま＝循環判定にも pull 解決にも触らない（計画 §4 案B）。
     /// 1周目は前周が無いので**空**を運ぶ（no-data ではない＝下流を止めない）。
+    ///
+    /// `"answer"` = v1.8 ③問い合わせカードの**答え箱**（付箋 → 問い合わせカード）。
+    /// `"system"` と同じく通常入力に数えない。付箋が空なら「まだ答えていない」。
     #[serde(default)]
     pub role: Option<String>,
 }
@@ -1917,6 +1938,24 @@ mod tests {
         // しかも原因が画面のどこにも出ない。
         assert!(judge_text("regex", "(", "x").is_err());
         assert!(judge_text("いつか", "", "x").is_err());
+    }
+
+    /// v1.8 ③: 答え箱の付箋から「人が書いた分」だけを取り出す。`>` 行は質問であって答えでは
+    /// ないので落とす —— 落とさないと、自動生成した質問文がそのまま答えとして下流へ流れ、
+    /// 「答えていないのにフローが進む」という一番まずい壊れ方をする。
+    #[test]
+    fn answer_text_drops_the_quoted_question() {
+        assert_eq!(answer_text("> この案でよいですか？"), "", "質問だけ＝未回答");
+        assert_eq!(answer_text(""), "", "空の付箋＝未回答");
+        assert_eq!(answer_text("   \n \n"), "", "空白だけ＝未回答");
+        assert_eq!(
+            answer_text("> この案でよいですか？\n\nはい。ただし価格は据え置きで。"),
+            "はい。ただし価格は据え置きで。"
+        );
+        // 複数行の答えは形を保つ（箇条書きで答えることがある）。
+        assert_eq!(answer_text("> 問\n・A\n・B"), "・A\n・B");
+        // 引用は途中に混ざっていても質問扱い（付箋を書き足しても壊れない）。
+        assert_eq!(answer_text("答えA\n> 問\n答えB"), "答えA\n答えB");
     }
 
     /// ヒューズ（§8-3「反復は max_fires 相当必須」）: spec の値をそのまま信じない。

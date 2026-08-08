@@ -384,6 +384,9 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
                 {
                     crate::web::spec_url(&spec).is_none()
                 }
+                // v1.8 ③問い合わせカード: 材料は人の答え（役割ポート＝入力に数えない矢印で
+                // 入ってくる）なので、通常入力が0本でも成立する。
+                flow::NodeKind::Builtin if spec.builtin.as_deref() == Some("ask") => false,
                 flow::NodeKind::External => {
                     !spec.is_shell() && spec.cmd.as_deref().map(|c| c.contains("{in")).unwrap_or(false)
                 }

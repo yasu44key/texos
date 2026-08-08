@@ -1009,7 +1009,7 @@ pub(crate) fn eval_filter(
     }
 
     // フェーズ1: 入力エッジの収集（v1.8 ④で切り出し — 反復カードが同じ収集を何周も呼ぶ）。
-    let (edges, role_system) =
+    let CollectedInputs { edges, role_system, role_answer } =
         collect_input_edges(state, app, p, fid, visited, memo, report, job, ctx)?;
 
     let mut produced = Vec::new();
@@ -1104,6 +1104,13 @@ pub(crate) fn eval_filter(
         }
         None => spec,
     };
+
+    // v1.8 ③問い合わせカード（builtin:"ask"）: 途中で人に聞く。答えが無ければ no-data で
+    // 止まり、答えがあればそれを下流へ流す。tap と同じ「eval 側で完結」の流儀。
+    if spec.builtin.as_deref() == Some("ask") {
+        let out = run_ask_node(p, fid, &spec, role_answer.as_deref(), &collected, report);
+        return finish_eval(p, fid, visited, memo, 0, out);
+    }
 
     // v1.8 記録カード（builtin:"tap"）: 入力をそのまま下流へ通しつつ、通った中身を
     // プロジェクトへ書き出してカードにする。中間結果は本来メモリ上で消えるので、
@@ -1277,8 +1284,18 @@ pub(crate) fn eval_filter(
 }
 
 
+/// フェーズ1の収集結果。通常入力の列と、役割ポートが運んできたもの。
+pub(crate) struct CollectedInputs {
+    edges: Vec<EdgeOut>,
+    /// `role:"system"` が運んできたテキスト（AI カードのシステムプロンプト）。
+    role_system: Option<String>,
+    /// v1.8 ③ `role:"answer"` が運んできたテキスト（人の答え）。
+    /// **None = 答え箱の付箋がそもそも繋がっていない**／`Some("")` = 繋がっているが未記入。
+    role_answer: Option<String>,
+}
+
 /// フェーズ1（入力の収集）: このノードへ入る flow 矢印を順に評価し、when/carry を適用した
-/// `EdgeOut` の列と、役割ポート（`role:"system"`）が運んできたテキストを返す。
+/// `EdgeOut` の列と、役割ポート（`role:"system"` / `role:"answer"`）が運んだテキストを返す。
 ///
 /// v1.8 ④で eval_filter の本体から切り出した。**反復カードが同じ収集を何周も呼ぶ**ため
 /// （周ごとにメモを消して引き直す＝計画 §4 案B）、1か所に閉じている必要がある。
@@ -1294,7 +1311,7 @@ fn collect_input_edges(
     report: &mut FlowReport,
     job: &Job,
     ctx: &mut LoopCtx,
-) -> Result<(Vec<EdgeOut>, Option<String>), String> {
+) -> Result<CollectedInputs, String> {
     let cancel = &job.cancel;
     // 入力: このフィルタへ入る flow 矢印（生きているカードのみ）。
     // v1.5.3 WS-P1（§4.3 拡張点アンカーの成立形）: rel.attrs {when, carry, port} を読み、
@@ -1343,6 +1360,8 @@ fn collect_input_edges(
     let mut edges: Vec<EdgeOut> = Vec::new();
     // v1.8 役割ポート: role="system" の矢印が運んできたテキスト（AI のシステムプロンプト）。
     let mut role_system: Option<String> = None;
+    // v1.8 ③: role="answer" の矢印（答え箱の付箋）が運んできたテキスト。
+    let mut role_answer: Option<String> = None;
     for (vid, real_id, vlabel, mime, ext, kind, url_ref, attrs) in &inputs {
         // 中断後は新しいプロセスを起こさない（複数入力の連鎖を断つ）
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1455,22 +1474,30 @@ fn collect_input_edges(
         // （edges）に入れないので、AI カードのファンアウト（入力ごとに1回実行）を起こさない。
         // when/carry は適用しない — 役割は条件分岐する対象ではなく直結の配線だから。
         if let Some(role) = attrs.role.as_deref() {
-            if role == "system" {
-                let text = up
-                    .payloads
+            let joined = || {
+                up.payloads
                     .iter()
                     .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
                     .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.trim().is_empty() {
-                    role_system = Some(text);
+                    .join("\n")
+            };
+            match role {
+                "system" => {
+                    let text = joined();
+                    if !text.trim().is_empty() {
+                        role_system = Some(text);
+                    }
                 }
+                // v1.8 ③: 空でも Some を入れる — 「繋がっているが未記入」と「そもそも
+                // 繋がっていない」は扱いが違う（後者にだけ答え箱の付箋を作ってやる）。
+                "answer" => role_answer = Some(joined()),
+                _ => {}
             }
             continue;
         }
         edges.push(apply_edge(&up, attrs, vlabel, report));
     }
-    Ok((edges, role_system))
+    Ok(CollectedInputs { edges, role_system, role_answer })
 }
 
 /// v1.8 ④反復カード（`builtin:"loop"`）の実行（計画 §4 案B — DAG を保つ反復）。
@@ -1520,7 +1547,7 @@ fn run_loop_node(
         emit_job_progress(app, job, Some(&format!("{label}: {round}周目")), None);
         ctx.rounds.push(round);
         let collected = collect_input_edges(state, app, p, fid, visited, memo, report, job, ctx)
-            .map(|(edges, _role_system)| {
+            .map(|CollectedInputs { edges, .. }| {
                 // 材料が全滅した周は「そこで打ち切り」。1周目なら反復そのものが no-data。
                 if edges.is_empty() || edges.iter().all(|e| e.nodata) {
                     None
@@ -1618,6 +1645,149 @@ fn upstream_ids(p: &Project, fid: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// 答え箱の付箋に書き写す材料の上限（行数・文字数）。付箋として読める量に留める。
+const ANSWER_QUOTE_LINES: usize = 40;
+const ANSWER_QUOTE_CHARS: usize = 1200;
+
+/// v1.8 ③問い合わせカード（`builtin:"ask"`）— 途中で人に聞く（計画 §3 案B）。
+///
+/// **ドロップポイントの「問い版」**。あちらが人のファイル投入待ち、こちらが人の言葉待ち。
+/// 答えは**答え箱の付箋**（`role:"answer"` の矢印で繋がった付箋）に置く。付箋にしたのは、
+/// 答えが面から読めて・その場で直せて・プロジェクトに残るから（水泡に帰さない設計と整合）。
+///
+/// - 答えあり → その文字列を text/plain で下流へ。
+/// - 答えなし → **no-data**（エラーではない）。付箋がまだ無ければ**作って矢印まで引く**ので、
+///   人は現れた付箋に書いて ▶ を押し直すだけでよい。
+///
+/// 案C（止めて待つ＝実行中のジョブへ答えを流し込む）へ進むときも、答えの置き場はここで
+/// できた付箋のままでよい。永続化を先に済ませてあるのがこの順序の狙い（計画 §3）。
+fn run_ask_node(
+    p: &Project,
+    fid: &str,
+    spec: &flow::FilterSpec,
+    role_answer: Option<&str>,
+    collected: &[FlowPayload],
+    report: &mut FlowReport,
+) -> EvalOut {
+    let label = node_label(p, fid);
+    let question = spec
+        .question
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(label.as_str())
+        .to_string();
+
+    // 答え箱の中身から、人が書いた分だけを取り出す（`>` 行＝質問は答えではない）。
+    let answer = role_answer.map(flow::answer_text).unwrap_or_default();
+    if !answer.is_empty() {
+        let stem = spec
+            .prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(label.as_str())
+            .to_string();
+        return EvalOut::data(
+            vec![FlowPayload {
+                bytes: answer.into_bytes(),
+                ext: "txt".into(),
+                mime: "text/plain".into(),
+                stem,
+                meta: None,
+            }],
+            None,
+        );
+    }
+
+    // 未回答。付箋がまだ無ければ用意する（無いまま「答えてください」と言われても困る）。
+    if role_answer.is_none() {
+        match create_answer_note(p, fid, &question, collected) {
+            Ok(()) => report.outputs.push(format!("{label}: 答えの付箋を用意しました")),
+            Err(e) => report.errors.push(format!("{label}: 答えの付箋を作れません（{e}）")),
+        }
+    }
+    report
+        .skipped
+        .push(format!("{label}（答え待ち: {question} — 付箋に答えを書いて、もう一度実行してください）"));
+    EvalOut::nodata_out()
+}
+
+/// 答え箱の付箋を問い合わせカードの横に作り、`role:"answer"` の矢印で繋ぐ。
+///
+/// 本文は**すべて `>` の引用**（質問と、そのとき届いていた材料）で、**答え欄は空のまま**。
+/// 案内文を素で書くと、それがそのまま「答え」として下流へ流れてしまうため。
+///
+/// 材料まで書き写すのは、**人が何を見て答えたのかを残す**ため。AI の案について聞くとき、
+/// 引用が無いと付箋には答えだけが残り、後から読んでも何の話か分からない。
+/// 作るのは1回だけで、以後この付箋には触らない（人が書いた答えを消さない）。
+fn create_answer_note(
+    p: &Project,
+    fid: &str,
+    question: &str,
+    collected: &[FlowPayload],
+) -> Result<(), String> {
+    let (fx, fy): (f64, f64) = p
+        .conn
+        .query_row(
+            "SELECT pos_x, pos_y FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![fid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let quote = |s: &str| -> String {
+        s.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+    };
+    let mut text = quote(question);
+    // 届いていた材料（テキストのものだけ）を引用で添える。付箋として読める長さに切る
+    // ——全文は記録カードや実身で読めるので、ここは「何の話か思い出せる」量でよい。
+    let material = collected
+        .iter()
+        .filter(|pl| pl.mime.starts_with("text/"))
+        .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let material = material.trim();
+    if !material.is_empty() {
+        let mut shown: String = material.lines().take(ANSWER_QUOTE_LINES).collect::<Vec<_>>().join("\n");
+        let trimmed = shown.chars().count() > ANSWER_QUOTE_CHARS
+            || material.lines().count() > ANSWER_QUOTE_LINES;
+        if shown.chars().count() > ANSWER_QUOTE_CHARS {
+            shown = shown.chars().take(ANSWER_QUOTE_CHARS).collect();
+        }
+        text.push_str("\n>\n");
+        text.push_str(&quote(&shown));
+        if trimmed {
+            text.push_str("\n> …（以下略）");
+        }
+    }
+    let id = crate::util::uuid();
+    let style = serde_json::json!({ "width": 300.0, "font_size": 13.0 }).to_string();
+    p.conn
+        .execute(
+            "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, note_text, style_ref)
+             VALUES (?1, 'note:sentinel', ?2, ?3, ?4, ?5, 'note', ?6, ?7)",
+            rusqlite::params![
+                id,
+                crate::notes::note_label(&text),
+                fx - 340.0,
+                fy,
+                db::now_ms(),
+                text,
+                style
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    p.conn
+        .execute(
+            "INSERT INTO relations (from_id, to_id, kind, created_at, attrs)
+             VALUES (?1, ?2, 'flow', ?3, '{\"role\":\"answer\"}')",
+            rusqlite::params![id, fid, db::now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// カードのラベル（進捗・レポートの文言用。見つからなければ id）。
@@ -2775,6 +2945,166 @@ mod tap_tests {
         assert_eq!(r2, vec!["途中_2.md".to_string()]);
         assert_eq!(std::fs::read_to_string(dir.join("途中_1.md")).unwrap(), "1周目");
         assert_eq!(std::fs::read_to_string(dir.join("途中_2.md")).unwrap(), "2周目");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// v1.8 ③問い合わせカード。人が答えるところは実機の仕事だが、**答えの有無で止まる／進む**と
+/// **答え箱を用意する**は DB だけで確かめられる。
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    fn project(tag: &str) -> (Project, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("texos_ask_{tag}_{}", db::now_ms()));
+        std::fs::create_dir_all(dir.join(".texos")).unwrap();
+        let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+             VALUES ('filter:sentinel','application/vnd.texos.filter',0,?1)",
+            rusqlite::params![db::now_ms()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+             VALUES ('ask1','filter:sentinel','確認',500.0,300.0,?1,'filter',
+                     '{\"builtin\":\"ask\",\"question\":\"この案でよいですか？\"}')",
+            rusqlite::params![db::now_ms()],
+        )
+        .unwrap();
+        let p = Project { conn, root: dir.clone(), cas_root: dir.join(".texos").join("cas") };
+        (p, dir)
+    }
+
+    fn report() -> FlowReport {
+        FlowReport {
+            created: vec![],
+            updated: vec![],
+            outputs: vec![],
+            skipped: vec![],
+            errors: vec![],
+            shell_capture: None,
+        }
+    }
+
+    /// 未回答＝no-data（エラーではない）。付箋が無ければ用意して矢印まで引く
+    /// ——「答えてください」と言われても書く場所が無い、を起こさないため。
+    #[test]
+    fn unanswered_stops_the_flow_and_prepares_the_answer_note() {
+        let (p, dir) = project("new");
+        let spec = flow::parse_spec(
+            r#"{"builtin":"ask","question":"この案でよいですか？"}"#,
+        )
+        .unwrap();
+        let mut r = report();
+
+        let out = run_ask_node(&p, "ask1", &spec, None, &[], &mut r);
+        assert!(out.nodata, "未回答は no-data");
+        assert!(out.ok, "エラーではない");
+        assert!(r.skipped.iter().any(|s| s.contains("答え待ち")), "{:?}", r.skipped);
+
+        // 付箋が1枚でき、role:"answer" の矢印で問い合わせカードに繋がっている。
+        let (note_id, text): (String, String) = p
+            .conn
+            .query_row(
+                "SELECT id, note_text FROM virtual_bodies WHERE kind = 'note' AND deleted_at IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "> この案でよいですか？", "質問は引用で書き、答え欄は空のまま");
+        assert_eq!(
+            flow::answer_text(&text),
+            "",
+            "用意した付箋をそのまま読んでも「未回答」でなければならない"
+        );
+        let attrs: String = p
+            .conn
+            .query_row(
+                "SELECT attrs FROM relations WHERE from_id = ?1 AND to_id = 'ask1'",
+                rusqlite::params![note_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(attrs.contains("answer"), "{attrs}");
+
+        // 付箋が既にあるとき（＝繋がっているが未記入）は作り足さない。
+        let mut r2 = report();
+        run_ask_node(&p, "ask1", &spec, Some(&text), &[], &mut r2);
+        let notes: i64 = p
+            .conn
+            .query_row("SELECT COUNT(*) FROM virtual_bodies WHERE kind = 'note'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(notes, 1, "答え箱を毎回増やしてはいけない");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 届いていた材料も引用で書き写す（人が何を見て答えたのかを残すため）。
+    /// **書き写した材料が「答え」に化けないこと**がこのテストの本題 —— 引用を1行でも
+    /// 素で書いてしまうと、誰も答えていないのにフローが先へ進む。
+    #[test]
+    fn the_answer_note_quotes_the_material_without_becoming_an_answer() {
+        let (p, dir) = project("material");
+        let spec = flow::parse_spec(r#"{"builtin":"ask","question":"この案でよいですか？"}"#).unwrap();
+        let mut r = report();
+        let material = FlowPayload {
+            bytes: "案:\nバックアップは自動で取ります。".as_bytes().to_vec(),
+            ext: "md".into(),
+            mime: "text/markdown".into(),
+            stem: "案".into(),
+            meta: None,
+        };
+
+        run_ask_node(&p, "ask1", &spec, None, std::slice::from_ref(&material), &mut r);
+        let text: String = p
+            .conn
+            .query_row(
+                "SELECT note_text FROM virtual_bodies WHERE kind = 'note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(text.contains("> 案:"), "材料が引用で残る: {text}");
+        assert!(text.contains("> バックアップは自動で取ります。"), "{text}");
+        assert!(text.lines().all(|l| l.starts_with('>')), "素の行があってはいけない: {text}");
+        assert_eq!(flow::answer_text(&text), "", "作った直後は必ず未回答");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回答済み＝答えの文字列を text/plain で下流へ。質問の引用行は混ぜない。
+    #[test]
+    fn answered_passes_the_human_text_downstream() {
+        let (p, dir) = project("answered");
+        let spec =
+            flow::parse_spec(r#"{"builtin":"ask","question":"この案でよいですか？","prefix":"判断"}"#)
+                .unwrap();
+        let mut r = report();
+
+        let out = run_ask_node(
+            &p,
+            "ask1",
+            &spec,
+            Some("> この案でよいですか？\n\nはい。ただし価格は据え置きで。"),
+            &[],
+            &mut r,
+        );
+        assert!(!out.nodata);
+        assert_eq!(out.payloads.len(), 1);
+        assert_eq!(
+            String::from_utf8_lossy(&out.payloads[0].bytes),
+            "はい。ただし価格は据え置きで。"
+        );
+        assert_eq!(out.payloads[0].stem, "判断");
+        assert_eq!(out.payloads[0].mime, "text/plain");
+        // 答えたのだから、付箋を作り足すことはない。
+        let notes: i64 = p
+            .conn
+            .query_row("SELECT COUNT(*) FROM virtual_bodies WHERE kind = 'note'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(notes, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

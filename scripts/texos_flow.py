@@ -73,7 +73,7 @@ CREATE INDEX IF NOT EXISTS idx_rel_from ON relations(from_id);
 # 集約ノード（全入力を1回で受け取る）。これ以外の builtin は入力ごとにファンアウトする。
 AGGREGATE_BUILTINS = {"text_concat", "text_diff", "text_paste"}
 # 素通し系（入力を何本受けてもファンアウトしない）。
-PASSTHROUGH_BUILTINS = {"tap", "loop"}
+PASSTHROUGH_BUILTINS = {"tap", "loop", "ask"}
 
 MIME_BY_EXT = {
     "md": "text/markdown", "txt": "text/plain", "csv": "text/csv",
@@ -166,6 +166,22 @@ class Project:
         spec = {"builtin": "tap", "accept_mime": "*/*", "prefix": prefix or label}
         return self._filter(label, spec, x, y, memo)
 
+    def ask(self, label: str, x: float, y: float, *, question: str | None = None,
+            prefix: str | None = None, memo: str | None = None) -> str:
+        """問い合わせカード。実行の途中で人の答えを待つ。
+
+        答えは `role="answer"` で繋いだ付箋に書く。付箋を繋がずに実行すると、
+        TexoS が答え箱の付箋を作って矢印まで引く（そこに書いて再実行する）。
+        付箋の中の「>」で始まる行は質問の控えで、答えには含まれない。
+        答えが空のあいだは no-data ＝下流へ進まない（エラーではない）。
+        """
+        spec: dict = {"builtin": "ask", "accept_mime": "*/*"}
+        if question:
+            spec["question"] = question
+        if prefix:
+            spec["prefix"] = prefix
+        return self._filter(label, spec, x, y, memo)
+
     def loop(self, label: str, x: float, y: float, *, max_rounds: int = 3,
              until_contains: str | None = None, memo: str | None = None) -> str:
         """反復カード。上流のサブグラフを、条件を満たすまで引き直す。
@@ -208,8 +224,10 @@ class Project:
         for c in (src, dst):
             if c not in self._cards:
                 raise BuildError(f"未知のカードid: {c}")
-        if role is not None and role not in ("system", "previous"):
-            raise BuildError(f'role は "system" / "previous" のみ対応しています（指定: {role}）')
+        if role is not None and role not in ("system", "previous", "answer"):
+            raise BuildError(
+                f'role は "system" / "previous" / "answer" のみ対応しています（指定: {role}）'
+            )
         self._edges.append((src, dst, role))
 
     def shape(self, x, y, w, h, label="", fill="#4a90d9", opacity=0.15) -> None:
@@ -222,13 +240,14 @@ class Project:
     def _inputs_of(self) -> dict[str, list[str]]:
         """入力に数える矢印。
 
-        role="system" は「設定」であって入力ではない（数に入れない）。
+        role="system"（AIの役割）と role="answer"（問い合わせの答え箱）は「設定」で
+        あって入力ではない（数に入れない）。
         role="previous"（反復の戻り）は**材料なので入力に数える** — 数えないと
         「AIカードに前周と資料の2本が入る＝ファンアウト」を見逃す。
         """
         d: dict[str, list[str]] = {}
         for f, t, role in self._edges:
-            if role != "system":
+            if role not in ("system", "answer"):
                 d.setdefault(t, []).append(f)
         return d
 
@@ -279,6 +298,27 @@ class Project:
                 )
             if cid not in outs and cid not in ins:
                 warns.append(f"[{c['label']}] どこにも繋がっていません")
+
+        # 問い合わせ（v1.8 ③）: 答え箱は「付箋 → 問い合わせカード」。向きや相手を
+        # 間違えると、答えたつもりでいつまでも no-data で止まる（黙って進まない失敗）。
+        for f, t, role in self._edges:
+            if role != "answer":
+                continue
+            src, dst = self._cards[f], self._cards[t]
+            if src["kind"] != "note":
+                errs.append(f"[{src['label']}] 役割（answer）の矢印は付箋からだけ引けます")
+            if dst["kind"] != "filter" or dst["spec"].get("builtin") != "ask":
+                errs.append(
+                    f"[{dst['label']}] 役割（answer）の矢印は問い合わせカードにだけ繋げます"
+                )
+        for cid, c in self._cards.items():
+            if c["kind"] != "filter" or c["spec"].get("builtin") != "ask":
+                continue
+            if not any(t == cid and r == "answer" for _, t, r in self._edges):
+                warns.append(
+                    f"[{c['label']}] 答えの付箋が繋がっていません"
+                    f"（最初の実行で自動生成されますが、先に置いておくほうが面から読めます）"
+                )
 
         # 反復（v1.8 ④）: 戻り矢印は反復カードからしか出せない。ここを間違えると
         # 「前周の結果」が永遠に空のまま静かに回り続ける（気づけない失敗になる）。

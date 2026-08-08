@@ -1174,6 +1174,14 @@ function App() {
               "実行は行き止まりのない一方向のままです）。",
             onClick: () => setAttrs({ role: "previous" }),
           },
+          {
+            label: check(role === "answer", "役割＝答え（問い合わせカードへ）"),
+            hint:
+              "付箋を「答えの箱」として問い合わせカードに繋ぎます。付箋に何か書いてあれば" +
+              "それが答えとして下流へ流れ、空なら実行はそこで止まります。\n" +
+              "「>」で始まる行は質問の控えとして扱い、答えには含めません。",
+            onClick: () => setAttrs({ role: "answer" }),
+          },
           { label: "", onClick: () => {}, divider: true },
           {
             label: "矢印を削除",
@@ -1387,6 +1395,20 @@ function App() {
           onConfirm: (name) => {
             const stem = name.trim() || "記録";
             create(stem, { builtin: "tap", accept_mime: "*/*", prefix: stem });
+          },
+        });
+      } else if (builtin === "ask") {
+        // v1.8 問い合わせカード: 質問だけ聞いて作成。答えの付箋は最初の実行で用意される。
+        setPrompt({
+          title: "問い合わせ: 人に聞くこと",
+          initial: "この案で進めてよいですか？",
+          onConfirm: (q) => {
+            const question = q.trim() || "この案で進めてよいですか？";
+            create(`問い合わせ: ${question}`, {
+              builtin: "ask",
+              accept_mime: "*/*",
+              question,
+            });
           },
         });
       } else if (builtin === "loop") {

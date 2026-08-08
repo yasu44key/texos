@@ -1323,6 +1323,15 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
             onClick: () => a.addFilter("tap"),
           },
           {
+            label: "問い合わせ（途中で人に聞く）",
+            hint:
+              "実行がここまで来たら、いったん人の答えを待ちます。答えは繋がった「答えの付箋」に" +
+              "書きます（付箋が無ければ最初の実行で用意されます）。書いてから、もう一度 ▶ を" +
+              "押してください。\n" +
+              "前か後ろでしか口を挟めなかったフローに、途中で判断を入れるためのカードです。",
+            onClick: () => a.addFilter("ask"),
+          },
+          {
             label: "反復（納得するまで繰り返す）",
             hint:
               "上流のカードをもう一度たどり直します。判定 → 直して判定、のように" +

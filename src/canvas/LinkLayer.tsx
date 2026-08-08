@@ -17,6 +17,8 @@ function edgeLabel(attrs?: string | null): string | null {
     if (a.role === "system") parts.push("役割");
     // v1.8 ④反復: 戻り矢印。これが「上流へ戻っているが評価は遡らない線」だと分かる目印。
     else if (a.role === "previous") parts.push("前周");
+    // v1.8 ③問い合わせ: 答えの箱（付箋 → 問い合わせカード）。
+    else if (a.role === "answer") parts.push("答え");
     if (a.when === "success") parts.push("成功時");
     else if (a.when === "failure") parts.push("失敗時");
     if (a.carry === "none") parts.push("信号のみ");
