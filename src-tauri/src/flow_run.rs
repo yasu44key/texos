@@ -791,6 +791,90 @@ fn run_import_new(
     Ok(count)
 }
 
+/// v1.8 記録カード（builtin:"tap"）の書き出し。
+///
+/// フローの途中を通ったペイロードを、**固定名で上書き**しながらプロジェクトへ残し、
+/// 実身カードとして面に出す。名前は `prefix`（無ければカードのラベル）。2本目以降の
+/// 入力は `_2`, `_3` を付ける。出力先は `out_dir` 指定があればそこ、無ければ直下。
+///
+/// 2回目以降は同じ実ファイルを指す生きたカードを探して**中身だけ差し替える**
+/// （毎回 import すると同じ実体に2枚目のカードができてしまう＝v1.3.9 の根幹原則違反）。
+fn write_tap_record(
+    p: &Project,
+    fid: &str,
+    spec: &flow::FilterSpec,
+    payloads: &[FlowPayload],
+) -> Result<Vec<String>, String> {
+    let (label, fx, fy): (String, f64, f64) = p
+        .conn
+        .query_row(
+            "SELECT label, pos_x, pos_y FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![fid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let base = spec
+        .prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&label);
+    let base = crate::web::sanitize_stem(base).unwrap_or_else(|| "記録".into());
+    let dir: PathBuf = match spec.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => PathBuf::from(s),
+        None => p.root.clone(),
+    };
+    if !dir.is_dir() {
+        return Err(format!("記録の出力先フォルダがありません: {}", dir.display()));
+    }
+
+    let mut names = Vec::new();
+    for (i, pl) in payloads.iter().enumerate() {
+        let stem = if i == 0 { base.clone() } else { format!("{base}_{}", i + 1) };
+        let name = format!("{stem}.{}", pl.ext);
+        let path = dir.join(&name);
+        std::fs::write(&path, &pl.bytes).map_err(|e| format!("{name}: 書き出し失敗 ({e})"))?;
+        let hash = cas::store_bytes(&p.cas_root, &pl.bytes).map_err(|e| e.to_string())?;
+        let ext_l = pl.ext.to_ascii_lowercase();
+        let mime = mime_for_ext(&ext_l).unwrap_or(pl.mime.as_str());
+        db::insert_real_body(&p.conn, &hash, mime, pl.bytes.len() as u64, Some(&ext_l))
+            .map_err(|e| e.to_string())?;
+
+        let path_str = path.to_string_lossy().to_string();
+        let existing: Option<String> = p
+            .conn
+            .query_row(
+                "SELECT id FROM virtual_bodies
+                 WHERE committed_path = ?1 AND deleted_at IS NULL
+                 ORDER BY created_at LIMIT 1",
+                rusqlite::params![path_str],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match existing {
+            Some(vid) => {
+                p.conn
+                    .execute(
+                        "UPDATE virtual_bodies
+                         SET real_id = ?1, committed_mtime = ?2, ext = ?3, mime_type = ?4
+                         WHERE id = ?5",
+                        rusqlite::params![hash, file_mtime_ms(&path), ext_l, mime, vid],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            None => {
+                // 初回だけカードを作る。記録カードのすぐ下に並べる。
+                let cx = fx + (i as f64) * 170.0;
+                let cy = fy + 150.0;
+                objects::import_file_into(p, path_str, String::new(), cx, cy)?;
+            }
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
 pub(crate) fn eval_filter(
     state: &AppState,
     app: &tauri::AppHandle,
@@ -924,6 +1008,8 @@ pub(crate) fn eval_filter(
     // フェーズ1: エッジごとに上流を評価し when/carry を適用（EdgeOut の列で保持＝
     // セレクタの first-match と no-data の NULL 伝搬はエッジ単位の情報が要る）。
     let mut edges: Vec<EdgeOut> = Vec::new();
+    // v1.8 役割ポート: role="system" の矢印が運んできたテキスト（AI のシステムプロンプト）。
+    let mut role_system: Option<String> = None;
     for (vid, real_id, vlabel, mime, ext, kind, url_ref, attrs) in &inputs {
         // 中断後は新しいプロセスを起こさない（複数入力の連鎖を断つ）
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1022,6 +1108,23 @@ pub(crate) fn eval_filter(
                 }
             }
         };
+        // v1.8 役割ポート: role 付きの矢印は「入力」ではなく「設定」を運ぶ。通常入力の列
+        // （edges）に入れないので、AI カードのファンアウト（入力ごとに1回実行）を起こさない。
+        // when/carry は適用しない — 役割は条件分岐する対象ではなく直結の配線だから。
+        if let Some(role) = attrs.role.as_deref() {
+            if role == "system" {
+                let text = up
+                    .payloads
+                    .iter()
+                    .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.trim().is_empty() {
+                    role_system = Some(text);
+                }
+            }
+            continue;
+        }
         edges.push(apply_edge(&up, attrs, vlabel, report));
     }
 
@@ -1093,6 +1196,46 @@ pub(crate) fn eval_filter(
         let out = if collected.is_empty() {
             EvalOut::nodata_out()
         } else {
+            EvalOut::data(collected, None)
+        };
+        return finish_eval(p, fid, visited, memo, 0, out);
+    }
+
+    // v1.8 役割ポート: system 役割の矢印が来ていたら、このノードの spec を差し替える。
+    // spec を作り替えるだけなので execute_node 以下（run_ai）は無改造で乗る。
+    let spec = match role_system {
+        Some(sys) => {
+            if spec.node_kind() == flow::NodeKind::Ai {
+                let mut s = spec.clone();
+                s.system = Some(sys);
+                s
+            } else {
+                report
+                    .skipped
+                    .push("役割（システムプロンプト）の矢印は AI カードにだけ効きます".into());
+                spec
+            }
+        }
+        None => spec,
+    };
+
+    // v1.8 記録カード（builtin:"tap"）: 入力をそのまま下流へ通しつつ、通った中身を
+    // プロジェクトへ書き出してカードにする。中間結果は本来メモリ上で消えるので、
+    // 「1周流した後もグラフが読める」ようにするための素通しノード。
+    // import_new と同じ流儀で eval 側で完結させる（DB への作用は execute_node の
+    // バイト変換契約に乗せない）。集約/ファンアウトの手前で返すので入力は何本でもよい。
+    if spec.builtin.as_deref() == Some("tap") {
+        let out = if collected.is_empty() {
+            EvalOut::nodata_out()
+        } else {
+            match write_tap_record(p, fid, &spec, &collected) {
+                Ok(names) => {
+                    for n in names {
+                        report.outputs.push(format!("{n}（記録）"));
+                    }
+                }
+                Err(e) => report.errors.push(e),
+            }
             EvalOut::data(collected, None)
         };
         return finish_eval(p, fid, visited, memo, 0, out);
@@ -2267,3 +2410,92 @@ pub(crate) fn cancel_all(state: State<AppState>) {
     flow::t23d_post_cancel();
 }
 
+
+#[cfg(test)]
+mod tap_tests {
+    use super::*;
+
+    fn payload(text: &str) -> FlowPayload {
+        FlowPayload {
+            bytes: text.as_bytes().to_vec(),
+            ext: "md".into(),
+            mime: "text/markdown".into(),
+            stem: "x".into(),
+            meta: None,
+        }
+    }
+
+    /// v1.8 記録カード: 1回目はカードを作り、2回目は**同じカードの中身を差し替える**。
+    /// 2回目に import してしまうと、同じ実ファイルを指すカードが2枚できて
+    /// 「同一プロジェクト内に同じ実体を2つの実身として登録しない」（v1.3.9 根幹原則）を破る。
+    #[test]
+    fn tap_writes_once_then_overwrites_same_card() {
+        let dir = std::env::temp_dir().join(format!("texos_tap_test_{}", db::now_ms()));
+        let cas_root = dir.join(".texos").join("cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
+        let p = Project { conn, root: dir.clone(), cas_root: cas_root.clone() };
+        p.conn
+            .execute(
+                "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+                 VALUES ('filter:sentinel','application/vnd.texos.filter',0,?1)",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+                 VALUES ('tap1','filter:sentinel','記録',10.0,20.0,?1,'filter','{\"builtin\":\"tap\",\"prefix\":\"途中\"}')",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        let spec = flow::parse_spec(r#"{"builtin":"tap","prefix":"途中"}"#).unwrap();
+
+        let names = write_tap_record(&p, "tap1", &spec, &[payload("一回目")]).unwrap();
+        assert_eq!(names, vec!["途中.md".to_string()]);
+        let path = dir.join("途中.md");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "一回目");
+        let path_str = path.to_string_lossy().to_string();
+        let count = |p: &Project| -> i64 {
+            p.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM virtual_bodies
+                     WHERE committed_path = ?1 AND deleted_at IS NULL",
+                    rusqlite::params![path_str],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(&p), 1, "1回目でカードが1枚できる");
+        let first_real: String = p
+            .conn
+            .query_row(
+                "SELECT real_id FROM virtual_bodies WHERE committed_path = ?1",
+                rusqlite::params![path_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // 2回目: 中身が変わってもカードは増えず、実身だけ差し替わる。
+        write_tap_record(&p, "tap1", &spec, &[payload("二回目")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "二回目");
+        assert_eq!(count(&p), 1, "2回目でカードが増えてはいけない");
+        let second_real: String = p
+            .conn
+            .query_row(
+                "SELECT real_id FROM virtual_bodies WHERE committed_path = ?1",
+                rusqlite::params![path_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(first_real, second_real, "内容が変われば実身も変わる（CAS）");
+        assert!(cas::object_path(&cas_root, &second_real).exists(), "CAS に載っている");
+
+        // 入力が複数のときは _2, _3 を付けて全部残す（素通し＝ファンアウトしない）。
+        let names = write_tap_record(&p, "tap1", &spec, &[payload("A"), payload("B")]).unwrap();
+        assert_eq!(names, vec!["途中.md".to_string(), "途中_2.md".to_string()]);
+        assert_eq!(std::fs::read_to_string(dir.join("途中_2.md")).unwrap(), "B");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

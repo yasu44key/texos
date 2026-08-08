@@ -1313,6 +1313,15 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
             hint: "ファイルやカードを落とすと、つないだ下流フローを自動実行するデータ投入口です。",
             onClick: () => a.addFilter("drop_point"),
           },
+          {
+            label: "記録（途中を残す・素通し）",
+            hint:
+              "矢印の途中に置きます。データはそのまま下流へ通しながら、通った中身を" +
+              "ファイルに書き出してカードにします（同じ名前で毎回上書き）。\n" +
+              "フローの途中の結果はふつう残らないので、1周流したあとに「何がどう変わったか」を" +
+              "読み返したいところに置いてください。",
+            onClick: () => a.addFilter("tap"),
+          },
         ]),
     },
     {

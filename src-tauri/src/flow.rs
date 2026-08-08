@@ -232,6 +232,12 @@ pub struct EdgeAttrs {
     /// IN 順の明示（1始まり）。無し = created_at 接続順（port 昇順 → created_at で安定）。
     #[serde(default)]
     pub port: Option<i64>,
+    /// v1.8 役割ポート: この矢印が運ぶものの**意味**。無し＝ふつうの入力（従来）。
+    /// `"system"` = 上流の中身を AI カードの**システムプロンプト**として渡す。
+    /// 役割つきの矢印は通常入力に数えられない（＝ファンアウトを起こさない）。
+    /// 狙いは「AI カードの一番重要な中身＝役割を、面から見える付箋にする」こと。
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// relations.attrs の JSON を読む（NULL・壊れた JSON は既定＝従来挙動）。
@@ -2593,8 +2599,13 @@ mod tests {
         assert_eq!(a.port, Some(2));
         let d = parse_edge_attrs(None);
         assert!(d.when.is_none() && d.carry.is_none() && d.port.is_none());
+        assert!(d.role.is_none(), "role 無し＝ふつうの入力（従来）");
         let broken = parse_edge_attrs(Some("{not json"));
         assert!(broken.when.is_none());
+        // v1.8 役割ポート: role は既存キーと同居でき、無い JSON も従来どおり読める。
+        let r = parse_edge_attrs(Some(r#"{"role":"system","port":1}"#));
+        assert_eq!(r.role.as_deref(), Some("system"));
+        assert_eq!(r.port, Some(1));
         assert_eq!(spec(r#"{"builtin":"select"}"#).node_kind(), NodeKind::Select);
         assert!(spec(r#"{"builtin":"select"}"#).absorbs_nodata());
         assert!(spec(r#"{"cmd":"x {out}","nodata":"absorb"}"#).absorbs_nodata());

@@ -1693,6 +1693,7 @@ pub(crate) fn set_relation_attrs(
     when: Option<String>,
     carry: Option<String>,
     port: Option<i64>,
+    role: Option<String>,
     state: State<AppState>,
 ) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
@@ -1729,6 +1730,14 @@ pub(crate) fn set_relation_attrs(
             obj.remove("port");
         } else {
             obj.insert("port".into(), serde_json::json!(n));
+        }
+    }
+    // v1.8 役割ポート: 空文字＝役割を外す（ふつうの入力に戻す）。
+    if let Some(r) = role {
+        if r.is_empty() {
+            obj.remove("role");
+        } else {
+            obj.insert("role".into(), serde_json::json!(r));
         }
     }
     let new_attrs: Option<String> = if obj.is_empty() { None } else { Some(v.to_string()) };

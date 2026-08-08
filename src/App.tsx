@@ -1089,7 +1089,7 @@ function App() {
   // マージ書き込み（NULL=従来）。リンク矢印（kind='link'）は従来どおりクリック=削除。
   const handleFlowRelationClick = useCallback(
     (r: RelationInfo, clientX: number, clientY: number) => {
-      let attrs: { when?: string; carry?: string } = {};
+      let attrs: { when?: string; carry?: string; role?: string } = {};
       try {
         attrs = JSON.parse(r.attrs ?? "{}");
       } catch {
@@ -1097,7 +1097,8 @@ function App() {
       }
       const when = attrs.when ?? "always";
       const carry = attrs.carry ?? "";
-      const setAttrs = (patch: { when?: string; carry?: string }) => {
+      const role = attrs.role ?? "";
+      const setAttrs = (patch: { when?: string; carry?: string; role?: string }) => {
         void invoke("set_relation_attrs", { id: r.id, ...patch })
           .then(async () => setRelations(await invoke<RelationInfo[]>("list_relations")))
           .catch((e) => console.error("set_relation_attrs failed", e));
@@ -1136,6 +1137,21 @@ function App() {
           {
             label: check(carry === "none", "なし（信号のみ＝ゲート）"),
             onClick: () => setAttrs({ carry: "none" }),
+          },
+          { label: "", onClick: () => {}, divider: true },
+          { label: "この矢印が運ぶもの（役割）", onClick: () => {}, disabled: true },
+          {
+            label: check(role === "", "入力（既定）"),
+            onClick: () => setAttrs({ role: "" }),
+          },
+          {
+            label: check(role === "system", "役割＝システムプロンプト"),
+            hint:
+              "上流の中身を、AI カードの「役割」（システムプロンプト）として渡します。" +
+              "付箋を繋いで役割にすれば、誰がどんな担当なのかがキャンバスから読めて、" +
+              "その場で書き換えられます。\n" +
+              "この矢印は入力に数えません（AI カードが入力ごとに何度も走るのを避けるため）。",
+            onClick: () => setAttrs({ role: "system" }),
           },
           { label: "", onClick: () => {}, divider: true },
           {
@@ -1342,6 +1358,16 @@ function App() {
         // v1.5.3 WS-P1: セレクタ（オペ層 §5.4.1）。パラメータなし＝即作成。
         // 入力順の first-match（最初の有データ枝を採用）・no-data 吸収を内包。
         create("セレクタ", { builtin: "select", accept_mime: "*/*" });
+      } else if (builtin === "tap") {
+        // v1.8 記録カード: 素通ししながら中身をファイルに残す。名前＝prefix（既定はラベル）。
+        setPrompt({
+          title: "記録の名前（この名前で毎回上書き保存します）",
+          initial: "記録",
+          onConfirm: (name) => {
+            const stem = name.trim() || "記録";
+            create(stem, { builtin: "tap", accept_mime: "*/*", prefix: stem });
+          },
+        });
       } else if (builtin === "text_grep") {
         setPrompt({
           title: "grep: 抽出する正規表現",
