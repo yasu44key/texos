@@ -94,7 +94,9 @@ pub fn set_clipboard_image(path: &str) -> Result<(), String> {
 }
 
 /// Allocate a movable global holding the CF_HDROP payload (DROPFILES + paths).
-unsafe fn alloc_hdrop(paths: &[String]) -> Result<HGLOBAL, String> {
+/// v1.8.1: drag_out.rs も同じバイト列を OLE のデータオブジェクトへ載せるので共用する
+///（クリップボード持ち出しとドラッグアウトで中身がズレないよう、組み立ては一箇所）。
+pub(crate) unsafe fn alloc_hdrop(paths: &[String]) -> Result<HGLOBAL, String> {
     let mut list: Vec<u16> = Vec::new();
     for p in paths {
         list.extend(p.encode_utf16());

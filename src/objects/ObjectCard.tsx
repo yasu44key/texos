@@ -95,6 +95,8 @@ interface Props {
   onDragLive?: (id: string, x: number, y: number) => void;
   /** Begin dragging a link from this card. (fromId, clientX, clientY) */
   onStartLink?: (fromId: string, clientX: number, clientY: number) => void;
+  /** v1.8.1: 左端のつまみから OS へファイルを持ち出す（ネイティブ OLE ドラッグ）。 */
+  onDragOut?: (id: string) => void;
   /** Double-click to open/edit this object. */
   onOpen?: (id: string) => void;
   /** v1.3.10: ラベルのダブルクリックでリネーム（実身=実ファイル改名／仮身=表示名）。 */
@@ -310,7 +312,7 @@ export function ObjectCard({
   ext = null, memo = null, expanded = false, editPath = null,
   panelW = null, panelH = null, onPanelResize,
   zIndex = 0, selected = false, onToggleSelect, onCtrlClone, onSelectConnected, onSelect, onGroupDragStart,
-  onMoveEnd, onDragLive, onStartLink, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
+  onMoveEnd, onDragLive, onStartLink, onDragOut, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
   onToggleOpPause,
   showHints = true,
 }: Props) {
@@ -540,6 +542,36 @@ export function ObjectCard({
     e.preventDefault();
     onStartLink?.(id, e.clientX, e.clientY);
   };
+
+  // v1.8.1 ドラッグアウト: 左端のつまみを掴んで OS 側（エクスプローラ・DAW・他アプリ）へ
+  // 実ファイルを手渡す。素ドラッグ＝カード移動 を壊さないための専用つまみで、Alt は
+  // 既に「つながり選択」に取られているのでモディファイアには乗せない。
+  // 4px 動いてから始めるのは Ctrl+ドラッグ（化身）と同じ流儀＝つまみを素クリックしただけで
+  // 空のドラッグが走らないようにするため。開始後は OS のモーダルループがマウスを奪うので
+  // mousemove/mouseup はこちらへ返ってこない（先に外しておく）。
+  const handleExportDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const sx = e.clientX;
+    const sy = e.clientY;
+    function onMove(me: globalThis.MouseEvent) {
+      if (Math.hypot(me.clientX - sx, me.clientY - sy) <= 4) return;
+      finish();
+      onDragOut?.(id);
+    }
+    function finish() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", finish);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", finish);
+  };
+
+  // 持ち出せる＝実体（ファイルかフォルダ）を持つカード。フィルタ／ドロップポイント／
+  // ランチャは TexoS 内の道具、URL は実体が無いので、つまみ自体を出さない
+  //（バックエンドの持ち出し規則＝resolve_export_paths と同じ線引き）。
+  const exportable = !isFilter && !isDrop && !isLauncher && !isUrl;
 
   return (
     <div
@@ -848,6 +880,38 @@ export function ObjectCard({
           pointerEvents: "none",
         }}
       />
+      )}
+
+      {/* v1.8.1 export grip on left edge — appears on hover.
+          右端＝TexoS内へつなぐ／左端＝OSへ持ち出す、と両端で向きを対にしている。 */}
+      {exportable && (
+        <div
+          onMouseDown={handleExportDown}
+          title="ドラッグして OS へ持ち出す（コピー／未保存の仮身はここで実身になります）"
+          style={{
+            position: "absolute",
+            left: -8,
+            top: "50%",
+            transform: "translateY(-50%)",
+            width: 16,
+            height: 16,
+            borderRadius: 4,
+            background: "#2a3242",
+            border: "2px solid #8a93a6",
+            boxShadow: "0 1px 4px #00000088",
+            color: "#cfd6e4",
+            fontSize: 9,
+            lineHeight: "12px",
+            textAlign: "center",
+            cursor: "grab",
+            opacity: hover ? 1 : 0,
+            transition: "opacity 0.12s",
+            zIndex: 2,
+            userSelect: "none",
+          }}
+        >
+          ↗
+        </div>
       )}
 
       {/* connection handle on right edge — appears on hover */}

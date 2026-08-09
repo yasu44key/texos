@@ -4302,6 +4302,113 @@ function App() {
     [refresh]
   );
 
+  // --- v1.8.1 ドラッグアウト（出す側・ドラッグ経路） -------------------------
+  // 持ち出しの規則は Ctrl+C と同一（バックエンドの resolve_export_paths を共用）。
+  // 違うのは運び方だけ＝クリップボードに置くか、OS のドラッグに載せるか。
+  //
+  // 掴んだカードが選択に含まれていればその選択ぜんぶ、含まれていなければその1枚を運ぶ
+  //（複数選択の1枚を素ドラッグ＝群移動、と同じ流儀）。
+  //
+  // ドラッグ中は OS のモーダルループが前面を握るので、警告ダイアログはここで出さず
+  // 完了イベント（texos://drag-out）まで持ち越す。掴んだ瞬間にダイアログを出すと
+  // フォーカスを奪ってドラッグ自体が壊れる。
+  const pendingDragOut = useRef<{
+    count: number;
+    warnings: { label: string; kind: string; detail: string }[];
+    errors: string[];
+  } | null>(null);
+
+  const handleDragOut = useCallback(
+    async (id: string) => {
+      const ids = selectedRef.current.has(id) ? [...selectedRef.current] : [id];
+      // 持ち出しで新規に実身化されるのは「未コミットのファイル系カード」だけ
+      //（handleCopyFiles と同じ判定＝今セッション中は緑にする）。
+      const idSet = new Set(ids);
+      const freshlyCommitted = objectsRef.current
+        .filter(
+          (o) =>
+            idSet.has(o.id) &&
+            !o.committed_path &&
+            !o.url_ref &&
+            !o.project_ref &&
+            !o.folder_ref &&
+            o.kind !== "filter" &&
+            o.kind !== "drop"
+        )
+        .map((o) => o.id);
+      try {
+        const rep = await invoke<{
+          copied: string[];
+          count: number;
+          warnings: { label: string; kind: string; detail: string }[];
+          errors: string[];
+        }>("start_object_drag", { ids });
+        if (freshlyCommitted.length)
+          setTouched((prev) => new Set([...prev, ...freshlyCommitted]));
+        await refresh();
+        if (rep.count === 0) {
+          // ドラッグは始まっていない＝完了イベントは来ないので、ここで理由を出す。
+          pendingDragOut.current = null;
+          if (rep.warnings.length || rep.errors.length)
+            setConfirm({
+              title: "ドラッグで持ち出せませんでした",
+              message: rep.warnings.length
+                ? "ファイルを持たないカードです:\n" +
+                  rep.warnings.map((w) => `・${w.label}`).join("\n")
+                : rep.errors.map((e) => `・${e}`).join("\n"),
+              okLabel: "OK",
+              onConfirm: () => setConfirm(null),
+            });
+          return;
+        }
+        // 一部だけ持ち出せた場合の内訳はドロップ完了後に伝える。
+        pendingDragOut.current =
+          rep.warnings.length || rep.errors.length ? rep : null;
+      } catch (e) {
+        console.error("start_object_drag failed", e);
+      }
+    },
+    [refresh]
+  );
+
+  // ドラッグアウト完了（ドロップ or 中止）。持ち越した内訳をここで出す。
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen<{ dropped: boolean; error?: string | null }>("texos://drag-out", (event) => {
+      const pending = pendingDragOut.current;
+      pendingDragOut.current = null;
+      if (event.payload.error) {
+        console.error("drag-out failed", event.payload.error);
+        return;
+      }
+      // 中止（どこにも落とさなかった）なら黙って終わる。
+      if (!event.payload.dropped || !pending) return;
+      const lines: string[] = [];
+      if (pending.warnings.length)
+        lines.push(
+          "持ち出せなかったカード（ファイルを持たない）:\n" +
+            pending.warnings.map((w) => `・${w.label}`).join("\n")
+        );
+      if (pending.errors.length)
+        lines.push("エラー:\n" + pending.errors.map((e) => `・${e}`).join("\n"));
+      if (!lines.length) return;
+      setConfirm({
+        title: `${pending.count} 件を持ち出しました`,
+        message: lines.join("\n\n"),
+        okLabel: "OK",
+        onConfirm: () => setConfirm(null),
+      });
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   // v1.3.8 (G6): 画像カードをビットマップ(CF_DIB)としてコピー（RMBメニュー専用）。
   // 未保存の仮身は自動でコミットされ得るので、状態シグナル更新のため refresh。
   const handleCopyImage = useCallback(
@@ -6121,6 +6228,7 @@ function App() {
             onGroupDragStart={handleGroupDragStart}
             onMoveEnd={handleMoveEnd}
             onDragLive={handleDragLive}
+            onDragOut={handleDragOut}
             onStartLink={handleStartLink}
             onOpen={handleOpenObject}
             onRenameTitle={handleRenameTitle}

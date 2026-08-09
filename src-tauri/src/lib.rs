@@ -4,6 +4,9 @@ mod clipboard_out;
 mod db;
 #[cfg(windows)]
 mod drag_drop;
+// v1.8.1: ドラッグアウト（OLE ドラッグ元）。drag_drop の対。
+#[cfg(windows)]
+mod drag_out;
 mod flow;
 mod os_icon;
 use rusqlite::Connection;
@@ -751,6 +754,7 @@ pub fn run() {
             write_text_file,
             paste_clipboard,
             copy_objects_to_clipboard,
+            start_object_drag,
             copy_image_to_clipboard,
             create_text_object,
             create_empty_object,

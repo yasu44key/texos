@@ -2165,7 +2165,21 @@ pub(crate) fn copy_objects_to_clipboard(
 ) -> Result<ClipboardExportReport, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let (paths, report) = resolve_export_paths(p, &ids);
+    if !paths.is_empty() {
+        #[cfg(windows)]
+        clipboard_out::set_clipboard_files(&paths)?;
+        #[cfg(not(windows))]
+        return Err("クリップボード持ち出しは Windows のみ対応です".into());
+    }
+    Ok(report)
+}
 
+/// v1.8.1: 「持ち出せるカード＝実ファイル」の解決規則を一箇所に集約する。
+/// Ctrl+C（クリップボードへ CF_HDROP）とドラッグアウト（同じ CF_HDROP を OLE で
+/// 手渡す）は運び方が違うだけで、何が持ち出せるかの規則は同一。規則をここにしか
+/// 置かないので、両者がズレようがない。
+fn resolve_export_paths(p: &Project, ids: &[String]) -> (Vec<String>, ClipboardExportReport) {
     let mut report = ClipboardExportReport {
         copied: vec![],
         count: 0,
@@ -2174,7 +2188,7 @@ pub(crate) fn copy_objects_to_clipboard(
     };
     let mut paths: Vec<String> = vec![];
 
-    for id in &ids {
+    for id in ids {
         let row: Result<(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>), _> =
             p.conn.query_row(
                 "SELECT label, committed_path, project_ref, url_ref, folder_ref, kind
@@ -2244,11 +2258,44 @@ pub(crate) fn copy_objects_to_clipboard(
     }
 
     report.count = paths.len();
-    if !paths.is_empty() {
-        #[cfg(windows)]
-        clipboard_out::set_clipboard_files(&paths)?;
-        #[cfg(not(windows))]
-        return Err("クリップボード持ち出しは Windows のみ対応です".into());
+    (paths, report)
+}
+
+/// v1.8.1 ドラッグアウト: 選択カードの実ファイルを OS へ「ドラッグで」手渡す。
+/// 持ち出しの規則は Ctrl+C と共通（`resolve_export_paths`）＝未コミットの仮身は
+/// ここでコミットされ、URL／フィルタ／ドロップポイントは warnings に落ちる。
+///
+/// ドラッグ本体は **メインスレッドへ投げっぱなし**にする。`SHDoDragDrop` はマウスを
+/// 奪うモーダルループなので、ここで完了を待つとコマンドの応答が止まり、ドラッグ中の
+/// 前面が固まる。呼び出し側にはまず解決結果（何枚持ち出せたか）を返し、ドロップの
+/// 成否は完了後の `texos://drag-out` イベントで受け取る。
+#[tauri::command]
+pub(crate) fn start_object_drag(
+    ids: Vec<String>,
+    window: tauri::WebviewWindow,
+    state: State<AppState>,
+) -> Result<ClipboardExportReport, String> {
+    // プロジェクトのロックはパス解決の間だけ。ドラッグ中ずっと握らない。
+    let (paths, report) = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        resolve_export_paths(p, &ids)
+    };
+    if paths.is_empty() {
+        return Ok(report); // 持ち出せるものが無い＝ドラッグは始めない
+    }
+    #[cfg(windows)]
+    {
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+        let app = window.app_handle().clone();
+        window
+            .run_on_main_thread(move || crate::drag_out::start_file_drag(hwnd, &paths, &app))
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        return Err("ドラッグでの持ち出しは Windows のみ対応です".into());
     }
     Ok(report)
 }

@@ -75,6 +75,9 @@ windows = { version = "0.61", features = [
   "Win32_System_SystemInformation",
   "Win32_System_SystemServices",
   "Win32_UI_Shell",
+  # v1.8.1 ドラッグアウト: SHCreateDataObject（シェル既製の IDataObject）が
+  # ITEMIDLIST を引数に取るため Shell_Common が要る。SHDoDragDrop は Ole 側。
+  "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
 ] }
 
