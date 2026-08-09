@@ -501,6 +501,22 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
         hint: "答えの付箋の頭に「>」付きで書き込まれるので、後から見ても何を聞かれたのか分かります。",
       },
       {
+        key: "skip_upstream",
+        label: "答えが入ったら",
+        type: "select",
+        optional: true,
+        default: "",
+        options: [
+          { value: "", label: "上流をもう一度動かす（既定）" },
+          { value: "on", label: "上流を動かさない（聞いたときのまま）" },
+        ],
+        hint:
+          "AI に原案を書かせてから聞く形では、既定のままだと2回目の実行で原案が作り直され、" +
+          "人が読んだ案と別物になります。「動かさない」にすると、答えが入っている限り" +
+          "上流を評価せず答えだけを流します（AI も呼ばれません）。" +
+          "答えを消せばまた上流から動きます。",
+      },
+      {
         key: "prefix",
         label: "出力名",
         type: "text",

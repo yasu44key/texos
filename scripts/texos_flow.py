@@ -167,19 +167,26 @@ class Project:
         return self._filter(label, spec, x, y, memo)
 
     def ask(self, label: str, x: float, y: float, *, question: str | None = None,
-            prefix: str | None = None, memo: str | None = None) -> str:
+            prefix: str | None = None, skip_upstream: bool = False,
+            memo: str | None = None) -> str:
         """問い合わせカード。実行の途中で人の答えを待つ。
 
         答えは `role="answer"` で繋いだ付箋に書く。付箋を繋がずに実行すると、
         TexoS が答え箱の付箋を作って矢印まで引く（そこに書いて再実行する）。
         付箋の中の「>」で始まる行は質問の控えで、答えには含まれない。
         答えが空のあいだは no-data ＝下流へ進まない（エラーではない）。
+
+        skip_upstream=True にすると、**答えが入っている限り上流を評価しない**。
+        AI に原案を書かせてから聞く形では、これを付けないと2パス目に原案が作り直され、
+        人が読んだ案と別物になる（答えを消せばまた上流から動く）。
         """
         spec: dict = {"builtin": "ask", "accept_mime": "*/*"}
         if question:
             spec["question"] = question
         if prefix:
             spec["prefix"] = prefix
+        if skip_upstream:
+            spec["skip_upstream"] = "on"
         return self._filter(label, spec, x, y, memo)
 
     def loop(self, label: str, x: float, y: float, *, max_rounds: int = 3,

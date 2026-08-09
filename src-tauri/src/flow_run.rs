@@ -1008,6 +1008,19 @@ pub(crate) fn eval_filter(
         return finish_eval(p, fid, visited, memo, 0, out);
     }
 
+    // v1.8 ③ スイッチ（実機FB 2026-08-08）: 「答えが入ったら上流を動かさない」。
+    // **収集より手前**でなければ意味がない — 収集した時点で上流の AI はもう走っている。
+    // 人がもう判断した後に材料を引き直すと、原案が別物に書き換わってしまう。
+    if spec.builtin.as_deref() == Some("ask") && spec.skip_upstream.as_deref() == Some("on") {
+        if let Some(note) = peek_answer_note(p, fid) {
+            let answer = flow::answer_text(&note);
+            if !answer.is_empty() {
+                let out = ask_answer_out(&spec, &node_label(p, fid), answer);
+                return finish_eval(p, fid, visited, memo, 0, out);
+            }
+        }
+    }
+
     // フェーズ1: 入力エッジの収集（v1.8 ④で切り出し — 反復カードが同じ収集を何周も呼ぶ）。
     let CollectedInputs { edges, role_system, role_answer } =
         collect_input_edges(state, app, p, fid, visited, memo, report, job, ctx)?;
@@ -1683,23 +1696,7 @@ fn run_ask_node(
     // 答え箱の中身から、人が書いた分だけを取り出す（`>` 行＝質問は答えではない）。
     let answer = role_answer.map(flow::answer_text).unwrap_or_default();
     if !answer.is_empty() {
-        let stem = spec
-            .prefix
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(label.as_str())
-            .to_string();
-        return EvalOut::data(
-            vec![FlowPayload {
-                bytes: answer.into_bytes(),
-                ext: "txt".into(),
-                mime: "text/plain".into(),
-                stem,
-                meta: None,
-            }],
-            None,
-        );
+        return ask_answer_out(spec, &label, answer);
     }
 
     // 未回答。付箋がまだ無ければ用意する（無いまま「答えてください」と言われても困る）。
@@ -1713,6 +1710,54 @@ fn run_ask_node(
         .skipped
         .push(format!("{label}（答え待ち: {question} — 付箋に答えを書いて、もう一度実行してください）"));
     EvalOut::nodata_out()
+}
+
+/// 人の答え1本を下流へ流す EvalOut（名前は `prefix` かカード名）。
+fn ask_answer_out(spec: &flow::FilterSpec, label: &str, answer: String) -> EvalOut {
+    let stem = spec
+        .prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(label)
+        .to_string();
+    EvalOut::data(
+        vec![FlowPayload {
+            bytes: answer.into_bytes(),
+            ext: "txt".into(),
+            mime: "text/plain".into(),
+            stem,
+            meta: None,
+        }],
+        None,
+    )
+}
+
+/// v1.8 ③ スイッチ `skip_upstream:"on"` 用: **上流を1枚も評価せずに**答えだけ覗く。
+///
+/// 答え箱に使うのは付箋（`role:"answer"`）なので、`note_text` を直接読めば評価は要らない。
+/// 付箋以外が繋がっているときは None を返して通常の評価に落ちる（中身が評価しないと
+/// 決まらないため）。**評価しないことがこの関数の目的**なので、ここで手を抜いてはいけない。
+fn peek_answer_note(p: &Project, fid: &str) -> Option<String> {
+    let mut stmt = p
+        .conn
+        .prepare(
+            "SELECT v.note_text, rel.attrs FROM relations rel
+             JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+             WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+               AND v.kind = 'note'
+             ORDER BY rel.created_at",
+        )
+        .ok()?;
+    let rows: Vec<(Option<String>, Option<String>)> = stmt
+        .query_map(rusqlite::params![fid], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    rows.into_iter()
+        .find(|(_, attrs)| {
+            flow::parse_edge_attrs(attrs.as_deref()).role.as_deref() == Some("answer")
+        })
+        .map(|(text, _)| text.unwrap_or_default())
 }
 
 /// 答え箱の付箋を問い合わせカードの横に作り、`role:"answer"` の矢印で繋ぐ。
@@ -3085,6 +3130,50 @@ mod ask_tests {
         assert!(text.contains("> バックアップは自動で取ります。"), "{text}");
         assert!(text.lines().all(|l| l.starts_with('>')), "素の行があってはいけない: {text}");
         assert_eq!(flow::answer_text(&text), "", "作った直後は必ず未回答");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// スイッチ `skip_upstream:"on"`（実機FB）: 答えが入っていれば**上流を1枚も評価せずに**
+    /// 答えだけを返せること。ここが評価に落ちると、2パス目に原案の AI が走り直して
+    /// 人が読んだ案と別物になる。答えが空のあいだは通常どおり（＝上流を見る）。
+    #[test]
+    fn the_switch_reads_the_answer_without_touching_upstream() {
+        let (p, dir) = project("switch");
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, note_text)
+                 VALUES ('note1','note:sentinel','答え',0.0,0.0,?1,'note',?2)",
+                rusqlite::params![db::now_ms(), "> 問い\n> ── ここから下に\n"],
+            )
+            .unwrap();
+        p.conn
+            .execute(
+                "INSERT INTO relations (from_id, to_id, kind, created_at, attrs)
+                 VALUES ('note1','ask1','flow',?1,'{\"role\":\"answer\"}')",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+
+        // 未回答のあいだは「答えなし」— 呼び出し側は通常の評価へ落ちる。
+        let note = peek_answer_note(&p, "ask1").expect("答え箱は見つかる");
+        assert_eq!(flow::answer_text(&note), "", "引用行だけ＝未回答");
+
+        // 人が書いたら、上流に触らずここで答えが取れる。
+        p.conn
+            .execute(
+                "UPDATE virtual_bodies SET note_text = ?1 WHERE id = 'note1'",
+                rusqlite::params!["> 問い\n> ── ここから下に\n方針: 上位2割だけ片づける。"],
+            )
+            .unwrap();
+        let note = peek_answer_note(&p, "ask1").unwrap();
+        assert_eq!(flow::answer_text(&note), "方針: 上位2割だけ片づける。");
+
+        // 役割なしの矢印（ふつうの材料）は答え箱ではない。
+        p.conn
+            .execute("UPDATE relations SET attrs = NULL WHERE from_id = 'note1'", [])
+            .unwrap();
+        assert!(peek_answer_note(&p, "ask1").is_none(), "材料の矢印を答えと取り違えない");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
