@@ -26,12 +26,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
 import sqlite3
+import sys
 import time
 import uuid
 
 FILTER_SENTINEL = "filter:sentinel"
 NOTE_SENTINEL = "note:sentinel"
+LAUNCHER_SENTINEL = "launcher:sentinel"
+OP_SENTINEL = "op:empty"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS real_bodies (
@@ -75,10 +80,39 @@ AGGREGATE_BUILTINS = {"text_concat", "text_diff", "text_paste"}
 # 素通し系（入力を何本受けてもファンアウトしない）。
 PASSTHROUGH_BUILTINS = {"tap", "loop", "ask"}
 
+# 拡張子 → MIME。**正本は `src-tauri/src/util.rs: mime_for_ext`** で、ここはその写し。
+# ここに無い拡張子は application/octet-stream になり、`accept_mime="text/*"` の
+# カード（AI・連結など）に**エラーも出さず黙って読み飛ばされる**（規約 §3-7）。
+# ソースコードを流すフローで踏み抜くので、テキスト系は広めに持っておく。
 MIME_BY_EXT = {
-    "md": "text/markdown", "txt": "text/plain", "csv": "text/csv",
-    "json": "application/json", "html": "text/html",
+    "txt": "text/plain", "log": "text/plain", "ini": "text/plain", "diff": "text/plain",
+    "patch": "text/plain", "md": "text/markdown", "png": "image/png", "jpg": "image/jpeg",
+    "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+    "svg": "image/svg+xml", "glb": "model/gltf-binary", "gltf": "model/gltf+json", "mp4": "video/mp4",
+    "webm": "video/webm", "avi": "video/x-msvideo", "mov": "video/quicktime", "mkv": "video/x-matroska",
+    "mp3": "audio/mpeg", "wav": "audio/wav", "flac": "audio/flac", "ogg": "audio/ogg",
+    "m4a": "audio/mp4", "json": "application/json", "csv": "text/csv", "tsv": "text/tab-separated-values",
+    "xml": "application/xml", "html": "text/html", "htm": "text/html", "css": "text/css",
+    "py": "text/x-python", "js": "text/javascript", "ts": "text/javascript", "rs": "text/x-rust",
+    "c": "text/x-c", "cpp": "text/x-c", "cc": "text/x-c", "cxx": "text/x-c", "h": "text/x-c",
+    "hpp": "text/x-c", "java": "text/x-java", "kt": "text/x-kotlin", "kts": "text/x-kotlin",
+    "go": "text/x-go", "rb": "text/x-ruby", "sh": "text/x-shellscript", "bash": "text/x-shellscript",
+    "zsh": "text/x-shellscript", "ps1": "text/x-powershell", "psm1": "text/x-powershell",
+    "bat": "text/x-bat", "cmd": "text/x-bat", "sql": "text/x-sql", "lua": "text/x-lua",
+    "pl": "text/x-perl", "php": "text/x-php", "swift": "text/x-swift", "cs": "text/x-csharp",
+    "hs": "text/x-haskell", "r": "text/x-r", "jsx": "text/javascript", "tsx": "text/javascript",
+    "tex": "text/x-tex", "yaml": "text/yaml", "yml": "text/yaml", "toml": "text/x-toml",
+    "pdf": "application/pdf", "doc": "application/msword", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel", "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "ppt": "application/vnd.ms-powerpoint", "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "odt": "application/vnd.oasis.opendocument.text", "ods": "application/vnd.oasis.opendocument.spreadsheet",
+    "odp": "application/vnd.oasis.opendocument.presentation", "rtf": "application/rtf",
+    "epub": "application/epub+zip", "zip": "application/zip", "7z": "application/x-7z-compressed",
+    "rar": "application/vnd.rar", "gz": "application/gzip", "tar": "application/x-tar",
 }
+
+# 外部プログラムカードが集約になる条件（flow.rs: cmd_is_aggregate と同じ規則）。
+_AGG_CMD = re.compile(r"\{in\*\}|\{in([2-9]|[1-9]\d+)\}")
 
 
 class BuildError(Exception):
@@ -94,18 +128,84 @@ class Project:
         self._edges: list[tuple[str, str, str | None]] = []  # (from, to, role)
         self._shapes: list[tuple] = []
         self._files: list[tuple[str, bytes, str]] = []   # (path, bytes, card_id)
+        self._bundles: list[tuple[str, str, tuple[str, ...]]] = []  # 同梱プログラム
         self._view = None
 
     # ---------------------------------------------------------------- カード
-    def file(self, name: str, text: str, x: float, y: float, memo: str | None = None) -> str:
-        """プロジェクト直下に実ファイルを作り、コミット済み実身カードとして置く。"""
+    def file(self, name: str, text: str | bytes, x: float, y: float,
+             memo: str | None = None) -> str:
+        """プロジェクト直下に実ファイルを作り、コミット済み実身カードとして置く。
+        text は文字列（UTF-8で書く）でもバイト列（wav などの実体）でもよい。"""
         cid = uuid.uuid4().hex
         path = os.path.join(self.root, name)
-        self._files.append((path, text.encode("utf-8"), cid))
+        self._files.append((path, text if isinstance(text, bytes) else text.encode("utf-8"), cid))
         self._cards[cid] = dict(label=name, kind="file", spec=None, x=x, y=y,
                                 memo=memo, path=path,
                                 ext=name.rsplit(".", 1)[-1] if "." in name else None)
         return cid
+
+    def copy_file(self, src: str, x: float, y: float, name: str | None = None,
+                  memo: str | None = None) -> str:
+        """既存のファイル（wav・画像など）をプロジェクトに取り込んで実身カードにする。"""
+        with open(src, "rb") as f:
+            data = f.read()
+        return self.file(name or os.path.basename(src), data, x, y, memo)
+
+    def program(self, label: str, x: float, y: float, *, name: str,
+                cmd: str = "", mode: str = "command", path: str | None = None,
+                output_ext: str | None = None, accept_mime: str | None = None,
+                prefix: str | None = None, timeout_secs: int | None = None,
+                out_dir: str | None = None, memo: str | None = None) -> str:
+        """外部プログラムのカード（内蔵フィルタではない実プログラムを呼ぶ）。
+
+        name  … プログラムのファイル名。TexoS は「path → .texos/filters → PATH」の
+                順に探す。**`name` に `wavmix\\wavmix.cmd` のような相対パスを書くと
+                `.texos/filters` 起点で解決される**＝プロジェクトに同梱したまま
+                絶対パスなしで配れる（bundle() と対で使う）。
+        cmd   … 引数。`{in}`（入力）/ `{out}`（出力）/ `{out*}`（出力フォルダ・複数）。
+                `{in*}` か `{in2}` 以降を書けば**集約**（全入力を1回で受ける）、
+                `{in}`/`{in1}` だけなら入力ごとにファンアウトする。
+        mode  … "command"（引数で受け渡し）/ "filter"（標準入出力）/ "generator"（入力不要）
+        """
+        if mode not in ("command", "filter", "generator"):
+            raise BuildError(f'mode は "command" / "filter" / "generator" のみ（指定: {mode}）')
+        spec: dict = {"name": name, "type": mode, "cmd": cmd}
+        for k, v in (("path", path), ("output_ext", output_ext),
+                     ("accept_mime", accept_mime), ("prefix", prefix),
+                     ("out_dir", out_dir)):
+            if v:
+                spec[k] = v
+        if timeout_secs is not None:
+            spec["timeout_secs"] = timeout_secs
+        return self._filter(label, spec, x, y, memo)
+
+    def launcher(self, label: str, x: float, y: float, *, name: str,
+                 path: str | None = None, memo: str | None = None) -> str:
+        """ランチャーカード（対話的なアプリをそのまま起動する。TexoS が抱えない統合）。
+
+        起動時、TexoS は作業ディレクトリをプロジェクト直下にし、環境変数
+        `TEXOS_PROJECT_DIR` にもその場所を入れる。だからアプリ側が
+        「今のプロジェクト」に書き出せる。プログラムの探し方は program() と同じで、
+        `arrange\\arrange.cmd` のような相対名なら `.texos/filters` 起点で解決される。
+        """
+        spec: dict = {"name": name, "type": "launcher"}
+        if path:
+            spec["path"] = path
+        cid = uuid.uuid4().hex
+        self._cards[cid] = dict(label=label, kind="launcher", spec=spec,
+                                x=x, y=y, memo=memo)
+        return cid
+
+    def bundle(self, src_dir: str, name: str | None = None,
+               ignore: tuple[str, ...] = ("venv", "__pycache__", ".git", ".claude")) -> str:
+        """プログラム一式を `.texos/filters/<name>/` に同梱する（プロジェクトごと配る形）。
+
+        戻り値は program(name=...) に渡す相対名の頭（`<name>`）。同梱したものは
+        `.texos/filters` 起点で解決されるので、受け取った人は解凍して開くだけで動く。
+        """
+        dest_name = name or os.path.basename(os.path.abspath(src_dir))
+        self._bundles.append((os.path.abspath(src_dir), dest_name, ignore))
+        return dest_name
 
     def note(self, text: str, x: float, y: float, width: float = 300,
              font_size: float = 13, title_size: float | None = None,
@@ -122,15 +222,18 @@ class Project:
                                 note_text=text, style=style)
         return cid
 
-    def ai(self, label: str, x: float, y: float, *, system: str,
+    def ai(self, label: str, x: float, y: float, *, system: str = "",
            prefix: str | None = None, temperature: float | None = None,
            model: str | None = None, provider: str | None = None,
            endpoint: str | None = None, memo: str | None = None) -> str:
         """AIフィルタカード（builtin:"ai" transform）。
 
         **通常入力は1本にすること**（複数繋ぐと入力ごとにファンアウトする → cat() で束ねる）。
-        `system` は役割ポート（`flow(付箋, ai, role="system")`）で上書きできる。
-        役割を付箋にすると、担当が何者なのかがキャンバスから読めて、その場で直せる。
+
+        `system` は**省略できる**（既定は空）。役割を付箋にして
+        `flow(付箋, ai, role="system")` で渡すのが基本形で、そのとき system は空のままでよい
+        —— 担当が何者なのかがキャンバスから読めて、その場で直せるため。
+        逆に**役割の矢印も system も無い AI カードは指示ゼロ**なので save() が警告する。
         """
         spec = {"builtin": "ai", "provider": provider or self.provider,
                 "mode": "transform", "model": model or self.model,
@@ -206,6 +309,42 @@ class Project:
             spec["until"] = "contains"
             spec["pattern"] = until_contains
         return self._filter(label, spec, x, y, memo)
+
+    def op_in(self, label: str, x: float, y: float, memo: str | None = None) -> str:
+        """IN カード（モジュールの入口）。素通しで、受けたものをそのまま下流へ渡す。
+
+        「差し替えられる口」を1か所に見せるための札。仕組みの入口がどこかを
+        キャンバスから一目で分かるようにする以外の働きは無い（評価では素通し）。
+        **IN は終端になれない**（▶ で実行するのは OUT か普通のフィルタカード）。
+
+        人が課題や設定を書き込む場所が要るなら、IN ではなく **付箋か実身**を使うこと
+        （§3-5 定数カード）。IN は中身を持てない。
+        """
+        return self._op(label, {"op": "in"}, x, y, memo)
+
+    def op_out(self, label: str, x: float, y: float, memo: str | None = None) -> str:
+        """OUT カード（モジュールの出口）。**▶ を押せる終端になれる**素通しカード。
+
+        押すと上流をさかのぼって実行し、結果のカードが OUT の横に生まれる。
+        「ここが出口です」と示しつつ、何度でも押せる実行口を兼ねる。
+        """
+        return self._op(label, {"op": "out"}, x, y, memo)
+
+    def op(self, label: str, x: float, y: float, *, kind: str,
+           memo: str | None = None, **params) -> str:
+        """任意の op カード。`kind` は in / out / trigger / timer / watch。
+
+        トリガ・タイマ・ウォッチャは**発行（リクエスト）側**で、pull の評価には出てこない
+        （▶ を押す代わりに下流のフィルタを走らせる仕掛け）。フローの矢印では繋がない。
+        """
+        if kind not in ("in", "out", "trigger", "timer", "watch"):
+            raise BuildError(f'op の kind は in/out/trigger/timer/watch のみ（指定: {kind}）')
+        return self._op(label, {"op": kind, **params}, x, y, memo)
+
+    def _op(self, label, spec, x, y, memo) -> str:
+        cid = uuid.uuid4().hex
+        self._cards[cid] = dict(label=label, kind="op", spec=spec, x=x, y=y, memo=memo)
+        return cid
 
     def builtin(self, label: str, x: float, y: float, *, name: str,
                 memo: str | None = None, **params) -> str:
@@ -286,6 +425,33 @@ class Project:
                 continue
             spec, n = c["spec"], len(ins.get(cid, []))
             b = spec.get("builtin")
+            if b is None:  # 外部プログラムカード（内蔵ではない）
+                cmd, mode = spec.get("cmd") or "", spec.get("type")
+                if not spec.get("name") and not cmd:
+                    errs.append(f"[{c['label']}] プログラム名も cmd もありません")
+                if not _AGG_CMD.search(cmd) and "{in" in cmd and n > 1:
+                    errs.append(
+                        f"[{c['label']}] 入力が {n} 本ありますが cmd は `{{in}}` だけです。"
+                        f"**入力ごとに別々に実行**されます（ファンアウト）。"
+                        f"1回でまとめて受けるなら cmd を `{{in*}}` にしてください"
+                    )
+                if "{in" in cmd and n == 0:
+                    errs.append(f"[{c['label']}] cmd が入力を要求していますが、入力の矢印がありません")
+                if mode == "generator" and n > 0:
+                    warns.append(
+                        f"[{c['label']}] ジェネレータ（入力不要）に入力が {n} 本繋がっています"
+                    )
+                if cid not in outs and "{out" not in cmd:
+                    warns.append(
+                        f"[{c['label']}] cmd に `{{out}}` も `{{out*}}` もありません"
+                        f"（成果物を取り込まない実行になります）"
+                    )
+                elif cid not in outs and "{out}" in cmd and not spec.get("prefix"):
+                    warns.append(
+                        f"[{c['label']}] 終端カードに prefix がありません。"
+                        f"出力名が「入力名_フィルタ名」になります"
+                    )
+                continue
             if b == "text_diff" and n != 2:
                 errs.append(f"[{c['label']}] diff は入力ちょうど2本が必要（現在 {n} 本）")
             elif b not in AGGREGATE_BUILTINS and b not in PASSTHROUGH_BUILTINS and n > 1:
@@ -298,6 +464,13 @@ class Project:
                 errs.append(f"[{c['label']}] AIカードに model がありません")
             if b == "ai" and n == 0:
                 errs.append(f"[{c['label']}] AIカードに入力がありません")
+            if b == "ai" and not (spec.get("system") or "").strip() and not any(
+                t == cid and r == "system" for _, t, r in self._edges
+            ):
+                warns.append(
+                    f"[{c['label']}] AIカードに指示がありません"
+                    f"（system= を書くか、役割の付箋を role=\"system\" で繋いでください）"
+                )
             if cid not in outs and not spec.get("prefix"):
                 warns.append(
                     f"[{c['label']}] 終端カードに prefix がありません。"
@@ -305,6 +478,19 @@ class Project:
                 )
             if cid not in outs and cid not in ins:
                 warns.append(f"[{c['label']}] どこにも繋がっていません")
+
+        # IN/OUT（v1.5.6 WS-M M1）。IN は終端になれない＝▶ を押す先が無いフローになる。
+        for cid, c in self._cards.items():
+            if c["kind"] != "op":
+                continue
+            op = c["spec"].get("op")
+            if op == "in" and cid not in outs:
+                errs.append(
+                    f"[{c['label']}] IN カードが終端になっています。IN は ▶ で実行できません"
+                    f"（出口には OUT か普通のフィルタカードを置いてください）"
+                )
+            if op == "in" and cid not in ins:
+                warns.append(f"[{c['label']}] IN カードに入力がありません（口として空回りします）")
 
         # 問い合わせ（v1.8 ③）: 答え箱は「付箋 → 問い合わせカード」。向きや相手を
         # 間違えると、答えたつもりでいつまでも no-data で止まる（黙って進まない失敗）。
@@ -375,27 +561,82 @@ class Project:
         outs = {f for f, _, _ in self._edges}
         r = []
         for cid, c in self._cards.items():
+            if c["kind"] == "op" and cid not in outs and c["spec"].get("op") == "out":
+                r.append((c["label"], "（上流の出力がそのまま OUT の横に出る）"))
+                continue
             if c["kind"] == "filter" and cid not in outs:
                 spec = c["spec"]
                 pre = spec.get("prefix")
-                ext = spec.get("output_ext", "md")
-                r.append((c["label"], f"{pre}.{ext}" if pre else "（入力名_フィルタ名）"))
+                b = spec.get("builtin")
+                # flow.rs の run_builtin が返す拡張子に合わせる（text_* は txt・AI は md）
+                ext = spec.get("output_ext") or {
+                    "t2i": "png", "t23d": "glb", "text_diff": "diff",
+                    "web_capture": "png", "img_convert": spec.get("format") or "png",
+                    "ai": "md", "web_fetch": "md", "md_codeblock": "txt",
+                }.get(b) or ("txt" if (b or "").startswith("text_") else
+                             "md" if b else "bin")
+                if "{out*}" in (spec.get("cmd") or ""):
+                    r.append((c["label"], f"（書き出したファイル名のまま複数）"))
+                else:
+                    r.append((c["label"], f"{pre}.{ext}" if pre else "（入力名_フィルタ名）"))
         return r
 
     # ---------------------------------------------------------------- 書き出し
-    def save(self, verbose: bool = True) -> None:
+    def save(self, verbose: bool = True, reset: bool = False) -> None:
+        """検証してからプロジェクトに書き出す。
+
+        既にカードのあるプロジェクトには**追記しない**（同じスクリプトを2回流すと
+        カードが二重になるため）。作り直すときは reset=True — `.texos/texos.db` を
+        捨てて組み直す（プロジェクト直下のファイルはそのまま／同名なら上書き）。
+        """
         warns = self.validate()
         texos = os.path.join(self.root, ".texos")
         cas = os.path.join(texos, "cas")
         os.makedirs(cas, exist_ok=True)
-        conn = sqlite3.connect(os.path.join(texos, "texos.db"))
+        db_path = os.path.join(texos, "texos.db")
+        locked = False   # TexoS が開いていて DB ファイルを消せなかった
+        if reset:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(db_path + suffix)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    # Windows は他プロセスが開いているファイルを消せない。
+                    # ここを黙って握りつぶすと「reset したのに古いカードが残る」になる（実機で踏んだ）。
+                    locked = True
+        conn = sqlite3.connect(db_path)
         conn.executescript("PRAGMA journal_mode=WAL;")
         conn.executescript(_SCHEMA)
+        if reset and locked:
+            # 消せないなら中身を空にして組み直す。TexoS 側は自分の接続を持っているので
+            # **開き直すまで面には出ない**（規約 §3-8）。
+            for tbl in ("relations", "diff_stack", "shapes", "virtual_bodies",
+                        "real_bodies", "meta", "desktops"):
+                conn.execute(f"DELETE FROM {tbl}")
+            conn.commit()
+        n = conn.execute("SELECT COUNT(*) FROM virtual_bodies").fetchone()[0]
+        if n:
+            conn.close()
+            raise BuildError(
+                f"このプロジェクトには既に {n} 枚のカードがあります（{self.root}）。"
+                f"追記するとカードが二重になります。組み直すなら save(reset=True) を、"
+                f"別のプロジェクトから入口だけ張るなら link_into() を、"
+                f"別物として作るなら別のフォルダを指定してください"
+            )
         t = _now()
         for rid, mime in ((FILTER_SENTINEL, "application/vnd.texos.filter"),
-                          (NOTE_SENTINEL, "text/vnd.texos.note")):
+                          (NOTE_SENTINEL, "text/vnd.texos.note"),
+                          (LAUNCHER_SENTINEL, "application/vnd.texos.launcher"),
+                          (OP_SENTINEL, "application/vnd.texos.op")):
             conn.execute("INSERT OR IGNORE INTO real_bodies (id,mime_type,size,created_at)"
                          " VALUES (?,?,0,?)", (rid, mime, t))
+
+        # 同梱プログラム → .texos/filters/<name>/（受け手は解凍して開くだけで動く）
+        for src_dir, dest_name, ignore in self._bundles:
+            dest = os.path.join(texos, "filters", dest_name)
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(src_dir, dest, ignore=shutil.ignore_patterns(*ignore))
 
         # 実ファイル → CAS → 実身カード（import_file と同じ形にする＝
         # committed_path と origin_path の両方を実体へ、mtime も記録）
@@ -431,6 +672,18 @@ class Project:
                     " kind,note_text,style_ref) VALUES (?,?,?,?,?,?,'note',?,?)",
                     (cid, NOTE_SENTINEL, c["label"], c["x"], c["y"], _now(),
                      c["note_text"], json.dumps(c["style"], ensure_ascii=False)))
+            elif c["kind"] == "op":
+                conn.execute(
+                    "INSERT INTO virtual_bodies (id,real_id,label,pos_x,pos_y,created_at,"
+                    " kind,filter_ref,memo) VALUES (?,?,?,?,?,?,'op',?,?)",
+                    (cid, OP_SENTINEL, c["label"], c["x"], c["y"], _now(),
+                     json.dumps(c["spec"], ensure_ascii=False), c["memo"]))
+            elif c["kind"] == "launcher":
+                conn.execute(
+                    "INSERT INTO virtual_bodies (id,real_id,label,pos_x,pos_y,created_at,"
+                    " kind,filter_ref,memo) VALUES (?,?,?,?,?,?,'launcher',?,?)",
+                    (cid, LAUNCHER_SENTINEL, c["label"], c["x"], c["y"], _now(),
+                     json.dumps(c["spec"], ensure_ascii=False), c["memo"]))
             else:
                 conn.execute(
                     "INSERT INTO virtual_bodies (id,real_id,label,pos_x,pos_y,created_at,"
@@ -458,10 +711,118 @@ class Project:
         if verbose:
             print(f"作成: {self.root}")
             print(f"  カード {len(self._cards)} 枚 / 矢印 {len(self._edges)} 本")
+            for _src, dest_name, _ig in self._bundles:
+                print(f"  同梱: .texos/filters/{dest_name}/")
             for label, out in self.terminals():
                 print(f"  ▶ {label} → {out}")
             for w in warns:
                 print(f"  警告: {w}")
+            if locked:
+                print("  ※ TexoS がこのプロジェクトを開いたままです。"
+                      "開き直すまで面には出ません（規約 §3-8）")
+
+    # ------------------------------------------------------ 親プロジェクトへの掲示
+    def link_into(self, parent: str | None = None, x: float | None = None,
+                  y: float | None = None, label: str | None = None,
+                  verbose: bool = True) -> str:
+        """組んだプロジェクトへの**プロジェクトカード（リンク）**を親に1枚置く。
+
+        既にカードのあるプロジェクトへ、フローそのものを流し込むことはしない
+        （save() が拒む＝二重生成と座標衝突の元）。代わりに「別プロジェクトとして組んで、
+        いま開いているプロジェクトにその入口を貼る」。人はカードをダブルクリックすれば
+        中へ入れるし、親の面は散らからない。
+
+        parent … 親プロジェクトのフォルダ。None なら **いま開いているプロジェクト**
+                 （current_project()）。
+        x, y  … 置き場所。None なら親の既存カードの下に自動で空けて置く。
+
+        注意: TexoS が親プロジェクトを開いたまま呼ぶと、**開き直すまで面に出ない**
+        （規約 §3-8）。開き直すよう最後に案内する。
+        """
+        root = os.path.abspath(parent) if parent else current_project()
+        if not root:
+            raise BuildError(
+                "親プロジェクトが分かりません（TexoS で一度もプロジェクトを開いていない？）。"
+                "link_into(parent=r'...') でフォルダを指定してください"
+            )
+        db_path = os.path.join(root, ".texos", "texos.db")
+        if not os.path.exists(db_path):
+            raise BuildError(f"TexoS のプロジェクトではありません（.texos/texos.db が無い）: {root}")
+        if os.path.abspath(root) == self.root:
+            raise BuildError("自分自身にはリンクできません")
+
+        target = self.root
+        real_id = "project:" + hashlib.sha256(target.encode("utf-8")).hexdigest()
+        conn = sqlite3.connect(db_path)
+        try:
+            dup = conn.execute(
+                "SELECT id FROM virtual_bodies"
+                " WHERE project_ref = ? AND deleted_at IS NULL LIMIT 1", (target,)
+            ).fetchone()
+            if dup:
+                if verbose:
+                    print(f"すでにリンク済み: {root} → {os.path.basename(target)}")
+                return dup[0]
+            if x is None or y is None:
+                # 人はプロジェクトカードを一列に並べる。既にあるならその**右隣**に置く
+                # （面の隅に一枚だけ飛ぶと、貼ったことに気づかれない）。
+                row = conn.execute(
+                    "SELECT MAX(pos_x), MIN(pos_y) FROM virtual_bodies"
+                    " WHERE kind = 'project' AND deleted_at IS NULL"
+                ).fetchone()
+                if row and row[0] is not None:
+                    ax, ay = row[0] + 178.0, row[1]
+                else:
+                    row = conn.execute(
+                        "SELECT MIN(pos_x), MIN(pos_y) FROM virtual_bodies"
+                        " WHERE deleted_at IS NULL"
+                    ).fetchone()
+                    ax = row[0] if row and row[0] is not None else 0.0
+                    ay = (row[1] - 220.0) if row and row[1] is not None else 0.0
+                x = ax if x is None else x
+                y = ay if y is None else y
+            conn.execute(
+                "INSERT OR IGNORE INTO real_bodies (id,mime_type,size,created_at)"
+                " VALUES (?,'application/vnd.texos.project',0,?)", (real_id, _now()))
+            cid = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO virtual_bodies (id,real_id,label,pos_x,pos_y,created_at,"
+                " kind,project_ref) VALUES (?,?,?,?,?,?,'project',?)",
+                (cid, real_id, label or os.path.basename(target), x, y, _now(), target))
+            conn.commit()
+        finally:
+            conn.close()
+        if verbose:
+            print(f"リンクを設置: {root}")
+            print(f"  「{label or os.path.basename(target)}」（{x:.0f}, {y:.0f}）→ {target}")
+            print("  ※ TexoS で開いたままなら、プロジェクトを開き直すと出てきます")
+        return cid
+
+
+def current_project() -> str | None:
+    """TexoS が最後に開いたプロジェクト＝「いま開いているプロジェクト」。
+
+    正本は Tauri の app_data_dir にある config.json の "last"
+    （`src-tauri/src/project.rs: add_recent`）。エージェントは人にパスを聞かなくてよい。
+    """
+    ident = "com.yoshi.texos"
+    if os.name == "nt":
+        base = os.environ.get("APPDATA")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    if not base:
+        return None
+    cfg = os.path.join(base, ident, "config.json")
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            last = json.load(f).get("last")
+    except (OSError, ValueError):
+        return None
+    if not last or not os.path.exists(os.path.join(last, ".texos", "texos.db")):
+        return None
+    return os.path.abspath(last)
 
 
 def _now() -> int:
