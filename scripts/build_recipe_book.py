@@ -393,6 +393,15 @@ def main() -> int:
         "41種類ありましたが、目的が重なるもの（画像生成が10回、AI単体が9回…）を\n"
         "畳んで18本にしています。外部プログラムの引数は実物からそのまま写しました。",
         60, -420, width=680, title_size=18)
+    # 道具の入手先は、道具が要ると気づく場所（レシピの面）に置いておく。
+    # 正本は docs/外部依存プログラム一覧.md で、ここへは組むたびに写しを持ってくる。
+    guide = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "docs", "外部依存プログラム一覧.md")
+    if os.path.exists(guide):
+        p.copy_file(guide, 60, -180, name="道具のインストールガイド.md",
+                    memo="各レシピの「要るもの」の入手先と注意点。"
+                         "正本は texos の docs/外部依存プログラム一覧.md")
+
     build(p, media)
     p.view(0, -380, 0.28)
     p.save(reset=True)
