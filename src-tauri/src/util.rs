@@ -122,13 +122,38 @@ pub(crate) fn mime_for_ext(ext: &str) -> Option<&'static str> {
         "m4a" => "audio/mp4",
         "json" => "application/json",
         "csv" => "text/csv",
+        // v1.8.2: tsv が抜けていた。octet-stream に落ちると text/* のカードに黙って
+        // 飛ばされる（§3-7）——「列の取り出し」「行の横結合」はまさに TSV を扱う
+        // カードなのに、.tsv ファイルを繋げなかった（データカタログを作って発覚）。
+        "tsv" => "text/tab-separated-values",
         "xml" => "application/xml",
         "html" | "htm" => "text/html",
         "css" => "text/css",
         "py" => "text/x-python",
         "js" | "ts" => "text/javascript",
         "rs" => "text/x-rust",
-        "c" | "cpp" | "h" => "text/x-c",
+        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => "text/x-c",
+        // v1.8.2: ここに無い拡張子は application/octet-stream に落ち、accept_mime="text/*"
+        // のカード（AI・連結など）に**エラーも出さず読み飛ばされる**。md_codeblock が
+        // lang として受ける言語（java/kt/go/rb/ps1/sh/sql …）が抜けていたため、
+        // 「自分で切り出したソースを自分で捨てる」状態になっていた（実機で確認・2026-08-21）。
+        "java" => "text/x-java",
+        "kt" | "kts" => "text/x-kotlin",
+        "go" => "text/x-go",
+        "rb" => "text/x-ruby",
+        "sh" | "bash" | "zsh" => "text/x-shellscript",
+        "ps1" | "psm1" => "text/x-powershell",
+        "bat" | "cmd" => "text/x-bat",
+        "sql" => "text/x-sql",
+        "lua" => "text/x-lua",
+        "pl" => "text/x-perl",
+        "php" => "text/x-php",
+        "swift" => "text/x-swift",
+        "cs" => "text/x-csharp",
+        "hs" => "text/x-haskell",
+        "r" => "text/x-r",
+        "jsx" | "tsx" => "text/javascript",
+        "tex" => "text/x-tex",
         "yaml" | "yml" => "text/yaml",
         "toml" => "text/x-toml",
         "pdf" => "application/pdf",
@@ -228,3 +253,26 @@ pub(crate) fn uuid() -> String {
     format!("{:x}", t ^ (t >> 17) ^ (t << 3))
 }
 
+
+#[cfg(test)]
+mod mime_tests {
+    use super::*;
+
+    /// md_codeblock が `lang` として受ける言語の拡張子は、すべて `accept_mime="text/*"`
+    /// のカード（AI・連結など）に通ること。ここが欠けると octet-stream に落ち、
+    /// **エラーも出さず読み飛ばされる**（規約 §3-7）。実機で java が消えて発覚した。
+    #[test]
+    fn md_codeblock_langs_pass_text_glob() {
+        for ext in [
+            "c", "cc", "java", "kt", "py", "rb", "rs", "ts", "js", "go", "ps1", "sh", "zsh",
+            "sql", "toml", "yml", "json", "html", "css", "md", "txt", "csv", "tsv",
+        ] {
+            let mime = mime_for_ext(ext)
+                .unwrap_or_else(|| panic!("{ext} が MIME 表にありません（octet-stream に落ちます）"));
+            assert!(
+                crate::flow::mime_matches("text/*", mime),
+                "{ext} → {mime} は text/* のカードに繋がりません"
+            );
+        }
+    }
+}
