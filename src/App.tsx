@@ -6389,6 +6389,8 @@ function App() {
         <FilterDialog
           initialLabel={filterDlg.edit?.label}
           initialSpec={filterDlg.edit?.spec}
+          // v1.8.3: 出力先フォルダの参照もプロジェクト相対で保存する（可搬性）。
+          projectRoot={projectPathRef.current}
           onCancel={() => setFilterDlg(null)}
           onSave={async (label, spec) => {
             const dlg = filterDlg;
@@ -6426,6 +6428,8 @@ function App() {
           builtin={builtinDlg.builtin}
           initialLabel={builtinDlg.label}
           initialSpec={builtinDlg.spec}
+          // v1.8.3: フォルダ欄の「参照…」でプロジェクト配下を選んだら相対パスに畳む。
+          projectRoot={projectPathRef.current}
           onCancel={() => setBuiltinDlg(null)}
           onSave={async (label, spec) => {
             const dlg = builtinDlg;

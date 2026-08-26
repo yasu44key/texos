@@ -64,6 +64,9 @@ struct OpCard {
 
 /// 収集した部分グラフ（ロック内で作り、以後はロックなしで検査する）。
 struct Graph {
+    /// 評価の起点＝終端カードの id。v1.8.3: 自己発火検査で「結果カードがどこに生まれるか」を
+    /// 判断するのに要る（結果を materialize するのは終端だけ・flow_run の out_root）。
+    terminal: String,
     nodes: HashMap<String, Node>,
     edges: Vec<Edge>,
     /// 到達集合に req で発行しようとしている op カード（自己発火・ヒューズ検査用）。
@@ -194,6 +197,7 @@ fn collect(p: &Project, terminal: &str) -> Result<Graph, String> {
     // op カード（トリガ/タイマ/ウォッチャ）と req ターゲットを読む。
     let (ops_into, dangling_ops, dangling_ios) = collect_ops(p, &nodes);
     Ok(Graph {
+        terminal: terminal.to_string(),
         nodes,
         edges,
         ops_into,
@@ -402,7 +406,12 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
         }
     }
 
-    // 3) 自己発火リスク（警告）: ウォッチャの監視パスが到達下流の出力先(out_dir)と重なる。
+    // 3) 自己発火リスク（警告）: ウォッチャの監視パスと、この実行が**ファイルを書く場所**が
+    //    重なる（＝結果の生成が次の発火を呼ぶ＝§6.2 の発振）。
+    //
+    //    v1.8.3: 監視パスも出力先も resolve_project_path で**解いてから**比べる。
+    //    「空欄＝プロジェクトフォルダ」「相対＝プロジェクト基準」を入れたので、文字列のまま
+    //    比べると空欄が空文字のまま素通りして、この警告が黙って消えてしまう。
     let out_dirs: Vec<(&str, String)> = g
         .nodes
         .values()
@@ -410,17 +419,47 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
             n.spec()
                 .and_then(|s| s.out_dir.clone())
                 .filter(|d| !d.trim().is_empty())
-                .map(|d| (n.label.as_str(), d))
+                .map(|d| {
+                    (
+                        n.label.as_str(),
+                        resolve_project_path(project_root, Some(&d))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
         })
         .collect();
     let root_str = project_root.to_string_lossy();
+    // 実行がプロジェクト直下へ書くか。v1.8.3: 既定の監視先がプロジェクトフォルダになったので、
+    // 「書かないと言い切れる」構成では黙る必要がある — でないと既定のまま作ったカードが
+    // 必ず黄色くなり、警告そのものが空気になる。ウォッチャ＋「新規カードを登録」の対
+    // （v1.6 随時登録）がまさにそれで、import_new はファイルを作らない＝再発火しない。
+    let writes_root = g.nodes.values().any(|n| {
+        let Some(spec) = n.spec() else { return false }; // データカードは書かない
+        let has_out_dir = spec
+            .out_dir
+            .as_deref()
+            .map(|d| !d.trim().is_empty())
+            .unwrap_or(false);
+        match spec.builtin.as_deref() {
+            // 記録（tap）は通るたびに書き出す（出力先未指定なら直下）。
+            Some("tap") => !has_out_dir,
+            // AI 対話はログ Markdown を直下へ上書きする（ai.rs upsert_chat_log_card）。
+            Some("ai") => spec.mode.as_deref() == Some("chat"),
+            // 結果カードを materialize するのは終端だけ（flow_run の out_root）。
+            // speak / import_new のような出力を持たないカードは何も書かない。
+            _ => n.id == g.terminal && !has_out_dir && !spec.is_self_contained(),
+        }
+    });
     for op in &g.ops_into {
         if op.spec.op != "watch" {
             continue;
         }
-        let Some(watch) = op.spec.path.as_deref() else { continue };
+        let watch = resolve_project_path(project_root, op.spec.path.as_deref())
+            .to_string_lossy()
+            .into_owned();
         for (card_label, dir) in &out_dirs {
-            if path_covers(watch, dir) || path_covers(dir, watch) {
+            if path_covers(&watch, dir) || path_covers(dir, &watch) {
                 f.push(Finding {
                     level: Level::Warning,
                     category: "自己発火リスク",
@@ -434,7 +473,7 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
         // v1.5.5 検証修正#3: out_dir 未指定の実行結果は**プロジェクト直下**に materialize
         // される。監視パスがプロジェクトフォルダを含むなら、結果カードの生成で再発火する
         // （§6.2「発振の主犯」の最頻ケース）。直下のみなので、サブフォルダ監視は対象外。
-        if !root_str.is_empty() && path_covers(watch, &root_str) {
+        if writes_root && !root_str.is_empty() && path_covers(&watch, &root_str) {
             f.push(Finding {
                 level: Level::Warning,
                 category: "自己発火リスク",
@@ -1004,11 +1043,14 @@ mod tests {
     }
 
     fn graph_of(nodes: Vec<Node>, edges: Vec<(&str, &str)>) -> Graph {
+        // 終端＝最後に渡したノード（collect は終端から上流へ辿るので、並びの末尾が終端）。
+        let terminal = nodes.last().map(|n| n.id.clone()).unwrap_or_default();
         let mut map = HashMap::new();
         for n in nodes {
             map.insert(n.id.clone(), n);
         }
         Graph {
+            terminal,
             nodes: map,
             edges: edges
                 .into_iter()
@@ -1172,6 +1214,60 @@ mod tests {
         });
         let f2 = inspect(&g2, Path::new("C:\\proj"), Path::new("."), Path::new("."));
         assert!(!f2.iter().any(|x| x.category == "自己発火リスク"));
+    }
+
+    #[test]
+    fn watch_default_path_still_flagged() {
+        // v1.8.3: path 省略＝プロジェクトフォルダ監視。解決してから比べないと
+        // 「空文字 vs ルート」で警告が黙って消える（静かな失敗）ので、その回帰テスト。
+        let mut g = graph_of(
+            vec![node("grep", "grep", "filter", Some(r#"{"builtin":"text_grep"}"#), "")],
+            vec![],
+        );
+        g.ops_into.push(OpCard {
+            label: "監視".into(),
+            spec: ops::parse_op_spec(r#"{"op":"watch"}"#).unwrap(),
+        });
+        let f = inspect(&g, Path::new("C:\\proj"), Path::new("."), Path::new("."));
+        assert!(f.iter().any(|x| x.category == "自己発火リスク"));
+    }
+
+    #[test]
+    fn watch_into_import_new_not_flagged() {
+        // v1.6 の「随時登録」の対（ウォッチャ＋新規カードを登録）は、import_new が
+        // ファイルを作らない＝再発火しない。既定の監視先がプロジェクトになった以上、
+        // ここで黙らないと既定構成が必ず黄色くなり、警告そのものが空気になる。
+        let mut g = graph_of(
+            vec![node("imp", "登録", "filter", Some(r#"{"builtin":"import_new"}"#), "")],
+            vec![],
+        );
+        g.ops_into.push(OpCard {
+            label: "監視".into(),
+            spec: ops::parse_op_spec(r#"{"op":"watch"}"#).unwrap(),
+        });
+        let f = inspect(&g, Path::new("C:\\proj"), Path::new("."), Path::new("."));
+        assert!(!f.iter().any(|x| x.category == "自己発火リスク"));
+    }
+
+    #[test]
+    fn watch_relative_path_resolved_against_project() {
+        // 相対パスはプロジェクト基準。out_dir も相対で同じ場所を指せば重なりとして出る。
+        let mut g = graph_of(
+            vec![node(
+                "grep",
+                "grep",
+                "filter",
+                Some(r#"{"builtin":"text_grep","out_dir":"out"}"#),
+                "",
+            )],
+            vec![],
+        );
+        g.ops_into.push(OpCard {
+            label: "監視".into(),
+            spec: ops::parse_op_spec(r#"{"op":"watch","path":"out"}"#).unwrap(),
+        });
+        let f = inspect(&g, Path::new("C:\\proj"), Path::new("."), Path::new("."));
+        assert!(f.iter().any(|x| x.category == "自己発火リスク"));
     }
 
     #[test]

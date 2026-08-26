@@ -33,6 +33,8 @@ pub(crate) struct OpSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
     /// watch: 監視パス（ファイルまたはフォルダ）。
+    /// v1.8.3: 空欄＝プロジェクトフォルダ／相対＝プロジェクト基準（`resolve_project_path`）。
+    /// 絶対パスのときだけホスト固有＝プロジェクトの外を見る意思表示。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// watch: 反応するイベント（"create"/"modify"）。省略=両方。
@@ -122,11 +124,9 @@ pub(crate) fn parse_op_spec(spec: &str) -> Result<OpSpec, String> {
                 return Err("タイマには every（秒）か at（HH:MM）のどちらかが必要です".into());
             }
         }
-        "watch" => {
-            if s.path.as_deref().map(str::trim).unwrap_or("").is_empty() {
-                return Err("ウォッチャには path（監視するファイル/フォルダ）が必要です".into());
-            }
-        }
+        // v1.8.3: path は任意。空欄＝プロジェクトフォルダ、相対パス＝プロジェクト基準
+        // （resolve_project_path）。既定でプロジェクトを見る＝「ここに置いたら動く」。
+        "watch" => {}
         other => return Err(format!("未知のオペレーション種別です: {other}")),
     }
     Ok(s)
@@ -604,7 +604,7 @@ fn tick(app: &tauri::AppHandle, rt: &mut HashMap<String, OpRuntime>) {
         let r = rt.entry(key).or_default();
         let due = match spec.op.as_str() {
             "timer" => timer_due(&spec, r, now),
-            "watch" => watch_due(&spec, r, now),
+            "watch" => watch_due(&spec, Path::new(&root), r, now),
             _ => false, // trigger は手動（▶）のみ
         };
         if !due {
@@ -675,9 +675,10 @@ fn timer_due(spec: &OpSpec, r: &mut OpRuntime, now: Instant) -> bool {
     false
 }
 
-fn watch_due(spec: &OpSpec, r: &mut OpRuntime, now: Instant) -> bool {
-    let path = Path::new(spec.path.as_deref().unwrap_or(""));
-    let snap = read_snapshot(path);
+fn watch_due(spec: &OpSpec, root: &Path, r: &mut OpRuntime, now: Instant) -> bool {
+    // v1.8.3: 空欄＝プロジェクトフォルダ／相対＝プロジェクト基準で解く（可搬性）。
+    let path = resolve_project_path(root, spec.path.as_deref());
+    let snap = read_snapshot(&path);
     let Some(old) = r.snapshot.take() else {
         // 初回観測 = ベースライン（既存ファイルでは発火しない）。
         r.snapshot = Some(snap);
@@ -755,7 +756,9 @@ mod tests {
         assert!(parse_op_spec(r#"{"op":"timer"}"#).is_err()); // every も at も無い
         assert!(parse_op_spec(r#"{"op":"timer","at":"25:00"}"#).is_err());
         assert!(parse_op_spec(r#"{"op":"watch","path":"C:/tmp"}"#).is_ok());
-        assert!(parse_op_spec(r#"{"op":"watch"}"#).is_err()); // path 無し
+        // v1.8.3: path 無し＝プロジェクトフォルダ監視（既定）。相対もプロジェクト基準。
+        assert!(parse_op_spec(r#"{"op":"watch"}"#).is_ok());
+        assert!(parse_op_spec(r#"{"op":"watch","path":"in"}"#).is_ok());
         assert!(parse_op_spec(r#"{"op":"unknown"}"#).is_err());
         assert!(is_op_spec(r#"{"op":"timer","every":5}"#));
         assert!(!is_op_spec(r#"{"builtin":"select"}"#));
@@ -801,6 +804,34 @@ mod tests {
         s.paused = false;
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("paused"));
+    }
+
+    #[test]
+    fn watch_defaults_to_project_folder() {
+        // v1.8.3: path 省略＝プロジェクトフォルダ直下を監視。相対パスもプロジェクト基準。
+        let root = std::env::temp_dir().join(format!("texos_watch_default_{}", db::now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(1);
+
+        let spec = parse_op_spec(r#"{"op":"watch","debounce":0,"min_interval":0}"#).unwrap();
+        let mut r = OpRuntime::default();
+        assert!(!watch_due(&spec, &root, &mut r, t0)); // 初回＝ベースライン（既存では発火しない）
+        std::fs::write(root.join("新着.txt"), b"hello").unwrap();
+        assert!(!watch_due(&spec, &root, &mut r, t0)); // 変化を見た → 静穏待ち
+        assert!(watch_due(&spec, &root, &mut r, later)); // 静穏 → 発火
+
+        let sub = root.join("受信箱");
+        std::fs::create_dir_all(&sub).unwrap();
+        let spec2 =
+            parse_op_spec(r#"{"op":"watch","path":"受信箱","debounce":0,"min_interval":0}"#).unwrap();
+        let mut r2 = OpRuntime::default();
+        assert!(!watch_due(&spec2, &root, &mut r2, t0));
+        std::fs::write(sub.join("a.txt"), b"x").unwrap();
+        assert!(!watch_due(&spec2, &root, &mut r2, t0));
+        assert!(watch_due(&spec2, &root, &mut r2, later));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

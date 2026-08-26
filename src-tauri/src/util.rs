@@ -276,3 +276,65 @@ mod mime_tests {
         }
     }
 }
+
+/// v1.8.3 パス可搬性: フォルダ指定をプロジェクト基準で解く。
+///
+/// - 空欄（None / 空白のみ）= **プロジェクトフォルダそのもの**
+/// - 相対パス（`sub` / `./in`）= **プロジェクトフォルダ起点**＝移動・配布しても壊れない
+/// - 絶対パス（`D:\in` / `\\host\share`）= そのまま（別ドライブの外部参照は正当な第一級機能）
+///
+/// 保存側はユーザが書いた形のまま DB に置く（解決結果を書き戻さない）＝
+/// ホスト絶対パスを load-bearing データとして焼き込まない。
+/// 正本 = `docs/V2.0_マルチプラットフォーム検討.md` §3（`%PROJECT%` トークン方式の先行実装）。
+pub(crate) fn resolve_project_path(root: &Path, s: Option<&str>) -> PathBuf {
+    let Some(v) = s.map(str::trim).filter(|v| !v.is_empty()) else {
+        return root.to_path_buf();
+    };
+    // 「./」「.\」の頭は落とす（＝カレントはプロジェクト、と明示的に書けるようにする）。
+    let mut rel = v;
+    loop {
+        let next = rel
+            .strip_prefix("./")
+            .or_else(|| rel.strip_prefix(".\\"))
+            .map(str::trim_start);
+        match next {
+            Some(n) => rel = n,
+            None => break,
+        }
+    }
+    if rel.is_empty() || rel == "." {
+        return root.to_path_buf();
+    }
+    // 絶対パス（Windows の `C:\…` / UNC、Unix の `/…`）は join が丸ごと置き換える。
+    root.join(rel)
+}
+
+#[cfg(test)]
+mod resolve_project_path_tests {
+    use super::*;
+
+    #[test]
+    fn empty_is_project_root() {
+        let root = Path::new("C:/proj");
+        assert_eq!(resolve_project_path(root, None), root);
+        assert_eq!(resolve_project_path(root, Some("   ")), root);
+        assert_eq!(resolve_project_path(root, Some(".")), root);
+        assert_eq!(resolve_project_path(root, Some("./")), root);
+    }
+
+    #[test]
+    fn relative_is_under_project() {
+        let root = Path::new("C:/proj");
+        assert_eq!(resolve_project_path(root, Some("in")), root.join("in"));
+        assert_eq!(resolve_project_path(root, Some("./in")), root.join("in"));
+        assert_eq!(resolve_project_path(root, Some(".\\in")), root.join("in"));
+        assert_eq!(resolve_project_path(root, Some("a/b")), root.join("a/b"));
+    }
+
+    #[test]
+    fn absolute_is_kept() {
+        let root = Path::new("C:/proj");
+        let abs = if cfg!(windows) { "D:/in" } else { "/in" };
+        assert_eq!(resolve_project_path(root, Some(abs)), PathBuf::from(abs));
+    }
+}

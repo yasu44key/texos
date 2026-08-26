@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 
 // v1.4.29 ⑤: ビルトインフィルタの設定ダイアログ。
 // 従来の JSON 直編集（小さなプロンプト窓）を廃し、builtin 種別ごとのパラメータスキーマから
@@ -6,7 +7,9 @@ import { useState } from "react";
 // 既存カードの JSON は「元の spec を土台に、既知フィールドだけ上書き」で後方互換を保つ
 // （builtin / accept_mime 等は落とさず、知らないキーもそのまま残す）。
 
-type FieldType = "text" | "number" | "select";
+// v1.8.3: "dir" = フォルダ欄（テキスト＋「参照」ボタン）。プロジェクト内を選んだら
+// **相対パスとして保存**する（絶対パスを DB に焼き込まない＝プロジェクトの可搬性）。
+type FieldType = "text" | "number" | "select" | "dir";
 
 interface FieldSchema {
   key: string;
@@ -236,9 +239,9 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       {
         key: "path",
         label: "対象フォルダ",
-        type: "text",
+        type: "dir",
         optional: true,
-        placeholder: "空 = プロジェクトフォルダ直下",
+        placeholder: "空欄=プロジェクトフォルダ（相対パスはプロジェクト基準）",
         hint: "プロジェクト内のファイルは実身、外部フォルダのファイルは窓（仮身）として登録します。ウォッチャの監視パスと同じにすると観測→登録が繋がります。",
       },
     ],
@@ -472,9 +475,9 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       {
         key: "out_dir",
         label: "出力先フォルダ",
-        type: "text",
+        type: "dir",
         optional: true,
-        placeholder: "空欄=プロジェクトフォルダ直下",
+        placeholder: "空欄=プロジェクトフォルダ（相対パスはプロジェクト基準）",
         hint: "指定するとそこへ書き出します（プロジェクト外なら窓＝仮身として登録されます）。試走の記録をまとめて置きたいときに。",
       },
     ],
@@ -656,9 +659,12 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
       {
         key: "path",
         label: "監視パス",
-        type: "text",
-        placeholder: "監視するファイルまたはフォルダのフルパス",
-        hint: "フォルダを指定すると直下のファイルの作成・更新を監視します。",
+        type: "dir",
+        optional: true,
+        placeholder: "空欄=プロジェクトフォルダ",
+        hint:
+          "フォルダを指定すると直下のファイルの作成・更新を監視します。" +
+          "相対パス（例: 受信箱）はプロジェクトフォルダ基準＝プロジェクトごと移動・配布しても壊れません。",
       },
       {
         key: "events",
@@ -788,6 +794,8 @@ interface Props {
   initialSpec?: string;
   onSave: (label: string, specJson: string) => void;
   onCancel: () => void;
+  /** v1.8.3: 開いているプロジェクトのフルパス。"dir" 欄の相対化に使う（無ければ絶対のまま）。 */
+  projectRoot?: string | null;
 }
 
 /** スキーマ＋spec から各フィールドの初期文字列値を作る（JSON⇄フォーム往復でも共用）。 */
@@ -804,7 +812,7 @@ function initVals(schema: BuiltinSchema | undefined, base: Record<string, unknow
   return v;
 }
 
-export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave, onCancel }: Props) {
+export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave, onCancel, projectRoot }: Props) {
   const schema = BUILTIN_SCHEMAS[builtin];
 
   const parseSpec = (s?: string): Record<string, unknown> => {
@@ -827,6 +835,14 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
   if (!schema) return null;
 
   const setVal = (k: string, val: string) => setVals((prev) => ({ ...prev, [k]: val }));
+
+  // v1.8.3: フォルダ参照。プロジェクト配下を選んだときは相対パスに畳んで保存する
+  // （＝プロジェクトごと移動・配布しても壊れない。プロジェクト自身なら空欄＝既定）。
+  const pickDir = async (k: string) => {
+    const dir = await open({ directory: true, title: "フォルダを選択" });
+    if (typeof dir !== "string") return;
+    setVal(k, relativizeToProject(dir, projectRoot));
+  };
 
   // 元 spec を土台に、builtin・固定キー・既知フィールドを上書き（未知キーは温存）。
   // v1.5.4 WS-P2: op カードは builtin キーを持たない（op キーが種別・fixed が付与する）。
@@ -995,6 +1011,20 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
                       </option>
                     ))}
                   </select>
+                ) : f.type === "dir" ? (
+                  // v1.8.3: フォルダ欄＝手打ちの苦痛をなくす「参照」付き。
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <input
+                      style={inputStyle()}
+                      type="text"
+                      value={vals[f.key] ?? ""}
+                      onChange={(e) => setVal(f.key, e.target.value)}
+                      placeholder={f.placeholder}
+                    />
+                    <button style={smallBtn()} onClick={() => void pickDir(f.key)} title="フォルダを選ぶ">
+                      参照…
+                    </button>
+                  </div>
                 ) : (
                   <input
                     style={f.type === "number" ? { ...inputStyle(), width: 120 } : inputStyle()}
@@ -1032,6 +1062,24 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
       </div>
     </div>
   );
+}
+
+/**
+ * v1.8.3: 選んだフォルダをプロジェクト基準へ畳む（可搬性）。
+ * プロジェクトそのもの → 空欄（＝既定の「プロジェクトフォルダ」）。
+ * プロジェクト配下 → 相対パス。外 → 絶対パスのまま（別ドライブ参照は正当な機能）。
+ * バックエンドの resolve_project_path（util.rs）と対の規約。
+ */
+export function relativizeToProject(dir: string, root?: string | null): string {
+  if (!root) return dir;
+  const norm = (s: string) => s.replace(/\\/g, "/").replace(/[\/]+$/, "").toLowerCase();
+  const d = norm(dir);
+  const r = norm(root);
+  if (d === r) return ""; // プロジェクトそのもの＝既定（空欄）
+  // 境界付きで判定（"C:/proj" が "C:/project2" を配下と誤認しないように）。
+  if (!r || !d.startsWith(r + "/")) return dir;
+  const rest = dir.slice(root.length).replace(/^[\\/]+/, "");
+  return rest || "";
 }
 
 function row(label: string, field: React.ReactNode) {

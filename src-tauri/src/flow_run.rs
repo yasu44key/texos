@@ -745,10 +745,8 @@ fn run_import_new(
     spec: &flow::FilterSpec,
     report: &mut FlowReport,
 ) -> Result<usize, String> {
-    let dir: PathBuf = match spec.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => PathBuf::from(s),
-        None => p.root.clone(),
-    };
+    // v1.8.3: 空欄＝プロジェクト直下／相対＝プロジェクト基準（可搬性・util §3）。
+    let dir = resolve_project_path(&p.root, spec.path.as_deref());
     if !dir.is_dir() {
         return Err(format!("フォルダがありません: {}", dir.display()));
     }
@@ -855,10 +853,8 @@ fn write_tap_record(
         .unwrap_or(&label);
     let base = crate::web::sanitize_stem(base).unwrap_or_else(|| "記録".into());
     let base = format!("{base}{round_suffix}");
-    let dir: PathBuf = match spec.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => PathBuf::from(s),
-        None => p.root.clone(),
-    };
+    // v1.8.3: 空欄＝プロジェクト直下／相対＝プロジェクト基準（可搬性・util §3）。
+    let dir = resolve_project_path(&p.root, spec.out_dir.as_deref());
     if !dir.is_dir() {
         return Err(format!("記録の出力先フォルダがありません: {}", dir.display()));
     }
@@ -2459,10 +2455,12 @@ fn run_flow_inner(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let (out_root, external_out) = match &out_dir {
+        // v1.8.3: 相対パスはプロジェクト基準で解く（従来はプロセスの CWD 基準＝実質壊れていた）。
         Some(d) => {
-            let pb = PathBuf::from(d);
+            let pb = resolve_project_path(root, Some(d));
             if !pb.is_dir() {
-                return Err(format!("出力フォルダがありません: {d}"));
+                // 相対指定のときは解決後のフルパスで知らせる（どこを見に行ったかが分かる）。
+                return Err(format!("出力フォルダがありません: {}", pb.display()));
             }
             (pb, true)
         }

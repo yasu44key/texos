@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { relativizeToProject } from "./BuiltinFilterDialog";
 
 // v1.5 フィルタ設定ダイアログ: JSON直編集の置き換え。
 // NAME/PATH をコマンドラインから分離し、CMD は「< {in} > {out} -option」だけ書く。
@@ -30,9 +31,11 @@ interface FilterDialogProps {
   initialSpec?: string;
   onSave: (label: string, specJson: string) => void;
   onCancel: () => void;
+  /** v1.8.3: 開いているプロジェクトのフルパス。OUT 欄の相対化に使う（無ければ絶対のまま）。 */
+  projectRoot?: string | null;
 }
 
-export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: FilterDialogProps) {
+export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel, projectRoot }: FilterDialogProps) {
   const init = useMemo(() => {
     try {
       return initialSpec ? (JSON.parse(initialSpec) as Record<string, unknown>) : {};
@@ -189,7 +192,8 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
 
   const pickOutDir = async () => {
     const dir = await open({ directory: true, title: "出力フォルダを選択" });
-    if (typeof dir === "string") setOutDir(dir);
+    // v1.8.3: プロジェクト配下なら相対パスで保存（プロジェクトごと移動しても壊れない）。
+    if (typeof dir === "string") setOutDir(relativizeToProject(dir, projectRoot));
   };
 
   const save = () => {
@@ -471,7 +475,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel }: Fi
               style={{ ...inputStyle(), flex: 1 }}
               value={outDir}
               onChange={(e) => setOutDir(e.target.value)}
-              placeholder="空欄=プロジェクト直下（実身）／指定=窓（仮身）で配置"
+              placeholder="空欄=プロジェクト直下（実身）／指定=窓（仮身）で配置（相対パスはプロジェクト基準）"
             />
             <button style={smallBtn()} onClick={() => void pickOutDir()}>
               フォルダ…
