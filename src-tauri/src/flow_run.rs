@@ -1660,6 +1660,130 @@ fn upstream_ids(p: &Project, fid: &str) -> Vec<String> {
 const ANSWER_QUOTE_LINES: usize = 40;
 const ANSWER_QUOTE_CHARS: usize = 1200;
 
+/// 答え箱の付箋の「ここから下は人のもの」を示す目印。**この行より上だけ**を実行のたびに
+/// 入れ替える（下には人が書いた案内や答えが残る）。文言を変えると過去の付箋で目印が
+/// 見つからなくなり、自動生成分が二重に積まれるので変えないこと。
+const ANSWER_NOTE_MARK: &str = "── ここから下に答えを書いてください";
+
+/// 材料の引用に添える案内。目印の直後に置かれる自動生成分なので、入れ直すときは
+/// 人の書き足しと区別してここで捨てる（新しいものが改めて入る）。
+const ANSWER_NOTE_GUIDE: &str = "上の引用は、聞かれたときに届いていた材料の控えです";
+
+/// 答え箱の付箋の本文を組む（質問＋そのとき届いていた材料＋目印＋案内）。
+///
+/// 本文は**すべて `>` の引用**にする。素の行を書くと `flow::answer_text` がそれを
+/// 「人の答え」として読んでしまい、誰も答えていないのに下流が動き出す。
+fn answer_note_text(question: &str, collected: &[FlowPayload]) -> String {
+    let quote = |s: &str| -> String {
+        s.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+    };
+    let mut text = quote(question);
+    let mut guide = String::new();
+    // 届いていた材料（テキストのものだけ）を引用で添える。付箋として読める長さに切る
+    // ——全文は記録カードや実身で読めるので、ここは「何の話か思い出せる」量でよい。
+    let material = collected
+        .iter()
+        .filter(|pl| pl.mime.starts_with("text/"))
+        .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let material = material.trim();
+    if !material.is_empty() {
+        let mut shown: String = material.lines().take(ANSWER_QUOTE_LINES).collect::<Vec<_>>().join("\n");
+        let trimmed = shown.chars().count() > ANSWER_QUOTE_CHARS
+            || material.lines().count() > ANSWER_QUOTE_LINES;
+        if shown.chars().count() > ANSWER_QUOTE_CHARS {
+            shown = shown.chars().take(ANSWER_QUOTE_CHARS).collect();
+        }
+        text.push_str("\n>\n");
+        text.push_str(&quote(&shown));
+        if trimmed {
+            text.push_str("\n> …（以下略）");
+        }
+        guide.push_str(&format!("（{ANSWER_NOTE_GUIDE}）"));
+    }
+    // 使い方の注釈もこの付箋に置く。実機フィードバック（2026-08-08）＝「答えはここに書く」
+    // 「自分で用意した付箋を答えにしてもよい」が、面のどこにも書いていなかった。
+    // **引用行に混ぜる**のがこの設計の効くところ: `>` 行は答えとして読まないので、
+    // 案内を書いても「答えたこと」にならず、書かれたまま残って次に見る人にも読める。
+    text.push_str(&format!(
+        "\n>\n> {ANSWER_NOTE_MARK}（「>」で始まる行は答えになりません）"
+    ));
+    if !guide.is_empty() {
+        text.push_str(&format!("\n> {guide}"));
+    }
+    text
+}
+
+/// v1.8.4: **既にある**答え箱の付箋へ、いま届いている材料を入れ直す。
+///
+/// 呼ばれるのは「答えがまだ空」のときだけ（`run_ask_node`）。目印 `ANSWER_NOTE_MARK` の
+/// 行より下は人の領分なのでそのまま残し、上（質問と材料の引用）だけを差し替える。
+/// 目印が無い付箋——エージェントや人が自分で置いた答え箱——は全体が人の書いたものなので、
+/// **消さずに新しい引用を上へ載せる**。次からは目印が挟まっているので二重にはならない。
+fn refresh_answer_note(
+    p: &Project,
+    fid: &str,
+    question: &str,
+    collected: &[FlowPayload],
+) -> Result<Option<String>, String> {
+    // 材料が1つも無いなら書き換える意味がない（空の引用で人の付箋を荒らさない）。
+    if !collected.iter().any(|pl| pl.mime.starts_with("text/")) {
+        return Ok(None);
+    }
+    // 答え箱の特定は peek_answer_note と同じ流儀（attrs を読んで role を見る）。
+    let mut stmt = p
+        .conn
+        .prepare(
+            "SELECT v.id, v.note_text, rel.attrs FROM relations rel
+             JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+             WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+               AND v.kind = 'note'
+             ORDER BY rel.created_at",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+        .query_map(rusqlite::params![fid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    let found = rows.into_iter().find(|(_, _, attrs)| {
+        flow::parse_edge_attrs(attrs.as_deref()).role.as_deref() == Some("answer")
+    });
+    let Some((vid, old, _)) = found else {
+        return Ok(None); // 付箋以外（実身など）が答えに繋がっている＝触らない
+    };
+    let old = old.unwrap_or_default();
+    // 自動生成分は [質問・材料・目印・材料の案内] の4部で、**その後ろが人の領分**。
+    // 目印が無い付箋は丸ごと人の書いたものなので、消さずに下へ送る（次からは目印が挟まる）。
+    let mine = match old.lines().position(|l| l.contains(ANSWER_NOTE_MARK)) {
+        Some(i) => old
+            .lines()
+            .skip(i + 1)
+            .filter(|l| !l.contains(ANSWER_NOTE_GUIDE))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None if old.trim().is_empty() => String::new(),
+        None => old.trim_end().to_string(),
+    };
+    let fresh = answer_note_text(question, collected);
+    let text = if mine.trim().is_empty() {
+        fresh
+    } else {
+        format!("{fresh}\n{mine}")
+    };
+    if text == old {
+        return Ok(None); // 変化なし（毎回 UPDATE して面をちらつかせない）
+    }
+    p.conn
+        .execute(
+            "UPDATE virtual_bodies SET label = ?1, note_text = ?2 WHERE id = ?3",
+            rusqlite::params![crate::notes::note_label(&text), text, vid],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(Some(vid))
+}
+
 /// v1.8 ③問い合わせカード（`builtin:"ask"`）— 途中で人に聞く（計画 §3 案B）。
 ///
 /// **ドロップポイントの「問い版」**。あちらが人のファイル投入待ち、こちらが人の言葉待ち。
@@ -1689,6 +1813,28 @@ fn run_ask_node(
         .unwrap_or(label.as_str())
         .to_string();
 
+    // v1.8.4: **材料の矢印は繋がっているのに中身が空**＝まだ聞く段階ではない。
+    // 2パスのフロー（①原案を作る ②人が判断して仕上げる）で、②を先に押したときに
+    // ここで静かに止まる。答えが先に書いてあっても止める —— 何も無いものに対する
+    // 「採用」を下流へ流すと、下流の AI は**承認された中身を知らないまま**書き始める
+    // （実機で踏んだ: 人が読んでいない文書に判子を押した形になった・2026-08-27）。
+    //
+    // 入力の矢印が1本も無い場合は従来どおり許す（質問だけのカードは正当・§3-12）。
+    let material_empty = !collected.is_empty()
+        && collected.iter().all(|pl| {
+            if pl.mime.starts_with("text/") {
+                String::from_utf8_lossy(&pl.bytes).trim().is_empty()
+            } else {
+                pl.bytes.is_empty()
+            }
+        });
+    if material_empty {
+        report.skipped.push(format!(
+            "{label}（材料がまだありません — 先に上流を実行してから、もう一度どうぞ）"
+        ));
+        return EvalOut::nodata_out();
+    }
+
     // 答え箱の中身から、人が書いた分だけを取り出す（`>` 行＝質問は答えではない）。
     let answer = role_answer.map(flow::answer_text).unwrap_or_default();
     if !answer.is_empty() {
@@ -1696,10 +1842,22 @@ fn run_ask_node(
     }
 
     // 未回答。付箋がまだ無ければ用意する（無いまま「答えてください」と言われても困る）。
+    // v1.8.4: 付箋が**既にある**ときも材料を入れ直す。エージェントや人があらかじめ
+    // 答え箱を置いておく配線（規約 §3-12 が勧める形）だと従来ここへ来ず、材料の引用が
+    // 一度も入らなかった —— 人は判断のたびに別のカードを開きに行く羽目になっていた
+    // （2026-08-27 実機）。答えが空なら付箋の中身は自動生成分と案内だけなので、
+    // 入れ替えても人の書いたものは消えない。
     if role_answer.is_none() {
         match create_answer_note(p, fid, &question, collected) {
             Ok(()) => report.outputs.push(format!("{label}: 答えの付箋を用意しました")),
             Err(e) => report.errors.push(format!("{label}: 答えの付箋を作れません（{e}）")),
+        }
+    } else {
+        match refresh_answer_note(p, fid, &question, collected) {
+            // 中身が変わった付箋には緑シグナルを付ける（固定名上書きのカードと同じ流儀）。
+            Ok(Some(vid)) => report.updated.push(vid),
+            Ok(None) => {}
+            Err(e) => report.errors.push(format!("{label}: 答えの付箋を更新できません（{e}）")),
         }
     }
     report
@@ -1778,42 +1936,7 @@ fn create_answer_note(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    let quote = |s: &str| -> String {
-        s.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
-    };
-    let mut text = quote(question);
-    let mut guide = String::new();
-    // 届いていた材料（テキストのものだけ）を引用で添える。付箋として読める長さに切る
-    // ——全文は記録カードや実身で読めるので、ここは「何の話か思い出せる」量でよい。
-    let material = collected
-        .iter()
-        .filter(|pl| pl.mime.starts_with("text/"))
-        .map(|pl| String::from_utf8_lossy(&pl.bytes).into_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let material = material.trim();
-    if !material.is_empty() {
-        let mut shown: String = material.lines().take(ANSWER_QUOTE_LINES).collect::<Vec<_>>().join("\n");
-        let trimmed = shown.chars().count() > ANSWER_QUOTE_CHARS
-            || material.lines().count() > ANSWER_QUOTE_LINES;
-        if shown.chars().count() > ANSWER_QUOTE_CHARS {
-            shown = shown.chars().take(ANSWER_QUOTE_CHARS).collect();
-        }
-        text.push_str("\n>\n");
-        text.push_str(&quote(&shown));
-        if trimmed {
-            text.push_str("\n> …（以下略）");
-        }
-        guide.push_str("（上の引用は、聞かれたときに届いていた材料の控えです）");
-    }
-    // 使い方の注釈もこの付箋に置く。実機フィードバック（2026-08-08）＝「答えはここに書く」
-    // 「自分で用意した付箋を答えにしてもよい」が、面のどこにも書いていなかった。
-    // **引用行に混ぜる**のがこの設計の効くところ: `>` 行は答えとして読まないので、
-    // 案内を書いても「答えたこと」にならず、書かれたまま残って次に見る人にも読める。
-    text.push_str("\n>\n> ── ここから下に答えを書いてください（「>」で始まる行は答えになりません）");
-    if !guide.is_empty() {
-        text.push_str(&format!("\n> {guide}"));
-    }
+    let text = answer_note_text(question, collected);
     let id = crate::util::uuid();
     let style = serde_json::json!({ "width": 300.0, "font_size": 13.0 }).to_string();
     p.conn
@@ -3128,6 +3251,127 @@ mod ask_tests {
         assert!(text.contains("> バックアップは自動で取ります。"), "{text}");
         assert!(text.lines().all(|l| l.starts_with('>')), "素の行があってはいけない: {text}");
         assert_eq!(flow::answer_text(&text), "", "作った直後は必ず未回答");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1.8.4（実機FB 2026-08-27）: **答え箱が先に置いてある**配線でも材料が入ること。
+    ///
+    /// 規約 §3-12 は「付箋は自分で用意して先に繋いでおける（そのほうが面から読める）」と
+    /// 勧めていて、エージェントが組んだフローは実際そうする。ところが従来は
+    /// 「付箋が無いとき」だけ材料を書き写していたので、**この配線では引用が一度も入らず**、
+    /// 人は判断のたびに別のカードを開きに行く羽目になっていた。
+    ///
+    /// 併せて確かめること: 人が書いた案内を消さないこと、2回流しても二重に積まないこと。
+    #[test]
+    fn an_existing_answer_note_gets_the_material_too() {
+        let (p, dir) = project("refresh");
+        let 人の案内 = "> 「採用」または「やり直し」を1行で書く";
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, note_text)
+                 VALUES ('note1','note:sentinel','答え',0.0,0.0,?1,'note',?2)",
+                rusqlite::params![db::now_ms(), 人の案内],
+            )
+            .unwrap();
+        p.conn
+            .execute(
+                "INSERT INTO relations (from_id, to_id, kind, created_at, attrs)
+                 VALUES ('note1','ask1','flow',?1,'{\"role\":\"answer\"}')",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        let spec = flow::parse_spec(r#"{"builtin":"ask","question":"この案でよいですか？"}"#).unwrap();
+        let material = FlowPayload {
+            bytes: "案:\nバックアップは自動で取ります。".as_bytes().to_vec(),
+            ext: "md".into(),
+            mime: "text/markdown".into(),
+            stem: "案".into(),
+            meta: None,
+        };
+        let read = |p: &Project| -> String {
+            p.conn
+                .query_row("SELECT note_text FROM virtual_bodies WHERE id='note1'", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let mut r = report();
+        let out = run_ask_node(&p, "ask1", &spec, Some(人の案内), std::slice::from_ref(&material), &mut r);
+        assert!(out.nodata, "まだ誰も答えていないので no-data のまま");
+        let text = read(&p);
+        assert!(text.contains("> バックアップは自動で取ります。"), "材料が入る: {text}");
+        assert!(text.contains(人の案内), "人が書いた案内は消さない: {text}");
+        assert!(text.lines().all(|l| l.starts_with('>')), "素の行があってはいけない: {text}");
+        assert_eq!(flow::answer_text(&text), "", "入れ直しても未回答のまま");
+
+        // 2回目: 目印より上だけが入れ替わるので、案内も目印も1つずつのまま。
+        let mut r2 = report();
+        run_ask_node(&p, "ask1", &spec, Some(&text), std::slice::from_ref(&material), &mut r2);
+        let again = read(&p);
+        assert_eq!(again, text, "同じ材料なら中身は動かない");
+        assert_eq!(
+            again.matches(ANSWER_NOTE_MARK).count(),
+            1,
+            "目印が二重に積まれてはいけない: {again}"
+        );
+        assert_eq!(again.matches(人の案内).count(), 1, "案内も二重にしない: {again}");
+
+        // 人が答えを書いたら、もう触らない（材料の入れ直しで答えを流さない）。
+        let 答え入り = format!("{again}\n採用");
+        let mut r3 = report();
+        let out3 = run_ask_node(&p, "ask1", &spec, Some(&答え入り), std::slice::from_ref(&material), &mut r3);
+        assert!(!out3.nodata, "答えがあるので下流へ流れる");
+        assert_eq!(read(&p), again, "答えが入った付箋は書き換えない");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1.8.4（実機FB 2026-08-27）: **材料が空なら、答えが書いてあっても止まる。**
+    ///
+    /// 2パスのフロー（①原案を作る ②人が判断して仕上げる）で ② を先に押すと、従来は
+    /// 「採用」の3文字だけが下流へ流れ、下流の AI は**承認された中身を知らないまま**
+    /// それらしい文書を書いた —— 人は自分が読んでいないものに判子を押した形になる。
+    /// 空の実身を間に挟む配線（先に置いて記録カードが埋める）が成立するかどうかは、
+    /// ここが止まるかどうかで決まる。
+    #[test]
+    fn empty_material_stops_even_when_the_answer_is_written() {
+        let (p, dir) = project("empty");
+        let spec = flow::parse_spec(r#"{"builtin":"ask","question":"この案でよいですか？"}"#).unwrap();
+        let empty = FlowPayload {
+            bytes: "\n  \n".as_bytes().to_vec(), // まだ埋まっていない実身
+            ext: "md".into(),
+            mime: "text/markdown".into(),
+            stem: "企画案".into(),
+            meta: None,
+        };
+
+        let mut r = report();
+        let out = run_ask_node(&p, "ask1", &spec, Some("採用"), std::slice::from_ref(&empty), &mut r);
+        assert!(out.nodata, "材料が空なら答えがあっても流さない");
+        assert!(
+            r.skipped.iter().any(|s| s.contains("材料がまだありません")),
+            "何が足りないかを言う: {:?}",
+            r.skipped
+        );
+
+        // 材料が入れば、同じ答えでそのまま通る。
+        let filled = FlowPayload {
+            bytes: "企画案: 320ml ボディに温度センサー".as_bytes().to_vec(),
+            ..empty.clone()
+        };
+        let mut r2 = report();
+        let out2 = run_ask_node(&p, "ask1", &spec, Some("採用"), std::slice::from_ref(&filled), &mut r2);
+        assert!(!out2.nodata, "材料が揃えば通る");
+        assert_eq!(
+            String::from_utf8_lossy(&out2.payloads[0].bytes),
+            "採用",
+            "出力は答えの文字列だけ（従来どおり）"
+        );
+
+        // 入力の矢印が1本も無いカードは従来どおり許す（質問だけのカードは正当・§3-12）。
+        let mut r3 = report();
+        let out3 = run_ask_node(&p, "ask1", &spec, Some("採用"), &[], &mut r3);
+        assert!(!out3.nodata, "入力0は従来どおり通す");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
