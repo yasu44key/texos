@@ -131,9 +131,13 @@ class DryRun:
         その判定が必ず 0 枚になる（2026-08-21 実機で踏んだ）。
         見るべきは「下流に処理カード（filter / op）があるか」。
         """
+        # v1.8 ④ 反復の戻り矢印（role="previous"）は**下流ではない**。評価では遡らず、
+        # 値は反復カードが実行文脈へ置いたものを読むだけ（規約 §3-11）。これを下流と
+        # 数えると、反復カードが終端から外れて「終端 0 枚」になる（2026-08-27 実機）。
         consumed = {
-            f for f, t, _ in self.edges
-            if self.cards.get(t, {}).get("kind") in ("filter", "op")
+            f for f, t, role in self.edges
+            if role != "previous"
+            and self.cards.get(t, {}).get("kind") in ("filter", "op")
         }
         out = []
         for cid, c in self.cards.items():
@@ -211,6 +215,12 @@ class DryRun:
         if kind == "note":
             return [Payload((c["note"] or "").encode("utf-8"), "txt", "text/plain",
                             self.label(cid))]
+
+        if kind == "drop":
+            # flow_run.rs:1399 と同じ契約 —— 未投入のドロップポイントは
+            # エラーにせず「スキップ」（no-data ではない＝下流は止まらない）。
+            self.notes.append(f"スキップ: [{self.label(cid)}]（まだファイルが投入されていません）")
+            return []
 
         if kind == "op":
             op = c["spec"].get("op")

@@ -35,6 +35,7 @@ import uuid
 
 FILTER_SENTINEL = "filter:sentinel"
 NOTE_SENTINEL = "note:sentinel"
+DROP_SENTINEL = "drop:empty"
 LAUNCHER_SENTINEL = "launcher:sentinel"
 OP_SENTINEL = "op:empty"
 
@@ -207,6 +208,20 @@ class Project:
         self._bundles.append((os.path.abspath(src_dir), dest_name, ignore))
         return dest_name
 
+    def drop(self, label: str = "ドロップポイント", x: float = 0, y: float = 0,
+             memo: str | None = None) -> str:
+        """ドロップポイント。**人があとからファイルを投げ込む口**（画像・音・PDF など）。
+
+        付箋にも実身にもできない入力はこれ。空の実身を置くと、バイナリを食うカードは
+        実行時に「壊れたファイル」として落ちる（実測: 空の .png に magick が
+        `improper image header` を返した・2026-08-27）。**投入されるまでは
+        「スキップ」**されるので、フローは組んだ状態で置いておける。
+        """
+        cid = uuid.uuid4().hex
+        self._cards[cid] = dict(label=label, kind="drop", spec=None,
+                                x=x, y=y, memo=memo)
+        return cid
+
     def note(self, text: str, x: float, y: float, width: float = 300,
              font_size: float = 13, title_size: float | None = None,
              color: str | None = None) -> str:
@@ -293,7 +308,8 @@ class Project:
         return self._filter(label, spec, x, y, memo)
 
     def loop(self, label: str, x: float, y: float, *, max_rounds: int = 3,
-             until_contains: str | None = None, memo: str | None = None) -> str:
+             until_contains: str | None = None, prefix: str | None = None,
+             memo: str | None = None) -> str:
         """反復カード。上流のサブグラフを、条件を満たすまで引き直す。
 
         入力にはループさせたい流れの出口を繋ぐ。前周の結果を上流へ戻すには、
@@ -308,6 +324,8 @@ class Project:
         if until_contains:
             spec["until"] = "contains"
             spec["pattern"] = until_contains
+        if prefix:
+            spec["prefix"] = prefix   # 反復カードを終端にしたときの出力名（他のカードと同じ）
         return self._filter(label, spec, x, y, memo)
 
     def op_in(self, label: str, x: float, y: float, memo: str | None = None) -> str:
@@ -322,13 +340,21 @@ class Project:
         """
         return self._op(label, {"op": "in"}, x, y, memo)
 
-    def op_out(self, label: str, x: float, y: float, memo: str | None = None) -> str:
+    def op_out(self, label: str, x: float, y: float, memo: str | None = None,
+               *, prefix: str | None = None) -> str:
         """OUT カード（モジュールの出口）。**▶ を押せる終端になれる**素通しカード。
 
         押すと上流をさかのぼって実行し、結果のカードが OUT の横に生まれる。
         「ここが出口です」と示しつつ、何度でも押せる実行口を兼ねる。
+
+        `prefix` を書くと出来るファイルの名前を決められる（規約 §3-15）。
+        省略すると `入力名_OUTのラベル.拡張子` になるので、ラベルに案内文を
+        入れているとそれがファイル名に化ける。**OUT を終端にするなら prefix を付ける**。
         """
-        return self._op(label, {"op": "out"}, x, y, memo)
+        spec: dict = {"op": "out"}
+        if prefix:
+            spec["prefix"] = prefix
+        return self._op(label, spec, x, y, memo)
 
     def op(self, label: str, x: float, y: float, *, kind: str,
            memo: str | None = None, **params) -> str:
@@ -558,11 +584,15 @@ class Project:
 
     def terminals(self) -> list[tuple[str, str]]:
         """(ラベル, 実行すると出来るファイル名) の一覧。"""
-        outs = {f for f, _, _ in self._edges}
+        # 反復の戻り矢印は下流ではない（評価で遡らない）。数えると反復カードが
+        # 終端から外れる — texos_dryrun.terminals() と同じ規則にそろえる。
+        outs = {f for f, _, role in self._edges if role != "previous"}
         r = []
         for cid, c in self._cards.items():
             if c["kind"] == "op" and cid not in outs and c["spec"].get("op") == "out":
-                r.append((c["label"], "（上流の出力がそのまま OUT の横に出る）"))
+                pre = c["spec"].get("prefix")
+                r.append((c["label"], f"{pre}.（上流の拡張子）" if pre
+                          else "（入力名_OUTのラベル）"))
                 continue
             if c["kind"] == "filter" and cid not in outs:
                 spec = c["spec"]
@@ -628,7 +658,8 @@ class Project:
         for rid, mime in ((FILTER_SENTINEL, "application/vnd.texos.filter"),
                           (NOTE_SENTINEL, "text/vnd.texos.note"),
                           (LAUNCHER_SENTINEL, "application/vnd.texos.launcher"),
-                          (OP_SENTINEL, "application/vnd.texos.op")):
+                          (OP_SENTINEL, "application/vnd.texos.op"),
+                          (DROP_SENTINEL, "application/vnd.texos.drop")):
             conn.execute("INSERT OR IGNORE INTO real_bodies (id,mime_type,size,created_at)"
                          " VALUES (?,?,0,?)", (rid, mime, t))
 
@@ -678,6 +709,11 @@ class Project:
                     " kind,filter_ref,memo) VALUES (?,?,?,?,?,?,'op',?,?)",
                     (cid, OP_SENTINEL, c["label"], c["x"], c["y"], _now(),
                      json.dumps(c["spec"], ensure_ascii=False), c["memo"]))
+            elif c["kind"] == "drop":
+                conn.execute(
+                    "INSERT INTO virtual_bodies (id,real_id,label,pos_x,pos_y,created_at,"
+                    " kind,memo) VALUES (?,?,?,?,?,?,'drop',?)",
+                    (cid, DROP_SENTINEL, c["label"], c["x"], c["y"], _now(), c["memo"]))
             elif c["kind"] == "launcher":
                 conn.execute(
                     "INSERT INTO virtual_bodies (id,real_id,label,pos_x,pos_y,created_at,"
