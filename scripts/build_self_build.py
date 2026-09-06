@@ -250,10 +250,49 @@ def 同梱する(root: str) -> None:
     print(r"同梱: 組み立てる.py / ツール\texos_agent.py / ツール\texos_flow.py")
 
 
+def 引数(名: str, 既定: str) -> str:
+    """`--root <パス>` のような指定を拾う（無ければ既定）。"""
+    旗 = f"--{名}"
+    for i, a in enumerate(sys.argv):
+        if a == 旗 and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(旗 + "="):
+            return a.split("=", 1)[1]
+    return 既定
+
+
+def 既存の依頼(root: str) -> str | None:
+    """組み直す前に、いまの面に置かれている依頼の付箋を引き継ぐ。
+
+    人が書いた文はこのビルダーの持ち物ではない。reset で消す前に拾っておく。
+    """
+    import sqlite3
+    db = os.path.join(root, ".texos", "texos.db")
+    if not os.path.isfile(db):
+        return None
+    try:
+        conn = sqlite3.connect(db)
+        for (t,) in conn.execute(
+                "SELECT note_text FROM virtual_bodies"
+                " WHERE kind='note' AND deleted_at IS NULL"):
+            if t and t.lstrip().startswith(("依頼", "課題")):
+                return t
+    except Exception:
+        pass
+    return None
+
+
 def main() -> None:
-    os.makedirs(ROOT, exist_ok=True)
-    同梱する(ROOT)
-    p = Project(ROOT, model=MODEL)
+    global ROLE, MODEL
+    root = os.path.abspath(引数("root", ROOT))
+    MODEL = 引数("model", MODEL)
+    ROLE = ROLE.replace("qwen3.8:latest", MODEL)
+    依頼 = 既存の依頼(root) if "--reset" in sys.argv else None
+    if 依頼:
+        print(f"依頼の付箋を引き継ぎます: {依頼.splitlines()[0][:40]}")
+    os.makedirs(root, exist_ok=True)
+    同梱する(root)
+    p = Project(root, model=MODEL)
 
     # --- 材料 -----------------------------------------------------------------
     原文 = io.open(SPEC_MD, encoding="utf-8").read()
@@ -262,7 +301,7 @@ def main() -> None:
           f"（{100 - len(絞り) * 100 // len(原文)}% 削減・面から使えない節を落とした）")
     規約 = p.file("フロー構築規約.md", 絞り, 40, 340,
                   memo="AI に渡す教科書。書き換えれば作法が変わる")
-    依頼 = p.note(REQUEST, 40, 620, width=360)
+    依頼 = p.note(依頼 or REQUEST, 40, 620, width=360)
     役割 = p.note(ROLE, 480, 30, width=420, color="#fff3c4")
 
     # --- 案を作るレーン --------------------------------------------------------
@@ -303,7 +342,8 @@ def main() -> None:
     p.shape(1320, 680, 280, 400, "② 読んで、実行する（人が押す）")
     p.view(0, 0, 0.45)
     p.save(reset="--reset" in sys.argv)
-    p.link_into(PARENT)
+    if "--no-link" not in sys.argv:
+        p.link_into(PARENT)
 
 
 if __name__ == "__main__":

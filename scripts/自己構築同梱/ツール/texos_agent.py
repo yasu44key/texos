@@ -32,6 +32,10 @@ from texos_flow import Project  # noqa: E402
 
 既定モデル = "qwen3.8:latest"
 
+# new_project() が作ったものの控え。踏み台（組み立てる.py）が、実行のあとで
+# ホストの面へ入口カードを1枚置くために読む。案の側は何も知らなくてよい。
+作ったもの: list[Project] = []
+
 _使えない文字 = '\/:*?"<>|'
 
 
@@ -50,4 +54,17 @@ def new_project(name: str, model: str = 既定モデル) -> Project:
             "（フォルダ名だけを渡すこと。パスや絶対パスは書けません）"
         )
     os.makedirs(生成先, exist_ok=True)
-    return Project(os.path.join(生成先, name), model=model)
+    # 同じ名前が埋まっていたら 2, 3 … と番号を振る（2026-09-06 実機）。
+    # この使い方では「同じ課題をもう一度投げる」のが普通で、そこで save() が
+    # 「既にカードがあります」と拒むと**実行カードが exit 1 で落ちる**。
+    # 前の試みを消さずに残し、番号で並べるほうが、読み比べられて都合がよい。
+    先 = os.path.join(生成先, name)
+    if os.path.isfile(os.path.join(先, ".texos", "texos.db")):
+        n = 2
+        while os.path.isfile(os.path.join(生成先, f"{name}{n}", ".texos", "texos.db")):
+            n += 1
+        先 = os.path.join(生成先, f"{name}{n}")
+        print(f"「{name}」は既にあるので「{name}{n}」に作ります")
+    p = Project(先, model=model)
+    作ったもの.append(p)
+    return p

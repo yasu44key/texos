@@ -467,11 +467,25 @@ class Project:
                     warns.append(
                         f"[{c['label']}] ジェネレータ（入力不要）に入力が {n} 本繋がっています"
                     )
-                if cid not in outs and "{out" not in cmd:
-                    warns.append(
-                        f"[{c['label']}] cmd に `{{out}}` も `{{out*}}` もありません"
-                        f"（成果物を取り込まない実行になります）"
-                    )
+                # 2026-09-06 実機: ここは終端のときしか見ていなかったが、**途中のカードも
+                # {out} に書かなければ下流へ何も流れない**。しかも「出力を作らない
+                # 自己完結コマンド」とみなされてエラーにならず、静かに 0 枚になる（§3-14）。
+                # 下流がある／出力名を決めている＝出力を期待している、とみなして弾く。
+                if "{out" not in cmd:
+                    期待 = ("下流のカードがあります" if cid in outs else
+                            "出力名（output_ext / prefix）を決めています" 
+                            if spec.get("output_ext") or spec.get("prefix") else None)
+                    if 期待:
+                        errs.append(
+                            f"[{c['label']}] {期待}が、cmd に `{{out}}` がありません。"
+                            f"コマンドの標準出力は捨てられるので、**結果が1枚も出来ません**"
+                            f"（エラーにもなりません）。`... > \"{{out}}\"` を足してください"
+                        )
+                    else:
+                        warns.append(
+                            f"[{c['label']}] cmd に `{{out}}` も `{{out*}}` もありません"
+                            f"（成果物を取り込まない実行になります）"
+                        )
                 elif cid not in outs and "{out}" in cmd and not spec.get("prefix"):
                     warns.append(
                         f"[{c['label']}] 終端カードに prefix がありません。"
