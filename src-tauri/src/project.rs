@@ -161,6 +161,8 @@ pub(crate) fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), 
     // Copy the object graph via ATTACH. No CAS files are copied. Committed
     // state is reset (every object starts as an uncommitted 仮身); text-linked
     // notes' file_ref is cleared (it pointed at the source's committed file).
+    // real_bodies は OR IGNORE — db::open が新規DBへ 'note:sentinel' 等の共有センチネルを
+    // 先にシードするので、親側の同 id と衝突して UNIQUE 違反になっていた（v1.8.4 まで）。
     let child_db = texos_dir(new_root).join("texos.db");
     src.conn
         .execute(
@@ -170,7 +172,7 @@ pub(crate) fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), 
         .map_err(|e| e.to_string())?;
     let result = (|| -> rusqlite::Result<()> {
         src.conn.execute_batch(
-            "INSERT INTO fork.real_bodies (id,mime_type,size,created_at,codec_ref,tags,ext)
+            "INSERT OR IGNORE INTO fork.real_bodies (id,mime_type,size,created_at,codec_ref,tags,ext)
                SELECT id,mime_type,size,created_at,codec_ref,tags,ext FROM main.real_bodies;
              INSERT INTO fork.virtual_bodies
                (id,real_id,label,pos_x,pos_y,desktop_id,created_at,etag,last_modified,
@@ -549,7 +551,11 @@ pub(crate) fn create_subproject(
     // Fork (分岐): inherit the entire structure of the current project —
     // all objects as 仮身, their relations, notes and the referenced real bodies.
     if sibling {
-        fork_structure_into(p, &new_root)?;
+        if let Err(e) = fork_structure_into(p, &new_root) {
+            // 作りかけの兄弟フォルダを残さない（unique_path で今作った新規フォルダなので安全）
+            let _ = std::fs::remove_dir_all(&new_root);
+            return Err(e);
+        }
     }
 
     let new_root_str = new_root.to_string_lossy().to_string();
@@ -713,3 +719,34 @@ pub(crate) fn open_origin_project(
     Ok(None)
 }
 
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+
+    /// 回帰: db::open が新規DBへ 'note:sentinel' をシードするため、フォーク時の
+    /// real_bodies コピーが UNIQUE 違反で落ちていた（「プロジェクトを作成できませんでした
+    /// UNIQUE constraint failed: real_bodies.id」）。
+    #[test]
+    fn fork_into_fresh_db_does_not_collide_on_sentinel() {
+        let tmp = std::env::temp_dir().join(format!("texos_fork_test_{}", uuid()));
+        let src_root = tmp.join("src");
+        let dst_root = tmp.join("dst");
+        std::fs::create_dir_all(&src_root).unwrap();
+        let src = open_project_at(&src_root).unwrap();
+        // 親に付箋カード（note:sentinel を実身とする）を1枚置く
+        db::insert_virtual_body(&src.conn, &uuid(), "note:sentinel", "memo", 0.0, 0.0, None, None)
+            .unwrap();
+        drop(open_project_at(&dst_root).unwrap()); // 子DBを初期化（ここでセンチネルがシードされる）
+
+        fork_structure_into(&src, &dst_root).expect("fork must not fail on seeded sentinel");
+
+        let dst = open_project_at(&dst_root).unwrap();
+        let n: i64 = dst
+            .conn
+            .query_row("SELECT COUNT(*) FROM virtual_bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
