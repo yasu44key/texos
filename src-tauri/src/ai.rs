@@ -22,6 +22,9 @@ pub(crate) struct ChatMsg {
 pub(crate) struct ChatTokenEvent {
     id: String,
     delta: String,
+    /// v1.8.6 true＝思考（Thinking）の断片。パネルは折りたたみで表示するだけで、
+    /// 履歴JSON にも MDログにも残さない（次ターンのコンテキストにも入れない）。
+    thinking: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -504,12 +507,13 @@ fn ai_chat_send_inner(
     // 中断フラグはこのジョブのもの（ジョブ別＝毎回新品なのでリセット不要）。
     let result = std::thread::scope(|s| {
         s.spawn(|| {
-            let mut on_token = |tok: &str| {
+            let mut on_token = |kind: flow::ChatChunk, tok: &str| {
                 let _ = app.emit(
                     "ai-chat-token",
                     ChatTokenEvent {
                         id: id.clone(),
                         delta: tok.to_string(),
+                        thinking: kind == flow::ChatChunk::Thinking,
                     },
                 );
             };
@@ -521,6 +525,8 @@ fn ai_chat_send_inner(
     drop(ai_permit);
 
     match result {
+        // v1.8.6 answer は本文のみ（run_ai_chat_stream が思考を除いて返す）。
+        // 思考はここへ来ない＝履歴にもログにも残らない。
         Ok(answer) => {
             history.push(ChatMsg {
                 role: "assistant".into(),

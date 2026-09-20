@@ -95,6 +95,15 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     base.mode === "chat" ? "chat" : "transform"
   );
   const [logName, setLogName] = useState(s("log_name")); // v1.4.5 ログ保存名（chat）
+  // v1.8.6 GPU の使い方（Ollama のみ）。既定 "auto" = キーを書かない＝サーバ任せ
+  // （＝VRAM に載る層は GPU。旧来の「VRAM が少ないから CPU」という既定は廃止）。
+  const [gpu, setGpu] = useState<"auto" | "max" | "cpu">(
+    base.gpu === "max" || base.gpu === "cpu" ? base.gpu : "auto"
+  );
+  // v1.8.6 Thinking（思考）モード。off / on / low / medium / high。
+  const [think, setThink] = useState<string>(
+    typeof base.think === "string" && base.think !== "" ? (base.think as string) : "off"
+  );
 
   // v1.4.28 WS3: PCスペック検出。モデルサイズ選択の根拠として表示する。
   const [spec, setSpec] = useState<SpecInfo | null>(null);
@@ -151,6 +160,11 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     else delete spec.timeout_secs;
     if (mode === "chat" && logName.trim()) spec.log_name = logName.trim();
     else delete spec.log_name;
+    // v1.8.6 既定値はキーごと落とす（spec を小さく保つ＝JSON編集でも読める）。
+    if (gpu !== "auto" && provider === "ollama") spec.gpu = gpu;
+    else delete spec.gpu;
+    if (think !== "off") spec.think = think;
+    else delete spec.think;
     // 接続時型チェック・出力の既定（未設定なら補う）。
     if (!spec.accept_mime) spec.accept_mime = mode === "chat" ? "*/*" : "text/*";
     if (!spec.output_ext) spec.output_ext = "md";
@@ -328,6 +342,64 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
               )}
             </div>
           )}
+
+        {provider === "ollama" &&
+          row(
+            "GPU",
+            <div>
+              <select
+                style={{ ...inp(), width: 220 }}
+                value={gpu}
+                onChange={(e) => setGpu(e.target.value as "auto" | "max" | "cpu")}
+                title={
+                  "自動: Ollama が VRAM に載る分だけ GPU に置き、溢れた層を CPU へ逃がします（推奨）。\n" +
+                  "最大限: 全ての層を GPU に強制します（num_gpu=999）。載り切らないとロードに失敗します。\n" +
+                  "CPU のみ: GPU を使いません（他の処理に VRAM を空けたいとき）。"
+                }
+              >
+                <option value="auto">自動（載る分だけ GPU・推奨）</option>
+                <option value="max">最大限 GPU（全層を強制）</option>
+                <option value="cpu">CPU のみ</option>
+              </select>
+              <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginTop: 3 }}>
+                {gpu === "auto"
+                  ? "VRAM 容量による CPU 転落はしません — 載る分は必ず GPU を使います"
+                  : gpu === "max"
+                  ? "VRAM に載り切らないモデルではロードに失敗します（そのときは自動へ戻してください）"
+                  : "GPU を使わないため応答は遅くなります"}
+              </div>
+            </div>
+          )}
+
+        {row(
+          "思考",
+          <div>
+            <select
+              style={{ ...inp(), width: 220 }}
+              value={think}
+              onChange={(e) => setThink(e.target.value)}
+              title={
+                "思考（Thinking）対応モデルに、答える前の思考を出させます。\n" +
+                "思考は本文と分けて折りたたみ表示するだけで、会話履歴にも MDログにも残りません。\n" +
+                "Ollama は think パラメータで分離。LM Studio / OpenAI互換は、サーバが返す\n" +
+                "reasoning と、本文に混ざる <think>…</think> の両方を拾って分離します。"
+              }
+            >
+              <option value="off">使わない</option>
+              <option value="on">使う</option>
+              <option value="low">使う（浅く）</option>
+              <option value="medium">使う（中）</option>
+              <option value="high">使う（深く）</option>
+            </select>
+            <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginTop: 3 }}>
+              {think === "off"
+                ? "思考型モデルが本文に混ぜてくる <think>…</think> は、この設定に関わらず常に取り除きます"
+                : provider === "ollama"
+                ? "思考対応モデル（gpt-oss / qwen3 / deepseek-r1 等）が必要です。非対応モデルでは無視されます"
+                : "浅さ・深さの指定はサーバ側が解釈しない場合があります（そのときは「使う」と同じ扱い）"}
+            </div>
+          </div>
+        )}
 
         {row(
           "システム\nプロンプト",

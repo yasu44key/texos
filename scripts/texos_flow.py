@@ -240,7 +240,8 @@ class Project:
     def ai(self, label: str, x: float, y: float, *, system: str = "",
            prefix: str | None = None, temperature: float | None = None,
            model: str | None = None, provider: str | None = None,
-           endpoint: str | None = None, memo: str | None = None) -> str:
+           endpoint: str | None = None, gpu: str | None = None,
+           think: str | None = None, memo: str | None = None) -> str:
         """AIフィルタカード（builtin:"ai" transform）。
 
         **通常入力は1本にすること**（複数繋ぐと入力ごとにファンアウトする → cat() で束ねる）。
@@ -249,6 +250,11 @@ class Project:
         `flow(付箋, ai, role="system")` で渡すのが基本形で、そのとき system は空のままでよい
         —— 担当が何者なのかがキャンバスから読めて、その場で直せるため。
         逆に**役割の矢印も system も無い AI カードは指示ゼロ**なので save() が警告する。
+
+        gpu: None（既定・Ollama 任せ＝VRAM に載る層は GPU）| "max"（全層を GPU へ強制）|
+             "cpu"（GPU を使わない）。Ollama ネイティブのみ有効。
+        think: None（既定・思考モード指定なし）| "on" | "low" | "medium" | "high"。
+             transform では思考は出力から必ず取り除かれる（下流のフィルタが食べるため）。
         """
         spec = {"builtin": "ai", "provider": provider or self.provider,
                 "mode": "transform", "model": model or self.model,
@@ -259,6 +265,10 @@ class Project:
             spec["endpoint"] = endpoint
         if prefix:
             spec["prefix"] = prefix
+        if gpu:
+            spec["gpu"] = gpu
+        if think:
+            spec["think"] = think
         return self._filter(label, spec, x, y, memo)
 
     def cat(self, label: str, x: float, y: float, *, separator: str = "rule",

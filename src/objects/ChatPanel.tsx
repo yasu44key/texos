@@ -119,6 +119,10 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
 
   const [history, setHistory] = useState<Msg[]>([]);
   const [streaming, setStreaming] = useState<string | null>(null);
+  // v1.8.6 Thinking: 思考は「表示するだけ」。履歴にも MDログにも残らない（backend が
+  // 本文だけを保存する）ので、ここでもターンが確定したら捨てる＝画面にも残さない。
+  const [thinking, setThinking] = useState<string | null>(null);
+  const [thinkOpen, setThinkOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -173,14 +177,16 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
       if (alive) unlisteners.push(u);
       else u();
     };
-    listen<{ id: string; delta: string }>("ai-chat-token", (e) => {
+    listen<{ id: string; delta: string; thinking?: boolean }>("ai-chat-token", (e) => {
       if (e.payload.id !== objId) return;
-      setStreaming((prev) => (prev ?? "") + e.payload.delta);
+      if (e.payload.thinking) setThinking((prev) => (prev ?? "") + e.payload.delta);
+      else setStreaming((prev) => (prev ?? "") + e.payload.delta);
     }).then(keep);
     listen<{ id: string; error: string | null }>("ai-chat-done", (e) => {
       if (e.payload.id !== objId) return;
       setBusy(false);
       setStreaming(null);
+      setThinking(null); // 思考は残さない（保存もしない）
       jobIdRef.current = null;
       if (e.payload.error) setError(e.payload.error);
       reload();
@@ -201,7 +207,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [history, streaming]);
+  }, [history, streaming, thinking, thinkOpen]);
 
   const send = useCallback(() => {
     const text = input.trim();
@@ -210,11 +216,13 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
     setError(null);
     setBusy(true);
     setStreaming("");
+    setThinking(null);
     setHistory((prev) => [...prev, { role: "user", content: text }]); // 楽観表示
     invoke<string>("ai_chat_send", { id: objId, message: text }).catch((e) => {
       setError(String(e));
       setBusy(false);
       setStreaming(null);
+      setThinking(null);
     });
   }, [input, busy, objId]);
 
@@ -228,6 +236,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
       .then(() => {
         setHistory([]);
         setStreaming(null);
+        setThinking(null);
         setError(null);
       })
       .catch(() => {});
@@ -365,6 +374,14 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
         {history.map((m, i) => (
           <Bubble key={i} role={m.role} content={m.content} />
         ))}
+        {thinking != null && (
+          <ThinkingBox
+            text={thinking}
+            open={thinkOpen}
+            onToggle={() => setThinkOpen((v) => !v)}
+            live={busy && !streaming}
+          />
+        )}
         {streaming != null && <Bubble role="assistant" content={streaming + "▋"} />}
       </div>
 
@@ -423,6 +440,80 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
             "linear-gradient(135deg, transparent 0 50%, #4a6a58 50% 60%, transparent 60% 70%, #4a6a58 70% 80%, transparent 80%)",
         }}
       />
+    </div>
+  );
+}
+
+/// v1.8.6 思考の折りたたみ表示。既定は閉じたまま（本文の邪魔をしない）で、
+/// 生成中は最後の一行だけを覗かせて「止まっていない」ことを示す。
+/// 会話が確定すると親が捨てるので、この箱はそのターンの間しか存在しない。
+function ThinkingBox({
+  text,
+  open,
+  onToggle,
+  live,
+}: {
+  text: string;
+  open: boolean;
+  onToggle: () => void;
+  live: boolean;
+}) {
+  const lastLine = text.trimEnd().split("\n").pop() ?? "";
+  return (
+    <div
+      style={{
+        border: "1px dashed var(--panel-border, #3a5a68)",
+        borderRadius: 8,
+        background: "var(--panel-header-bg, #121c22)",
+        fontSize: 12,
+        color: "var(--panel-muted, #8fb0ca)",
+      }}
+    >
+      <div
+        onClick={onToggle}
+        title="モデルの思考（表示のみ — 会話履歴にもログにも保存されません）"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          padding: "4px 8px",
+          cursor: "pointer",
+          userSelect: "none",
+        }}
+      >
+        <span>{open ? "▼" : "▶"}</span>
+        <span>💭 思考{live ? "中…" : ""}</span>
+        {!open && (
+          <span
+            style={{
+              flex: 1,
+              minWidth: 0,
+              opacity: 0.7,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {lastLine}
+          </span>
+        )}
+      </div>
+      {open && (
+        <div
+          style={{
+            padding: "0 8px 6px",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            lineHeight: 1.5,
+            maxHeight: 180,
+            overflowY: "auto",
+            userSelect: "text",
+            WebkitUserSelect: "text",
+          }}
+        >
+          {text}
+        </div>
+      )}
     </div>
   );
 }

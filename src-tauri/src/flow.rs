@@ -133,6 +133,21 @@ pub struct FilterSpec {
     /// 同名カードでもログが衝突しない。
     #[serde(default)]
     pub log_name: Option<String>,
+    /// v1.8.6 AI: GPU の使い方。"auto"（既定・キー無し＝サーバ任せ）|
+    /// "max"（全層を GPU へ強制＝Ollama options.num_gpu=999。VRAM に載らなければ
+    /// Ollama 側がロードに失敗するので、載る自信があるときだけ）|
+    /// "cpu"（GPU を使わない＝num_gpu=0）。
+    /// Ollama ネイティブ経路のみ有効 — OpenAI互換API に層割り当ての標準パラメータは無く、
+    /// LM Studio 等はサーバ側の設定で決まる。
+    #[serde(default)]
+    pub gpu: Option<String>,
+    /// v1.8.6 AI: Thinking（思考）モード。"off"（既定・キー無し）| "on" |
+    /// "low" | "medium" | "high"（レベルを解釈できないモデルでは on 相当に丸められる）。
+    /// Ollama は /api/chat の think へ渡し、思考は message.thinking で分けて届く。
+    /// OpenAI互換はサーバによって delta.reasoning_content で来るか本文に
+    /// <think>…</think> で混ざるかが分かれるため、両方を受けて分離する。
+    #[serde(default)]
+    pub think: Option<String>,
     /// v1.4.9 録音モード（ジェネレータ）: true なら stdin をパイプで開いたまま起動し、
     /// 子プロセスへ制御文字列（ffmpeg の 'q' 等）を送れるようにする（汎用 stdin チャネル）。
     /// 録音は自分で終わらない（-t 不要）ので「停止」で 'q' を送って正常終了させ WAV を確定する。
@@ -1019,6 +1034,167 @@ pub fn dshow_audio_device(cmd: &str) -> Option<String> {
     c.get(1).or_else(|| c.get(2)).map(|m| m.as_str().to_string())
 }
 
+// --- v1.8.6 GPU の使い方と Thinking（思考）モード ----------------------------------
+// 方針: 「載るなら GPU」を既定にする（VRAM 量での CPU 転落はしない — 溢れた層は
+// Ollama が自動で CPU へ逃がすので、少 VRAM でも GPU を使った方が速い）。明示指定が
+// 要るのは (a) 全層 GPU を強制したい（max）、(b) 意図的に GPU を空けたい（cpu）の2つだけ。
+//
+// Thinking は「本文と思考を混ぜない」ことが本体。届き方が3系統あるので全部受ける:
+//   1. Ollama ネイティブ ... /api/chat に think を渡すと message.thinking で分かれて来る
+//   2. OpenAI互換 ......... delta.reasoning_content / delta.reasoning（LM Studio 等）
+//   3. どちらでもない ..... 本文に <think>…</think> がそのまま混ざる（タグ分離が要る）
+
+/// spec.gpu → Ollama の options.num_gpu（None＝キーを送らない＝サーバ任せ）。
+pub(crate) fn ollama_num_gpu(spec: &FilterSpec) -> Option<i64> {
+    match spec.gpu.as_deref().map(str::trim).unwrap_or("") {
+        // 999 = 「全部の層」。Ollama は層数を超える値をクランプするので実質「最大限」。
+        "max" => Some(999),
+        "cpu" => Some(0),
+        _ => None, // "auto" / "" / 未知の値＝サーバ任せ（＝載る限り GPU）
+    }
+}
+
+/// spec.think → /api/chat の think に載せる値（None＝キーを送らない）。
+pub(crate) fn ollama_think(spec: &FilterSpec) -> Option<serde_json::Value> {
+    match spec.think.as_deref().map(str::trim).unwrap_or("") {
+        "" | "off" | "false" => None,
+        "on" | "true" => Some(serde_json::json!(true)),
+        // レベル指定はそのまま渡す（解さないモデル・サーバでは true 相当に丸められる）。
+        "low" => Some(serde_json::json!("low")),
+        "medium" => Some(serde_json::json!("medium")),
+        "high" => Some(serde_json::json!("high")),
+        _ => None,
+    }
+}
+
+/// v1.8.6 ストリーム断片の種別。本文と思考を取り違えないための区別で、
+/// Thinking は表示のみ（履歴にもログにも残さない）＝呼び出し側が捨てられるようにする。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChatChunk {
+    /// 会話本文。履歴に積まれる。
+    Content,
+    /// 思考。表示するだけで保存しない。
+    Thinking,
+}
+
+/// 思考タグ。`<think>` が主流だが `<thinking>` を出すモデルもある。
+const THINK_OPEN: [&str; 2] = ["<think>", "<thinking>"];
+const THINK_CLOSE: [&str; 2] = ["</think>", "</thinking>"];
+
+/// 本文に混ざる `<think>…</think>` を切り分ける状態機械。
+///
+/// ストリームは任意の位置で切れる（"<thi" / "nk>" のようにタグが割れて届く）ので、
+/// タグの書きかけになり得る末尾は確定させずに保留し、次のチャンクと繋いでから判定する。
+/// これをやらないと、割れたタグが本文としてそのまま画面に出る。
+pub(crate) struct ThinkSplitter {
+    inside: bool,
+    pending: String,
+}
+
+impl ThinkSplitter {
+    pub(crate) fn new() -> Self {
+        Self {
+            inside: false,
+            pending: String::new(),
+        }
+    }
+
+    /// チャンクを与え、確定した断片を (種別, テキスト) の順で返す。
+    pub(crate) fn push(&mut self, chunk: &str) -> Vec<(ChatChunk, String)> {
+        self.pending.push_str(chunk);
+        let mut out = Vec::new();
+        loop {
+            let tags = if self.inside { THINK_CLOSE } else { THINK_OPEN };
+            // 最も手前に現れるタグを採る（"<think>" と "<thinking>" は前者が先に一致する
+            // ので、位置が同じなら長い方＝"<thinking>" を優先して消す）。
+            let hit = tags
+                .iter()
+                .filter_map(|t| self.pending.find(*t).map(|i| (i, t.len())))
+                .min_by_key(|(i, len)| (*i, std::cmp::Reverse(*len)));
+            match hit {
+                Some((i, len)) => {
+                    if i > 0 {
+                        out.push((self.kind(), self.pending[..i].to_string()));
+                    }
+                    self.pending = self.pending[i + len..].to_string();
+                    self.inside = !self.inside;
+                }
+                None => {
+                    // タグの書きかけが末尾にあれば次チャンクまで持ち越す。
+                    let keep = partial_tag_len(&self.pending, &tags);
+                    let cut = self.pending.len() - keep;
+                    if cut > 0 {
+                        let head = self.pending[..cut].to_string();
+                        self.pending = self.pending[cut..].to_string();
+                        out.push((self.kind(), head));
+                    }
+                    break;
+                }
+            }
+        }
+        out.retain(|(_, t)| !t.is_empty());
+        out
+    }
+
+    /// ストリーム終了時。保留中の端切れ（未完のタグ等）を吐き出す。
+    pub(crate) fn flush(&mut self) -> Option<(ChatChunk, String)> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let t = std::mem::take(&mut self.pending);
+        Some((self.kind(), t))
+    }
+
+    fn kind(&self) -> ChatChunk {
+        if self.inside {
+            ChatChunk::Thinking
+        } else {
+            ChatChunk::Content
+        }
+    }
+}
+
+/// 末尾が tags のいずれかの「途中まで」になっている長さ（0＝書きかけ無し）。
+fn partial_tag_len(s: &str, tags: &[&str; 2]) -> usize {
+    let max = tags.iter().map(|t| t.len()).max().unwrap_or(0);
+    let n = s.len();
+    // 完全一致は find 済みなので、見るのは「最長タグ-1」文字まで（ここを含める —
+    // 含め損ねると "<think" のような 6 文字の書きかけを保留できず本文へ漏れる）。
+    for k in (1..=max.saturating_sub(1).min(n)).rev() {
+        let start = n - k;
+        if !s.is_char_boundary(start) {
+            continue;
+        }
+        let tail = &s[start..];
+        if tags.iter().any(|t| t.starts_with(tail)) {
+            return k;
+        }
+    }
+    0
+}
+
+/// 非ストリーム応答から思考を落として本文だけにする（変換モード用）。
+/// 変換カードの出力は下流のフィルタが食べるので、思考が混ざると壊れる。
+pub(crate) fn strip_think_blocks(text: &str) -> String {
+    let mut sp = ThinkSplitter::new();
+    let mut out = String::new();
+    let mut removed = false;
+    let mut chunks = sp.push(text);
+    chunks.extend(sp.flush());
+    for (kind, t) in chunks {
+        match kind {
+            ChatChunk::Content => out.push_str(&t),
+            ChatChunk::Thinking => removed = true,
+        }
+    }
+    if !removed {
+        // タグが無かった＝何も削っていない。既存の出力（前後の空白含む）を変えない。
+        return text.to_string();
+    }
+    // 思考ブロックの前後に残る空白（"…</think>\n\n本文"）を落とす。
+    out.trim().to_string()
+}
+
 pub fn run_ai(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, String), String> {
     std::thread::scope(|s| {
         s.spawn(|| run_ai_blocking(spec, input))
@@ -1102,7 +1278,11 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
         if let Some(t) = spec.temperature {
             options.insert("temperature".into(), serde_json::json!(t));
         }
-        let body = serde_json::json!({
+        // v1.8.6 GPU の使い方（既定＝キー無し＝載る限り GPU）。
+        if let Some(n) = ollama_num_gpu(spec) {
+            options.insert("num_gpu".into(), serde_json::json!(n));
+        }
+        let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": false,
@@ -1110,6 +1290,12 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
             "keep_alive": "5m",
             "options": serde_json::Value::Object(options),
         });
+        // v1.8.6 Thinking。変換モードでは思考を捨てるので、本来 think は不要だが、
+        // 思考型モデルは think を渡さないと本文に <think> を混ぜてくる方が多い。
+        // 明示的に分離させたうえで message.thinking を読み捨てるのが確実。
+        if let Some(t) = ollama_think(spec) {
+            body["think"] = t;
+        }
         let resp = client
             .post(format!("{endpoint}/api/chat"))
             .json(&body)
@@ -1129,6 +1315,10 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
             .ok_or("AI応答に content がありません")?
             .to_string()
     };
+
+    // v1.8.6 変換カードの出力は下流のフィルタが食べる → 思考は必ず落とす。
+    // think を解さないサーバや、think を無視して本文に混ぜるモデルへの保険でもある。
+    let content = strip_think_blocks(&content);
 
     Ok((content.into_bytes(), "md".into(), "text/markdown".into()))
 }
@@ -1353,15 +1543,36 @@ fn run_t23d_blocking(spec: &FilterSpec, image: &[u8]) -> Result<(Vec<u8>, String
     Ok((bytes, "glb".into(), "model/gltf-binary".into()))
 }
 
+/// 本文として届いた断片をタグ分離に通し、確定分を配信・累積する。
+/// サーバが思考を分けてくれる場合でも通す — 分けてくれない場合との分岐を増やさないため、
+/// そして think を無視して本文に <think> を混ぜるモデルが実在するため。
+fn emit_content(
+    raw: &str,
+    sp: &mut ThinkSplitter,
+    full: &mut String,
+    on_token: &mut dyn FnMut(ChatChunk, &str),
+) {
+    for (kind, t) in sp.push(raw) {
+        if kind == ChatChunk::Content {
+            full.push_str(&t);
+        }
+        on_token(kind, &t);
+    }
+}
+
 /// v1.4.1 チャット: ストリーミング応答。messages は system を含む会話履歴全体。
 /// on_token はトークン断片ごとに呼ばれる（UIへ逐次表示する）。完成した本文を返す。
 /// 呼び出し側は tokio 文脈外の素のOSスレッドで実行すること（run_ai と同じ理由 —
 /// reqwest::blocking の内部ランタイム drop パニックを避ける）。cancel で途中停止。
+///
+/// v1.8.6 Thinking: on_token は断片の種別（ChatChunk::Content / Thinking）を受け取る。
+/// 戻り値の本文には **思考は含まれない** — 思考は表示だけして履歴にもログにも残さない、
+/// という方針（コンテキストを食わせない・次ターンへ送らない）をここで保証する。
 pub fn run_ai_chat_stream(
     spec: &FilterSpec,
     messages: &[serde_json::Value],
     cancel: &std::sync::atomic::AtomicBool,
-    on_token: &mut dyn FnMut(&str),
+    on_token: &mut dyn FnMut(ChatChunk, &str),
 ) -> Result<String, String> {
     use std::io::BufRead;
     use std::sync::atomic::Ordering;
@@ -1376,6 +1587,8 @@ pub fn run_ai_chat_stream(
     let client = gen_client(spec.timeout_secs)?;
 
     let mut full = String::new();
+    // 本文に混ざる <think>…</think> の分離器（チャンク境界で割れても落とさない）。
+    let mut sp = ThinkSplitter::new();
     if is_openai_compat(provider) {
         // OpenAI準拠: SSE（"data: {...}" 行、終端は [DONE]）
         let endpoint = spec
@@ -1412,9 +1625,21 @@ pub fn run_ai_chat_stream(
                 break;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(tok) = v["choices"][0]["delta"]["content"].as_str() {
-                    full.push_str(tok);
-                    on_token(tok);
+                let delta = &v["choices"][0]["delta"];
+                // v1.8.6 思考を別フィールドで返すサーバ（LM Studio 等）。キー名は
+                // reasoning_content / reasoning の二派があるので両方見る。
+                if let Some(th) = delta["reasoning_content"]
+                    .as_str()
+                    .or_else(|| delta["reasoning"].as_str())
+                {
+                    if !th.is_empty() {
+                        on_token(ChatChunk::Thinking, th);
+                    }
+                }
+                if let Some(tok) = delta["content"].as_str() {
+                    if !tok.is_empty() {
+                        emit_content(tok, &mut sp, &mut full, on_token);
+                    }
                 }
             }
         }
@@ -1431,10 +1656,18 @@ pub fn run_ai_chat_stream(
         if let Some(t) = spec.temperature {
             options.insert("temperature".into(), serde_json::json!(t));
         }
-        let body = serde_json::json!({
+        // v1.8.6 GPU の使い方（既定＝キー無し＝載る限り GPU）。
+        if let Some(n) = ollama_num_gpu(spec) {
+            options.insert("num_gpu".into(), serde_json::json!(n));
+        }
+        let mut body = serde_json::json!({
             "model": model, "messages": messages, "stream": true,
             "keep_alive": "5m", "options": serde_json::Value::Object(options),
         });
+        // v1.8.6 Thinking。think を付けると思考が message.thinking に分かれて届く。
+        if let Some(t) = ollama_think(spec) {
+            body["think"] = t;
+        }
         let resp = client
             .post(format!("{endpoint}/api/chat"))
             .json(&body)
@@ -1456,10 +1689,15 @@ pub fn run_ai_chat_stream(
                 if let Some(err) = v["error"].as_str() {
                     return Err(format!("AI APIエラー: {err}"));
                 }
+                // v1.8.6 思考は message.thinking に分かれて来る（think 指定時）。
+                if let Some(th) = v["message"]["thinking"].as_str() {
+                    if !th.is_empty() {
+                        on_token(ChatChunk::Thinking, th);
+                    }
+                }
                 if let Some(tok) = v["message"]["content"].as_str() {
                     if !tok.is_empty() {
-                        full.push_str(tok);
-                        on_token(tok);
+                        emit_content(tok, &mut sp, &mut full, on_token);
                     }
                 }
                 if v["done"].as_bool().unwrap_or(false) {
@@ -1467,6 +1705,13 @@ pub fn run_ai_chat_stream(
                 }
             }
         }
+    }
+    // 保留中の端切れ（未完のタグ・中断時の書きかけ）を取りこぼさない。
+    if let Some((kind, t)) = sp.flush() {
+        if kind == ChatChunk::Content {
+            full.push_str(&t);
+        }
+        on_token(kind, &t);
     }
     Ok(full)
 }
@@ -2033,7 +2278,7 @@ mod tests {
         let msgs = vec![serde_json::json!({ "role": "user", "content": "日本の首都は？" })];
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut toks = 0usize;
-        let full = run_ai_chat_stream(&s, &msgs, &cancel, &mut |_| toks += 1).unwrap();
+        let full = run_ai_chat_stream(&s, &msgs, &cancel, &mut |_, _| toks += 1).unwrap();
         assert!(!full.trim().is_empty(), "ストリームが空だった");
         assert!(toks > 0, "トークンが1つも配信されなかった");
         eprintln!("AI応答(ストリーム/{toks}トークン): {full}");
@@ -2075,15 +2320,118 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut tokens = 0usize;
         let mut acc = String::new();
-        let full = run_ai_chat_stream(&s, &msgs, &cancel, &mut |t| {
-            tokens += 1;
-            acc.push_str(t);
+        let full = run_ai_chat_stream(&s, &msgs, &cancel, &mut |kind, t| {
+            // 戻り値の本文は Content だけ＝ここも Content だけ積めば一致するはず。
+            if kind == ChatChunk::Content {
+                tokens += 1;
+                acc.push_str(t);
+            }
         })
         .unwrap();
         eprintln!("tokens={tokens} full={full}");
         assert!(tokens > 1, "ストリームが断片で届いていない (tokens={tokens})");
         assert_eq!(full, acc, "返却本文と逐次累積が一致");
         assert!(!full.trim().is_empty());
+    }
+
+    // --- v1.8.6 Thinking: <think> 分離の状態機械 -------------------------------
+
+    /// 1文字ずつ流し込む（最悪のチャンク分割）ヘルパ。タグが必ず割れる。
+    fn split_by_chars(text: &str) -> (String, String) {
+        let mut sp = ThinkSplitter::new();
+        let (mut content, mut thinking) = (String::new(), String::new());
+        let mut chunks: Vec<(ChatChunk, String)> = Vec::new();
+        let mut buf = [0u8; 4];
+        for ch in text.chars() {
+            chunks.extend(sp.push(ch.encode_utf8(&mut buf)));
+        }
+        chunks.extend(sp.flush());
+        for (k, t) in chunks {
+            match k {
+                ChatChunk::Content => content.push_str(&t),
+                ChatChunk::Thinking => thinking.push_str(&t),
+            }
+        }
+        (content, thinking)
+    }
+
+    #[test]
+    fn think_splitter_separates_content_and_thinking() {
+        let mut sp = ThinkSplitter::new();
+        let mut got: Vec<(ChatChunk, String)> = Vec::new();
+        got.extend(sp.push("前<think>考え中</think>後"));
+        got.extend(sp.flush());
+        let content: String = got
+            .iter()
+            .filter(|(k, _)| *k == ChatChunk::Content)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        let thinking: String = got
+            .iter()
+            .filter(|(k, _)| *k == ChatChunk::Thinking)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(content, "前後");
+        assert_eq!(thinking, "考え中");
+    }
+
+    #[test]
+    fn think_splitter_survives_tags_split_across_chunks() {
+        // ストリームは任意の位置で切れる。1文字ずつでも結果が変わらないこと。
+        let (content, thinking) = split_by_chars("A<think>秘密</think>B");
+        assert_eq!(content, "AB", "割れたタグが本文に漏れた");
+        assert_eq!(thinking, "秘密");
+
+        // <thinking> 表記も同じに扱う。
+        let (content, thinking) = split_by_chars("<thinking>t</thinking>本文");
+        assert_eq!(content, "本文");
+        assert_eq!(thinking, "t");
+    }
+
+    #[test]
+    fn think_splitter_keeps_plain_text_untouched() {
+        // タグが無ければ 1 文字も変えない（"<" を含む本文も壊さない）。
+        let src = "a < b && c<d です\n<html>タグの話</html>";
+        let (content, thinking) = split_by_chars(src);
+        assert_eq!(content, src);
+        assert!(thinking.is_empty());
+    }
+
+    #[test]
+    fn think_splitter_handles_unclosed_tag_at_eos() {
+        // 中断・打ち切りで </think> が来ないまま終わっても、保留分を落とさない。
+        let (content, thinking) = split_by_chars("本文<think>途中で");
+        assert_eq!(content, "本文");
+        assert_eq!(thinking, "途中で");
+    }
+
+    #[test]
+    fn strip_think_blocks_removes_only_when_present() {
+        assert_eq!(strip_think_blocks("<think>xy</think>答え"), "答え");
+        // タグが無いときは trim もしない＝既存の変換出力を変えない。
+        assert_eq!(strip_think_blocks("  答え\n"), "  答え\n");
+    }
+
+    #[test]
+    fn gpu_and_think_options_map_to_ollama_params() {
+        let auto = spec(r#"{"builtin":"ai","model":"m"}"#);
+        assert_eq!(ollama_num_gpu(&auto), None, "既定はサーバ任せ＝キーを送らない");
+        assert_eq!(ollama_think(&auto), None);
+
+        let max = spec(r#"{"builtin":"ai","model":"m","gpu":"max"}"#);
+        assert_eq!(ollama_num_gpu(&max), Some(999));
+
+        let cpu = spec(r#"{"builtin":"ai","model":"m","gpu":"cpu"}"#);
+        assert_eq!(ollama_num_gpu(&cpu), Some(0));
+
+        let on = spec(r#"{"builtin":"ai","model":"m","think":"on"}"#);
+        assert_eq!(ollama_think(&on), Some(serde_json::json!(true)));
+
+        let high = spec(r#"{"builtin":"ai","model":"m","think":"high"}"#);
+        assert_eq!(ollama_think(&high), Some(serde_json::json!("high")));
+
+        let off = spec(r#"{"builtin":"ai","model":"m","think":"off"}"#);
+        assert_eq!(ollama_think(&off), None);
     }
 
     #[test]

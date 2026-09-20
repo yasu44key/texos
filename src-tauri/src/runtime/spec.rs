@@ -96,7 +96,13 @@ pub(crate) fn detect_ram_mb() -> u64 {
 /// GPU（VRAM）から t2i 推奨構成を決める。値は「実測で調整」の初期値（WS3 推奨テーブル）。
 /// - NVIDIA VRAM ≥ 12GB: cu124 / 重いモデルも可
 /// - NVIDIA VRAM 6〜12GB: cu124 / SD1.5 fp16 が快適
-/// - NVIDIA VRAM < 6GB もしくは GPU なし: cpu / SD1.5（低ステップ）＝確実に動く
+/// - NVIDIA VRAM < 6GB: cu124 / SD1.5 の低解像度・低ステップから
+/// - GPU なし: cpu（唯一の CPU 分岐）
+///
+/// v1.8.6 方針転換: 旧実装は VRAM 6GB 未満を CPU 構成にしていたが、4GB 級でも
+/// SD1.5 fp16（~2GB）は GPU の方が桁違いに速い。attention slicing / VAE slicing で
+/// 収まる範囲は広く、溢れた場合も CPU オフロードで動く。「確実に動く」を CPU で
+/// 買うのは代償が大きすぎるため、GPU があれば常に GPU を使う。
 fn recommend(gpu: &Option<GpuInfo>) -> (String, String, bool, String, String) {
     // 返り値: (tier, torch_index, cuda, recommended_model, note)
     match gpu {
@@ -116,10 +122,10 @@ fn recommend(gpu: &Option<GpuInfo>) -> (String, String, bool, String, String) {
         ),
         Some(_) => (
             "NVIDIA GPU・VRAM 6GB未満".into(),
-            TORCH_INDEX_CPU.into(),
-            false,
+            TORCH_INDEX_CU124.into(),
+            true,
             "sd1.5".into(),
-            "VRAM が少なめのため、確実に動く CPU 構成を既定にします。SD1.5 の低ステップ生成を推奨します。".into(),
+            "VRAM は少なめですが GPU を使います（CPU より速い）。SD1.5 を 512px・低ステップから試してください。メモリ不足で落ちる場合は解像度かステップを下げます。".into(),
         ),
         None => (
             "GPU なし（CPU 動作）".into(),
@@ -138,12 +144,18 @@ fn ollama_hint(ram_mb: u64, gpu: &Option<GpuInfo>) -> String {
     if ram_mb == 0 && gpu.is_none() {
         return String::new(); // 何も取れなければ提示しない
     }
-    if budget >= 16_000 {
-        "gemma3:12b など大きめのモデルも動かせます。".into()
+    // v1.8.6: GPU があるなら「載る限り GPU」が既定（AIカードの GPU 欄＝自動）。
+    // VRAM に収まらない層は Ollama が自動で CPU へ逃がすので、少 VRAM でも GPU は効く。
+    let size = if budget >= 16_000 {
+        "gemma3:12b など大きめのモデルも動かせます。"
     } else if budget >= 8_000 {
-        "gemma3:4b（既定）が快適。余裕があれば gemma3:12b も試せます。".into()
+        "gemma3:4b（既定）が快適。余裕があれば gemma3:12b も試せます。"
     } else {
-        "gemma3:4b（既定・軽量）を推奨します。".into()
+        "gemma3:4b（既定・軽量）を推奨します。"
+    };
+    match gpu {
+        Some(_) => format!("{size} GPU に載る分は自動で GPU が使われます。"),
+        None => format!("{size} GPU が無いため CPU 実行です（応答は遅めになります）。"),
     }
 }
 
