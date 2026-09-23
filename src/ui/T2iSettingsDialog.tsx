@@ -145,6 +145,8 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
       // インラインパネルが保存した追加プロンプトを消さない（編集はパネル側）。
       prompt: init.prompt || undefined,
     };
+    // v1.8.7 途中出力スイッチ（右クリックで切り替える）はこのダイアログの外の設定なので温存。
+    if ((init as unknown as Record<string, unknown>).emit_mid === "on") (spec as unknown as Record<string, unknown>).emit_mid = "on";
     onSave(label.trim() || "画像生成", JSON.stringify(spec));
   };
 

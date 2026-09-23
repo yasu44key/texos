@@ -15,7 +15,7 @@ const DocPreview = lazy(() =>
 const GlbPreview = lazy(() =>
   import("./GlbPreview").then((m) => ({ default: m.GlbPreview }))
 );
-import { isTextMime } from "../model";
+import { isTextMime, type RunAlert } from "../model";
 
 // Fixed card geometry so link endpoints are predictable from (x, y) alone.
 export const CARD_W = 150;
@@ -42,6 +42,10 @@ interface Props {
   isUrl?: boolean;
   /** v1.7 P2 更新マーク: URLカードの「更新を確認」で内容の変化が検出された（強制反映なし） */
   webUpdate?: boolean;
+  /** v1.8.7 カードの色でのお知らせ（前回の実行で失敗／後段で失敗）。null = 何もなし。 */
+  runAlert?: RunAlert | null;
+  /** v1.8.7 エラー印のクリックで実行ログを開く。 */
+  onShowTrace?: (id: string, label: string) => void;
   /** this card is a link to an OS folder */
   isFolder?: boolean;
   /** v1.4 オートフロー: this card is a filter (pipeline processor) */
@@ -261,6 +265,18 @@ function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_
   return "filter";
 }
 
+// v1.8.7 カードの色でのお知らせ。
+const ALERT_COLOR: Record<"error" | "warn", string> = { error: "#d9534f", warn: "#e0a040" };
+
+// v1.8.7: 途中出力スイッチ（emit_mid）が入っているか（面に小さな印を出す）。
+function emitMidOf(ref: string | null | undefined): boolean {
+  try {
+    return JSON.parse(ref ?? "{}").emit_mid === "on";
+  } catch {
+    return false;
+  }
+}
+
 // v1.5.5: op カード（タイマ/ウォッチャ）の一時停止状態。キー無し=稼働（後方互換）。
 function opPausedOf(ref: string | null | undefined): boolean {
   try {
@@ -314,6 +330,8 @@ export function ObjectCard({
   zIndex = 0, selected = false, onToggleSelect, onCtrlClone, onSelectConnected, onSelect, onGroupDragStart,
   onMoveEnd, onDragLive, onStartLink, onDragOut, onOpen, onRenameTitle, onCollapse, onAfterSave, onRequestEdit, onRunFlow,
   onToggleOpPause,
+  runAlert = null,
+  onShowTrace,
   showHints = true,
 }: Props) {
   const ftype = filterTypeOf(filterRef);
@@ -597,7 +615,10 @@ export function ObjectCard({
           : isLauncher
           ? "var(--card-bg-launcher, #14241c)"
           : "var(--card-bg, #111120)",
-        border: `1px ${isDrop ? "dashed" : "solid"} ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? fstyle.border : isDrop ? "#4a90d9" : isLauncher ? "#2f6a4a" : status.border}`,
+        // v1.8.7: 前回の実行で失敗したカードは枠を赤（エラー）／琥珀（後段で失敗）に。
+        border: runAlert
+          ? `2px solid ${ALERT_COLOR[runAlert.level]}`
+          : `1px ${isDrop ? "dashed" : "solid"} ${isUrl ? "#2f5a7a" : isProject ? "#5a4d7a" : isFolder ? "#7a6a3a" : isFilter ? fstyle.border : isDrop ? "#4a90d9" : isLauncher ? "#2f6a4a" : status.border}`,
         outline: selected ? "2px solid var(--accent, #4a90d9)" : "none",
         outlineOffset: 1,
         borderRadius: 10,
@@ -607,7 +628,9 @@ export function ObjectCard({
         color: "var(--card-text, #d0d8e8)",
         fontSize: 11,
         fontFamily: "sans-serif",
-        boxShadow: "var(--card-shadow, 0 2px 16px #00000080)",
+        boxShadow: runAlert
+          ? `0 0 14px ${ALERT_COLOR[runAlert.level]}88, var(--card-shadow, 0 2px 16px #00000080)`
+          : "var(--card-shadow, 0 2px 16px #00000080)",
         cursor: "default", // ホバーは矢印のまま。手のひらはドラッグ中だけ（G5）
         willChange: "transform",
       }}
@@ -633,6 +656,40 @@ export function ObjectCard({
           : `${mimeType}\nid: ${id}${memo ? `\n\n${memo}` : ""}`
       }
     >
+      {/* v1.8.7 カードの色でのお知らせ: 前回の実行で失敗したカードの上辺に印。ホバーで理由、
+          クリックで実行ログ。次の実行で上書きされる（直して再実行すれば消える）。 */}
+      {runAlert && (
+        <div
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onShowTrace?.(id, label);
+          }}
+          title={`${runAlert.level === "error" ? "前回の実行でエラー" : "前回の実行で注意"}\n${runAlert.message}\n\nクリックで実行ログを開く`}
+          style={{
+            position: "absolute",
+            top: -11,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 3,
+            maxWidth: "92%",
+            padding: "1px 8px",
+            borderRadius: 9,
+            background: runAlert.level === "error" ? "#5a1f1f" : "#5a4318",
+            border: `1px solid ${ALERT_COLOR[runAlert.level]}`,
+            color: runAlert.level === "error" ? "#ffb3b0" : "#ffd89a",
+            fontSize: 9.5,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            cursor: "pointer",
+          }}
+        >
+          {runAlert.level === "error" ? "✗ " : "⚠ "}
+          {runAlert.message.split("\n")[0]}
+        </div>
+      )}
       {/* inner content clipped to rounded card */}
       <div style={{
         position: "absolute",
@@ -724,6 +781,11 @@ export function ObjectCard({
             {isFilter && (
               <span style={{ fontSize: 9, color: fstyle.text }}>
                 {isAiChat ? "🤖 AI対話" : fstyle.badge}
+                {emitMidOf(filterRef) && (
+                  <span title="途中の出力もキャンバスに出す（右クリックで切替）" style={{ marginLeft: 4, color: "#e0c068" }}>
+                    ⤓出力
+                  </span>
+                )}
               </span>
             )}
             {/* v1.3.9: 実行は明示ボタンで（ダブルクリックは設定）。誤爆を防ぐ。

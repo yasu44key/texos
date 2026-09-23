@@ -32,6 +32,31 @@ export interface VirtualBodyInfo {
   window_of: string | null;
   /** v1.7 取得メタ JSON: 取得実身={source_url,fetched_at,…}／URLカード={checked_at,update} */
   web_meta: string | null;
+  /** v1.5.3 構造化実行記録 {at, exit, ok, nodata, skipped, message, warning?}（v1.8.7 から表示に使う） */
+  last_run?: string | null;
+}
+
+/** v1.8.7 カードの色でのお知らせ: 前回の実行で何かあったか。
+ *  error = そのカードの実行が失敗／実行そのものが止まった、warn = 実行は成功したが後段
+ *  （キャンバスへの着地など）で失敗した。何もなければ null。次の実行で上書きされる。 */
+export interface RunAlert {
+  level: "error" | "warn";
+  message: string;
+  at: number;
+}
+export function runAlertOf(o: { last_run?: string | null }): RunAlert | null {
+  if (!o.last_run) return null;
+  try {
+    const r = JSON.parse(o.last_run);
+    const at = typeof r.at === "number" ? r.at : 0;
+    if (r.ok === false) {
+      return { level: "error", message: typeof r.message === "string" && r.message ? r.message : "実行に失敗しました", at };
+    }
+    if (typeof r.warning === "string" && r.warning) return { level: "warn", message: r.warning, at };
+  } catch {
+    /* 壊れた記録は無視 */
+  }
+  return null;
 }
 
 export interface NoteInfo {

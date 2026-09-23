@@ -15,6 +15,7 @@ import { FilterDialog } from "./ui/FilterDialog";
 import { BuiltinFilterDialog, hasBuiltinSchema } from "./ui/BuiltinFilterDialog";
 import { ShellSettingsDialog } from "./ui/ShellSettingsDialog";
 import { ShellOutputDialog } from "./ui/ShellOutputDialog";
+import { TraceDialog, type CardTrace } from "./ui/TraceDialog";
 import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
 import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
@@ -79,6 +80,7 @@ import {
   noteSize,
   shapeCenterOn,
   webUpdateOf,
+  runAlertOf,
   type NoteInfo,
   type VirtualBodyInfo,
 } from "./model";
@@ -163,6 +165,17 @@ function App() {
   const [showReqArrows, setShowReqArrows] = useState<boolean>(
     () => localStorage.getItem("texos-show-req") !== "0"
   );
+  // v1.8.7 実行トレース: デバッグモード（実行ログに入出力の中身・stderr まで記録。既定オフ・永続化）。
+  // バックエンドはジョブ開始時点の値を使うので、変更のたびに送っておく。
+  const [debugTrace, setDebugTrace] = useState<boolean>(
+    () => localStorage.getItem("texos-debug-trace") === "1"
+  );
+  useEffect(() => {
+    void invoke("set_trace_detail", { on: debugTrace }).catch(() => {});
+  }, [debugTrace]);
+
+  // v1.8.7: カードの実行ログダイアログ（trace=null は「まだ記録なし」）。
+  const [traceDlg, setTraceDlg] = useState<{ label: string; trace: CardTrace | null } | null>(null);
   const [newNoteId, setNewNoteId] = useState<string | null>(null);
   const [relations, setRelations] = useState<RelationInfo[]>([]);
   const [linkDrag, setLinkDrag] = useState<LinkDrag | null>(null);
@@ -510,7 +523,8 @@ function App() {
         setJobs((prev) => prev.filter((j) => j.id !== e.payload.job_id));
         // v1.5.4 WS-P2: タイマ/ウォッチャ発の背景フローは完了ダイアログを出さないので、
         // 完了時にキャンバスを更新して結果カードを見せる（手動実行の refresh と重なっても無害）。
-        if (ev === "job:done") void refresh();
+        // v1.8.7: 失敗（job:failed）でも読み直す — 終端カードに付いたエラーの色を見せるため。
+        void refresh();
       }).then((u) => (alive ? uns.push(u) : u()));
     }
     // 復元（リロード時など。started_at はバックエンドの unix ms をそのまま使う）。
@@ -5622,6 +5636,23 @@ function App() {
     }
   }, [notes, pushUndo, refresh]);
 
+  // v1.8.7: カードの実行ログを開く（右クリック・カード面のエラー印の両方から）。
+  const handleShowTrace = useCallback((id: string, label: string) => {
+    void invoke<string | null>("get_card_trace", { id })
+      .then((raw) => {
+        let trace: CardTrace | null = null;
+        if (raw) {
+          try {
+            trace = JSON.parse(raw) as CardTrace;
+          } catch {
+            trace = null;
+          }
+        }
+        setTraceDlg({ label, trace });
+      })
+      .catch(() => setTraceDlg({ label, trace: null }));
+  }, []);
+
   const handleContextMenu = useCallback(
     (info: { clientX: number; clientY: number; canvasX: number; canvasY: number }) => {
       const el = document.elementFromPoint(info.clientX, info.clientY);
@@ -5707,6 +5738,35 @@ function App() {
           setShowMenuHints((v) => {
             const nv = !v;
             localStorage.setItem("texos-menu-hints", nv ? "1" : "0");
+            return nv;
+          }),
+        // v1.8.7 実行トレース
+        showTrace: handleShowTrace,
+        // v1.8.7 途中出力スイッチ（emit_mid）。未知キーを温存したまま1キーだけ切り替える。
+        toggleEmitMid: (id: string, currentSpec: string) => {
+          let s: Record<string, unknown>;
+          try {
+            s = JSON.parse(currentSpec || "{}");
+          } catch {
+            s = {};
+          }
+          if (s.emit_mid === "on") delete s.emit_mid;
+          else s.emit_mid = "on";
+          void invoke("update_filter", { id, spec: JSON.stringify(s) })
+            .then(() => refresh())
+            .catch((e) =>
+              setConfirm({
+                title: "設定を変更できませんでした",
+                message: String(e),
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              })
+            );
+        },
+        toggleDebugTrace: () =>
+          setDebugTrace((v) => {
+            const nv = !v;
+            localStorage.setItem("texos-debug-trace", nv ? "1" : "0");
             return nv;
           }),
         // v1.5.4 WS-P2: リクエスト矢印（req）の表示トグル（永続化）。
@@ -5888,6 +5948,7 @@ function App() {
             cardHints: showCardHints,
             shapeSnap,
             showReqArrows,
+            debugTrace,
           },
           actions
         );
@@ -5975,6 +6036,8 @@ function App() {
       showMenuHints,
       showCardHints,
       shapeSnap,
+      debugTrace,
+      handleShowTrace,
       expanded,
       notes,
       filterLibrary,
@@ -6019,7 +6082,7 @@ function App() {
         return;
       }
       if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || typing) return;
-      if (prompt || confirm || filterDlg || builtinDlg || shellDlg || shellOut || aiDlg || whisperDlg || menu || appPicker) return;
+      if (prompt || confirm || filterDlg || builtinDlg || shellDlg || shellOut || traceDlg || aiDlg || whisperDlg || menu || appPicker) return;
       const k = e.key.toLowerCase();
       if (k === "a") {
         e.preventDefault();
@@ -6060,6 +6123,7 @@ function App() {
     builtinDlg,
     shellDlg,
     shellOut,
+    traceDlg,
     aiDlg,
     whisperDlg,
     menu,
@@ -6075,7 +6139,7 @@ function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Delete") return;
-      if (prompt || confirm || filterDlg || builtinDlg || shellDlg || shellOut || aiDlg || whisperDlg || menu) return;
+      if (prompt || confirm || filterDlg || builtinDlg || shellDlg || shellOut || traceDlg || aiDlg || whisperDlg || menu) return;
       const ae = document.activeElement as HTMLElement | null;
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable))
         return;
@@ -6091,7 +6155,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [prompt, confirm, filterDlg, builtinDlg, shellDlg, shellOut, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete, handleDeleteNote]);
+  }, [prompt, confirm, filterDlg, builtinDlg, shellDlg, shellOut, traceDlg, aiDlg, whisperDlg, menu, handleBulkDelete, handleRequestDelete, handleDeleteNote]);
 
   const handleChosen = useCallback((info: ProjectInfo) => {
     setShowChooser(false);
@@ -6206,6 +6270,8 @@ function App() {
             isProject={obj.mime_type === PROJECT_MIME || !!obj.project_ref}
             isUrl={!!obj.url_ref}
             webUpdate={webUpdateOf(obj)}
+            runAlert={runAlertOf(obj)}
+            onShowTrace={handleShowTrace}
             isFolder={!!obj.folder_ref}
             isFilter={obj.kind !== "launcher" && (obj.kind === "filter" || !!obj.filter_ref)}
             filterRef={obj.filter_ref}
@@ -6509,6 +6575,14 @@ function App() {
           output={shellOut.output}
           truncated={shellOut.truncated}
           onClose={() => setShellOut(null)}
+        />
+      )}
+      {traceDlg && (
+        <TraceDialog
+          label={traceDlg.label}
+          trace={traceDlg.trace}
+          debugMode={debugTrace}
+          onClose={() => setTraceDlg(null)}
         />
       )}
       {aiDlg && (

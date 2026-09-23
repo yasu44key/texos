@@ -208,6 +208,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     // v1.5.3 WS-P1（オペ層設計 §6.1）: 構造化実行記録 {at, exit, ok, nodata, skipped, message}。
     // memo の人間向けログとは別。WS-P2 のウォッチャ・運用前評価・メタ認知カードが読む。
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN last_run TEXT", []);
+    // v1.8.7 実行トレース: 直近の実行でこのカードが何を受け取り何を出したか（JSON）。
+    // last_run（成否の構造化記録）とは別。右クリック「実行ログを見る」が読む。
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN last_trace TEXT", []);
     // v1.7 P1（情報収集経路計画 §3）: web_fetch の取得メタ
     // {source_url, final_url, fetched_at, etag, last_modified} JSON。
     // P2 の「更新を確認」（条件付きGET→ハッシュ比較→更新マーク）がここを読む。

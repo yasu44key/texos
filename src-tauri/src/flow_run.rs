@@ -590,10 +590,10 @@ impl EvalOut {
     pub(crate) fn data(payloads: Vec<FlowPayload>, exit: Option<i32>) -> Self {
         EvalOut { payloads, nodata: false, ok: true, exit, errors: vec![], failed_inputs: vec![] }
     }
-    fn nodata_out() -> Self {
+    pub(crate) fn nodata_out() -> Self {
         EvalOut { payloads: vec![], nodata: true, ok: true, exit: None, errors: vec![], failed_inputs: vec![] }
     }
-    fn failed(errors: Vec<String>, exit: Option<i32>, failed_inputs: Vec<FlowPayload>) -> Self {
+    pub(crate) fn failed(errors: Vec<String>, exit: Option<i32>, failed_inputs: Vec<FlowPayload>) -> Self {
         EvalOut { payloads: vec![], nodata: false, ok: false, exit, errors, failed_inputs }
     }
 }
@@ -652,9 +652,45 @@ fn write_last_run(p: &Project, fid: &str, out: &EvalOut, skipped: u32) {
     );
 }
 
+/// v1.8.7 カードの色でのお知らせ: 評価そのものは成功したが、その後の段取り（キャンバスへの
+/// 着地など）で失敗した／フロー全体が起動前に止まった、を last_run に書き足す。
+/// `level` = "warn"（評価は成功・後段で失敗）| "error"（実行できなかった）。
+/// 次の実行で write_last_run が丸ごと上書きする＝直せば自然に消える。
+pub(crate) fn mark_last_run(p: &Project, fid: &str, level: &str, message: &str) {
+    let cur: Option<String> = p
+        .conn
+        .query_row(
+            "SELECT last_run FROM virtual_bodies WHERE id = ?1",
+            rusqlite::params![fid],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten();
+    let mut v = cur
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({ "at": db::now_ms() }));
+    if level == "error" {
+        v["ok"] = serde_json::Value::Bool(false);
+        v["at"] = db::now_ms().into();
+        v["message"] = serde_json::Value::String(message.to_string());
+    } else {
+        let prev = v.get("warning").and_then(|w| w.as_str()).unwrap_or("").to_string();
+        let joined = if prev.is_empty() { message.to_string() } else { format!("{prev}\n{message}") };
+        v["warning"] = serde_json::Value::String(joined);
+    }
+    let _ = p.conn.execute(
+        "UPDATE virtual_bodies SET last_run = ?1 WHERE id = ?2",
+        rusqlite::params![v.to_string(), fid],
+    );
+}
+
 /// 評価の終端処理: visited を抜け・last_run を保存・メモ表へ登録して返す。
 fn finish_eval(
     p: &Project,
+    job: &Job,
     fid: &str,
     visited: &mut std::collections::HashSet<String>,
     memo: &mut EvalMemo,
@@ -663,6 +699,7 @@ fn finish_eval(
 ) -> Result<EvalOut, String> {
     visited.remove(fid);
     write_last_run(p, fid, &out, skipped);
+    job.trace.end(fid, &out, skipped);
     memo.insert(fid.to_string(), out.clone());
     Ok(out)
 }
@@ -920,6 +957,8 @@ pub(crate) fn eval_filter(
 ) -> Result<EvalOut, String> {
     // メモ化（§5.1-5）: 同一ジョブ内の再 pull は実行せず前回結果を配る。
     if let Some(hit) = memo.get(fid) {
+        // v1.8.7 トレース: 同じ実行内で2回目以降に引かれた（再実行はしていない）。
+        job.trace.reused(fid, &node_label(p, fid));
         return Ok(hit.clone());
     }
     let root: &Path = &p.root;
@@ -947,6 +986,18 @@ pub(crate) fn eval_filter(
     };
     let accept = spec.accept_mime.clone().unwrap_or_else(|| "*/*".into());
 
+    // v1.8.7 トレース: 評価開始（終了は finish_eval が必ず記録する）。
+    job.trace.begin(fid, &node_label(p, fid), &trace_kind_name(&spec, passthrough), &ctx.round_suffix());
+    if !passthrough
+        && !spec.is_shell()
+        && matches!(spec.node_kind(), flow::NodeKind::External | flow::NodeKind::Generator)
+    {
+        match build_cmdline(root, &spec) {
+            Ok(c) => job.trace.note(fid, "コマンド", &c),
+            Err(e) => job.trace.note(fid, "コマンド（解決失敗）", &e),
+        }
+    }
+
     // ジェネレータ型: 入力を取らず1回実行してファイルを生む（入力矢印は無視）。
     // §4.1: 実行は execute_node に一任し、ここは命名（stem＝prefix or "output"）だけ担う。
     if spec.node_kind() == flow::NodeKind::Generator {
@@ -957,6 +1008,7 @@ pub(crate) fn eval_filter(
             });
         let out = match run {
             Ok(r) => {
+                job.trace.note_detail(fid, "stderr", &r.stderr);
                 let stem = spec
                     .prefix
                     .clone()
@@ -979,7 +1031,12 @@ pub(crate) fn eval_filter(
             }
             Err(e) => EvalOut::failed(vec![e], None, vec![]),
         };
-        return finish_eval(p, fid, visited, memo, 0, out);
+        let warn = emit_mid_outputs(state, p, job, fid, &spec, spec_json.as_deref(), &out, report);
+        let r = finish_eval(p, job, fid, visited, memo, 0, out);
+        if let Some(w) = warn {
+            mark_last_run(p, fid, "warn", &w);
+        }
+        return r;
     }
 
     // v1.6 「新規カードを登録」（builtin:"import_new"）: 入力を取らずフォルダを走査して
@@ -992,7 +1049,7 @@ pub(crate) fn eval_filter(
             Ok(_n) => EvalOut::data(vec![], None),
             Err(e) => EvalOut::failed(vec![e], None, vec![]),
         };
-        return finish_eval(p, fid, visited, memo, 0, out);
+        return finish_eval(p, job, fid, visited, memo, 0, out);
     }
 
     // v1.8 ④反復カード（builtin:"loop"）: 上流サブグラフを条件が満たされるまで引き直す。
@@ -1001,7 +1058,7 @@ pub(crate) fn eval_filter(
     // 1周目を番号なしの名前で書いてしまう。
     if spec.builtin.as_deref() == Some("loop") {
         let out = run_loop_node(state, app, p, fid, &spec, visited, memo, report, job, ctx)?;
-        return finish_eval(p, fid, visited, memo, 0, out);
+        return finish_eval(p, job, fid, visited, memo, 0, out);
     }
 
     // v1.8 ③ スイッチ（実機FB 2026-08-08）: 「答えが入ったら上流を動かさない」。
@@ -1012,7 +1069,7 @@ pub(crate) fn eval_filter(
             let answer = flow::answer_text(&note);
             if !answer.is_empty() {
                 let out = ask_answer_out(&spec, &node_label(p, fid), answer);
-                return finish_eval(p, fid, visited, memo, 0, out);
+                return finish_eval(p, job, fid, visited, memo, 0, out);
             }
         }
     }
@@ -1028,6 +1085,35 @@ pub(crate) fn eval_filter(
     // v1.5.7 セレクタ設定: 採用後に (1) 失敗枝ならエラー時メッセージへ差し替え（fail_text）、
     // (2) 出力名（prefix）で stem/拡張子を宣言名に差し替え、してから下流へ流す。
     if spec.node_kind() == flow::NodeKind::Select {
+        // v1.8.7 トレース: 各枝の状態と採用した枝を残す（セレクタは「どれが選ばれたか」が要）。
+        {
+            let all: Vec<FlowPayload> =
+                edges.iter().filter(|e| !e.nodata).flat_map(|e| e.payloads.clone()).collect();
+            job.trace.inputs(fid, &all);
+            let states: Vec<String> = edges
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let st = if e.nodata {
+                        "no-data"
+                    } else if e.payloads.is_empty() {
+                        "空"
+                    } else if e.failure {
+                        "失敗枝"
+                    } else {
+                        "有データ"
+                    };
+                    format!("枝{}={st}", i + 1)
+                })
+                .collect();
+            job.trace.note(fid, "枝の状態", &states.join(" / "));
+            let adopted = edges
+                .iter()
+                .position(|e| !e.nodata && !e.payloads.is_empty())
+                .map(|i| format!("枝{}", i + 1))
+                .unwrap_or_else(|| "なし（全枝 no-data → 自分も no-data）".into());
+            job.trace.note(fid, "採用した枝", &adopted);
+        }
         let out = match edges.iter().find(|e| !e.nodata && !e.payloads.is_empty()) {
             Some(e) => {
                 let mut pls = e.payloads.clone();
@@ -1063,24 +1149,26 @@ pub(crate) fn eval_filter(
             }
             None => EvalOut::nodata_out(),
         };
-        return finish_eval(p, fid, visited, memo, 0, out);
+        return finish_eval(p, job, fid, visited, memo, 0, out);
     }
 
     // no-data の NULL 伝搬（§5.1-4）: 伝搬型（既定）は入力エッジに1つでも no-data が
     // あれば自分も no-data（実行しない）。吸収型（nodata:"absorb"）は欠けを落として続行。
     if !spec.absorbs_nodata() && edges.iter().any(|e| e.nodata) {
-        return finish_eval(p, fid, visited, memo, 0, EvalOut::nodata_out());
+        return finish_eval(p, job, fid, visited, memo, 0, EvalOut::nodata_out());
     }
     let all_nodata = !edges.is_empty() && edges.iter().all(|e| e.nodata);
     if all_nodata {
         // 吸収型でも材料が全滅なら no-data（実行するものがない）。
-        return finish_eval(p, fid, visited, memo, 0, EvalOut::nodata_out());
+        return finish_eval(p, job, fid, visited, memo, 0, EvalOut::nodata_out());
     }
     let collected: Vec<FlowPayload> = edges
         .into_iter()
         .filter(|e| !e.nodata)
         .flat_map(|e| e.payloads)
         .collect();
+    // v1.8.7 トレース: このノードが実際に受け取った入力。
+    job.trace.inputs(fid, &collected);
 
     // v1.5.6 WS-M M1（§9.4）: IN/OUT バーチャルカードは素通し＝入力をそのまま返す。
     // 型チェックも実行も無し。入力が無ければ no-data（未接続の口＝材料なし）。
@@ -1093,7 +1181,7 @@ pub(crate) fn eval_filter(
         } else {
             EvalOut::data(collected, None)
         };
-        return finish_eval(p, fid, visited, memo, 0, out);
+        return finish_eval(p, job, fid, visited, memo, 0, out);
     }
 
     // v1.8 役割ポート: system 役割の矢印が来ていたら、このノードの spec を差し替える。
@@ -1101,6 +1189,7 @@ pub(crate) fn eval_filter(
     let spec = match role_system {
         Some(sys) => {
             if spec.node_kind() == flow::NodeKind::Ai {
+                job.trace.note_detail(fid, "役割（システムプロンプト）", &sys);
                 let mut s = spec.clone();
                 s.system = Some(sys);
                 s
@@ -1118,7 +1207,7 @@ pub(crate) fn eval_filter(
     // 止まり、答えがあればそれを下流へ流す。tap と同じ「eval 側で完結」の流儀。
     if spec.builtin.as_deref() == Some("ask") {
         let out = run_ask_node(p, fid, &spec, role_answer.as_deref(), &collected, report);
-        return finish_eval(p, fid, visited, memo, 0, out);
+        return finish_eval(p, job, fid, visited, memo, 0, out);
     }
 
     // v1.8 記録カード（builtin:"tap"）: 入力をそのまま下流へ通しつつ、通った中身を
@@ -1140,7 +1229,7 @@ pub(crate) fn eval_filter(
             }
             EvalOut::data(collected, None)
         };
-        return finish_eval(p, fid, visited, memo, 0, out);
+        return finish_eval(p, job, fid, visited, memo, 0, out);
     }
 
     // フェーズ2: 実行。種別ごとの分岐は execute_node へ一本化（§4.1）。ここに残るのは
@@ -1192,6 +1281,7 @@ pub(crate) fn eval_filter(
             match run {
                 Ok(run) => {
                     last_exit = run.exit_code;
+                    job.trace.note_detail(fid, "stderr", &run.stderr);
                     for (bytes, ext, mime, stem_o, meta) in run.outputs {
                         let stem = stem_o.unwrap_or_else(|| stem0.clone());
                         produced.push(FlowPayload { bytes, ext, mime, stem, meta });
@@ -1216,6 +1306,7 @@ pub(crate) fn eval_filter(
             match run {
                 Ok(run) => {
                     last_exit = run.exit_code;
+                    job.trace.note_detail(fid, "stderr", &run.stderr);
                     for (bytes, ext, mime, stem_o, meta) in run.outputs {
                         produced.push(FlowPayload {
                             bytes,
@@ -1260,6 +1351,7 @@ pub(crate) fn eval_filter(
             match run {
                 Ok(run) => {
                     last_exit = run.exit_code;
+                    job.trace.note_detail(fid, "stderr", &run.stderr);
                     for (bytes, ext, mime, stem_o, meta) in run.outputs {
                         produced.push(FlowPayload {
                             bytes,
@@ -1289,7 +1381,61 @@ pub(crate) fn eval_filter(
             failed_inputs: collected,
         }
     };
-    finish_eval(p, fid, visited, memo, skips, out)
+    let warn = emit_mid_outputs(state, p, job, fid, &spec, spec_json.as_deref(), &out, report);
+    let r = finish_eval(p, job, fid, visited, memo, skips, out);
+    if let Some(w) = warn {
+        mark_last_run(p, fid, "warn", &w);
+    }
+    r
+}
+
+/// v1.8.7 途中出力スイッチ（`emit_mid:"on"`）の本体: このカードがパイプラインの**途中**で
+/// 評価されて成功したら、出力を終端と同じ規則でキャンバスへ着地させる。
+/// - 終端カード自身は run_flow_inner が着地させるので対象外（二重に出さない）
+/// - フロー以外のジョブ（AI チャットの文脈評価など）では出さない（副作用を持ち込まない）
+/// - 失敗・no-data・出力なしは出さない（出すものがない）
+#[allow(clippy::too_many_arguments)]
+fn emit_mid_outputs(
+    state: &AppState,
+    p: &Project,
+    job: &Job,
+    fid: &str,
+    spec: &flow::FilterSpec,
+    fref: Option<&str>,
+    out: &EvalOut,
+    report: &mut FlowReport,
+) -> Option<String> {
+    if spec.emit_mid.as_deref() != Some("on") {
+        return None;
+    }
+    if job.kind != JobKind::Flow || job.card.as_deref() == Some(fid) {
+        return None;
+    }
+    if !out.ok || out.nodata || out.payloads.is_empty() {
+        return None;
+    }
+    let Ok((fx, fy, label)) = p.conn.query_row(
+        "SELECT pos_x, pos_y, label FROM virtual_bodies WHERE id = ?1",
+        rusqlite::params![fid],
+        |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?)),
+    ) else {
+        return None;
+    };
+    let before = report.outputs.len();
+    match materialize_payloads(
+        state, p, &p.root, fid, fx, fy, &label, fref, spec, out.payloads.clone(), true, report,
+    ) {
+        Ok(()) => {
+            let names = report.outputs[before..].join(", ");
+            job.trace.note(fid, "キャンバスへ出力（途中出力スイッチ）", &names);
+            None
+        }
+        Err(e) => {
+            job.trace.note(fid, "キャンバスへ出力（失敗）", &e);
+            report.errors.push(format!("{label}（途中出力）: {e}"));
+            Some(format!("途中出力をキャンバスに出せませんでした: {e}"))
+        }
+    }
 }
 
 
@@ -2374,12 +2520,37 @@ pub(crate) fn run_flow_for(id: &str, app: &tauri::AppHandle) -> Result<FlowRepor
         .jobs
         .register_flow(&id, &flabel, &root.to_string_lossy())?;
     let _guard = JobGuard::new(&state.jobs, job.id);
+    // v1.8.7 実行トレース: ログの書き出し名（日時_ラベル_job）をここで確定する。
+    job.trace.begin_run(&root, &flabel, job.id);
     // card 付き（パネルが録音対応/停止コマンドを spec から引く）。
     let _ = app.emit(
         "job:started",
         serde_json::json!({ "job_id": job.id, "kind": "flow", "label": flabel, "card": id }),
     );
     let result = run_flow_inner(&id, fx, fy, &flabel, fref.as_deref(), &root, app, &state, &job);
+    // v1.8.7 カードの色でのお知らせ: 実行そのものが起動前後に止まった（出力フォルダがない・
+    // 入力が繋がっていない等）ときは、終端カードを「エラー」にする。トリガ等から起動した実行は
+    // ダイアログが出ないので、これが無いとユーザーのミスが黙って消える。
+    if let Err(e) = &result {
+        if let Ok(p) = open_project_at(&root) {
+            mark_last_run(&p, &id, "error", e);
+        }
+    }
+    // v1.8.7 実行トレース: ノード単位の記録を .texos/logs へ書き出し、各カードの last_trace を更新。
+    // best-effort（書けなくてもフローの結果には影響させない）。front は trace:written で知る。
+    {
+        let (report, fatal) = match &result {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e.as_str())),
+        };
+        let sum = TraceSummary { job_id: job.id, label: &flabel, card: &id, report, fatal };
+        if let Some(path) = write_trace_log(&root, &job.trace, &sum) {
+            let _ = app.emit(
+                "trace:written",
+                serde_json::json!({ "job_id": job.id, "card": id, "path": path.to_string_lossy() }),
+            );
+        }
+    }
     // report 内のエラーは「完了した実行の報告」なので done 扱い＝Err はコマンド自体の失敗。
     let _ = app.emit(
         if result.is_ok() { "job:done" } else { "job:failed" },
@@ -2473,7 +2644,10 @@ fn run_flow_inner(
             };
             // ② 上流の pull 評価 → 一時実体化（{stem}.{ext} 名＝exe やバッチが素直に動く）。
             let resolved: Option<PathBuf> = match direct {
-                Some(p) => Some(p),
+                Some(p) => {
+                    job.trace.note(&id, "入力（直結の実ファイル・上流は評価せず）", &p.display().to_string());
+                    Some(p)
+                }
                 None => {
                     let mut visited = std::collections::HashSet::new();
                     let mut memo = EvalMemo::new();
@@ -2533,6 +2707,19 @@ fn run_flow_inner(
             firstline
         };
         let window = term_spec.window.as_deref().unwrap_or("keep");
+        // v1.8.7 トレース: シェル終端で実際に投げたコマンド行と窓の扱い。
+        // ウィンドウあり実行ではプログラムの出力は TexoS に戻らない（窓の中にだけ出る）。
+        job.trace.note(&id, "シェル", &shell);
+        job.trace.note(&id, "実行コマンド", &firstline);
+        job.trace.note(
+            &id,
+            "ウィンドウ",
+            match window {
+                "hidden" => "なし（出力を捕捉して結果パネルへ）",
+                "close" => "開いて実行後に閉じる（出力は記録されません）",
+                _ => "開いたまま（出力はウィンドウ内のみ・記録されません）",
+            },
+        );
         let capture = if window == "hidden" {
             // ウィンドウなし実行: 中断フラグはジョブ別（毎回新品）なのでリセット不要。
             let out = run_shell_captured(
@@ -2566,29 +2753,13 @@ fn run_flow_inner(
         return Ok(report);
     }
 
-    let prefix = term_spec
-        .prefix
-        .clone()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let mut seq = term_spec.seq.unwrap_or(0);
-    let out_dir = term_spec
-        .out_dir
-        .clone()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let (out_root, external_out) = match &out_dir {
-        // v1.8.3: 相対パスはプロジェクト基準で解く（従来はプロセスの CWD 基準＝実質壊れていた）。
-        Some(d) => {
-            let pb = resolve_project_path(root, Some(d));
-            if !pb.is_dir() {
-                // 相対指定のときは解決後のフルパスで知らせる（どこを見に行ったかが分かる）。
-                return Err(format!("出力フォルダがありません: {}", pb.display()));
-            }
-            (pb, true)
+    // v1.8.7: 早期の出力フォルダ検査（実行してから「置き場がない」で落ちないように）。
+    if let Some(d) = term_spec.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let pb = resolve_project_path(root, Some(d));
+        if !pb.is_dir() {
+            return Err(format!("出力フォルダがありません: {}", pb.display()));
         }
-        None => (root.to_path_buf(), false),
-    };
+    }
 
     let mut report = FlowReport {
         created: vec![],
@@ -2631,6 +2802,81 @@ fn run_flow_inner(
         }
     }
 
+    // マテリアライズ（v1.8.7 で materialize_payloads へ切り出し。途中出力スイッチと共用）。
+    let before_err = report.errors.len();
+    materialize_payloads(
+        state.inner(), &jp, root, &id, fx, fy, &flabel, fref, &term_spec, payloads, false, &mut report,
+    )?;
+    // v1.8.7: 着地（書き出し・CAS）で起きた失敗は終端カードの色で知らせる。
+    if report.errors.len() > before_err {
+        mark_last_run(&jp, &id, "warn", &report.errors[before_err..].join("\n"));
+    }
+    {
+    let p = &jp;
+    // 実行ログを memo に記録（最後の実行が常に見える — 確定方針4）。
+    // v1.3.9: 先頭の ▶ は実行ボタンと紛らわしいので「✓ 前回」に変更（これは結果表示）。
+    let mut log = format!("✓ 前回: 出力{}", report.outputs.len());
+    if !report.skipped.is_empty() {
+        log.push_str(&format!("・スキップ{}", report.skipped.len()));
+    }
+    if !report.errors.is_empty() {
+        log.push_str(&format!("・エラー{}", report.errors.len()));
+    }
+    let _ = p.conn.execute(
+        "UPDATE virtual_bodies SET memo = ?1 WHERE id = ?2",
+        rusqlite::params![log, id],
+    );
+    }
+
+    Ok(report)
+}
+
+/// 結果の着地（マテリアライズ）: ペイロードをファイル＋CAS＋カードとしてキャンバスへ出す。
+/// 命名・置き場所はカードの設定（prefix／seq／out_dir）に従う＝単体▶実行の終端と同じ規則。
+/// v1.8.7: 終端（run_flow_inner）と「途中の出力もキャンバスに出す」スイッチ（eval_filter）の
+/// 両方がここを通る。規則を一箇所にしか置かない＝両者がズレようがない。
+/// `below` = 新しいカードをカードの下に並べる（途中出力。右は次段のカードと重なるため）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_payloads(
+    state: &AppState,
+    p: &Project,
+    root: &Path,
+    id: &str,
+    fx: f64,
+    fy: f64,
+    flabel: &str,
+    fref: Option<&str>,
+    term_spec: &flow::FilterSpec,
+    payloads: Vec<FlowPayload>,
+    below: bool,
+    report: &mut FlowReport,
+) -> Result<(), String> {
+    let id = id.to_string();
+    let prefix = term_spec
+        .prefix
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut seq = term_spec.seq.unwrap_or(0);
+    let out_dir = term_spec
+        .out_dir
+        .clone()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (out_root, external_out) = match &out_dir {
+        // v1.8.3: 相対パスはプロジェクト基準で解く（従来はプロセスの CWD 基準＝実質壊れていた）。
+        Some(d) => {
+            let pb = resolve_project_path(root, Some(d));
+            if !pb.is_dir() {
+                // 相対指定のときは解決後のフルパスで知らせる（どこを見に行ったかが分かる）。
+                return Err(format!("出力フォルダがありません: {}", pb.display()));
+            }
+            (pb, true)
+        }
+        None => (root.to_path_buf(), false),
+    };
+
+
     // 出力ファイル名に使えるラベル（Windowsの禁止文字を逃がす）
     let safe_flabel: String = flabel
         .chars()
@@ -2645,10 +2891,8 @@ fn run_flow_inner(
     // マテリアライズ（DB と fs のみ・長時間プロセスなし）。ジョブ専用接続で起動元へ書く。
     // v1.5.2 WS-C（凍結 §11.4）: プロジェクト単位の採番ロックで、並行フローの固定名照合と
     // prefix 連番（seq）の採番・書き戻しを直列化する（同じ空き番号を同時に掴む競合の防止）。
-    let write_lock = project_write_lock(state.inner(), root);
+    let write_lock = project_write_lock(state, root);
     let _write_guard = write_lock.lock().unwrap();
-    {
-    let p = &jp;
     let mut out_i = 0usize;
     // v1.7 P5(a) リンクの受け皿: 終端フィルタから URL カードへ矢印が引いてあれば、
     // ペイロードのテキストから**最初の URL** を拾ってそのカードの url_ref を更新し、
@@ -2721,8 +2965,8 @@ fn run_flow_inner(
                     rusqlite::params![
                         new_vid,
                         label,
-                        fx + 190.0,
-                        fy + (out_i as f64) * 170.0,
+                        if below { fx + (out_i as f64) * 170.0 } else { fx + 190.0 },
+                        if below { fy + 150.0 } else { fy + (out_i as f64) * 170.0 },
                         db::now_ms(),
                         url
                     ],
@@ -2889,8 +3133,11 @@ fn run_flow_inner(
         }
 
         let new_vid = uuid();
-        let nx = fx + 190.0;
-        let ny = fy + (out_i as f64) * 170.0;
+        let (nx, ny) = if below {
+            (fx + (out_i as f64) * 170.0, fy + 150.0)
+        } else {
+            (fx + 190.0, fy + (out_i as f64) * 170.0)
+        };
         // 出力フォルダ指定時は外部ファイルへの窓（origin_path の仮身）、
         // 指定なしはプロジェクト直下のコミット済み実身（従来どおり）
         let (committed_path, committed_mtime, origin_path) = if external_out {
@@ -2947,23 +3194,7 @@ fn run_flow_inner(
             );
         }
     }
-
-    // 実行ログを memo に記録（最後の実行が常に見える — 確定方針4）。
-    // v1.3.9: 先頭の ▶ は実行ボタンと紛らわしいので「✓ 前回」に変更（これは結果表示）。
-    let mut log = format!("✓ 前回: 出力{}", report.outputs.len());
-    if !report.skipped.is_empty() {
-        log.push_str(&format!("・スキップ{}", report.skipped.len()));
-    }
-    if !report.errors.is_empty() {
-        log.push_str(&format!("・エラー{}", report.errors.len()));
-    }
-    let _ = p.conn.execute(
-        "UPDATE virtual_bodies SET memo = ?1 WHERE id = ?2",
-        rusqlite::params![log, id],
-    );
-    }
-
-    Ok(report)
+    Ok(())
 }
 
 /// ジョブの中断（UIの中断ボタン・v1.5.1 WS-B で job_id 引数化）。run_flow が外部コマンドで
@@ -3555,6 +3786,182 @@ mod loop_tests {
         assert!(!up.contains(&"loop".to_string()), "戻り矢印を辿って自分に戻ってはいけない");
         assert!(!up.contains(&"sink".to_string()), "下流は引き直しの対象外");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod emit_mid_tests {
+    use super::*;
+
+    fn setup(tag: &str) -> (PathBuf, Project, AppState) {
+        let dir = std::env::temp_dir().join(format!("texos_emit_{tag}_{}", db::now_ms()));
+        let cas_root = dir.join(".texos").join("cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
+        let p = Project { conn, root: dir.clone(), cas_root };
+        p.conn
+            .execute(
+                "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+                 VALUES ('filter:sentinel','application/vnd.texos.filter',0,?1)",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        let state = AppState {
+            current: Mutex::new(None),
+            app_data: dir.clone(),
+            jobs: Jobs::new(),
+            resources: ResourceLimits::new(),
+            write_locks: Mutex::new(std::collections::HashMap::new()),
+            t2i_server: Mutex::new(None),
+            t23d_server: Mutex::new(None),
+        };
+        (dir, p, state)
+    }
+
+    fn add_filter(p: &Project, id: &str, label: &str, spec: &str) {
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+                 VALUES (?1,'filter:sentinel',?2,100.0,200.0,?3,'filter',?4)",
+                rusqlite::params![id, label, db::now_ms(), spec],
+            )
+            .unwrap();
+    }
+
+    fn exe_out(bytes: &[u8]) -> EvalOut {
+        EvalOut::data(
+            vec![FlowPayload {
+                bytes: bytes.to_vec(),
+                ext: "exe".into(),
+                mime: "application/octet-stream".into(),
+                stem: "問題".into(),
+                meta: None,
+            }],
+            Some(0),
+        )
+    }
+
+    fn empty_report() -> FlowReport {
+        FlowReport { created: vec![], updated: vec![], outputs: vec![], skipped: vec![], errors: vec![], shell_capture: None }
+    }
+
+    fn cards_from(p: &Project, fid: &str) -> Vec<(String, f64, f64)> {
+        let mut st = p
+            .conn
+            .prepare(
+                "SELECT v.label, v.pos_x, v.pos_y FROM relations r JOIN virtual_bodies v ON v.id = r.to_id
+                 WHERE r.from_id = ?1 AND r.kind='flow' AND v.deleted_at IS NULL ORDER BY v.label",
+            )
+            .unwrap();
+        st.query_map(rusqlite::params![fid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+    }
+
+    /// 途中のカードは、終端と同じ規則（prefix＋seq＝連番履歴）でキャンバスへ出る。
+    /// 置き場所はカードの下（右は次段のカードと重なる）。
+    #[test]
+    fn mid_chain_card_lands_on_canvas_with_its_own_naming() {
+        let (dir, p, state) = setup("mid");
+        let spec_json = r#"{"cmd":"gcc {in} -o {out}","prefix":"fibo","seq":1,"emit_mid":"on"}"#;
+        add_filter(&p, "cc", "Cコンパイラ", spec_json);
+        let spec = flow::parse_spec(spec_json).unwrap();
+        let job = state.jobs.register_flow("shell_terminal", "コマンドプロンプト", "").unwrap();
+        job.trace.begin("cc", "Cコンパイラ", "外部コマンド", "");
+
+        let mut report = empty_report();
+        emit_mid_outputs(&state, &p, &job, "cc", &spec, Some(spec_json), &exe_out(b"MZ-1"), &mut report);
+        assert_eq!(std::fs::read(dir.join("fibo001.exe")).unwrap(), b"MZ-1");
+        assert_eq!(report.created.len(), 1);
+        let cards = cards_from(&p, "cc");
+        assert_eq!(cards, vec![("fibo001.exe".to_string(), 100.0, 350.0)], "カードの下に出る");
+
+        // 2回目（試行錯誤の次の周）: seq が進んで履歴として残る。spec は DB から読み直す。
+        let spec_json2: String = p
+            .conn
+            .query_row("SELECT filter_ref FROM virtual_bodies WHERE id='cc'", [], |r| r.get(0))
+            .unwrap();
+        let spec2 = flow::parse_spec(&spec_json2).unwrap();
+        let mut report = empty_report();
+        emit_mid_outputs(&state, &p, &job, "cc", &spec2, Some(&spec_json2), &exe_out(b"MZ-2"), &mut report);
+        assert_eq!(std::fs::read(dir.join("fibo002.exe")).unwrap(), b"MZ-2");
+        assert!(dir.join("fibo001.exe").exists(), "前回分は残る");
+        assert!(spec_json2.contains("\"emit_mid\":\"on\""), "seq の書き戻しでスイッチが消えない");
+
+        let t = job.trace.snapshot();
+        assert!(t[0].notes.iter().any(|(k, v)| k.starts_with("キャンバスへ出力") && v.contains("fibo001.exe")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1.8.7 途中出力の失敗はそのカードの last_run に warning として残る（成否は ok のまま）。
+    /// 起動できなかった実行は error（ok=false）。次の評価の write_last_run で消える。
+    #[test]
+    fn failures_are_marked_on_the_card() {
+        let (dir, p, state) = setup("mark");
+        let spec_json = r#"{"cmd":"gcc","out_dir":"存在しないフォルダ","emit_mid":"on"}"#;
+        add_filter(&p, "cc", "Cコンパイラ", spec_json);
+        let spec = flow::parse_spec(spec_json).unwrap();
+        let job = state.jobs.register_flow("term", "T", "").unwrap();
+        let out = exe_out(b"MZ");
+        write_last_run(&p, "cc", &out, 0);
+        let mut r = empty_report();
+        let w = emit_mid_outputs(&state, &p, &job, "cc", &spec, Some(spec_json), &out, &mut r);
+        let w = w.expect("出力フォルダが無いので警告");
+        assert!(w.contains("出力フォルダがありません"));
+        mark_last_run(&p, "cc", "warn", &w);
+        let lr: serde_json::Value = serde_json::from_str(
+            &p.conn.query_row("SELECT last_run FROM virtual_bodies WHERE id='cc'", [], |r| r.get::<_, String>(0)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lr["ok"], true, "評価そのものは成功のまま");
+        assert!(lr["warning"].as_str().unwrap().contains("出力フォルダ"));
+
+        mark_last_run(&p, "cc", "error", "入力がありません");
+        let lr: serde_json::Value = serde_json::from_str(
+            &p.conn.query_row("SELECT last_run FROM virtual_bodies WHERE id='cc'", [], |r| r.get::<_, String>(0)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lr["ok"], false);
+        assert_eq!(lr["message"], "入力がありません");
+
+        // 直して再実行 → 上書きで消える
+        write_last_run(&p, "cc", &out, 0);
+        let lr: serde_json::Value = serde_json::from_str(
+            &p.conn.query_row("SELECT last_run FROM virtual_bodies WHERE id='cc'", [], |r| r.get::<_, String>(0)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lr["ok"], true);
+        assert!(lr.get("warning").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 出さない場合: スイッチ OFF／終端カード自身（run_flow_inner が出す）／失敗／フロー以外のジョブ。
+    #[test]
+    fn switch_off_terminal_failure_and_chat_do_not_emit() {
+        let (dir, p, state) = setup("no");
+        let on = r#"{"cmd":"x","prefix":"fixed","emit_mid":"on"}"#;
+        add_filter(&p, "a", "A", on);
+        let spec_on = flow::parse_spec(on).unwrap();
+        let spec_off = flow::parse_spec(r#"{"cmd":"x","prefix":"fixed"}"#).unwrap();
+
+        let job = state.jobs.register_flow("a", "A", "").unwrap(); // a が終端
+        let mut r = empty_report();
+        emit_mid_outputs(&state, &p, &job, "a", &spec_on, Some(on), &exe_out(b"1"), &mut r);
+        assert!(r.created.is_empty(), "終端は二重に出さない");
+
+        let job2 = state.jobs.register_flow("other", "B", "").unwrap();
+        emit_mid_outputs(&state, &p, &job2, "a", &spec_off, Some(on), &exe_out(b"1"), &mut r);
+        assert!(r.created.is_empty(), "スイッチ OFF");
+        let failed = EvalOut::failed(vec!["gcc: error".into()], Some(1), vec![]);
+        emit_mid_outputs(&state, &p, &job2, "a", &spec_on, Some(on), &failed, &mut r);
+        assert!(r.created.is_empty(), "失敗は出さない");
+
+        let chat = state.jobs.register_chat("chat", "");
+        emit_mid_outputs(&state, &p, &chat, "a", &spec_on, Some(on), &exe_out(b"1"), &mut r);
+        assert!(r.created.is_empty(), "AI チャットの文脈評価では出さない");
+        assert!(!dir.join("fixed.exe").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -224,6 +224,8 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel, proj
       if (seq.trim() !== "") spec.seq = Math.max(0, parseInt(seq, 10) || 0);
     }
     if (note.trim()) spec.note = note.trim();
+    // v1.8.7 途中出力スイッチ（右クリックで切り替える）はこのダイアログの外の設定なので温存。
+    if (init.emit_mid === "on") spec.emit_mid = "on";
     // v1.3.11: 0 = 無制限（開発者モード）。負値は60にフォールバック。
     spec.timeout_secs = timeoutSecs >= 0 ? timeoutSecs : 60;
     // v1.4.9: 停止コマンド（stdin）。チェック時は record=true（バックエンドが stdin を開く）

@@ -101,6 +101,8 @@ pub struct Job {
     pub t23d_active: std::sync::atomic::AtomicBool,
     /// job:progress のスロットル（~10/s・凍結 §11.6）用の最終 emit 時刻。
     pub progress_at: Mutex<std::time::Instant>,
+    /// v1.8.7 実行トレース: このジョブで評価したノードの記録（終了時に .texos/logs へ）。
+    pub trace: Trace,
 }
 
 /// list_jobs の返却行（背景ジョブパネルの復元用）。
@@ -145,6 +147,7 @@ impl Jobs {
             t2i_active: std::sync::atomic::AtomicBool::new(false),
             t23d_active: std::sync::atomic::AtomicBool::new(false),
             progress_at: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            trace: Trace::new(),
         })
     }
     /// Chat の登録（排他なし — 同一エンドポイントの同時実行は ai セマフォが拒否する）。
@@ -630,6 +633,9 @@ mod shapes;
 mod util;
 // v1.7 P1: Web の実身化（web_fetch。安全最小セットの共通関数を web_* 系で共用）。
 mod web;
+// v1.8.7: 実行トレース（デバッグモード）— ノード単位の実行記録を .texos/logs へ。
+mod trace;
+pub(crate) use trace::*;
 pub(crate) use ai::*;
 pub(crate) use clipboard_in::*;
 pub(crate) use filters::*;
@@ -767,6 +773,9 @@ pub fn run() {
             fire_op,
             toggle_op_paused,
             evaluate_flow,
+            set_trace_detail,
+            get_trace_detail,
+            get_card_trace,
             break_flow,
             list_jobs,
             cancel_all,

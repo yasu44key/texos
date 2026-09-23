@@ -29,6 +29,12 @@ export interface MenuActions {
   runFlow: (id: string) => void;
   // v1.5.5 WS-P2 B: 終端カードから上流の到達集合を静的検査（実行しない）→評価レポートカード。
   evaluateFlow: (id: string) => void;
+  // v1.8.7 実行トレース: カードの直近の実行記録（入力・出力・エラー）を表示。
+  showTrace: (id: string, label: string) => void;
+  // v1.8.7 デバッグモード（実行ログに中身・stderr まで記録）のトグル。
+  toggleDebugTrace: () => void;
+  // v1.8.7 途中出力スイッチ（emit_mid）: パイプラインの途中でも出力をキャンバスへ出す。
+  toggleEmitMid: (id: string, currentSpec: string) => void;
   // v1.5.5: タイマ/ウォッチャの稼働/停止トグル（構成中の誤発火防止スイッチ）。
   toggleOpPause: (id: string) => void;
   // v1.3.11 ランチャー（一般プログラム/cmd/PowerShell の登録・起動）
@@ -501,6 +507,18 @@ export function buildObjectMenu(
       }
     })();
     const canEvaluate = opKind === null || opKind === "out";
+    // v1.8.7 途中出力スイッチの対象＝出力を「作る」カード（op・シェル・素通し系は対象外）。
+    const emitState = ((): { eligible: boolean; on: boolean } => {
+      if (opKind !== null) return { eligible: false, on: false };
+      try {
+        const s = JSON.parse(obj.filter_ref ?? "{}");
+        const passthru = ["select", "tap", "ask", "loop", "import_new", "speak"];
+        const eligible = typeof s.shell !== "string" && !passthru.includes(s.builtin);
+        return { eligible, on: s.emit_mid === "on" };
+      } catch {
+        return { eligible: false, on: false };
+      }
+    })();
     return [
       { label: `⚗「${obj.label}」`, onClick: () => {}, disabled: true },
       ...(opKind !== "in"
@@ -528,6 +546,22 @@ export function buildObjectMenu(
             },
           ]
         : []),
+      // v1.8.7 途中出力スイッチ: 連結したまま、この段の出力もキャンバスへ出す（カード単位）。
+      ...(emitState.eligible
+        ? [
+            {
+              label: (emitState.on ? "✓ " : "　") + "途中の出力もキャンバスに出す",
+              hint: "オンにすると、このカードがパイプラインの途中で実行されたときも、単体で▶実行したときと同じ規則（出力名・連番・出力フォルダの設定）で結果をキャンバスへ出します。下流へは従来どおり流れます。連番を設定しておくと試行ごとに履歴が残り、固定名なら上書きになります。",
+              onClick: () => a.toggleEmitMid(targetId, obj.filter_ref ?? "{}"),
+            },
+          ]
+        : []),
+      // v1.8.7 実行トレース: 直近の実行でこのカードが何を受け取り何を出したか。
+      {
+        label: "実行ログを見る",
+        hint: "直近の実行で、このカードが受け取った入力・出した結果・エラー・実行したコマンドを表示します。デバッグモードがオンなら中身（テキスト先頭4KB）や stderr も見られます。",
+        onClick: () => a.showTrace(targetId, obj.label),
+      },
       ...(opKind === "in" || opKind === "out"
         ? [
             {
@@ -992,6 +1026,8 @@ interface CanvasMenuCtx {
   shapeSnap: boolean;
   /// v1.5.4 WS-P2: リクエスト矢印（req）の表示オン/オフ（トグル表示用）。
   showReqArrows: boolean;
+  /// v1.8.7: デバッグモード（実行ログの詳細記録）のオン/オフ（トグル表示用）。
+  debugTrace: boolean;
 }
 
 // v1.4.16: UIカラーの連続比較用サブメニュー。選んでもメニューは閉じず（keepOpen）、
@@ -1622,6 +1658,14 @@ export function buildCanvasMenu(
       hint: "トリガ・タイマ・ウォッチャから引いたリクエスト矢印（破線）の表示/非表示を切り替えます。非表示でも発行は動き続けます。",
       onClick: () => a.toggleReqArrows(),
     },
+    {
+      // v1.8.7 実行トレース: オンの間の実行は、各カードの入出力の中身（テキスト先頭4KB）・
+      // SHA-256・外部コマンドの stderr まで .texos/logs に記録する。オフでも成否・時間・名前は残る。
+      label: (ctx.debugTrace ? "✓ " : "　") + "デバッグモード（実行ログに中身を記録）",
+      hint: "オンにすると、フロー実行時に各カードが受け取った入力・出した結果の中身（テキスト先頭4KB）や外部コマンドの stderr までログに残します。カード右クリック「実行ログを見る」で確認できます。オフでも成否・所要時間・データ名は記録されます。",
+      onClick: () => a.toggleDebugTrace(),
+    },
+
     {
       label: "ショートカット一覧（?）",
       hint: "キーボードショートカットの一覧を表示します（? または F1 キーでも開閉できます）。",
