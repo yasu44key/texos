@@ -72,6 +72,9 @@ export interface MenuActions {
   // カードを置く（旧・矢印引き出しメニューの「既存プロジェクトへのリンク」を1階層目へ移設。
   // フォルダ選択で新規登録する linkProject とは別の入口）。
   linkRegisteredProject: (x: number, y: number) => void;
+  // v1.8.8: プロジェクトフォルダ直下のフォルダ（内包プロジェクト／普通のフォルダ）への
+  // リンクカードを置く（非同期で一覧取得→サブメニュー）。
+  linkInnerFolders: (x: number, y: number) => void;
   commitAll: () => void;
   // v1.4.19 カードを検索: ライブ検索→フォーカス（Ctrl+F）。
   openSearch: () => void;
@@ -120,6 +123,8 @@ export interface MenuActions {
   openOriginProject: (path: string) => void;
   // v1.3.11 #12: リンクフォルダの参照先を選び直す（リンク切れの繋ぎ直し）。
   relinkFolder: (id: string, currentPath: string) => void;
+  // v1.8.8: プロジェクトカードの参照先を選び直す（移動・改名したプロジェクトへの繋ぎ直し）。
+  relinkProject: (id: string, currentPath: string) => void;
   // v1.3.9 問題点2: 実体喪失の実身を救う2経路。
   relink: (id: string) => void;
   restoreFromCas: (id: string) => void;
@@ -406,6 +411,12 @@ export function buildObjectMenu(
     return [
       { label: `「${obj.label}」`, onClick: () => {}, disabled: true },
       { label: "開く（プロジェクトへ移動）", onClick: () => a.openObject(targetId) },
+      // v1.8.8: フォルダ整理で移動・改名したプロジェクトへ繋ぎ直す（参照は絶対パス）。
+      {
+        label: "リンクし直す...",
+        hint: "参照先プロジェクトが見つからない（フォルダの移動・リネーム）ときに、正しいTexoSプロジェクトのフォルダを選んで繋ぎ直します。元のリンク先の親フォルダが既定で開きます。",
+        onClick: () => a.relinkProject(targetId, obj.project_ref!),
+      },
       ...zItems,
       {
         label: "表示名を変更...",
@@ -1797,6 +1808,13 @@ export function buildCanvasMenu(
       label: "登録プロジェクトへのリンク ...",
       hint: "TexoSに登録済み（最近開いた）プロジェクトの一覧から選び、そこへ移動できるリンクカードをこの場所に置きます。未登録のフォルダをリンクするときは「プロジェクトを作成 ... → 既存プロジェクトへのリンクを配置...」から。",
       onClick: () => a.linkRegisteredProject(pos.canvasX, pos.canvasY),
+    },
+    {
+      // v1.8.8: プロジェクトフォルダ直下のフォルダ（内包プロジェクト・普通のフォルダ）を
+      // 一覧から選んでリンクカードを置く。フォルダ選択ダイアログを経ずに済む。
+      label: "内包フォルダへのリンク ...",
+      hint: "このプロジェクトのフォルダ直下にあるフォルダ（内包プロジェクト🗂・普通のフォルダ📁）の一覧から選び、リンクカードをこの場所に置きます。✓ は既にリンクカードがあるもの。未配置が2件以上あれば、まとめて配置もできます。",
+      onClick: () => a.linkInnerFolders(pos.canvasX, pos.canvasY),
     },
     {
       label: "プロジェクトを切り替え...",

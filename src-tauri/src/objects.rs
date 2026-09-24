@@ -196,8 +196,11 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
             let committed_path: Option<String> = row.get(6)?;
             let committed_mtime: Option<i64> = row.get(7)?;
             let folder_ref: Option<String> = row.get(14)?;
+            let project_ref: Option<String> = row.get(8)?;
             // v1.3.11 #12: リンクフォルダカードは folder_ref の存在で cur_mtime を決める
             // （フォルダが消えていれば None → フロントが薄赤シグナルにする）。
+            // v1.8.8: プロジェクトカードも同様。参照先に .texos/texos.db が無ければ None
+            // （＝リンク切れ）。フォルダだけ残ってプロジェクトでなくなった場合も切れ扱い。
             let cur_mtime = committed_path
                 .as_deref()
                 .and_then(|p| file_mtime_ms(std::path::Path::new(p)))
@@ -205,6 +208,16 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
                     folder_ref
                         .as_deref()
                         .and_then(|p| file_mtime_ms(std::path::Path::new(p)))
+                })
+                .or_else(|| {
+                    project_ref.as_deref().and_then(|p| {
+                        let root = std::path::Path::new(p);
+                        if texos_dir(root).join("texos.db").exists() {
+                            file_mtime_ms(root)
+                        } else {
+                            None
+                        }
+                    })
                 });
             let committed_modified = match (cur_mtime, committed_mtime) {
                 (Some(cur), Some(m)) => cur > m,
@@ -219,7 +232,7 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
                 pos_y: row.get(5)?,
                 committed_path,
                 committed_modified,
-                project_ref: row.get(8)?,
+                project_ref,
                 ext: row.get(9)?,
                 expanded: row.get::<_, i64>(10)? != 0,
                 url_ref: row.get(11)?,
@@ -1977,6 +1990,7 @@ pub(crate) fn relink_object(id: String, new_path: String, state: State<AppState>
 /// v1.3.11 #12: リンクフォルダカードの参照先を選び直す（リネーム・移動でリンク切れに
 /// なったフォルダを繋ぎ直す）。folder_ref を更新するだけ。選んだ先が TexoS プロジェクト
 /// なら project_ref に切り替える（フォルダ→プロジェクトの昇格は import_file と同じ扱い）。
+/// v1.8.8: 上記「プロジェクトなら昇格」はコメントのみで未実装だったので実装（set_project_link）。
 #[tauri::command]
 pub(crate) fn relink_folder(id: String, new_path: String, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
@@ -1985,6 +1999,9 @@ pub(crate) fn relink_folder(id: String, new_path: String, state: State<AppState>
     if !np.is_dir() {
         return Err("選んだフォルダが見つかりません".into());
     }
+    if texos_dir(np).join("texos.db").exists() {
+        return set_project_link(p, &id, &new_path);
+    }
     p.conn
         .execute(
             "UPDATE virtual_bodies SET folder_ref = ?1 WHERE id = ?2",
@@ -1992,6 +2009,106 @@ pub(crate) fn relink_folder(id: String, new_path: String, state: State<AppState>
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// v1.8.8: プロジェクトカード（project_ref）の参照先を選び直す。フォルダ整理で
+/// プロジェクトを移動・改名するとリンクが切れる（参照は絶対パス）ため、その繋ぎ直し。
+/// 選んだ先が TexoS プロジェクトでなければ拒否する（普通のフォルダへ格下げはしない）。
+#[tauri::command]
+pub(crate) fn relink_project(id: String, new_path: String, state: State<AppState>) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let np = std::path::Path::new(&new_path);
+    if !np.is_dir() {
+        return Err("選んだフォルダが見つかりません".into());
+    }
+    if !texos_dir(np).join("texos.db").exists() {
+        return Err("選んだフォルダはTexoSプロジェクトではありません（.texos/texos.db がありません）".into());
+    }
+    set_project_link(p, &id, &new_path)
+}
+
+/// project_ref を差し替える共通部。real_id はパス由来のセンチネル（project:<hash(path)>）
+/// なので、新しいパスのセンチネルへ付け替えて link_project で作った場合と同じ状態に揃える。
+/// リンクフォルダからの昇格にも使うので folder_ref を外し kind='project' に確定する。
+fn set_project_link(p: &Project, id: &str, new_path: &str) -> Result<(), String> {
+    let real_id = ensure_project_real_body(&p.conn, new_path)?;
+    let n = p
+        .conn
+        .execute(
+            "UPDATE virtual_bodies
+                SET project_ref = ?1, real_id = ?2, folder_ref = NULL, kind = 'project'
+              WHERE id = ?3",
+            rusqlite::params![new_path, real_id, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("カードが見つかりません".into());
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct InnerFolder {
+    pub name: String,
+    pub path: String,
+    /// .texos/texos.db を持つ＝内包プロジェクト
+    pub is_project: bool,
+    /// このプロジェクトのキャンバスに、既にこのフォルダを指すカード（project_ref /
+    /// folder_ref）が生きている
+    pub linked: bool,
+}
+
+/// v1.8.8: 現在のプロジェクトフォルダ直下のサブフォルダ一覧（「内包フォルダへのリンクを配置」用）。
+/// 隠しフォルダ（.texos 等「.」始まり）は除く。内包プロジェクトか普通のフォルダかと、
+/// 既にリンクカードがあるかを返す。並びは プロジェクト→フォルダ、各々名前順。
+#[tauri::command]
+pub(crate) fn list_inner_folders(state: State<AppState>) -> Result<Vec<InnerFolder>, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // 既存リンクの照合は表記ゆれ（大小・区切り・末尾区切り）を吸収して行う。
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let linked: std::collections::HashSet<String> = {
+        let mut stmt = p
+            .conn
+            .prepare(
+                "SELECT COALESCE(project_ref, folder_ref) FROM virtual_bodies
+                  WHERE deleted_at IS NULL AND (project_ref IS NOT NULL OR folder_ref IS NOT NULL)",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).map(|s| norm(&s)).collect()
+    };
+    let mut out = Vec::new();
+    for ent in std::fs::read_dir(&p.root).map_err(|e| e.to_string())? {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = ent.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        out.push(InnerFolder {
+            is_project: texos_dir(&path).join("texos.db").exists(),
+            linked: linked.contains(&norm(&path_str)),
+            name,
+            path: path_str,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.is_project
+            .cmp(&a.is_project)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(out)
 }
 
 #[derive(Serialize)]

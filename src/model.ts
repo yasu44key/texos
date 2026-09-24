@@ -118,6 +118,20 @@ export function lostFolderOf(o: VirtualBodyInfo): boolean {
   return !!o.folder_ref && o.cur_mtime == null;
 }
 
+// v1.8.8: list_inner_folders の返り値（プロジェクトフォルダ直下のサブフォルダ）。
+export interface InnerFolder {
+  name: string;
+  path: string;
+  is_project: boolean;
+  linked: boolean;
+}
+
+// v1.8.8: プロジェクトカードの参照先が TexoS プロジェクトとして見つからない（リンク切れ）。
+// list_objects は参照先に .texos/texos.db があるときだけ cur_mtime を埋める。
+export function lostProjectOf(o: VirtualBodyInfo): boolean {
+  return !!o.project_ref && o.cur_mtime == null;
+}
+
 // v1.7 P2 更新マーク: URLカードの「更新を確認」で内容の変化が検出された状態。
 // web_meta = {checked_at, update}（バックエンド web_check_update が書く）。
 export function webUpdateOf(o: VirtualBodyInfo): boolean {

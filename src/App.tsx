@@ -75,6 +75,8 @@ import {
   lostOf,
   lostRealOf,
   lostFolderOf,
+  lostProjectOf,
+  type InnerFolder,
   launcherPathOf,
   mimeMatches,
   noteSize,
@@ -3191,6 +3193,68 @@ function App() {
     [refresh, project]
   );
 
+  // v1.8.8: プロジェクトカードの参照先を選び直す（フォルダ整理で移動・改名したプロジェクト
+  // への繋ぎ直し）。既定で元の参照先の親フォルダを開く（handleRelinkFolder と同じ想定）。
+  // 選んだ先が TexoS プロジェクトでなければバックエンドが拒否するので、その旨を表示する。
+  const handleRelinkProject = useCallback(
+    async (id: string, currentPath: string) => {
+      const parent = currentPath ? currentPath.replace(/[\\/][^\\/]*$/, "") : undefined;
+      try {
+        const sel = await open({
+          directory: true,
+          title: "リンクし直すTexoSプロジェクトのフォルダを選択",
+          defaultPath: parent || project?.path,
+        });
+        if (typeof sel !== "string") return;
+        await invoke("relink_project", { id, newPath: sel });
+        await refresh();
+      } catch (e) {
+        console.error("relink_project failed", e);
+        setConfirm({
+          title: "リンクし直せませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh, project]
+  );
+
+  // v1.8.8: 現在のプロジェクトフォルダ直下のフォルダ（内包プロジェクト／普通のフォルダ）へ
+  // リンクカードを置く。import_file はフォルダが TexoS プロジェクトなら project_ref、
+  // そうでなければ folder_ref のカードを作る（配置・ドロップと同じ判定）。
+  // 複数置くときは起点から格子状に並べ、まとめて1回の UNDO で消せるようにする。
+  const placeInnerFolders = useCallback(
+    async (paths: string[], canvasX: number, canvasY: number) => {
+      const COLS = 4;
+      const DX = 170;
+      const DY = 120;
+      const created: string[] = [];
+      const errors: string[] = [];
+      for (let i = 0; i < paths.length; i++) {
+        const x = canvasX + (i % COLS) * DX;
+        const y = canvasY + Math.floor(i / COLS) * DY;
+        try {
+          created.push(await invoke<string>("import_file", { path: paths[i], label: "", x, y }));
+        } catch (e) {
+          errors.push(`${paths[i]}: ${String(e)}`);
+        }
+      }
+      if (created.length) pushUndo([{ kind: "delete", ids: created }]);
+      await refresh();
+      if (errors.length) {
+        setConfirm({
+          title: "一部のフォルダをリンクできませんでした",
+          message: errors.join("\n"),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh, pushUndo]
+  );
+
   // v1.3.9 問題点2: 正しいファイルが無いとき、CASスナップショットから実体を書き出す。
   const handleRestoreFromCas = useCallback(
     (id: string) => {
@@ -5727,6 +5791,37 @@ function App() {
           ];
           window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items }), 0);
         },
+        // v1.8.8: プロジェクトフォルダ直下のフォルダ（内包プロジェクト／普通のフォルダ）への
+        // リンクカードを置く。linkRegisteredProject と同じ「一覧取得→サブメニュー」定石。
+        linkInnerFolders: async (x, y) => {
+          let list: InnerFolder[] = [];
+          try {
+            list = await invoke<InnerFolder[]>("list_inner_folders");
+          } catch (e) {
+            console.error("list_inner_folders failed", e);
+          }
+          const unlinked = list.filter((f) => !f.linked);
+          const items: MenuItem[] = list.length
+            ? [
+                ...(unlinked.length >= 2
+                  ? [
+                      {
+                        label: `未配置をまとめて配置（${unlinked.length}件）`,
+                        hint: "まだリンクカードが無い内包フォルダすべてを、この場所から格子状に並べて配置します（Ctrl+Z で一括で戻せます）。",
+                        onClick: () => void placeInnerFolders(unlinked.map((f) => f.path), x, y),
+                      },
+                      { divider: true, label: "", onClick: () => {} },
+                    ]
+                  : []),
+                ...list.map((f) => ({
+                  label: `${f.linked ? "✓ " : "　"}${f.is_project ? "🗂" : "📁"} ${f.name}${f.is_project ? "（プロジェクト）" : ""}`,
+                  hint: `${f.path}${f.linked ? "\n（既にこのキャンバスにリンクカードがあります。選ぶともう1枚置きます）" : ""}`,
+                  onClick: () => void placeInnerFolders([f.path], x, y),
+                })),
+              ]
+            : [{ label: "（内包するフォルダはありません）", onClick: () => {}, disabled: true }];
+          window.setTimeout(() => setMenu({ x: info.clientX, y: info.clientY, items }), 0);
+        },
         commitAll: handleCommitAll,
         openSearch: () => setSearchOpen(true),
         openTrash: () => setTrashOpen(true),
@@ -5830,6 +5925,7 @@ function App() {
         commitReveal: handleCommitReveal,
         openOriginProject: handleOpenOriginProject,
         relinkFolder: handleRelinkFolder,
+        relinkProject: handleRelinkProject,
         relink: handleRelink,
         restoreFromCas: handleRestoreFromCas,
         editInCanvas: handleEditInCanvas,
@@ -5996,6 +6092,9 @@ function App() {
       handleSendToBack,
       handleCommitReveal,
       handleRelink,
+      handleRelinkFolder,
+      handleRelinkProject,
+      placeInnerFolders,
       handleRestoreFromCas,
       handleFocusSelection,
       handlePaste,
@@ -6266,7 +6365,7 @@ function App() {
             y={obj.pos_y}
             committed={!!obj.committed_path}
             active={touched.has(obj.id)}
-            lost={lostOf(obj) ?? ((lostRealOf(obj) || lostFolderOf(obj)) ? "real" : null)}
+            lost={lostOf(obj) ?? ((lostRealOf(obj) || lostFolderOf(obj) || lostProjectOf(obj)) ? "real" : null)}
             isProject={obj.mime_type === PROJECT_MIME || !!obj.project_ref}
             isUrl={!!obj.url_ref}
             webUpdate={webUpdateOf(obj)}

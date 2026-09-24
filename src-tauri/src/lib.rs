@@ -736,6 +736,8 @@ pub fn run() {
             commit_all,
             relink_object,
             relink_folder,
+            relink_project,
+            list_inner_folders,
             uncommit_object,
             make_real,
             open_with_default,
