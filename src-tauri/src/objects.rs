@@ -1995,12 +1995,16 @@ pub(crate) fn relink_object(id: String, new_path: String, state: State<AppState>
 pub(crate) fn relink_folder(id: String, new_path: String, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    relink_folder_in(p, &id, &new_path)
+}
+
+pub(crate) fn relink_folder_in(p: &Project, id: &str, new_path: &str) -> Result<(), String> {
     let np = std::path::Path::new(&new_path);
     if !np.is_dir() {
         return Err("選んだフォルダが見つかりません".into());
     }
     if texos_dir(np).join("texos.db").exists() {
-        return set_project_link(p, &id, &new_path);
+        return set_project_link(p, id, new_path);
     }
     p.conn
         .execute(
@@ -2018,6 +2022,10 @@ pub(crate) fn relink_folder(id: String, new_path: String, state: State<AppState>
 pub(crate) fn relink_project(id: String, new_path: String, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    relink_project_in(p, &id, &new_path)
+}
+
+pub(crate) fn relink_project_in(p: &Project, id: &str, new_path: &str) -> Result<(), String> {
     let np = std::path::Path::new(&new_path);
     if !np.is_dir() {
         return Err("選んだフォルダが見つかりません".into());
@@ -2025,7 +2033,7 @@ pub(crate) fn relink_project(id: String, new_path: String, state: State<AppState
     if !texos_dir(np).join("texos.db").exists() {
         return Err("選んだフォルダはTexoSプロジェクトではありません（.texos/texos.db がありません）".into());
     }
-    set_project_link(p, &id, &new_path)
+    set_project_link(p, id, new_path)
 }
 
 /// project_ref を差し替える共通部。real_id はパス由来のセンチネル（project:<hash(path)>）
@@ -2066,6 +2074,10 @@ pub struct InnerFolder {
 pub(crate) fn list_inner_folders(state: State<AppState>) -> Result<Vec<InnerFolder>, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    inner_folders_of(p)
+}
+
+pub(crate) fn inner_folders_of(p: &Project) -> Result<Vec<InnerFolder>, String> {
     // 既存リンクの照合は表記ゆれ（大小・区切り・末尾区切り）を吸収して行う。
     let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
     let linked: std::collections::HashSet<String> = {
@@ -2715,3 +2727,124 @@ pub(crate) fn convert_office_to_pdf(id: String, state: State<AppState>) -> Resul
     Ok(pdf.to_string_lossy().to_string())
 }
 
+
+#[cfg(test)]
+mod relink_tests {
+    use super::*;
+
+    /// 一時フォルダに TexoS プロジェクトを作って開く（.texos/texos.db を持つ）。
+    fn temp_project(tag: &str) -> Project {
+        let dir = std::env::temp_dir().join(format!("texos_relink_{}_{}_{}", tag, db::now_ms(), uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        open_project_at(&dir).unwrap()
+    }
+
+    fn card(p: &Project, id: &str) -> (Option<String>, Option<String>, String, Option<String>) {
+        p.conn
+            .query_row(
+                "SELECT project_ref, folder_ref, real_id, kind FROM virtual_bodies WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// v1.8.8: 移動したプロジェクトへ繋ぎ直す。プロジェクト以外は拒否し、カードは変えない。
+    #[test]
+    fn relink_project_switches_ref_and_sentinel() {
+        let p = temp_project("host");
+        let old = p.root.join("旧プロジェクト");
+        let old_s = old.to_string_lossy().to_string();
+        let rid = ensure_project_real_body(&p.conn, &old_s).unwrap();
+        db::insert_virtual_body(&p.conn, "vp", &rid, "旧", 0.0, 0.0, None, Some(&old_s)).unwrap();
+
+        // 普通のフォルダは拒否（格下げしない）
+        let plain = p.root.join("ただのフォルダ");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(relink_project_in(&p, "vp", &plain.to_string_lossy()).is_err());
+        assert_eq!(card(&p, "vp").0.as_deref(), Some(old_s.as_str()));
+
+        // 移動先のプロジェクトへ繋ぎ直す
+        let moved = temp_project("moved");
+        let moved_s = moved.root.to_string_lossy().to_string();
+        relink_project_in(&p, "vp", &moved_s).unwrap();
+        let (pr, fr, real, kind) = card(&p, "vp");
+        assert_eq!(pr.as_deref(), Some(moved_s.as_str()));
+        assert!(fr.is_none());
+        assert_eq!(real, ensure_project_real_body(&p.conn, &moved_s).unwrap());
+        assert_eq!(kind.as_deref(), Some("project"));
+        // 存在しないカードはエラー
+        assert!(relink_project_in(&p, "nope", &moved_s).is_err());
+
+        let _ = std::fs::remove_dir_all(&p.root);
+        let _ = std::fs::remove_dir_all(&moved.root);
+    }
+
+    /// v1.3.11 のコメントどおり: リンクフォルダの張り直し先がプロジェクトなら昇格する。
+    /// 普通のフォルダなら folder_ref の差し替えだけ。
+    #[test]
+    fn relink_folder_promotes_to_project() {
+        let p = temp_project("host");
+        let a = p.root.join("a");
+        let b = p.root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let vid = import_file_into(&p, a.to_string_lossy().to_string(), String::new(), 0.0, 0.0).unwrap();
+
+        relink_folder_in(&p, &vid, &b.to_string_lossy()).unwrap();
+        let (pr, fr, _, _) = card(&p, &vid);
+        assert!(pr.is_none());
+        assert_eq!(fr.as_deref(), Some(b.to_string_lossy().as_ref()));
+
+        let sub = p.root.join("内包プロジェクト");
+        drop(open_project_at(&sub).unwrap());
+        let sub_s = sub.to_string_lossy().to_string();
+        relink_folder_in(&p, &vid, &sub_s).unwrap();
+        let (pr, fr, real, kind) = card(&p, &vid);
+        assert_eq!(pr.as_deref(), Some(sub_s.as_str()));
+        assert!(fr.is_none());
+        assert!(real.starts_with("project:"));
+        assert_eq!(kind.as_deref(), Some("project"));
+
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
+
+    /// v1.8.8: 直下のフォルダだけを、プロジェクト→フォルダ・名前順で返す。
+    /// 隠しフォルダ（.texos）とファイルは除く。配置済み（削除済みカードは除く）に ✓。
+    #[test]
+    fn inner_folders_lists_children_with_flags() {
+        let p = temp_project("host");
+        let sub = p.root.join("Zプロジェクト");
+        drop(open_project_at(&sub).unwrap());
+        for d in ["b_plain", "A_plain", ".hidden"] {
+            std::fs::create_dir_all(p.root.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(p.root.join("b_plain").join("孫")).unwrap();
+        std::fs::write(p.root.join("file.txt"), b"x").unwrap();
+
+        // b_plain とプロジェクトはカードあり、A_plain のカードはゴミ箱の中
+        import_file_into(&p, p.root.join("b_plain").to_string_lossy().to_string(), String::new(), 0.0, 0.0).unwrap();
+        let sub_s = sub.to_string_lossy().to_string();
+        let rid = ensure_project_real_body(&p.conn, &sub_s).unwrap();
+        db::insert_virtual_body(&p.conn, "vp", &rid, "Z", 0.0, 0.0, None, Some(&sub_s)).unwrap();
+        let va = import_file_into(&p, p.root.join("A_plain").to_string_lossy().to_string(), String::new(), 0.0, 0.0).unwrap();
+        p.conn
+            .execute("UPDATE virtual_bodies SET deleted_at = 1 WHERE id = ?1", rusqlite::params![va])
+            .unwrap();
+
+        let got: Vec<(String, bool, bool)> = inner_folders_of(&p)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.name, f.is_project, f.linked))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Zプロジェクト".to_string(), true, true),
+                ("A_plain".to_string(), false, false),
+                ("b_plain".to_string(), false, true),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
+}
