@@ -16,6 +16,11 @@ use tauri::{Emitter, Manager, State};
 pub(crate) struct ChatMsg {
     role: String,
     content: String,
+    /// v1.8.9 assistant 発話の実行条件（モデル・digest・能力・実際に送ったパラメータ）。
+    /// 対話はフローのトレースに乗らないので、発話ごとに履歴 JSON へ残す。
+    /// 旧履歴（キー無し）もそのまま読める。API へ送るメッセージには含めない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    meta: Option<crate::ai_models::AiRunRecord>,
 }
 
 #[derive(Serialize, Clone)]
@@ -428,6 +433,7 @@ fn ai_chat_send_inner(
     history.push(ChatMsg {
         role: "user".into(),
         content: user,
+        meta: None,
     });
 
     // リクエスト用 messages（system → 接続文脈 → 会話履歴 の順）
@@ -505,6 +511,7 @@ fn ai_chat_send_inner(
 
     // ストリーミングは tokio 文脈外の素のOSスレッドで（run_ai と同じ理由）。
     // 中断フラグはこのジョブのもの（ジョブ別＝毎回新品なのでリセット不要）。
+    let mut rec: Option<crate::ai_models::AiRunRecord> = None;
     let result = std::thread::scope(|s| {
         s.spawn(|| {
             let mut on_token = |kind: flow::ChatChunk, tok: &str| {
@@ -517,7 +524,7 @@ fn ai_chat_send_inner(
                     },
                 );
             };
-            flow::run_ai_chat_stream(spec, &messages, &job.cancel, &mut on_token)
+            flow::run_ai_chat_stream_rec(spec, &messages, &job.cancel, &mut on_token, &mut rec)
         })
         .join()
         .map_err(|_| "AI実行スレッドが異常終了しました".to_string())?
@@ -531,6 +538,7 @@ fn ai_chat_send_inner(
             history.push(ChatMsg {
                 role: "assistant".into(),
                 content: answer.clone(),
+                meta: rec,
             });
             let _ = save_chat_history(root, &id, &history);
             // MD実身ログを毎ターン自動更新（固定名上書き＝位置と矢印を保ち緑シグナル再誕生）。
@@ -550,8 +558,16 @@ fn ai_chat_send_inner(
             Ok(answer)
         }
         Err(mut e) => {
+            // v1.8.9 能力で画像非対応と分かっているなら、それを先に言う。
+            let no_vision = rec
+                .as_ref()
+                .and_then(|r| r.capabilities)
+                .is_some_and(|c| c.vision == crate::ai_models::Tri::No);
             // 画像添付時のエラーはモデル非対応が多い → ヒントを添える。
-            if !images.is_empty() && (e.contains("400") || e.to_lowercase().contains("image")) {
+            if !images.is_empty() && no_vision {
+                e.push_str("
+（このモデルは画像入力に非対応です — 能力に「画像入力」があるモデルを選んでください）");
+            } else if !images.is_empty() && (e.contains("400") || e.to_lowercase().contains("image")) {
                 e.push_str("\n（ヒント: 画像を見るにはビジョン対応モデルが必要です。例: gemma3:latest。qwen等のテキスト専用モデルは画像を受け付けません）");
             }
             // 失敗時はユーザー発話を保存しない（次回リトライで二重に積まれない）

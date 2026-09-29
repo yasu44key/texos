@@ -98,6 +98,7 @@ pub(crate) fn execute_node(
     kind: flow::NodeKind,
     inputs: &[(&[u8], &str, &str)],
     job: &Job,
+    card: &str,
 ) -> Result<NodeRun, String> {
     use flow::NodeKind;
     let cancel = &job.cancel;
@@ -191,7 +192,13 @@ pub(crate) fn execute_node(
         }
         NodeKind::Ai => {
             // v1.4.0 AIフィルタは builtin だがネットワークを使う別経路（同期blocking）。
-            let (bytes, ext, mime) = flow::run_ai(spec, inputs[0].0)?;
+            // v1.8.9 実行条件（digest・能力・実際に送ったパラメータ）を成否に関わらず記録。
+            let mut rec = None;
+            let res = flow::run_ai_rec(spec, inputs[0].0, &mut rec);
+            if let Some(r) = rec {
+                job.trace.ai(card, r);
+            }
+            let (bytes, ext, mime) = res?;
             // v1.5.1 WS-B: 実行中に中断された場合は応答を破棄する（HTTP は途中で切れないため
             // 完走後にここで判定。「中断＝出力は破棄」の既存契約に合わせる）。
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1004,7 +1011,7 @@ pub(crate) fn eval_filter(
         let run = acquire_node_permits(state, app, job, &spec, flow::NodeKind::Generator)
             .and_then(|_permits| {
                 emit_job_progress(app, job, Some(&node_note(p, fid)), None);
-                execute_node(root, &spec, flow::NodeKind::Generator, &[], job)
+                execute_node(root, &spec, flow::NodeKind::Generator, &[], job, fid)
             });
         let out = match run {
             Ok(r) => {
@@ -1276,7 +1283,7 @@ pub(crate) fn eval_filter(
                 .unwrap_or_else(|| "output".to_string());
             let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
                 emit_job_progress(app, job, Some(&node_note(p, fid)), None);
-                execute_node(root, &spec, kind, &ins, job)
+                execute_node(root, &spec, kind, &ins, job, fid)
             });
             match run {
                 Ok(run) => {
@@ -1301,7 +1308,7 @@ pub(crate) fn eval_filter(
         {
             let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
                 emit_job_progress(app, job, Some(&node_note(p, fid)), None);
-                execute_node(root, &spec, kind, &[], job)
+                execute_node(root, &spec, kind, &[], job, fid)
             });
             match run {
                 Ok(run) => {
@@ -1346,7 +1353,7 @@ pub(crate) fn eval_filter(
             let ins = [(pl.bytes.as_slice(), pl.ext.as_str(), pl.mime.as_str())];
             let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
                 emit_job_progress(app, job, Some(&node_note(p, fid)), None);
-                execute_node(root, &spec, kind, &ins, job)
+                execute_node(root, &spec, kind, &ins, job, fid)
             });
             match run {
                 Ok(run) => {

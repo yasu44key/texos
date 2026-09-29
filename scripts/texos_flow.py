@@ -241,7 +241,8 @@ class Project:
            prefix: str | None = None, temperature: float | None = None,
            model: str | None = None, provider: str | None = None,
            endpoint: str | None = None, gpu: str | None = None,
-           think: str | None = None, memo: str | None = None) -> str:
+           think: str | None = None, num_ctx: int | None = None,
+           memo: str | None = None) -> str:
         """AIフィルタカード（builtin:"ai" transform）。
 
         **通常入力は1本にすること**（複数繋ぐと入力ごとにファンアウトする → cat() で束ねる）。
@@ -255,6 +256,10 @@ class Project:
              "cpu"（GPU を使わない）。Ollama ネイティブのみ有効。
         think: None（既定・思考モード指定なし）| "on" | "low" | "medium" | "high"。
              transform では思考は出力から必ず取り除かれる（下流のフィルタが食べるため）。
+             思考非対応のモデルには送られない（実行時に能力を確認）。gpt-oss 系は
+             深さ指定のみで、"on" は "medium" として送られる。
+        num_ctx: None（既定・Ollama の既定長）| 整数（実行時のコンテキスト長・トークン）。
+             長い資料を渡すときに増やす。Ollama ネイティブのみ有効。
         """
         spec = {"builtin": "ai", "provider": provider or self.provider,
                 "mode": "transform", "model": model or self.model,
@@ -269,6 +274,8 @@ class Project:
             spec["gpu"] = gpu
         if think:
             spec["think"] = think
+        if num_ctx:
+            spec["num_ctx"] = num_ctx
         return self._filter(label, spec, x, y, memo)
 
     def cat(self, label: str, x: float, y: float, *, separator: str = "rule",

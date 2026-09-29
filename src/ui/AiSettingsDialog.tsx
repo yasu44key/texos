@@ -58,6 +58,55 @@ const DEFAULT_ENDPOINT: Record<Server, string> = {
 const isDefaultEndpoint = (v: string) =>
   Object.values(DEFAULT_ENDPOINT).includes(v.trim().replace(/\/+$/, ""));
 
+// v1.8.9 モデル能力（バックエンド ai_models::ModelInfo の写し）。
+// 能力は「機能の有無」であり、精度・品質は表さない（表示でも品質を示唆しない）。
+export type Tri = "yes" | "no" | "unknown";
+export interface ModelInfo {
+  provider: string;
+  endpoint: string;
+  name: string;
+  digest: string;
+  parameter_size?: string;
+  quantization?: string;
+  /** 学習上限（実行時の num_ctx とは別物） */
+  trained_context_length?: number;
+  capabilities: { completion: Tri; tools: Tri; thinking: Tri; vision: Tri; embedding: Tri };
+  raw_capabilities?: string[] | null;
+  thinking_mode: { kind: "none" | "boolean" | "levels" | "boolean_or_levels" | "unknown"; levels?: string[] };
+  /** 思考に出してよい値（off/on/low/medium/high の部分集合）。判定はバックエンドの1か所 */
+  think_choices: string[];
+  fetched_at: string;
+}
+
+const ALL_THINK = ["off", "on", "low", "medium", "high"];
+const THINK_LABEL: Record<string, string> = {
+  off: "使わない",
+  on: "使う",
+  low: "使う（浅く）",
+  medium: "使う（中）",
+  high: "使う（深く）",
+};
+
+const allUnknown = (m: ModelInfo) => Object.values(m.capabilities).every((t) => t === "unknown");
+
+/// 候補▼の各行に添える能力の印（有るものだけ）。不明は ⚠。
+function capBadge(m: ModelInfo): string {
+  if (allUnknown(m)) return "  ⚠能力不明";
+  const c = m.capabilities;
+  let b = "";
+  if (c.thinking === "yes") b += "🧠";
+  if (c.vision === "yes") b += "👁";
+  if (c.tools === "yes") b += "🔧";
+  return b ? `  ${b}` : "";
+}
+
+/// Ollama は "gemma3" を "gemma3:latest" として扱う。
+function findInfo(catalog: ModelInfo[], name: string): ModelInfo | undefined {
+  const n = name.trim();
+  if (!n) return undefined;
+  return catalog.find((m) => m.name === n) ?? catalog.find((m) => m.name === `${n}:latest`);
+}
+
 function parseServer(v: unknown): Server {
   return v === "openai" || v === "lmstudio" ? v : "ollama";
 }
@@ -104,6 +153,10 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   const [think, setThink] = useState<string>(
     typeof base.think === "string" && base.think !== "" ? (base.think as string) : "off"
   );
+  // v1.8.9 モデルに合わせて思考の値を直したときの説明（黙って変えない）。
+  const [thinkAdjusted, setThinkAdjusted] = useState<string | null>(null);
+  // v1.8.9 実行時のコンテキスト長（Ollama の num_ctx）。空欄＝サーバ既定。
+  const [numCtx, setNumCtx] = useState(typeof base.num_ctx === "number" ? String(base.num_ctx) : "");
 
   // v1.4.28 WS3: PCスペック検出。モデルサイズ選択の根拠として表示する。
   const [spec, setSpec] = useState<SpecInfo | null>(null);
@@ -114,20 +167,50 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   }, []);
 
   // v1.4.2 モデル候補（/api/tags 等から取得）。手入力も併用可（datalist）。
-  const [models, setModels] = useState<string[]>([]);
+  // v1.8.9 能力つきの一覧（ai_model_catalog）。Ollama は digest が変わったモデルだけ
+  // /api/show を呼び直す（キャッシュはマシン単位）。
+  const [catalog, setCatalog] = useState<ModelInfo[]>([]);
+  const models = useMemo(() => catalog.map((m) => m.name), [catalog]);
   const [modelsState, setModelsState] = useState<"idle" | "loading" | "error">("idle");
   const fetchModels = useCallback(() => {
     setModelsState("loading");
-    invoke<string[]>("ai_list_models", { provider, endpoint: endpoint.trim() || null })
+    invoke<ModelInfo[]>("ai_model_catalog", { provider, endpoint: endpoint.trim() || null })
       .then((list) => {
-        setModels(list);
+        setCatalog(list);
         setModelsState("idle");
       })
       .catch(() => {
-        setModels([]);
+        setCatalog([]);
         setModelsState("error");
       });
   }, [provider, endpoint]);
+  const info = useMemo(() => findInfo(catalog, model), [catalog, model]);
+  const levelsOnly = info?.thinking_mode.kind === "levels";
+  const thinkChoices = info?.think_choices ?? ALL_THINK;
+
+  // v1.8.9 選んだモデルで選べない思考の値は、実行時と同じ規則で読み替えて知らせる
+  // （思考非対応→使わない／gpt-oss の「使う」→中／深さ非対応→使う）。
+  useEffect(() => {
+    if (!info || thinkChoices.includes(think)) return;
+    const next =
+      think === "on" && levelsOnly ? "medium" : think !== "off" && thinkChoices.includes("on") ? "on" : "off";
+    setThink(next);
+    setThinkAdjusted(
+      info.capabilities.thinking === "no"
+        ? "このモデルは思考に非対応のため「使わない」にしました"
+        : `このモデルでは「${THINK_LABEL[think] ?? think}」を選べないため「${
+            levelsOnly && next === "off" ? "指定しない" : THINK_LABEL[next]
+          }」にしました`
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [info]);
+
+  // 候補▼で選べない理由（無ければ null）。no は選択不可、unknown は選べる（⚠付き）。
+  const unusable = (m: ModelInfo): string | null => {
+    if (m.capabilities.completion === "no") return "埋め込み専用・対話不可";
+    if (think !== "off" && m.capabilities.thinking === "no") return "思考非対応 — 思考を「使わない」にすると選べます";
+    return null;
+  };
   // 初回＋プロバイダ切替で自動取得（エンドポイント変更は「↻取得」で明示）。
   useEffect(() => {
     fetchModels();
@@ -165,6 +248,10 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     else delete spec.gpu;
     if (think !== "off") spec.think = think;
     else delete spec.think;
+    // v1.8.9 num_ctx は Ollama のみ（LM Studio はロード時に決まる）。
+    const nc = parseInt(numCtx, 10);
+    if (provider === "ollama" && numCtx.trim() !== "" && !Number.isNaN(nc) && nc > 0) spec.num_ctx = nc;
+    else delete spec.num_ctx;
     // 接続時型チェック・出力の既定（未設定なら補う）。
     if (!spec.accept_mime) spec.accept_mime = mode === "chat" ? "*/*" : "text/*";
     if (!spec.output_ext) spec.output_ext = "md";
@@ -287,17 +374,29 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
                 <select
                   value=""
                   onChange={(e) => {
-                    if (e.target.value) setModel(e.target.value);
+                    if (e.target.value) {
+                      setModel(e.target.value);
+                      setThinkAdjusted(null);
+                    }
                   }}
                   style={{ ...inp(), width: 130, flex: "none" }}
-                  title="取得したモデルから選ぶ"
+                  title={
+                    "取得したモデルから選ぶ。印は機能の有無（品質を示すものではありません）:\n" +
+                    "🧠 思考　👁 画像入力　🔧 ツール　⚠ 能力不明（サーバが返さない）\n" +
+                    "選べない行は、いまの設定では使えない機能のモデルです（理由を併記）。"
+                  }
                 >
                   <option value="">候補 ▼</option>
-                  {models.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
+                  {catalog.map((m) => {
+                    const why = unusable(m);
+                    return (
+                      <option key={m.name} value={m.name} disabled={!!why}>
+                        {m.name}
+                        {capBadge(m)}
+                        {why ? `（${why}）` : ""}
+                      </option>
+                    );
+                  })}
                 </select>
               )}
               <button onClick={fetchModels} style={smallBtn()} title="接続先からモデル一覧を取得">
@@ -328,6 +427,8 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             </div>
           </div>
         )}
+
+        {info && row("能力", capabilityView(info, mode))}
 
         {spec &&
           row(
@@ -377,7 +478,11 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             <select
               style={{ ...inp(), width: 220 }}
               value={think}
-              onChange={(e) => setThink(e.target.value)}
+              disabled={thinkChoices.length <= 1 && think === "off"}
+              onChange={(e) => {
+                setThink(e.target.value);
+                setThinkAdjusted(null);
+              }}
               title={
                 "思考（Thinking）対応モデルに、答える前の思考を出させます。\n" +
                 "思考は本文と分けて折りたたみ表示するだけで、会話履歴にも MDログにも残りません。\n" +
@@ -385,21 +490,55 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
                 "reasoning と、本文に混ざる <think>…</think> の両方を拾って分離します。"
               }
             >
-              <option value="off">使わない</option>
-              <option value="on">使う</option>
-              <option value="low">使う（浅く）</option>
-              <option value="medium">使う（中）</option>
-              <option value="high">使う（深く）</option>
+              {thinkChoices.map((c) => (
+                <option key={c} value={c}>
+                  {c === "off" && levelsOnly ? "指定しない（サーバ既定の深さ）" : THINK_LABEL[c] ?? c}
+                </option>
+              ))}
             </select>
+            {thinkAdjusted && <div style={{ fontSize: 11, color: "#e0a35c", marginTop: 3 }}>{thinkAdjusted}</div>}
             <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginTop: 3 }}>
-              {think === "off"
-                ? "思考型モデルが本文に混ぜてくる <think>…</think> は、この設定に関わらず常に取り除きます"
-                : provider === "ollama"
-                ? "思考対応モデル（gpt-oss / qwen3 / deepseek-r1 等）が必要です。非対応モデルでは無視されます"
-                : "浅さ・深さの指定はサーバ側が解釈しない場合があります（そのときは「使う」と同じ扱い）"}
+              {thinkHint(provider, think, info)}
             </div>
           </div>
         )}
+
+        {provider === "ollama" &&
+          row(
+            "コンテキスト長",
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  style={{ ...inp(), width: 100 }}
+                  value={numCtx}
+                  onChange={(e) => setNumCtx(e.target.value)}
+                  placeholder="サーバ既定"
+                  inputMode="numeric"
+                  title={
+                    "実行時に確保するコンテキスト長（Ollama の num_ctx・トークン数）。\n" +
+                    "空欄なら Ollama の既定（モデルの学習上限よりずっと小さい）。\n" +
+                    "長い資料をつなぐときに増やします。大きいほど VRAM を使います。"
+                  }
+                />
+                <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
+                  トークン（空欄=サーバ既定）
+                </span>
+              </div>
+              {info?.trained_context_length != null && (
+                <div
+                  style={{
+                    fontSize: 11,
+                    marginTop: 3,
+                    color:
+                      parseInt(numCtx, 10) > info.trained_context_length ? "#e0a35c" : "var(--panel-muted, #8a93a8)",
+                  }}
+                >
+                  このモデルの学習上限: {info.trained_context_length.toLocaleString()} トークン
+                  {parseInt(numCtx, 10) > info.trained_context_length && " — 学習上限を超えています"}
+                </div>
+              )}
+            </div>
+          )}
 
         {row(
           "システム\nプロンプト",
@@ -466,6 +605,64 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
       </div>
     </div>
   );
+}
+
+/// v1.8.9 選んだモデルの能力（機能の有無）と学習上限。品質を示唆する表現は使わない。
+function capabilityView(m: ModelInfo, mode: "chat" | "transform") {
+  const mark = (t: Tri) => (t === "yes" ? "○" : t === "no" ? "×" : "？");
+  const c = m.capabilities;
+  const items: [string, Tri][] = [
+    ["対話", c.completion],
+    ["思考", c.thinking],
+    ["画像入力", c.vision],
+    ["ツール", c.tools],
+    ["埋め込み", c.embedding],
+  ];
+  const facts = [
+    m.trained_context_length != null && `学習上限 ${m.trained_context_length.toLocaleString()} トークン`,
+    m.parameter_size,
+    m.quantization,
+  ].filter(Boolean);
+  return (
+    <div
+      style={{ fontSize: 11, lineHeight: 1.6, color: "var(--panel-muted, #8a93a8)", paddingTop: 5 }}
+      title={
+        "モデルが持つ機能の有無です（サーバの申告による）。精度や品質を示すものではありません。\n" +
+        "○ あり　× なし　？ 不明（サーバが能力を返さない）" +
+        (m.digest ? `\n中身の識別子: ${m.digest.slice(0, 24)}…` : "")
+      }
+    >
+      <div style={{ color: "var(--panel-text, #d6dded)" }}>{items.map(([k, t]) => `${k}${mark(t)}`).join("　")}</div>
+      {facts.length > 0 && <div>{facts.join(" ／ ")}</div>}
+      {allUnknown(m) && (
+        <div style={{ color: "#e0a35c" }}>
+          ⚠ このサーバは能力を返しません。選べますが、非対応の指定はエラーになることがあります（自動では送り直しません）
+        </div>
+      )}
+      {c.completion === "no" && (
+        <div style={{ color: "#e0a35c" }}>埋め込み専用モデルです — 対話・変換には使えません</div>
+      )}
+      {mode === "chat" && c.vision === "no" && <div>画像カードをつないでも、このモデルには見えません</div>}
+    </div>
+  );
+}
+
+/// v1.8.9 思考欄の下の説明（実際に何を送るか）。判定の本体はバックエンドの plan_think。
+function thinkHint(provider: Server, think: string, info: ModelInfo | undefined): string {
+  if (think === "off") {
+    if (info?.thinking_mode.kind === "levels")
+      return "このモデル（gpt-oss 系）は思考を止められません。深さを指定しなければサーバ既定で思考します";
+    return "思考型モデルが本文に混ぜてくる <think>…</think> は、この設定に関わらず常に取り除きます";
+  }
+  if (provider === "openai")
+    return "OpenAI互換（汎用）サーバには思考の指定を送りません。返ってきた思考は分離して表示します";
+  if (provider === "lmstudio") {
+    if (think === "on") return "思考の使う／使わないは LM Studio 側の設定に従います（API からは送りません）";
+    return `深さは reasoning_effort="${think}" として送ります`;
+  }
+  if (!info || info.capabilities.thinking === "unknown")
+    return "このモデルの能力は不明です。思考に非対応ならエラーになります（自動では送り直しません）";
+  return think === "on" ? "think=true として送ります" : `深さは think="${think}" として送ります`;
 }
 
 /// v1.7.3 OpenAI互換サーバー側で何を設定すべきかの案内。ダイアログ内に常設する

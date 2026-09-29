@@ -97,6 +97,10 @@ pub(crate) struct TraceEntry {
     pub(crate) skipped: u32,
     /// 付帯情報（コマンド行・採用した枝・stderr 等）。
     pub(crate) notes: Vec<(String, String)>,
+    /// v1.8.9 AI ノードの再現条件（モデル・digest・能力・実際に送ったパラメータ）。
+    /// 要約モードでも残す（中身ではなく条件なので）。反復で複数回走れば最後の1回。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ai: Option<crate::ai_models::AiRunRecord>,
 }
 
 #[derive(Default)]
@@ -175,6 +179,7 @@ impl Trace {
             errors: vec![],
             skipped: 0,
             notes: vec![],
+            ai: None,
         }
     }
 
@@ -225,6 +230,14 @@ impl Trace {
         e.status = "info".into();
         e.notes.push((key.to_string(), value));
         Self::push_done(&mut g, e);
+    }
+
+    /// v1.8.9 AI ノードの実行条件（評価中のエントリへ。成否に関わらず呼ぶ）。
+    pub(crate) fn ai(&self, card: &str, rec: crate::ai_models::AiRunRecord) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(e) = g.pending.get_mut(card) {
+            e.ai = Some(rec);
+        }
     }
 
     /// デバッグモードのときだけ残す付帯情報（stderr・プロンプト等の中身）。
@@ -533,6 +546,14 @@ pub(crate) fn render_markdown(trace: &Trace, entries: &[TraceEntry], sum: &Trace
         if e.skipped > 0 {
             md.push_str(&format!("- スキップした入力: {} 件（型不一致）\n", e.skipped));
         }
+        if let Some(ai) = &e.ai {
+            md.push_str("- AI 実行条件:
+");
+            for (k, v) in ai.lines() {
+                md.push_str(&format!("  - {k}: {v}
+"));
+            }
+        }
         for err in &e.errors {
             md.push_str(&format!("- エラー:\n\n{}\n{}\n{}\n\n", fence_for(err), err, fence_for(err)));
         }
@@ -721,6 +742,51 @@ mod tests {
         assert!(md.contains("gcc: error"));
         assert!(md.contains("未完了"));
         assert!(md.contains("実行失敗: boom"));
+    }
+
+    #[test]
+    fn ai_run_record_is_rendered_and_serialized() {
+        use crate::ai_models::*;
+        let t = Trace::with_detail(false);
+        t.begin("a", "AI", "AI", "");
+        t.ai(
+            "a",
+            AiRunRecord {
+                provider: "ollama".into(),
+                endpoint: "http://localhost:11434".into(),
+                model: "qwen3:8b".into(),
+                digest: Some("abc123".into()),
+                capabilities: Some(ModelCapabilities {
+                    completion: Tri::Yes,
+                    tools: Tri::Yes,
+                    thinking: Tri::Yes,
+                    vision: Tri::No,
+                    embedding: Tri::No,
+                }),
+                thinking_mode: Some(ThinkingMode::BooleanOrLevels { levels: vec!["low".into()] }),
+                think_setting: Some("low".into()),
+                sent: SentParams { think: Some(serde_json::json!("low")), num_ctx: Some(8192), ..Default::default() },
+                notes: vec![],
+                thinking_returned: true,
+            },
+        );
+        t.end("a", &EvalOut::failed(vec!["AI APIエラー (400)".into()], None, vec![]), 0);
+        let v = t.snapshot();
+        let md = render_markdown(
+            &t,
+            &v,
+            &TraceSummary { job_id: 1, label: "L", card: "a", report: None, fatal: None },
+            db::now_ms(),
+        );
+        assert!(md.contains("digest: abc123"));
+        assert!(md.contains("think \"low\""));
+        assert!(md.contains("num_ctx 8192"));
+        assert!(md.contains("AI APIエラー (400)"), "失敗しても条件とエラーが両方残る");
+        let j = serde_json::to_value(&v[0]).unwrap();
+        assert_eq!(j["ai"]["digest"], "abc123");
+        assert_eq!(j["ai"]["capabilities"]["vision"], "no");
+        assert_eq!(j["ai"]["thinking_mode"]["kind"], "boolean_or_levels");
+        assert_eq!(j["ai"]["sent"]["tools"], false);
     }
 
     #[test]

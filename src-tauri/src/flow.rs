@@ -148,6 +148,11 @@ pub struct FilterSpec {
     /// <think>…</think> で混ざるかが分かれるため、両方を受けて分離する。
     #[serde(default)]
     pub think: Option<String>,
+    /// v1.8.9 AI: 実行時のコンテキスト長（Ollama の options.num_ctx）。未指定＝キーを送らない
+    /// ＝サーバ既定（学習上限よりずっと小さい）。モデルの学習上限（/api/show の
+    /// context_length）とは別物。Ollama ネイティブ経路のみ有効（LM Studio はロード時に決まる）。
+    #[serde(default)]
+    pub num_ctx: Option<u32>,
     /// v1.4.9 録音モード（ジェネレータ）: true なら stdin をパイプで開いたまま起動し、
     /// 子プロセスへ制御文字列（ffmpeg の 'q' 等）を送れるようにする（汎用 stdin チャネル）。
     /// 録音は自分で終わらない（-t 不要）ので「停止」で 'q' を送って正常終了させ WAV を確定する。
@@ -1060,16 +1065,95 @@ pub(crate) fn ollama_num_gpu(spec: &FilterSpec) -> Option<i64> {
     }
 }
 
-/// spec.think → /api/chat の think に載せる値（None＝キーを送らない）。
-pub(crate) fn ollama_think(spec: &FilterSpec) -> Option<serde_json::Value> {
-    match spec.think.as_deref().map(str::trim).unwrap_or("") {
-        "" | "off" | "false" => None,
-        "on" | "true" => Some(serde_json::json!(true)),
-        // レベル指定はそのまま渡す（解さないモデル・サーバでは true 相当に丸められる）。
-        "low" => Some(serde_json::json!("low")),
-        "medium" => Some(serde_json::json!("medium")),
-        "high" => Some(serde_json::json!("high")),
-        _ => None,
+// v1.8.9 思考の送り方は ai_models::plan_think に一本化（能力が no のモデルには送らない —
+// Ollama 0.34 は思考非対応モデルへの think を 400 で拒否する。旧 ollama_think は
+// 「解さないモデルでは無視される」前提だったが、実機ではそうならなかった）。
+
+/// v1.8.9 Ollama の options（temperature / num_gpu / num_ctx）。変換と対話で共用。
+fn ollama_options(spec: &FilterSpec) -> serde_json::Value {
+    let mut options = serde_json::Map::new();
+    if let Some(t) = spec.temperature {
+        options.insert("temperature".into(), serde_json::json!(t));
+    }
+    // v1.8.6 GPU の使い方（既定＝キー無し＝載る限り GPU）。
+    if let Some(n) = ollama_num_gpu(spec) {
+        options.insert("num_gpu".into(), serde_json::json!(n));
+    }
+    if let Some(n) = spec.num_ctx.filter(|n| *n > 0) {
+        options.insert("num_ctx".into(), serde_json::json!(n));
+    }
+    serde_json::Value::Object(options)
+}
+
+/// v1.8.9 送信前の準備: モデルの能力を確かめ（Ollama は /api/tags を1回・digest が
+/// 変わっていたときだけ /api/show）、送る思考パラメータを決め、実行ログの雛形を作る。
+/// 能力を確かめられなくても実行は止めない（不明＝設定どおり送る）。
+/// tokio 文脈外のスレッドから呼ぶこと（reqwest::blocking）。
+fn prepare_ai_run(
+    spec: &FilterSpec,
+    provider: &str,
+    model: &str,
+) -> (crate::ai_models::ThinkPlan, crate::ai_models::AiRunRecord) {
+    use crate::ai_models::*;
+    let endpoint = effective_ai_endpoint(spec);
+    let mut notes = Vec::new();
+    // 汎用 OpenAI互換は能力を取る API が無い（毎回の注記はノイズなので黙って不明扱い）。
+    let info = if provider == "openai" {
+        None
+    } else {
+        match ensure_model_info(provider, &endpoint, model) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                notes.push(format!("能力を確認できませんでした（設定どおり送信）: {e}"));
+                None
+            }
+        }
+    };
+    let plan = plan_think(provider, spec.think.as_deref(), info.as_ref());
+    notes.extend(plan.note.clone());
+    let ollama = !is_openai_compat(provider);
+    if !ollama && spec.num_ctx.is_some() {
+        notes.push("num_ctx は Ollama でのみ有効です（送信していません）".into());
+    }
+    let rec = AiRunRecord {
+        provider: provider.to_string(),
+        endpoint: normalize_endpoint(provider, &endpoint),
+        model: model.to_string(),
+        digest: info.as_ref().map(|i| i.digest.clone()).filter(|d| !d.is_empty()),
+        capabilities: info.as_ref().map(|i| i.capabilities),
+        thinking_mode: info.as_ref().map(|i| i.thinking_mode.clone()),
+        think_setting: spec.think.clone().filter(|s| !s.trim().is_empty()),
+        sent: SentParams {
+            tools: false,
+            think: plan.ollama_think.clone(),
+            reasoning_effort: plan.reasoning_effort.clone(),
+            num_ctx: if ollama { spec.num_ctx.filter(|n| *n > 0) } else { None },
+            num_gpu: if ollama { ollama_num_gpu(spec) } else { None },
+            temperature: spec.temperature,
+        },
+        notes,
+        thinking_returned: false,
+    };
+    (plan, rec)
+}
+
+/// v1.8.9 エラー応答の本文から理由を取り出す。Ollama は {"error":"..."}、OpenAI準拠は
+/// {"error":{"message":"..."}}。対話（ストリーム）経路は従来ステータスしか出しておらず、
+/// 「"gemma3" does not support thinking」のような肝心の理由が消えていた。
+fn api_error_text(status: reqwest::StatusCode, body: &str) -> String {
+    let msg = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
+        v["error"]["message"]
+            .as_str()
+            .or_else(|| v["error"].as_str())
+            .map(String::from)
+    });
+    match msg {
+        Some(m) => format!("AI APIエラー ({status}): {m}"),
+        None if !body.trim().is_empty() => {
+            let head: String = body.trim().chars().take(300).collect();
+            format!("AI APIエラー ({status}): {head}")
+        }
+        None => format!("AI APIエラー ({status})"),
     }
 }
 
@@ -1201,15 +1285,31 @@ pub(crate) fn strip_think_blocks(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// 記録を取らない版（実機検証テスト用）。
+#[cfg(test)]
 pub fn run_ai(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, String), String> {
+    run_ai_rec(spec, input, &mut None)
+}
+
+/// v1.8.9 run_ai ＋実行条件の記録。rec には送信前に雛形が入る（失敗しても残る＝
+/// 非対応エラーの実行条件もログに書ける）。
+pub fn run_ai_rec(
+    spec: &FilterSpec,
+    input: &[u8],
+    rec: &mut Option<crate::ai_models::AiRunRecord>,
+) -> Result<(Vec<u8>, String, String), String> {
     std::thread::scope(|s| {
-        s.spawn(|| run_ai_blocking(spec, input))
+        s.spawn(|| run_ai_blocking(spec, input, rec))
             .join()
             .map_err(|_| "AI実行スレッドが異常終了しました".to_string())?
     })
 }
 
-fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, String), String> {
+fn run_ai_blocking(
+    spec: &FilterSpec,
+    input: &[u8],
+    rec: &mut Option<crate::ai_models::AiRunRecord>,
+) -> Result<(Vec<u8>, String, String), String> {
     let provider = spec.provider.as_deref().unwrap_or("ollama");
     let model = spec
         .model
@@ -1236,6 +1336,10 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
     }
     messages.push(serde_json::json!({ "role": "user", "content": user }));
 
+    // v1.8.9 能力の確認と思考パラメータの決定（記録の雛形はここで rec へ）。
+    let (plan, record) = prepare_ai_run(spec, provider, model);
+    let r = rec.insert(record);
+
     let content = if is_openai_compat(provider) {
         let endpoint = spec
             .endpoint
@@ -1252,23 +1356,28 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
         if let Some(t) = spec.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        // v1.8.9 LM Studio の深さ指定（gpt-oss 等・レベルを受けるモデルだけ）。
+        if let Some(e) = &plan.reasoning_effort {
+            body["reasoning_effort"] = serde_json::json!(e);
+        }
         let resp = client
             .post(format!("{endpoint}/chat/completions"))
             .json(&body)
             .send()
             .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
         let status = resp.status();
-        let v: serde_json::Value = resp
-            .json()
-            .map_err(|e| format!("AI応答の解析に失敗: {e}"))?;
+        let text = resp.text().map_err(|e| format!("AI応答の読み取りに失敗: {e}"))?;
         if !status.is_success() {
-            let msg = v["error"]["message"]
-                .as_str()
-                .or_else(|| v["error"].as_str())
-                .unwrap_or("不明なエラー");
-            return Err(format!("AI APIエラー ({status}): {msg}"));
+            return Err(api_error_text(status, &text));
         }
-        v["choices"][0]["message"]["content"]
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("AI応答の解析に失敗: {e}"))?;
+        let msg = &v["choices"][0]["message"];
+        let th = msg["reasoning_content"].as_str().or_else(|| msg["reasoning"].as_str());
+        if th.is_some_and(|t| !t.is_empty()) {
+            r.thinking_returned = true;
+        }
+        msg["content"]
             .as_str()
             .ok_or("AI応答に content がありません")?
             .to_string()
@@ -1280,27 +1389,20 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
             .filter(|s| !s.is_empty())
             .unwrap_or("http://localhost:11434")
             .trim_end_matches('/');
-        let mut options = serde_json::Map::new();
-        if let Some(t) = spec.temperature {
-            options.insert("temperature".into(), serde_json::json!(t));
-        }
-        // v1.8.6 GPU の使い方（既定＝キー無し＝載る限り GPU）。
-        if let Some(n) = ollama_num_gpu(spec) {
-            options.insert("num_gpu".into(), serde_json::json!(n));
-        }
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": false,
             // モデルをVRAMに5分常駐 → 連続実行でロード待ちを避ける（効率化）。
             "keep_alive": "5m",
-            "options": serde_json::Value::Object(options),
+            "options": ollama_options(spec),
         });
         // v1.8.6 Thinking。変換モードでは思考を捨てるので、本来 think は不要だが、
         // 思考型モデルは think を渡さないと本文に <think> を混ぜてくる方が多い。
         // 明示的に分離させたうえで message.thinking を読み捨てるのが確実。
-        if let Some(t) = ollama_think(spec) {
-            body["think"] = t;
+        // v1.8.9 送る値は能力に応じて plan_think が決める（非対応モデルには送らない）。
+        if let Some(t) = &plan.ollama_think {
+            body["think"] = t.clone();
         }
         let resp = client
             .post(format!("{endpoint}/api/chat"))
@@ -1308,13 +1410,15 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
             .send()
             .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
         let status = resp.status();
-        let v: serde_json::Value = resp
-            .json()
-            .map_err(|e| format!("AI応答の解析に失敗: {e}"))?;
+        let text = resp.text().map_err(|e| format!("AI応答の読み取りに失敗: {e}"))?;
         if !status.is_success() {
             // Ollama はエラーを {"error":"..."} で返す
-            let msg = v["error"].as_str().unwrap_or("不明なエラー");
-            return Err(format!("AI APIエラー ({status}): {msg}"));
+            return Err(api_error_text(status, &text));
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("AI応答の解析に失敗: {e}"))?;
+        if v["message"]["thinking"].as_str().is_some_and(|t| !t.is_empty()) {
+            r.thinking_returned = true;
         }
         v["message"]["content"]
             .as_str()
@@ -1324,9 +1428,12 @@ fn run_ai_blocking(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, 
 
     // v1.8.6 変換カードの出力は下流のフィルタが食べる → 思考は必ず落とす。
     // think を解さないサーバや、think を無視して本文に混ぜるモデルへの保険でもある。
-    let content = strip_think_blocks(&content);
+    let stripped = strip_think_blocks(&content);
+    if stripped != content {
+        r.thinking_returned = true;
+    }
 
-    Ok((content.into_bytes(), "md".into(), "text/markdown".into()))
+    Ok((stripped.into_bytes(), "md".into(), "text/markdown".into()))
 }
 
 /// v1.5 Text-To-Image デーモン（t2i_server.py）の待受ポート。TexoS が system Python で
@@ -1574,11 +1681,23 @@ fn emit_content(
 /// v1.8.6 Thinking: on_token は断片の種別（ChatChunk::Content / Thinking）を受け取る。
 /// 戻り値の本文には **思考は含まれない** — 思考は表示だけして履歴にもログにも残さない、
 /// という方針（コンテキストを食わせない・次ターンへ送らない）をここで保証する。
+#[cfg(test)]
 pub fn run_ai_chat_stream(
     spec: &FilterSpec,
     messages: &[serde_json::Value],
     cancel: &std::sync::atomic::AtomicBool,
     on_token: &mut dyn FnMut(ChatChunk, &str),
+) -> Result<String, String> {
+    run_ai_chat_stream_rec(spec, messages, cancel, on_token, &mut None)
+}
+
+/// v1.8.9 run_ai_chat_stream ＋実行条件の記録（rec は送信前に入る＝失敗時も残る）。
+pub fn run_ai_chat_stream_rec(
+    spec: &FilterSpec,
+    messages: &[serde_json::Value],
+    cancel: &std::sync::atomic::AtomicBool,
+    outer_on_token: &mut dyn FnMut(ChatChunk, &str),
+    rec: &mut Option<crate::ai_models::AiRunRecord>,
 ) -> Result<String, String> {
     use std::io::BufRead;
     use std::sync::atomic::Ordering;
@@ -1591,6 +1710,19 @@ pub fn run_ai_chat_stream(
         .ok_or("AIフィルタにモデルが指定されていません")?;
     // ストリーミングは長時間。生成系共通契約（未指定/0 = 無制限・cancel で停止）。
     let client = gen_client(spec.timeout_secs)?;
+
+    // v1.8.9 能力の確認と思考パラメータの決定（記録の雛形はここで rec へ）。
+    let (plan, record) = prepare_ai_run(spec, provider, model);
+    *rec = Some(record);
+    // 応答に思考が含まれていたかを記録する（中身は保存しない）。
+    let saw_thinking = std::cell::Cell::new(false);
+    let mut on_token_rec = |k: ChatChunk, t: &str| {
+        if k == ChatChunk::Thinking {
+            saw_thinking.set(true);
+        }
+        outer_on_token(k, t)
+    };
+    let on_token: &mut dyn FnMut(ChatChunk, &str) = &mut on_token_rec;
 
     let mut full = String::new();
     // 本文に混ざる <think>…</think> の分離器（チャンク境界で割れても落とさない）。
@@ -1610,13 +1742,19 @@ pub fn run_ai_chat_stream(
         if let Some(t) = spec.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        // v1.8.9 LM Studio の深さ指定（gpt-oss 等・レベルを受けるモデルだけ）。
+        if let Some(e) = &plan.reasoning_effort {
+            body["reasoning_effort"] = serde_json::json!(e);
+        }
         let resp = client
             .post(format!("{endpoint}/chat/completions"))
             .json(&body)
             .send()
             .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
         if !resp.status().is_success() {
-            return Err(format!("AI APIエラー ({})", resp.status()));
+            // v1.8.9 本文の理由まで出す（従来はステータスだけで原因が分からなかった）。
+            let status = resp.status();
+            return Err(api_error_text(status, &resp.text().unwrap_or_default()));
         }
         for line in std::io::BufReader::new(resp).lines() {
             if cancel.load(Ordering::Relaxed) {
@@ -1658,21 +1796,14 @@ pub fn run_ai_chat_stream(
             .filter(|s| !s.is_empty())
             .unwrap_or("http://localhost:11434")
             .trim_end_matches('/');
-        let mut options = serde_json::Map::new();
-        if let Some(t) = spec.temperature {
-            options.insert("temperature".into(), serde_json::json!(t));
-        }
-        // v1.8.6 GPU の使い方（既定＝キー無し＝載る限り GPU）。
-        if let Some(n) = ollama_num_gpu(spec) {
-            options.insert("num_gpu".into(), serde_json::json!(n));
-        }
         let mut body = serde_json::json!({
             "model": model, "messages": messages, "stream": true,
-            "keep_alive": "5m", "options": serde_json::Value::Object(options),
+            "keep_alive": "5m", "options": ollama_options(spec),
         });
         // v1.8.6 Thinking。think を付けると思考が message.thinking に分かれて届く。
-        if let Some(t) = ollama_think(spec) {
-            body["think"] = t;
+        // v1.8.9 送る値は能力に応じて plan_think が決める（非対応モデルには送らない）。
+        if let Some(t) = &plan.ollama_think {
+            body["think"] = t.clone();
         }
         let resp = client
             .post(format!("{endpoint}/api/chat"))
@@ -1680,7 +1811,9 @@ pub fn run_ai_chat_stream(
             .send()
             .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
         if !resp.status().is_success() {
-            return Err(format!("AI APIエラー ({})", resp.status()));
+            // v1.8.9 本文の理由まで出す（"… does not support thinking" 等）。
+            let status = resp.status();
+            return Err(api_error_text(status, &resp.text().unwrap_or_default()));
         }
         for line in std::io::BufReader::new(resp).lines() {
             if cancel.load(Ordering::Relaxed) {
@@ -1719,6 +1852,9 @@ pub fn run_ai_chat_stream(
         }
         on_token(kind, &t);
     }
+    if let Some(r) = rec.as_mut() {
+        r.thinking_returned = saw_thinking.get();
+    }
     Ok(full)
 }
 
@@ -1732,7 +1868,7 @@ pub fn list_models(provider: &str, endpoint: &str) -> Result<Vec<String>, String
     })
 }
 
-fn list_models_blocking(provider: &str, endpoint: &str) -> Result<Vec<String>, String> {
+pub(crate) fn list_models_blocking(provider: &str, endpoint: &str) -> Result<Vec<String>, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -2420,9 +2556,12 @@ mod tests {
 
     #[test]
     fn gpu_and_think_options_map_to_ollama_params() {
+        // v1.8.9 think は能力不明（info=None）なら設定どおり送る — 旧 ollama_think と同じ写像。
+        let think = |s: &FilterSpec| crate::ai_models::plan_think("ollama", s.think.as_deref(), None).ollama_think;
         let auto = spec(r#"{"builtin":"ai","model":"m"}"#);
         assert_eq!(ollama_num_gpu(&auto), None, "既定はサーバ任せ＝キーを送らない");
-        assert_eq!(ollama_think(&auto), None);
+        assert_eq!(think(&auto), None);
+        assert_eq!(ollama_options(&auto), serde_json::json!({}), "既定は options を空に");
 
         let max = spec(r#"{"builtin":"ai","model":"m","gpu":"max"}"#);
         assert_eq!(ollama_num_gpu(&max), Some(999));
@@ -2431,13 +2570,30 @@ mod tests {
         assert_eq!(ollama_num_gpu(&cpu), Some(0));
 
         let on = spec(r#"{"builtin":"ai","model":"m","think":"on"}"#);
-        assert_eq!(ollama_think(&on), Some(serde_json::json!(true)));
+        assert_eq!(think(&on), Some(serde_json::json!(true)));
 
         let high = spec(r#"{"builtin":"ai","model":"m","think":"high"}"#);
-        assert_eq!(ollama_think(&high), Some(serde_json::json!("high")));
+        assert_eq!(think(&high), Some(serde_json::json!("high")));
 
         let off = spec(r#"{"builtin":"ai","model":"m","think":"off"}"#);
-        assert_eq!(ollama_think(&off), None);
+        assert_eq!(think(&off), None);
+
+        // v1.8.9 num_ctx は options.num_ctx へ（0 は未指定扱い）。
+        let ctx = spec(r#"{"builtin":"ai","model":"m","num_ctx":16384,"temperature":0.2}"#);
+        assert_eq!(ollama_options(&ctx), serde_json::json!({"temperature":0.2,"num_ctx":16384}));
+        let zero = spec(r#"{"builtin":"ai","model":"m","num_ctx":0}"#);
+        assert_eq!(ollama_options(&zero), serde_json::json!({}));
+    }
+
+    #[test]
+    fn api_error_text_extracts_reason() {
+        let s = reqwest::StatusCode::BAD_REQUEST;
+        assert_eq!(
+            api_error_text(s, r#"{"error":"\"gemma3:latest\" does not support thinking"}"#),
+            "AI APIエラー (400 Bad Request): \"gemma3:latest\" does not support thinking"
+        );
+        assert!(api_error_text(s, r#"{"error":{"message":"Invalid 'reasoning_effort'"}}"#).ends_with("Invalid 'reasoning_effort'"));
+        assert_eq!(api_error_text(s, ""), "AI APIエラー (400 Bad Request)");
     }
 
     #[test]

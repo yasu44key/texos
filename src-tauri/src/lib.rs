@@ -8,6 +8,8 @@ mod drag_drop;
 #[cfg(windows)]
 mod drag_out;
 mod flow;
+// v1.8.9 AIカード: モデル能力の検出・キャッシュ・送信判定。
+mod ai_models;
 mod os_icon;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -664,6 +666,8 @@ pub fn run() {
                 .app_data_dir()
                 .expect("failed to get app data dir");
             std::fs::create_dir_all(&app_dir)?;
+            // v1.8.9 モデル能力のキャッシュはマシン単位（app_data）に置く。
+            ai_models::init_cache(&app_dir);
             // Discard last session's temporary view copies.
             let _ = std::fs::remove_dir_all(temp_view_dir());
             // Re-open the last project if it still exists.
@@ -787,6 +791,7 @@ pub fn run() {
             ai_chat_cancel,
             ai_chat_clear,
             ai_list_models,
+            ai_models::ai_model_catalog,
             ai_ollama_status,
             ai_install_ollama,
             ai_start_ollama,
