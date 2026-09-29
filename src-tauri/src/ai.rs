@@ -76,27 +76,10 @@ pub(crate) fn upsert_chat_log_card(
 ) -> Result<(), String> {
     // 1) transcript Markdown。v1.5.12 実機FB: 旧「**You:** 本文」の1行連結＋太字囲みは
     // grep 等での切り出しが面倒 →「You:」行の次行から本文（行頭アンカーで機械可読）。
-    let mut md = format!("# {ai_label}\n\n");
-    for m in history {
-        let who = match m.role.as_str() {
-            "user" => "You",
-            "assistant" => "AI",
-            other => other,
-        };
-        md.push_str(&format!("{who}:\n{}\n\n", m.content));
-    }
-    let bytes = md.into_bytes();
+    let all: Vec<&ChatMsg> = history.iter().collect();
+    let bytes = render_transcript(ai_label, &all, true).into_bytes();
 
     // 2) 出力ファイル名: log_name 指定があればそれ（.md を補う）、無ければ「<ラベル>のログ.md」。
-    let sanitize = |s: &str| -> String {
-        s.chars()
-            .map(|c| match c {
-                '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-                c if c.is_control() => '_',
-                c => c,
-            })
-            .collect()
-    };
     let fname = match log_name.map(str::trim).filter(|s| !s.is_empty()) {
         Some(name) => {
             let mut n = sanitize(name);
@@ -109,6 +92,44 @@ pub(crate) fn upsert_chat_log_card(
     };
     let dest = p.root.join(&fname);
     std::fs::write(&dest, &bytes).map_err(|e| format!("ログ書き出し失敗: {e}"))?;
+    place_md_card(p, ai_id, &dest, &fname, &bytes, 0.0).map(|_| ())
+}
+
+/// ファイル名に使えない文字を落とす（ログ・抜粋の共通）。
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// 会話の Markdown。with_labels=true はログと同じ「You:/AI: の次行から本文」、
+/// false は本文だけを空行区切りで並べる（v1.8.9 抜粋の「内容のみ」）。
+pub(crate) fn render_transcript(ai_label: &str, msgs: &[&ChatMsg], with_labels: bool) -> String {
+    if !with_labels {
+        let bodies: Vec<&str> = msgs.iter().map(|m| m.content.trim_end()).collect();
+        let mut md = bodies.join("\n\n");
+        md.push('\n');
+        return md;
+    }
+    let mut md = format!("# {ai_label}\n\n");
+    for m in msgs {
+        let who = match m.role.as_str() {
+            "user" => "You",
+            "assistant" => "AI",
+            other => other,
+        };
+        md.push_str(&format!("{who}:\n{}\n\n", m.content));
+    }
+    md
+}
+
+/// 書き出した MD を実身カードにする: 同じパスのカードがあれば中身差し替え（位置・矢印維持）、
+/// 無ければ AI カードの右（dy だけ下）に作り、AI → カードの flow 矢印を張る。返り値＝カード id。
+fn place_md_card(p: &Project, ai_id: &str, dest: &Path, fname: &str, bytes: &[u8], dy: f64) -> Result<String, String> {
     let dest_str = dest.to_string_lossy().into_owned();
 
     // 3) CAS + real_body
@@ -157,7 +178,7 @@ pub(crate) fn upsert_chat_log_card(
                     hash,
                     fname,
                     fx + 230.0,
-                    fy,
+                    fy + dy,
                     db::now_ms(),
                     dest_str,
                     file_mtime_ms(&dest),
@@ -185,7 +206,59 @@ pub(crate) fn upsert_chat_log_card(
             rusqlite::params![ai_id, log_id, db::now_ms()],
         );
     }
-    Ok(())
+    Ok(log_id)
+}
+
+/// v1.8.9 会話の抜粋を別の MD に書き出す（チャットパネルの「書き出し」）。
+/// indices＝履歴の何番目か（パネルのチェック）。with_labels=false で本文だけ（内容のみ）。
+/// 毎ターン自動更新のログとは別物: 既存ファイルは上書きせず「<ラベル>の抜粋_2.md」…と
+/// 連番で新しいカードを作る（書き出した時点の切り抜きとして残す）。返り値＝ファイル名。
+#[tauri::command]
+pub(crate) fn ai_chat_export(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    id: String,
+    indices: Vec<usize>,
+    with_labels: bool,
+) -> Result<String, String> {
+    let fname = {
+        let guard = state.current.lock().unwrap();
+        let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+        export_chat_excerpt(p, &id, &indices, with_labels)?
+    };
+    let _ = app.emit("ai-chat-exported", serde_json::json!({ "id": id, "file": fname }));
+    Ok(fname)
+}
+
+pub(crate) fn export_chat_excerpt(p: &Project, id: &str, indices: &[usize], with_labels: bool) -> Result<String, String> {
+    let label: String = p
+        .conn
+        .query_row(
+            "SELECT label FROM virtual_bodies WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .map_err(|_| "AIカードが見つかりません".to_string())?;
+    let history = load_chat_history(&p.root, id);
+    let mut idx = indices.to_vec();
+    idx.sort_unstable();
+    idx.dedup();
+    let picked: Vec<&ChatMsg> = idx.iter().filter_map(|&i| history.get(i)).collect();
+    if picked.is_empty() {
+        return Err("書き出す発言が選ばれていません".into());
+    }
+    let bytes = render_transcript(&label, &picked, with_labels).into_bytes();
+
+    let stem = format!("{}の抜粋", sanitize(&label).chars().take(24).collect::<String>());
+    let (fname, n) = (1u32..)
+        .map(|n| (if n == 1 { format!("{stem}.md") } else { format!("{stem}_{n}.md") }, n))
+        .find(|(f, _)| !p.root.join(f).exists())
+        .expect("連番は尽きない");
+    let dest = p.root.join(&fname);
+    std::fs::write(&dest, &bytes).map_err(|e| format!("書き出しに失敗: {e}"))?;
+    // ログカード（AI の右）の下へ、書き出すたびに少しずつずらして並べる。
+    place_md_card(p, id, &dest, &fname, &bytes, 90.0 * n as f64)?;
+    Ok(fname)
 }
 
 /// v1.4.4 マルチコンテキスト: AIカードへ flow 矢印で繋がった上流カードの内容を
@@ -655,3 +728,99 @@ pub(crate) fn ai_list_models(
     )
 }
 
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> ChatMsg {
+        ChatMsg { role: role.into(), content: content.into(), meta: None }
+    }
+
+    fn setup() -> Project {
+        let dir = std::env::temp_dir().join(format!("texos_export_{}", uuid()));
+        let cas_root = dir.join(".texos").join("cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
+        let p = Project { conn, root: dir, cas_root };
+        p.conn
+            .execute(
+                "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
+                 VALUES ('filter:sentinel','application/vnd.texos.filter',0,?1)",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        p.conn
+            .execute(
+                "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, filter_ref)
+                 VALUES ('ai1','filter:sentinel','AI対話',100.0,200.0,?1,'filter','{\"builtin\":\"ai\",\"mode\":\"chat\"}')",
+                rusqlite::params![db::now_ms()],
+            )
+            .unwrap();
+        save_chat_history(
+            &p.root,
+            "ai1",
+            &[msg("user", "質問1"), msg("assistant", "答え1
+"), msg("user", "質問2"), msg("assistant", "答え2")],
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn transcript_with_and_without_labels() {
+        let (a, b) = (msg("user", "Q"), msg("assistant", "A
+"));
+        assert_eq!(render_transcript("L", &[&a, &b], true), "# L
+
+You:
+Q
+
+AI:
+A
+
+
+");
+        assert_eq!(render_transcript("L", &[&a, &b], false), "Q
+
+A
+", "内容のみ＝見出しなし・空行区切り");
+    }
+
+    #[test]
+    fn export_picks_selected_in_order_and_never_overwrites() {
+        let p = setup();
+        // 順不同・重複・範囲外は整える。
+        let f1 = export_chat_excerpt(&p, "ai1", &[3, 1, 1, 99], false).unwrap();
+        assert_eq!(f1, "AI対話の抜粋.md");
+        assert_eq!(std::fs::read_to_string(p.root.join(&f1)).unwrap(), "答え1
+
+答え2
+");
+
+        let f2 = export_chat_excerpt(&p, "ai1", &[0, 1], true).unwrap();
+        assert_eq!(f2, "AI対話の抜粋_2.md", "既存の抜粋は上書きしない");
+        assert!(std::fs::read_to_string(p.root.join(&f2)).unwrap().starts_with("# AI対話
+
+You:
+質問1"));
+        // 1回目の中身はそのまま。
+        assert_eq!(std::fs::read_to_string(p.root.join(&f1)).unwrap(), "答え1
+
+答え2
+");
+
+        // カードと AI → 抜粋 の矢印が張られる（2枚とも）。
+        let n: i64 = p
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations WHERE from_id='ai1' AND kind='flow' AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+
+        assert!(export_chat_excerpt(&p, "ai1", &[], true).is_err(), "未選択はエラー");
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
+}

@@ -131,6 +131,17 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
     { label: string; kind: string }[]
   >([]); // v1.4.4 接続資料（kind: image|text|other）
   const scrollRef = useRef<HTMLDivElement>(null);
+  // v1.8.9 抜粋の書き出し: 吹き出しのチェック（履歴の何番目か）と「You:/AI: 見出しを付ける」。
+  // 選択はパネルを閉じれば消える（書き出した MD が残る）。見出しの有無だけ覚えておく。
+  const [selected, setSelected] = useState<Set<number>>(() => new Set());
+  const [withLabels, setWithLabels] = useState(() => {
+    try {
+      return localStorage.getItem("texos-chat-export-labels") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
   // v1.5.1 WS-B: 実行中ターンの job_id（job:started の card=このカードで受領）。
   // 停止ボタンはこれを ai_chat_cancel に渡す（未着なら null＝Chat 全体キャンセルで代用）。
   const jobIdRef = useRef<number | null>(null);
@@ -238,8 +249,48 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
         setStreaming(null);
         setThinking(null);
         setError(null);
+        setSelected(new Set()); // 番号が指す発言が無くなる
+        setExportMsg(null);
       })
       .catch(() => {});
+  };
+
+  // v1.8.9 選択の操作。役割ボタンは「その役割が全部選ばれていれば外す／でなければ全部選ぶ」。
+  const toggleOne = (i: number) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  const toggleRole = (role: "user" | "assistant" | null) => {
+    const idx = history.map((m, i) => (role == null || m.role === role ? i : -1)).filter((i) => i >= 0);
+    setSelected((prev) => {
+      const allOn = idx.length > 0 && idx.every((i) => prev.has(i));
+      const next = new Set(prev);
+      idx.forEach((i) => (allOn ? next.delete(i) : next.add(i)));
+      return next;
+    });
+  };
+  const roleAllOn = (role: "user" | "assistant" | null) => {
+    const idx = history.map((m, i) => (role == null || m.role === role ? i : -1)).filter((i) => i >= 0);
+    return idx.length > 0 && idx.every((i) => selected.has(i));
+  };
+  const changeLabels = (v: boolean) => {
+    setWithLabels(v);
+    try {
+      localStorage.setItem("texos-chat-export-labels", v ? "1" : "0");
+    } catch {
+      /* 保存できなくても動作は変わらない */
+    }
+  };
+  const exportSelected = () => {
+    const indices = [...selected].filter((i) => i < history.length).sort((a, b) => a - b);
+    if (indices.length === 0) return;
+    setExportMsg(null);
+    invoke<string>("ai_chat_export", { id: objId, indices, withLabels })
+      .then((f) => setExportMsg(`「${f}」に書き出しました（${indices.length}件）`))
+      .catch((e) => setError(String(e)));
   };
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -364,6 +415,71 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
 
       {ollama === "ready" && (
         <>
+      {/* v1.8.9 抜粋の書き出し（選んだ発言だけを別の MD に。毎ターンのログとは別） */}
+      {history.length > 0 && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            flexWrap: "wrap",
+            padding: "4px 8px",
+            fontSize: 11,
+            color: "var(--panel-muted, #9fc9b3)",
+            background: "var(--panel-header-bg, #0f1b15)",
+            borderBottom: "1px solid var(--panel-border, #233a2e)",
+          }}
+        >
+          <button
+            onClick={() => toggleRole(null)}
+            title="全部の発言を選ぶ（もう一度押すと全部外す）"
+            style={selBtn(roleAllOn(null))}
+          >
+            全部
+          </button>
+          <button
+            onClick={() => toggleRole("user")}
+            title="自分（You）の発言をまとめて選ぶ／外す"
+            style={selBtn(roleAllOn("user"))}
+          >
+            You
+          </button>
+          <button
+            onClick={() => toggleRole("assistant")}
+            title="AI の発言をまとめて選ぶ／外す"
+            style={selBtn(roleAllOn("assistant"))}
+          >
+            AI
+          </button>
+          <label
+            title={"オン: ログと同じ「You:／AI:」の見出し付き\nオフ: 内容のみ（本文を空行区切りで並べる）"}
+            style={{ display: "flex", alignItems: "center", gap: 3, marginLeft: 4, cursor: "pointer" }}
+          >
+            <input type="checkbox" checked={withLabels} onChange={(e) => changeLabels(e.target.checked)} />
+            見出し
+          </label>
+          <span style={{ flex: 1 }} />
+          <button
+            onClick={exportSelected}
+            disabled={selected.size === 0}
+            title={
+              "チェックした発言だけを新しい MD カードに書き出します（「<タイトル>の抜粋.md」・既存は上書きせず連番）。\n" +
+              "毎ターン自動で更新されるログとは別です。思考は含まれません。"
+            }
+            style={{ ...hdrBtn(), opacity: selected.size === 0 ? 0.45 : 1, cursor: selected.size ? "pointer" : "default" }}
+          >
+            📝 書き出し{selected.size > 0 ? `（${selected.size}）` : ""}
+          </button>
+        </div>
+      )}
+      {exportMsg && (
+        <div
+          onClick={() => setExportMsg(null)}
+          style={{ padding: "3px 8px", fontSize: 11, color: "#9fd8b8", background: "#12261c", cursor: "pointer" }}
+        >
+          {exportMsg}
+        </div>
+      )}
       {/* messages */}
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 8, display: "flex", flexDirection: "column", gap: 8 }}>
         {history.length === 0 && streaming == null && (
@@ -372,7 +488,13 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
           </div>
         )}
         {history.map((m, i) => (
-          <Bubble key={i} role={m.role} content={m.content} />
+          <Bubble
+            key={i}
+            role={m.role}
+            content={m.content}
+            checked={selected.has(i)}
+            onToggle={busy && i === history.length - 1 ? undefined : () => toggleOne(i)}
+          />
         ))}
         {thinking != null && (
           <ThinkingBox
@@ -518,10 +640,31 @@ function ThinkingBox({
   );
 }
 
-function Bubble({ role, content }: { role: string; content: string }) {
+function Bubble({
+  role,
+  content,
+  checked,
+  onToggle,
+}: {
+  role: string;
+  content: string;
+  /** v1.8.9 書き出しの選択。onToggle が無い吹き出し（生成中・送信直後）はチェック欄なし */
+  checked?: boolean;
+  onToggle?: () => void;
+}) {
   const isUser = role === "user";
+  const box = onToggle && (
+    <input
+      type="checkbox"
+      checked={!!checked}
+      onChange={onToggle}
+      title="書き出しに含める"
+      style={{ flex: "none", alignSelf: "flex-start", marginTop: 8, cursor: "pointer" }}
+    />
+  );
   return (
-    <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" }}>
+    <div style={{ display: "flex", gap: 4, justifyContent: isUser ? "flex-end" : "flex-start" }}>
+      {!isUser && box}
       <div
         style={{
           maxWidth: "85%",
@@ -548,8 +691,18 @@ function Bubble({ role, content }: { role: string; content: string }) {
       >
         {content}
       </div>
+      {isUser && box}
     </div>
   );
+}
+
+/// v1.8.9 選択ボタン（全部／You／AI）。その範囲が全部選ばれているとき点灯。
+function selBtn(on: boolean): React.CSSProperties {
+  return {
+    ...hdrBtn(),
+    padding: "1px 7px",
+    background: on ? "#2f6a4a" : "var(--panel-btn-bg, #1c2a22)",
+  };
 }
 
 function hdrBtn(): React.CSSProperties {

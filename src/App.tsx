@@ -462,16 +462,19 @@ function App() {
   // v1.4.1 チャット1ターン完了でキャンバスを更新（MD実身ログカードの誕生/更新を反映）。
   useEffect(() => {
     let alive = true;
-    let un: (() => void) | undefined;
-    listen("ai-chat-done", () => {
-      void refresh();
-    }).then((u) => {
-      if (alive) un = u;
-      else u();
-    });
+    // v1.8.9 抜粋の書き出し（新しい MD カード）も同じく反映する。
+    const uns: (() => void)[] = [];
+    for (const ev of ["ai-chat-done", "ai-chat-exported"]) {
+      listen(ev, () => {
+        void refresh();
+      }).then((u) => {
+        if (alive) uns.push(u);
+        else u();
+      });
+    }
     return () => {
       alive = false;
-      un?.();
+      uns.forEach((u) => u());
     };
   }, [refresh]);
 

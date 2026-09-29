@@ -787,6 +787,7 @@ pub fn run() {
             cancel_all,
             ai_chat_send,
             ai_chat_history,
+            ai_chat_export,
             ai_context_labels,
             ai_chat_cancel,
             ai_chat_clear,
