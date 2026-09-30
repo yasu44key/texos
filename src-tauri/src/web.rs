@@ -2266,4 +2266,21 @@ stem={:?}", r.stem);
         assert!(md.contains("news"), "news 系エンジンが出典に出るはず");
         crate::runtime::searxng_stop_daemon();
     }
+
+    /// 実機: 任意の spec と入力ファイルで web_search を1回通し、結果を書き出す
+    /// （サンプルフローの試走用。texos_dryrun は web_* を再現しないため）。
+    /// TEXOS_TEST_APPDATA / TEXOS_TEST_SPEC（JSON）/ TEXOS_TEST_INPUT（任意）/ TEXOS_TEST_OUT
+    #[test]
+    #[ignore]
+    fn web_search_file_live() {
+        let ad = std::env::var("TEXOS_TEST_APPDATA").expect("TEXOS_TEST_APPDATA");
+        crate::runtime::searxng_init(std::path::Path::new(&ad));
+        let sp = spec(&std::env::var("TEXOS_TEST_SPEC").expect("TEXOS_TEST_SPEC"));
+        let input = std::env::var("TEXOS_TEST_INPUT").ok().map(|f| std::fs::read(f).unwrap());
+        let r = run_web_search(&sp, input.as_deref(), None).unwrap();
+        crate::runtime::searxng_stop_daemon();
+        let r = r.expect("結果0件（no-data）");
+        std::fs::write(std::env::var("TEXOS_TEST_OUT").expect("TEXOS_TEST_OUT"), &r.bytes).unwrap();
+        println!("stem={:?} bytes={}", r.stem, r.bytes.len());
+    }
 }
