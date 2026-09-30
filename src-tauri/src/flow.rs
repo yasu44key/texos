@@ -212,8 +212,30 @@ pub struct FilterSpec {
     pub allow_private: bool,
     // --- v1.7 P3: web_feed（RSS/Atom → 記事カード群）---
     /// web_feed: 取り込む最大件数（新しい方から。未指定は10・0 = 全件）。
+    /// web_search: 検索語1つあたりの結果件数（未指定は10・1〜50 に丸める）。
     #[serde(default)]
     pub limit: Option<u32>,
+    // --- Web検索 P2: web_search（検索語 → SearXNG → 結果一覧 Markdown。
+    //     docs/Web検索_SearXNG計画.md §3）---
+    /// web_search: パラメータ欄の検索語（1行=1検索語）。入力を接続したときは入力が優先。
+    #[serde(default)]
+    pub query: Option<String>,
+    /// web_search: 使う検索元（カンマ区切り。SearXNG のエンジン名）。未指定は既定の組。
+    #[serde(default)]
+    pub engines: Option<String>,
+    /// web_search: 分類（general / news / it / science）。未指定は general。
+    #[serde(default)]
+    pub categories: Option<String>,
+    /// web_search: 言語（ja / en / all …）。未指定は ja。
+    #[serde(default)]
+    pub language: Option<String>,
+    /// web_search: 期間（day / week / month / year）。未指定・空は絞らない。
+    #[serde(default)]
+    pub time_range: Option<String>,
+    /// web_search: 1回の実行で検索する行数の上限＝**ヒューズ**（AI が大量の行を出しても
+    /// その回数は叩かない）。未指定は3・1〜10 に丸める。
+    #[serde(default)]
+    pub max_queries: Option<u32>,
     /// v1.7 P5 to_url: カード化するリンクの種類（実機FB: 全部拾うととんでもない枚数になる）。
     /// "all"（既定）| "page"（HTMLページ）| "image"（画像直リンク）| "media"（音声・動画・
     /// PDF などのファイル直リンク）。分類は URL 末尾の拡張子ベース。

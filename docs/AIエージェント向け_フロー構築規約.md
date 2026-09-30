@@ -608,7 +608,13 @@ md_codeblock（コードブロックの取り出し）      img_resize / img_con
 ai（文章の生成・変換）      t2i（文章 → 画像）      t23d（画像 → 3Dモデル）
 speak（読み上げ）           web_fetch（URL → 本文）  web_feed（RSS）
 web_capture（ページの画像）  img_resize / img_convert（画像の加工）
+web_search（検索語 → 結果一覧）
 ```
+
+- ✓ キーワードで Web を調べるのは内蔵の `p.builtin("Web検索", x, y, name="web_search")`
+  （**入力の空でない1行が1検索語**。上限 `max_queries` 既定3。AI に検索語を出させるなら
+  役割に「検索語だけを1行に1つ・最大3行・説明は書かない」と書く。結果0件は no-data）。
+  検索エンジン（SearXNG）は人が「Web検索エンジンの管理」で一度導入しておく必要がある
 
 内蔵に無い処理は `python.exe` に `-c` で書かせる（Windows に必ずある道具はこれ）。
 **それでも足りないときだけ外部プログラムを使い、依頼にその名前が書いてなければ

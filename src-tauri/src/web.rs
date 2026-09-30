@@ -1409,6 +1409,249 @@ pub fn run_web_capture(
     })
 }
 
+// --- Web検索 P2: web_search（検索語 → SearXNG → 結果一覧 Markdown）------------------------
+// docs/Web検索_SearXNG計画.md §3。検索エンジン本体は runtime/searxng.rs（遅延起動）。
+// 出力は Markdown 1枚。URL は裸で書く＝to_url がそのまま拾える（リンク集・本文取得へ繋がる）。
+
+/// general の既定の検索元（Brave は初回から too many requests・DuckDuckGo は連続検索で
+/// CAPTCHA になり休止した実例があるので外す。カード設定で足せる）。
+/// general 以外（news 等）は SearXNG がその分類の既定エンジンを選ぶ（engines を送ると
+/// 分類より優先され、ニュースを頼んだのに通常検索になりうるため）。
+pub const WEB_SEARCH_DEFAULT_ENGINES: &str = "google,bing,wikipedia";
+const WEB_SEARCH_DEFAULT_QUERIES: u32 = 3;
+const WEB_SEARCH_MAX_QUERIES: u32 = 10;
+const WEB_SEARCH_DEFAULT_LIMIT: u32 = 10;
+const WEB_SEARCH_MAX_LIMIT: u32 = 50;
+/// 検索と検索の間隔（SearXNG 自身の自動休止と二重の歯止め）。
+const WEB_SEARCH_INTERVAL: Duration = Duration::from_secs(1);
+
+fn nonempty(s: &Option<String>) -> Option<&str> {
+    s.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+pub fn spec_query(spec: &FilterSpec) -> Option<&str> {
+    nonempty(&spec.query)
+}
+
+/// 入力テキストを検索語の並びにする（空でない1行＝1検索語）。AI が付けがちな前置き・
+/// 箇条書き記号・番号・引用符・markdown 装飾は剥がし、重複は1つにする。
+pub fn parse_queries(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let mut s = raw.trim();
+        if s.is_empty() || s.starts_with("```") {
+            continue;
+        }
+        // 「以下のキーワードで検索します：」のような前置き＝コロンで終わる行は検索語ではない。
+        if s.ends_with(':') || s.ends_with('：') {
+            continue;
+        }
+        s = s.trim_start_matches(['#', '>']).trim();
+        for p in ["- ", "* ", "+ ", "・", "•"] {
+            if let Some(r) = s.strip_prefix(p) {
+                s = r.trim();
+                break;
+            }
+        }
+        // 番号付き（"1. " "2) " "3、"）。"1.5インチ" のような語は壊さないよう区切りは厳密に。
+        let digits = s.chars().take_while(|c| c.is_ascii_digit()).count();
+        if (1..=3).contains(&digits) {
+            for p in [". ", ") ", "、", "．", "）"] {
+                if let Some(r) = s[digits..].strip_prefix(p) {
+                    s = r.trim();
+                    break;
+                }
+            }
+        }
+        let s = s
+            .trim_matches(|c: char| {
+                matches!(c, '"' | '\'' | '`' | '「' | '」' | '『' | '』' | '“' | '”' | '*')
+            })
+            .trim();
+        if !s.is_empty() && !out.iter().any(|q| q == s) {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub title: String,
+    pub url: String,
+    pub content: String,
+    pub engines: Vec<String>,
+    pub date: Option<String>,
+}
+
+/// 1行に畳む（抜粋の改行・連続空白は読みにくいので）。
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// SearXNG の JSON 応答から結果を取り出す（URL の無いものは捨てる）。
+pub fn hits_from_json(v: &serde_json::Value, limit: usize) -> Vec<SearchHit> {
+    let Some(arr) = v.get("results").and_then(|r| r.as_array()) else { return Vec::new() };
+    arr.iter()
+        .filter_map(|r| {
+            let url = r.get("url")?.as_str()?.trim().to_string();
+            if url.is_empty() {
+                return None;
+            }
+            let s = |k: &str| r.get(k).and_then(|x| x.as_str()).map(one_line).unwrap_or_default();
+            let engines = r
+                .get("engines")
+                .and_then(|e| e.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let date = r
+                .get("publishedDate")
+                .and_then(|d| d.as_str())
+                .filter(|d| d.len() >= 10 && d.is_char_boundary(10))
+                .map(|d| d[..10].to_string());
+            let title = s("title");
+            Some(SearchHit {
+                title: if title.is_empty() { url.clone() } else { title },
+                url,
+                content: s("content"),
+                engines,
+                date,
+            })
+        })
+        .take(limit)
+        .collect()
+}
+
+/// 結果一覧 Markdown。検索語ごとに節を立て、各結果は「### タイトル／裸の URL／抜粋／出典」。
+pub fn format_search_md(
+    sections: &[(String, Vec<SearchHit>)],
+    conditions: &str,
+    dropped: &[String],
+    unresponsive: &[String],
+) -> String {
+    let mut md = String::from("# Web検索結果\n\n");
+    md.push_str(&format!("条件: {conditions}\n"));
+    for (q, hits) in sections {
+        md.push_str(&format!("\n## 🔍 {q}（{}件）\n", hits.len()));
+        if hits.is_empty() {
+            md.push_str("\n（結果なし）\n");
+        }
+        for h in hits {
+            md.push_str(&format!("\n### {}\n{}\n", h.title, h.url));
+            if !h.content.is_empty() {
+                md.push_str(&format!("{}\n", h.content));
+            }
+            let mut src = h.engines.join(", ");
+            if let Some(d) = &h.date {
+                src = if src.is_empty() { d.clone() } else { format!("{src} ／ {d}") };
+            }
+            if !src.is_empty() {
+                md.push_str(&format!("（出典: {src}）\n"));
+            }
+        }
+    }
+    if !dropped.is_empty() || !unresponsive.is_empty() {
+        md.push_str("\n---\n");
+        if !dropped.is_empty() {
+            md.push_str(&format!(
+                "※ 1回の上限を超えたため検索していない検索語: {}\n",
+                dropped.join(" ／ ")
+            ));
+        }
+        if !unresponsive.is_empty() {
+            md.push_str(&format!("※ 応答しなかった検索元: {}\n", unresponsive.join(" ／ ")));
+        }
+    }
+    md
+}
+
+/// SearXNG に渡す追加パラメータと、出力に書く条件の説明。
+fn search_params(spec: &FilterSpec) -> (Vec<(&'static str, String)>, String) {
+    let category = nonempty(&spec.categories).unwrap_or("general").to_string();
+    let language = nonempty(&spec.language).unwrap_or("ja").to_string();
+    let engines = nonempty(&spec.engines)
+        .map(String::from)
+        .or_else(|| (category == "general").then(|| WEB_SEARCH_DEFAULT_ENGINES.to_string()));
+    let time_range = nonempty(&spec.time_range).filter(|t| *t != "none").map(String::from);
+    let mut params = vec![("language", language.clone())];
+    let mut cond = vec![format!("言語 {language}")];
+    // categories と engines を両方送ると SearXNG は「和」を取る（分類の既定エンジンが全部
+    // 足され、指定外の brave 等まで走る＝実機で確認）。検索元を指定したら分類は送らない。
+    match &engines {
+        Some(e) => {
+            params.push(("engines", e.clone()));
+            cond.insert(0, format!("検索元 {e}"));
+        }
+        None => {
+            params.push(("categories", category.clone()));
+            cond.insert(0, format!("分類 {category}（検索元は SearXNG の既定）"));
+        }
+    }
+    if let Some(t) = time_range {
+        cond.push(format!("期間 {t}"));
+        params.push(("time_range", t));
+    }
+    (params, cond.join(" ／ "))
+}
+
+/// web_search 本体。結果が1件も無ければ Ok(None)＝no-data（下流を止める）。
+pub fn run_web_search(
+    spec: &FilterSpec,
+    input: Option<&[u8]>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Option<WebFetchOut>, String> {
+    let text = match input {
+        Some(b) => String::from_utf8_lossy(b).to_string(),
+        None => spec_query(spec).map(String::from).ok_or(
+            "検索語がありません。パラメータ欄に書くか、検索語を書いたテキストカードを接続してください",
+        )?,
+    };
+    let mut queries = parse_queries(&text);
+    if queries.is_empty() {
+        return Err("検索語が見つかりません（空行と「…：」で終わる前置きの行は検索語として扱いません）".into());
+    }
+    let max_q = spec
+        .max_queries
+        .unwrap_or(WEB_SEARCH_DEFAULT_QUERIES)
+        .clamp(1, WEB_SEARCH_MAX_QUERIES) as usize;
+    let dropped = if queries.len() > max_q { queries.split_off(max_q) } else { Vec::new() };
+    let limit = spec
+        .limit
+        .unwrap_or(WEB_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, WEB_SEARCH_MAX_LIMIT) as usize;
+    let (params, conditions) = search_params(spec);
+    let app_data = crate::runtime::searxng_app_data()?;
+
+    let mut sections = Vec::new();
+    let mut unresponsive: Vec<String> = Vec::new();
+    for (i, q) in queries.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(WEB_SEARCH_INTERVAL);
+        }
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err("中断されました".into());
+        }
+        let v = crate::runtime::searxng_query(app_data, q, &params)?;
+        for u in crate::runtime::unresponsive_list(&v) {
+            if !unresponsive.contains(&u) {
+                unresponsive.push(u);
+            }
+        }
+        sections.push((q.clone(), hits_from_json(&v, limit)));
+    }
+    if sections.iter().all(|(_, h)| h.is_empty()) {
+        return Ok(None);
+    }
+    let md = format_search_md(&sections, &conditions, &dropped, &unresponsive);
+    Ok(Some(WebFetchOut {
+        bytes: md.into_bytes(),
+        ext: "md".into(),
+        mime: "text/markdown".into(),
+        stem: sanitize_stem(&format!("検索_{}", queries[0])),
+        meta: String::new(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1912,5 +2155,115 @@ mod tests {
         }
         let again = fetch_url_cond("https://example.com/", false, Some(&cond)).unwrap();
         assert!(again.is_none(), "同じ条件なら 304 = Ok(None) のはず");
+    }
+
+    // --- Web検索 P2: web_search ---
+
+    #[test]
+    fn parse_queries_strips_ai_decorations() {
+        let t = "以下のキーワードで検索します：\n\n- 最新 ガジェット 2026\n2. **折りたたみスマホ 新製品**\n3) 「スマートウォッチ 発表」\n```\n- 最新 ガジェット 2026\n";
+        assert_eq!(
+            parse_queries(t),
+            vec!["最新 ガジェット 2026", "折りたたみスマホ 新製品", "スマートウォッチ 発表"]
+        );
+    }
+
+    #[test]
+    fn parse_queries_keeps_numbers_inside_terms() {
+        assert_eq!(
+            parse_queries("1.5インチ ディスプレイ\n5G スマホ"),
+            vec!["1.5インチ ディスプレイ", "5G スマホ"]
+        );
+    }
+
+    #[test]
+    fn hits_from_json_reads_searxng_shape() {
+        let v = serde_json::json!({"results": [
+            {"title": "A", "url": "https://a.jp/", "content": "x\n  y", "engines": ["google", "bing"], "publishedDate": "2026-09-28T10:00:00"},
+            {"title": "", "url": "https://b.jp/"},
+            {"title": "no url"}
+        ]});
+        let h = hits_from_json(&v, 10);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].content, "x y");
+        assert_eq!(h[0].date.as_deref(), Some("2026-09-28"));
+        assert_eq!(h[1].title, "https://b.jp/");
+        assert_eq!(hits_from_json(&v, 1).len(), 1);
+    }
+
+    #[test]
+    fn search_md_has_bare_urls_for_to_url() {
+        let hits = vec![SearchHit {
+            title: "T".into(),
+            url: "https://a.jp/x".into(),
+            content: "c".into(),
+            engines: vec!["google".into()],
+            date: None,
+        }];
+        let md = format_search_md(&[("q".into(), hits)], "条件", &["d".into()], &["brave: x".into()]);
+        assert!(md.contains("## 🔍 q（1件）"));
+        assert!(md.contains("\n### T\nhttps://a.jp/x\nc\n（出典: google）"));
+        assert!(md.contains("検索していない検索語: d"));
+        assert!(md.contains("応答しなかった検索元: brave: x"));
+        assert_eq!(scan_urls(&md), vec!["https://a.jp/x".to_string()]);
+    }
+
+    #[test]
+    fn search_params_engines_only_for_general_by_default() {
+        let (p, _) = search_params(&spec(r#"{"builtin":"web_search"}"#));
+        assert!(p.contains(&("engines", WEB_SEARCH_DEFAULT_ENGINES.to_string())));
+        assert!(p.contains(&("language", "ja".to_string())));
+        // 検索元を送るときは分類を送らない（SearXNG は和を取るので絞り込みにならない）。
+        assert!(!p.iter().any(|(k, _)| *k == "categories"));
+        let (p, c) =
+            search_params(&spec(r#"{"builtin":"web_search","categories":"news","time_range":"week"}"#));
+        assert!(!p.iter().any(|(k, _)| *k == "engines"));
+        assert!(p.contains(&("categories", "news".to_string())));
+        assert!(p.contains(&("time_range", "week".to_string())));
+        assert!(c.contains("期間 week"));
+        let (p, _) = search_params(&spec(r#"{"builtin":"web_search","time_range":"none"}"#));
+        assert!(!p.iter().any(|(k, _)| *k == "time_range"));
+    }
+
+    #[test]
+    fn web_search_without_query_is_clear_error() {
+        let e = run_web_search(&spec(r#"{"builtin":"web_search"}"#), None, None).unwrap_err();
+        assert!(e.contains("検索語がありません"));
+        let e = run_web_search(&spec(r#"{"builtin":"web_search"}"#), Some("見出し：\n\n".as_bytes()), None)
+            .unwrap_err();
+        assert!(e.contains("検索語が見つかりません"));
+    }
+
+    /// 実機: 導入済み app_data（TEXOS_TEST_APPDATA）で web_search を通す。
+    /// cargo test --lib web_search_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn web_search_live() {
+        let ad = std::env::var("TEXOS_TEST_APPDATA").expect("TEXOS_TEST_APPDATA");
+        crate::runtime::searxng_init(std::path::Path::new(&ad));
+        let input = "以下で検索します：
+- 最新 ガジェット
+- 折りたたみスマホ
+- スマートウォッチ
+- 4つ目は上限で落ちる";
+        let r = run_web_search(&spec(r#"{"builtin":"web_search","limit":3}"#), Some(input.as_bytes()), None)
+            .unwrap()
+            .expect("general で結果あり");
+        let md = String::from_utf8(r.bytes).unwrap();
+        println!("{md}
+stem={:?}", r.stem);
+        assert!(md.contains("検索していない検索語: 4つ目は上限で落ちる"));
+        assert!(!md.contains("brave") && !md.contains("google cse"), "指定外の検索元が走っていない");
+        let r = run_web_search(
+            &spec(r#"{"builtin":"web_search","query":"ガジェット","categories":"news","time_range":"week","limit":5}"#),
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("news で結果あり");
+        let md = String::from_utf8(r.bytes).unwrap();
+        println!("{md}");
+        assert!(md.contains("news"), "news 系エンジンが出典に出るはず");
+        crate::runtime::searxng_stop_daemon();
     }
 }

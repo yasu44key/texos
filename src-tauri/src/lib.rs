@@ -668,6 +668,8 @@ pub fn run() {
             std::fs::create_dir_all(&app_dir)?;
             // v1.8.9 モデル能力のキャッシュはマシン単位（app_data）に置く。
             ai_models::init_cache(&app_dir);
+            // Web検索 P2: web_search がフロー実行中に SearXNG の置き場所を引けるように。
+            runtime::searxng_init(&app_dir);
             // Discard last session's temporary view copies.
             let _ = std::fs::remove_dir_all(temp_view_dir());
             // Re-open the last project if it still exists.

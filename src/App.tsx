@@ -20,7 +20,7 @@ import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
 import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
 import { T2iSetupDialog, type T2iStatus } from "./ui/T2iSetupDialog";
-import { SearxngSetupDialog } from "./ui/SearxngSetupDialog";
+import { SearxngSetupDialog, type SearxngStatus } from "./ui/SearxngSetupDialog";
 
 // v2.0 t23d: t23d_status（runtime/t23d.rs）の返却形。専用セットアップ画面は持たず、
 // エンジン未設定時のパス入力（プロンプト）だけで足りるためここに置く。
@@ -270,9 +270,14 @@ function App() {
     y: number;
     linkFrom?: string;
   } | null>(null);
-  // Web検索 P1: 検索エンジン（SearXNG）の導入・管理ダイアログ。P2 で web_search カード作成へ繋ぐ
-  // （そのときはここに作成位置を持たせる）。
-  const [searxngSetup, setSearxngSetup] = useState<{ x: number; y: number; linkFrom?: string } | null>(null);
+  // Web検索: 検索エンジン（SearXNG）の導入・管理ダイアログ。manage=false はカード作成の途中
+  // （未導入だった）＝導入が済んだらそのまま web_search カード作成へ進む。
+  const [searxngSetup, setSearxngSetup] = useState<{
+    x: number;
+    y: number;
+    linkFrom?: string;
+    manage?: boolean;
+  } | null>(null);
   // v1.4.9: 録音プリセット用の dshow 音声デバイス名（メニューは同期構築なので state に持つ）。
   const [audioDevices, setAudioDevices] = useState<string[]>([]);
   const audioDevicesRef = useRef<string[]>([]);
@@ -1342,9 +1347,38 @@ function App() {
         })();
         return;
       }
+      if (builtin === "searxng_manage") {
+        setSearxngSetup({ x: canvasX, y: canvasY, linkFrom, manage: true });
+        return;
+      }
       if (builtin === "web_search") {
-        // Web検索 P1: まずは検索エンジンの導入・管理だけ（カード作成は P2）。
-        setSearxngSetup({ x: canvasX, y: canvasY, linkFrom });
+        // Web検索 P2: 検索エンジンが未導入なら先に導入ダイアログ（済めばここへ戻ってくる）。
+        // 導入済みなら検索語を聞いて作成（空欄=検索語を書いたテキストカードを接続する運用）。
+        (async () => {
+          let installed = false;
+          try {
+            installed = (await invoke<SearxngStatus>("searxng_status")).installed;
+          } catch (e) {
+            console.error("searxng_status failed", e);
+          }
+          if (!installed) {
+            setSearxngSetup({ x: canvasX, y: canvasY, linkFrom });
+            return;
+          }
+          setPrompt({
+            title: "Web検索: 検索語（空欄=検索語を書いたテキストカードを接続）",
+            initial: "",
+            allowEmpty: true,
+            onConfirm: (q) => {
+              const query = q.trim();
+              create(query ? `Web検索: ${query.slice(0, 24)}` : "Web検索", {
+                builtin: "web_search",
+                ...(query ? { query } : {}),
+                accept_mime: "text/*",
+              });
+            },
+          });
+        })();
         return;
       }
       if (builtin === "t23d") {
@@ -6768,7 +6802,20 @@ function App() {
           }}
         />
       )}
-      {searxngSetup && <SearxngSetupDialog onCancel={() => setSearxngSetup(null)} />}
+      {searxngSetup && (
+        <SearxngSetupDialog
+          onCancel={() => setSearxngSetup(null)}
+          onReady={
+            searxngSetup.manage
+              ? undefined
+              : () => {
+                  const d = searxngSetup;
+                  setSearxngSetup(null);
+                  handleAddFilter("web_search", d.x, d.y, d.linkFrom);
+                }
+          }
+        />
+      )}
       {t2iSetup && (
         <T2iSetupDialog
           onCancel={() => setT2iSetup(null)}

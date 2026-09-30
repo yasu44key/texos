@@ -633,7 +633,7 @@ class Project:
                 ext = spec.get("output_ext") or {
                     "t2i": "png", "t23d": "glb", "text_diff": "diff",
                     "web_capture": "png", "img_convert": spec.get("format") or "png",
-                    "ai": "md", "web_fetch": "md", "md_codeblock": "txt",
+                    "ai": "md", "web_fetch": "md", "web_search": "md", "md_codeblock": "txt",
                 }.get(b) or ("txt" if (b or "").startswith("text_") else
                              "md" if b else "bin")
                 if "{out*}" in (spec.get("cmd") or ""):

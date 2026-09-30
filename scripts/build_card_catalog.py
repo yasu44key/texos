@@ -88,6 +88,7 @@ EXHIBITS = {
     "web_fetch":    ("情報収集", None, {"url": "https://example.com/"}, "ネット接続"),
     "web_feed":     ("情報収集", None, {"url": "https://example.com/feed"}, "ネット接続"),
     "web_capture":  ("情報収集", None, {"url": "https://example.com/"}, "ネット接続"),
+    "web_search":   ("情報収集", None, {"query": "TexoS"}, "ネット接続・SearXNG 導入済み"),
     "to_url":       ("情報収集", "https://example.com/a\nhttps://example.com/b\n", {}, None),
     # --- 画像 ---
     "img_resize":   ("画像", None, {"width": 800}, "画像カードを繋ぐ"),

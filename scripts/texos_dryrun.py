@@ -41,6 +41,7 @@ UNSUPPORTED = {
     "t2i": "画像生成（常駐デーモンが要る）",
     "t23d": "3D生成（常駐デーモンが要る）",
     "web_fetch": "Web取得", "web_feed": "フィード取得", "web_capture": "ページ保存",
+    "web_search": "Web検索（SearXNG デーモンが要る）",
     "to_url": "URLカード化", "speak": "読み上げ", "import_new": "新規カードの登録",
     "select": "セレクタ",
 }

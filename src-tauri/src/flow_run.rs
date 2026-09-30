@@ -147,6 +147,20 @@ pub(crate) fn execute_node(
             // v1.7 P3: web_feed も同系のネットワーク別経路。1入力→N出力＝ビルトイン
             // 複数出力の解禁実例（標準フィルタ充実検討 §10 で据え置いた件の実例がこれ。
             // NodeRun.outputs が受け皿なので実行系の拡張はこの分岐だけで済む）。
+            // Web検索 P2: web_search（検索語 → SearXNG → 結果一覧 Markdown 1枚）。
+            // 入力なし（パラメータ欄の検索語）も許す。結果0件は outputs 空 → eval_filter が
+            // no-data にする（下流を止める）。取得メタは付けない（更新確認の対象ではない）。
+            else if b == "web_search" {
+                let r = web::run_web_search(spec, inputs.first().map(|i| i.0), Some(cancel))?;
+                Ok(NodeRun {
+                    outputs: r
+                        .into_iter()
+                        .map(|r| (r.bytes, r.ext, r.mime, r.stem, None))
+                        .collect(),
+                    exit_code: None,
+                    stderr: String::new(),
+                })
+            }
             else if b == "web_feed" {
                 let rs = web::run_web_feed(spec, inputs.first().map(|i| i.0))?;
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1303,7 +1317,7 @@ pub(crate) fn eval_filter(
         if collected.is_empty()
             && matches!(
                 spec.builtin.as_deref(),
-                Some("web_fetch") | Some("web_feed") | Some("web_capture")
+                Some("web_fetch") | Some("web_feed") | Some("web_capture") | Some("web_search")
             )
         {
             let run = acquire_node_permits(state, app, job, &spec, kind).and_then(|_permits| {
@@ -1373,7 +1387,18 @@ pub(crate) fn eval_filter(
             }
         }
     }
-    let out = if errs.is_empty() {
+    // Web検索 P2: 検索結果が1件も無い＝材料が無い → no-data（下流の AI を空で走らせない）。
+    let search_empty =
+        errs.is_empty() && produced.is_empty() && spec.builtin.as_deref() == Some("web_search");
+    if search_empty {
+        report.skipped.push(format!(
+            "{}（Web検索の結果が0件でした — 検索語や条件を見直してください）",
+            node_note(p, fid)
+        ));
+    }
+    let out = if search_empty {
+        EvalOut::nodata_out()
+    } else if errs.is_empty() {
         EvalOut::data(produced, last_exit)
     } else {
         // 失敗: 入力スナップショットを carry:"input" 用に保持（リトライ材料）。

@@ -330,6 +330,19 @@ struct Daemon {
 
 static DAEMON: Mutex<Option<Daemon>> = Mutex::new(None);
 static IDLE_WATCHER: OnceLock<()> = OnceLock::new();
+/// app_data（setup で一度だけ設定）。フロー実行（execute_node）は AppState を持たないので、
+/// web_search はここから SearXNG の置き場所を引く。
+static APP_DATA: OnceLock<PathBuf> = OnceLock::new();
+
+pub(crate) fn searxng_init(app_data: &Path) {
+    let _ = APP_DATA.set(app_data.to_path_buf());
+}
+pub(crate) fn searxng_app_data() -> Result<&'static Path, String> {
+    APP_DATA
+        .get()
+        .map(|p| p.as_path())
+        .ok_or_else(|| "Web検索エンジンの置き場所が未設定です（TexoS の起動処理が済んでいません）".into())
+}
 
 /// デーモン宛ての HTTP クライアント（localhost 固定・システムプロキシを通さない）。
 fn local_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {

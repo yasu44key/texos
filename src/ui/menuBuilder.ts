@@ -1299,11 +1299,17 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
       label: "Web ...",
       onClick: () =>
         a.openSubmenu([
-          // Web検索 P1: 検索エンジン（SearXNG）の導入・管理。P2 で web_search カード作成に育てる。
+          // Web検索 P2: 検索語 → 結果一覧 Markdown（検索エンジンは SearXNG・未導入なら先に導入）。
+          {
+            label: "Web検索（キーワード→結果一覧）...",
+            hint: "検索語（1行=1検索語）で検索し、タイトル・URL・抜粋の一覧を Markdown 1枚にします。検索語はパラメータ欄に書くか、テキストカードや AI の出力を接続します。結果を AI カードに渡せばレポートに、URLカード化に繋げばリンク集になります。初回は検索エンジンの導入（1クリック）から。",
+            onClick: () => a.addFilter("web_search"),
+          },
+          // Web検索 P1: 検索エンジン（SearXNG）の導入・管理。
           {
             label: "Web検索エンジンの管理（SearXNG）...",
-            hint: "キーワード検索に使う検索エンジン（SearXNG）を、この PC の中だけで動かします。未導入なら「導入する」1回で自動で組み立てます（約200MB・API キー／Docker 不要）。",
-            onClick: () => a.addFilter("web_search"),
+            hint: "キーワード検索に使う検索エンジン（SearXNG）を、この PC の中だけで動かします。未導入なら「導入する」1回で自動で組み立てます（約200MB・API キー／Docker 不要）。試験検索・停止・入れ直しもここから。",
+            onClick: () => a.addFilter("searxng_manage"),
           },
           {
             label: "ページ取得（URL→Markdown実身）...",

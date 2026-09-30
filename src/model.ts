@@ -254,6 +254,8 @@ export function filterOutputMime(filterRef: string | null): string | null {
     if (s.builtin === "web_fetch") return null;
     // v1.7 P3 web_feed: 常に記事カード（Markdown）を吐く
     if (s.builtin === "web_feed") return "text/markdown";
+    // Web検索 P2 web_search: 常に結果一覧（Markdown）を吐く
+    if (s.builtin === "web_search") return "text/markdown";
     // v1.7 P4 web_capture: 常にスクリーンショット（PNG）を吐く
     if (s.builtin === "web_capture") return "image/png";
     // v1.7 P5 to_url: URL 文字列（text/plain）— 下流接続可・終端なら URL カード着地
