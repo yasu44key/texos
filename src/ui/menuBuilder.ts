@@ -1299,6 +1299,12 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
       label: "Web ...",
       onClick: () =>
         a.openSubmenu([
+          // Web検索 P1: 検索エンジン（SearXNG）の導入・管理。P2 で web_search カード作成に育てる。
+          {
+            label: "Web検索エンジンの管理（SearXNG）...",
+            hint: "キーワード検索に使う検索エンジン（SearXNG）を、この PC の中だけで動かします。未導入なら「導入する」1回で自動で組み立てます（約200MB・API キー／Docker 不要）。",
+            onClick: () => a.addFilter("web_search"),
+          },
           {
             label: "ページ取得（URL→Markdown実身）...",
             hint: "URLの本文を抽出して Markdown 実身にします（タイトル=カード名）。URLはパラメータ欄に直書きするか、URLを書いたテキストカードを接続します。画像・CSV などの直リンクはそのままの形式で取り込みます。",

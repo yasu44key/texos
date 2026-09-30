@@ -20,6 +20,7 @@ import { AiSettingsDialog } from "./ui/AiSettingsDialog";
 import { WhisperSetupDialog, type WhisperStatus } from "./ui/WhisperSetupDialog";
 import { T2iSettingsDialog } from "./ui/T2iSettingsDialog";
 import { T2iSetupDialog, type T2iStatus } from "./ui/T2iSetupDialog";
+import { SearxngSetupDialog } from "./ui/SearxngSetupDialog";
 
 // v2.0 t23d: t23d_status（runtime/t23d.rs）の返却形。専用セットアップ画面は持たず、
 // エンジン未設定時のパス入力（プロンプト）だけで足りるためここに置く。
@@ -269,6 +270,9 @@ function App() {
     y: number;
     linkFrom?: string;
   } | null>(null);
+  // Web検索 P1: 検索エンジン（SearXNG）の導入・管理ダイアログ。P2 で web_search カード作成へ繋ぐ
+  // （そのときはここに作成位置を持たせる）。
+  const [searxngSetup, setSearxngSetup] = useState<{ x: number; y: number; linkFrom?: string } | null>(null);
   // v1.4.9: 録音プリセット用の dshow 音声デバイス名（メニューは同期構築なので state に持つ）。
   const [audioDevices, setAudioDevices] = useState<string[]>([]);
   const audioDevicesRef = useRef<string[]>([]);
@@ -1336,6 +1340,11 @@ function App() {
             setT2iSetup({ x: canvasX, y: canvasY, linkFrom });
           }
         })();
+        return;
+      }
+      if (builtin === "web_search") {
+        // Web検索 P1: まずは検索エンジンの導入・管理だけ（カード作成は P2）。
+        setSearxngSetup({ x: canvasX, y: canvasY, linkFrom });
         return;
       }
       if (builtin === "t23d") {
@@ -6759,6 +6768,7 @@ function App() {
           }}
         />
       )}
+      {searxngSetup && <SearxngSetupDialog onCancel={() => setSearxngSetup(null)} />}
       {t2iSetup && (
         <T2iSetupDialog
           onCancel={() => setT2iSetup(null)}

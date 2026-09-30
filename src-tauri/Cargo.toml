@@ -66,9 +66,13 @@ windows-core = "0.61"
 windows = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  # Web検索 P1: CreateJobObjectW の引数型（SECURITY_ATTRIBUTES）。
+  "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_DataExchange",
+  # Web検索 P1: SearXNG デーモンを TexoS と一蓮托生にする Job Object（KILL_ON_JOB_CLOSE）。
+  "Win32_System_JobObjects",
   "Win32_System_Memory",
   "Win32_System_Ole",
   # v1.4.28 WS3: GlobalMemoryStatusEx（RAM 総量検出）。

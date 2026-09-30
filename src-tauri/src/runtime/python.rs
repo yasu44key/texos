@@ -192,7 +192,7 @@ pub(crate) fn detect_python(app_data: &Path) -> PyEnv {
 // gather_spec()（VRAM 量まで見て torch index を決める）へ発展・置換した。
 
 /// "python-env" 進捗イベント（{env, status, percent}）。whisper-install の流儀を踏襲。
-fn emit_env_progress(app: &tauri::AppHandle, env: &str, status: &str, percent: u32) {
+pub(crate) fn emit_env_progress(app: &tauri::AppHandle, env: &str, status: &str, percent: u32) {
     let _ = app.emit(
         "python-env",
         serde_json::json!({ "env": env, "status": status, "percent": percent }),
@@ -277,7 +277,7 @@ pub(crate) fn ensure_uv(app: &tauri::AppHandle, app_data: &Path, env: &str) -> R
 
 /// uv をサブコマンド実行（キャッシュ/Python置き場は runtime/ 配下に固定）。
 /// 出力（stderr）を進捗イベントとして流し、失敗時は末尾を含むエラーを返す。
-fn run_uv(
+pub(crate) fn run_uv(
     app: &tauri::AppHandle,
     app_data: &Path,
     env: &str,
