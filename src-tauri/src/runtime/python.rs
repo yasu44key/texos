@@ -369,7 +369,9 @@ pub(crate) fn ensure_env(
         app,
         app_data,
         name,
-        &["python", "install", MANAGED_PYTHON_VERSION],
+        // uv 0.8 の既定は ~/.local/bin への python3.x.exe 配置＋Windows レジストリ登録
+        // （TexoS の外を触る・既存の非 uv 製 exe があると失敗する）。両方止める。
+        &["python", "install", MANAGED_PYTHON_VERSION, "--no-bin", "--no-registry"],
         &format!("Python {MANAGED_PYTHON_VERSION} を取得中…"),
         15,
     )?;
