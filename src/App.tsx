@@ -3908,6 +3908,61 @@ function App() {
     });
   }, [clearHistory]);
 
+  // v1.9.1「リンク切れを修復」: dry-run（repair_links_scan）で内訳を見せ、確認してから
+  // repair_links_apply。自動では走らせない（推測を伴うので明示操作にする・作者合意）。
+  const handleRepairLinks = useCallback(async () => {
+    type Report = { fixable: [string, string][]; ambiguous: string[]; missing: string[] };
+    const list = (xs: string[], max = 8) =>
+      xs.slice(0, max).map((x) => `　・${x}`).join("\n") +
+      (xs.length > max ? `\n　…ほか${xs.length - max}件` : "");
+    const leftover = (r: Report) =>
+      (r.ambiguous.length
+        ? `\n\n候補が複数あるため選べないもの ${r.ambiguous.length}件:\n${list(r.ambiguous)}`
+        : "") +
+      (r.missing.length
+        ? `\n\nプロジェクト内に見つからないもの ${r.missing.length}件:\n${list(r.missing)}`
+        : "") +
+      (r.ambiguous.length || r.missing.length
+        ? "\n\n残ったものは右クリック「実ファイルを再リンク...」か「CASから復元」で個別に対応してください。"
+        : "");
+    const notice = (title: string, message: string) =>
+      setConfirm({ title, message, okLabel: "OK", onConfirm: () => setConfirm(null) });
+    try {
+      const s = await invoke<Report>("repair_links_scan");
+      if (!s.fixable.length) {
+        notice(
+          "繋ぎ直せるものはありません",
+          s.ambiguous.length || s.missing.length
+            ? `プロジェクトフォルダの中から自動で繋ぎ直せる実身はありませんでした。${leftover(s)}`
+            : "実ファイルが見つからない実身はありません。"
+        );
+        return;
+      }
+      setConfirm({
+        title: "リンク切れを修復",
+        message:
+          `${s.fixable.length}件の実身を、プロジェクトフォルダの中の次のファイルへ繋ぎ直します。\n` +
+          list(s.fixable.map(([label, to]) => `${label} → ${to}`)) +
+          leftover(s),
+        okLabel: "繋ぎ直す",
+        onConfirm: async () => {
+          setConfirm(null);
+          try {
+            const r = await invoke<Report>("repair_links_apply");
+            await refresh();
+            notice("修復しました", `${r.fixable.length}件の実身を繋ぎ直しました。${leftover(r)}`);
+          } catch (e) {
+            console.error("repair_links_apply failed", e);
+            notice("修復できませんでした", String(e));
+          }
+        },
+      });
+    } catch (e) {
+      console.error("repair_links_scan failed", e);
+      notice("確認できませんでした", String(e));
+    }
+  }, [refresh]);
+
   // v1.4.15 データの掃除B（正規化）: どのカードからも参照されない孤立CASを削除。
   // まず dry-run（gc_cas_scan）で件数・サイズを出し、確認してから gc_cas_clean。
   const handleGcCas = useCallback(async () => {
@@ -5873,6 +5928,7 @@ function App() {
         openTrash: () => setTrashOpen(true),
         cleanCaches: handleCleanCaches,
         gcCas: handleGcCas,
+        repairLinks: handleRepairLinks,
         setTheme,
         uiAdjust: handleUiAdjust,
         toggleMenuHints: () =>
@@ -6114,6 +6170,7 @@ function App() {
       handleSendSelectionPickFolder,
       handleCleanCaches,
       handleGcCas,
+      handleRepairLinks,
       handleUiAdjust,
       handleViewTemp,
       handleNewSubproject,

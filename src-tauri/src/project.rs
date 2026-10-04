@@ -37,6 +37,96 @@ pub(crate) fn path_inside(child: &Path, parent: &Path) -> bool {
     c == pa || c.starts_with(&(pa.clone() + "\\"))
 }
 
+/// v1.9.1 内部レーンの相対化（V2.0_マルチプラットフォーム検討 §3）: `child` が `root` の中なら
+/// root 基準の相対パス（区切りは `/`）を返す。プロジェクトをフォルダごと移動・持ち出しても
+/// 内包ファイルのリンクが切れないよう、DB にはこの形で保存する。Windows の大文字小文字差は
+/// コンポーネント単位で吸収し、表記で合わなければ canonicalize して再判定する。
+pub(crate) fn rel_to_root(child: &Path, root: &Path) -> Option<String> {
+    fn strip(child: &Path, root: &Path) -> Option<String> {
+        let key = |c: std::path::Component| -> String {
+            let s = c.as_os_str().to_string_lossy();
+            if cfg!(windows) {
+                s.trim_start_matches(r"\\?\").to_lowercase()
+            } else {
+                s.to_string()
+            }
+        };
+        let mut cs = child.components();
+        for rc in root.components() {
+            if matches!(rc, std::path::Component::CurDir) {
+                continue;
+            }
+            let cc = cs.next()?;
+            if key(cc) != key(rc) {
+                return None;
+            }
+        }
+        let rest: Vec<String> = cs
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        if rest.is_empty() || rest.iter().any(|s| s == "..") {
+            return None;
+        }
+        Some(rest.join("/"))
+    }
+    if !child.is_absolute() {
+        return None;
+    }
+    strip(child, root).or_else(|| {
+        let c = std::fs::canonicalize(child).ok()?;
+        let r = std::fs::canonicalize(root).ok()?;
+        strip(&c, &r)
+    })
+}
+
+/// DB へ書く形: プロジェクト内なら相対、外（別ドライブ等の正当な外部参照）は絶対のまま。
+/// 既に相対ならそのまま。パス文字列で照合する SQL の引数もこれを通すこと。
+pub(crate) fn store_path(root: &Path, s: &str) -> String {
+    rel_to_root(Path::new(s), root).unwrap_or_else(|| s.to_string())
+}
+
+/// DB から読んだ形を実行機の絶対パスへ。相対ならこのプロジェクトの root 基準で展開する。
+/// 展開結果を DB へ書き戻さないこと（書くときは store_path）。
+pub(crate) fn load_path(root: &Path, s: &str) -> String {
+    if s.is_empty() || Path::new(s).is_absolute() {
+        return s.to_string();
+    }
+    let mut pb = root.to_path_buf();
+    for seg in s.split(['/', '\\']).filter(|x| !x.is_empty() && *x != ".") {
+        pb.push(seg);
+    }
+    pb.to_string_lossy().to_string()
+}
+
+pub(crate) fn load_path_opt(root: &Path, s: Option<String>) -> Option<String> {
+    s.map(|v| load_path(root, &v))
+}
+
+/// v1.9.1: 旧 DB の移行。現在の root の中を指す絶対パスの committed_path / origin_path を
+/// 相対へ畳む（決定的な書き換えのみ・推測はしない）。root の外を指す絶対パス（移動前の
+/// 古い場所を指してリンク切れになったもの等）には触れない＝「リンク切れを修復」の担当。
+pub(crate) fn relativize_internal_paths(conn: &Connection, root: &Path) {
+    for col in ["committed_path", "origin_path"] {
+        let rows: Vec<(String, String)> = match conn.prepare(&format!(
+            "SELECT id, {col} FROM virtual_bodies WHERE {col} IS NOT NULL AND {col} <> ''"
+        )) {
+            Ok(mut st) => st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|it| it.flatten().collect())
+                .unwrap_or_default(),
+            Err(_) => continue,
+        };
+        for (id, v) in rows {
+            if let Some(rel) = rel_to_root(Path::new(&v), root) {
+                let _ = conn.execute(
+                    &format!("UPDATE virtual_bodies SET {col} = ?1 WHERE id = ?2"),
+                    rusqlite::params![rel, id],
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn open_project_at(root: &Path) -> Result<Project, String> {
     let texos = texos_dir(root);
     let cas_root = texos.join("cas");
@@ -45,6 +135,7 @@ pub(crate) fn open_project_at(root: &Path) -> Result<Project, String> {
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     repair_mime_types(&conn);
     backfill_vbody_ext(&conn);
+    relativize_internal_paths(&conn, root);
     Ok(Project {
         conn,
         root: root.to_path_buf(),
@@ -237,6 +328,27 @@ pub(crate) fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), 
         //   3) origin_path = 親のライブファイル（最新を見る窓）／committed_path = NULL（仮身）
         // にする。＝子は「親ファイルを仮身として取り込んだ」状態。閲覧③(origin)／実身化／自前CAS
         // バックアップ④ が外部取り込みと同じルーチンで成立し、親CAS（⑤）にも依存しない。
+        // v1.9.1: 親の origin_path は親 root 基準の相対で保存されうる。子へそのまま写すと
+        // 子 root 基準で解かれて別物を指すので、まず親基準で展開し、子の規則で保存し直す
+        // （下のファイルカード処理が上書きしない＝実体喪失カードの origin もこれで正しく残る）。
+        {
+            let rows: Vec<(String, String)> = {
+                let mut stmt = src.conn.prepare(
+                    "SELECT id, origin_path FROM fork.virtual_bodies WHERE origin_path IS NOT NULL",
+                )?;
+                let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                mapped.flatten().collect()
+            };
+            for (id, op) in rows {
+                let fixed = store_path(new_root, &load_path(&src.root, &op));
+                if fixed != op {
+                    src.conn.execute(
+                        "UPDATE fork.virtual_bodies SET origin_path = ?1 WHERE id = ?2",
+                        rusqlite::params![fixed, id],
+                    )?;
+                }
+            }
+        }
         let fork_cas = texos_dir(new_root).join("cas");
         let mut file_cards: Vec<(String, String, String, Option<String>)> = Vec::new();
         {
@@ -276,7 +388,7 @@ pub(crate) fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), 
             )?;
             src.conn.execute(
                 "UPDATE fork.virtual_bodies SET real_id = ?1, origin_path = ?2 WHERE id = ?3",
-                rusqlite::params![h, live.to_string_lossy().to_string(), cid],
+                rusqlite::params![h, store_path(new_root, &live.to_string_lossy()), cid],
             )?;
         }
         Ok(())
@@ -290,7 +402,17 @@ pub(crate) fn fork_structure_into(src: &Project, new_root: &Path) -> Result<(), 
 /// own committed が実在すればそれを、無ければ window_of（複製元の実身カードID）を再帰。
 /// CAS・origin・real_id 兄弟には一切落ちない＝喪失なら None を返し、呼び出し側が
 /// 赤（CAS 保険）に倒す。指し先カードが削除済みでも None（→赤）。
-pub(crate) fn resolve_live_file(conn: &Connection, vid: &str, depth: u32) -> Option<PathBuf> {
+/// v1.9.1: CAS ルート（`<root>/.texos/cas`）からプロジェクトルートを逆算する。
+/// 接続だけを持つ解決経路（フォーク元チェーンを辿る resolve_view_conn 等）で相対パスを解くため。
+pub(crate) fn root_of_cas(cas_root: &Path) -> PathBuf {
+    cas_root
+        .parent()
+        .and_then(|t| t.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+pub(crate) fn resolve_live_file(conn: &Connection, root: &Path, vid: &str, depth: u32) -> Option<PathBuf> {
     if depth > 16 {
         return None;
     }
@@ -306,13 +428,13 @@ pub(crate) fn resolve_live_file(conn: &Connection, vid: &str, depth: u32) -> Opt
         .flatten();
     let (committed, window_of) = row.unwrap_or((None, None));
     if let Some(cp) = committed {
-        let p = PathBuf::from(&cp);
+        let p = PathBuf::from(load_path(root, &cp));
         if p.exists() {
             return Some(p);
         }
     }
     if let Some(w) = window_of {
-        return resolve_live_file(conn, &w, depth + 1);
+        return resolve_live_file(conn, root, &w, depth + 1);
     }
     None
 }
@@ -346,6 +468,10 @@ pub(crate) fn resolve_view_conn(
         .ok()
         .flatten();
     let (committed, origin, window_of) = row.unwrap_or((None, None, None));
+    // v1.9.1: 保存形（root 基準の相対）をこの接続のプロジェクトで解決してから使う。
+    let root = root_of_cas(cas_root);
+    let committed = load_path_opt(&root, committed);
+    let origin = load_path_opt(&root, origin);
     // ① own committed (possibly edited) file at this level
     if let Some(cp) = committed {
         let p = PathBuf::from(&cp);
@@ -358,7 +484,7 @@ pub(crate) fn resolve_view_conn(
     // 落とさない。指し先が実体喪失なら CAS（保険・赤）/ none（赤）で止め、②以降の
     // 外部レーンには進めない（内部と外部を混ぜない）。
     if let Some(w) = &window_of {
-        if let Some(p) = resolve_live_file(conn, w, depth + 1) {
+        if let Some(p) = resolve_live_file(conn, &root, w, depth + 1) {
             return Some((p, if depth == 0 { "window" } else { "fork-live" }));
         }
         let local = cas::object_path(cas_root, real_id);
@@ -388,7 +514,7 @@ pub(crate) fn resolve_view_conn(
             if let Ok(rows) = stmt.query_map(rusqlite::params![real_id, vid], |r| {
                 r.get::<_, String>(0)
             }) {
-                let sibs: Vec<String> = rows.flatten().collect();
+                let sibs: Vec<String> = rows.flatten().map(|c| load_path(&root, &c)).collect();
                 // 優先: origin_path（窓の対象＝複製元の実ファイル）に一致する生存兄弟
                 if let Some(op) = &origin {
                     for cp in &sibs {
@@ -491,7 +617,9 @@ pub(crate) fn refresh_origin_snapshot(p: &Project, vid: &str) {
         return; // 実身 is fixed; its snapshot lineage stays as-is
     }
     let Some(origin) = origin else { return };
-    let origin_path = Path::new(&origin);
+    // origin = DB の保存形（下の SQL 照合用）／origin_full = FS 操作用。
+    let origin_full = load_path(&p.root, &origin);
+    let origin_path = Path::new(&origin_full);
     if !origin_path.is_file() {
         return;
     }
@@ -748,5 +876,105 @@ mod fork_tests {
             .unwrap();
         assert_eq!(n, 1);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod portable_path_tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("texos_pp_{}_{}_{}", tag, db::now_ms(), uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn paths(p: &Project, id: &str) -> (Option<String>, Option<String>) {
+        p.conn
+            .query_row(
+                "SELECT committed_path, origin_path FROM virtual_bodies WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn rel_to_root_inside_outside_and_case() {
+        let root = Path::new(r"C:\Proj\Sub");
+        assert_eq!(rel_to_root(Path::new(r"C:\Proj\Sub\a.txt"), root).as_deref(), Some("a.txt"));
+        assert_eq!(rel_to_root(Path::new(r"C:\Proj\Sub\d\a.txt"), root).as_deref(), Some("d/a.txt"));
+        #[cfg(windows)]
+        assert_eq!(rel_to_root(Path::new(r"c:\proj\SUB\a.txt"), root).as_deref(), Some("a.txt"));
+        // 外・親・自分自身・相対は畳まない
+        assert_eq!(rel_to_root(Path::new(r"D:\other\a.txt"), root), None);
+        assert_eq!(rel_to_root(Path::new(r"C:\Proj\a.txt"), root), None);
+        assert_eq!(rel_to_root(Path::new(r"C:\Proj\Sub"), root), None);
+        assert_eq!(rel_to_root(Path::new("a.txt"), root), None);
+        // 往復
+        #[cfg(windows)]
+        assert_eq!(load_path(root, "d/a.txt"), r"C:\Proj\Sub\d\a.txt");
+        assert_eq!(load_path(root, r"D:\other\a.txt"), r"D:\other\a.txt");
+    }
+
+    /// 本題: プロジェクトをフォルダごと移動しても内包ファイルのリンクが切れない。
+    #[test]
+    fn moved_project_keeps_internal_links() {
+        let a = temp_root("a");
+        std::fs::create_dir_all(a.join("sub")).unwrap();
+        std::fs::write(a.join("メモ.txt"), "hello").unwrap();
+        std::fs::write(a.join("sub").join("b.md"), "# b").unwrap();
+        let (v1, v2) = {
+            let p = open_project_at(&a).unwrap();
+            let v1 = import_file_into(&p, a.join("メモ.txt").to_string_lossy().into(), String::new(), 0.0, 0.0).unwrap();
+            let v2 = import_file_into(&p, a.join("sub").join("b.md").to_string_lossy().into(), String::new(), 0.0, 0.0).unwrap();
+            // 保存は相対（origin も同じ形＝内部実身判定 origin==committed を保つ）
+            assert_eq!(paths(&p, &v1), (Some("メモ.txt".into()), Some("メモ.txt".into())));
+            assert_eq!(paths(&p, &v2), (Some("sub/b.md".into()), Some("sub/b.md".into())));
+            // 同じファイルの2枚目は窓仮身になる（照合が相対でも効く）
+            let v3 = import_file_into(&p, a.join("メモ.txt").to_string_lossy().into(), String::new(), 0.0, 0.0).unwrap();
+            assert_eq!(paths(&p, &v3), (None, None));
+            (v1, v2)
+        };
+
+        let b = a.with_file_name(format!("{}_moved", a.file_name().unwrap().to_string_lossy()));
+        std::fs::rename(&a, &b).unwrap();
+        let p = open_project_at(&b).unwrap();
+        for (vid, rid_rel) in [(&v1, "メモ.txt"), (&v2, "sub/b.md")] {
+            let rid: String = p
+                .conn
+                .query_row("SELECT real_id FROM virtual_bodies WHERE id = ?1", [vid], |r| r.get(0))
+                .unwrap();
+            let live = resolve_view_path(&p, vid, &rid);
+            assert_eq!(live, PathBuf::from(load_path(&b, rid_rel)));
+            assert!(live.is_file(), "移動後も実ファイルに解決できる: {}", live.display());
+        }
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// 旧 DB（絶対パス）の移行: 今の root の中を指すものだけ相対へ畳む。外部・リンク切れは触らない。
+    #[test]
+    fn legacy_absolute_paths_are_relativized_on_open() {
+        let a = temp_root("legacy");
+        std::fs::write(a.join("x.txt"), "x").unwrap();
+        let inside = a.join("x.txt").to_string_lossy().to_string();
+        let outside = r"Z:\elsewhere\y.txt".to_string();
+        {
+            let p = open_project_at(&a).unwrap();
+            db::insert_real_body(&p.conn, "h1", "text/plain", 1, Some("txt")).unwrap();
+            for (id, c, o) in [("in", Some(&inside), Some(&inside)), ("ext", None, Some(&outside))] {
+                p.conn
+                    .execute(
+                        "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, committed_path, origin_path)
+                         VALUES (?1, 'h1', ?1, 0, 0, 0, ?2, ?3)",
+                        rusqlite::params![id, c, o],
+                    )
+                    .unwrap();
+            }
+        }
+        let p = open_project_at(&a).unwrap();
+        assert_eq!(paths(&p, "in"), (Some("x.txt".into()), Some("x.txt".into())));
+        assert_eq!(paths(&p, "ext"), (None, Some(outside)));
+        let _ = std::fs::remove_dir_all(&a);
     }
 }

@@ -893,7 +893,7 @@ fn write_report(p: &Project, terminal_id: &str, terminal_label: &str, bytes: &[u
         .query_row(
             "SELECT id FROM virtual_bodies
              WHERE deleted_at IS NULL AND (committed_path = ?1 OR origin_path = ?1)",
-            rusqlite::params![dest_str],
+            rusqlite::params![store_path(&p.root, &dest_str)],
             |r| r.get(0),
         )
         .optional()
@@ -930,7 +930,7 @@ fn write_report(p: &Project, terminal_id: &str, terminal_label: &str, bytes: &[u
                     fx + 260.0,
                     fy + 120.0,
                     db::now_ms(),
-                    dest_str,
+                    store_path(&p.root, &dest_str),
                     file_mtime_ms(&dest),
                 ],
             )

@@ -854,7 +854,7 @@ fn run_import_new(
             .query_row(
                 "SELECT 1 FROM virtual_bodies
                  WHERE (committed_path = ?1 OR origin_path = ?1) AND deleted_at IS NULL",
-                rusqlite::params![path_str],
+                rusqlite::params![store_path(&p.root, &path_str)],
                 |_| Ok(()),
             )
             .optional()
@@ -936,7 +936,7 @@ fn write_tap_record(
                 "SELECT id FROM virtual_bodies
                  WHERE committed_path = ?1 AND deleted_at IS NULL
                  ORDER BY created_at LIMIT 1",
-                rusqlite::params![path_str],
+                rusqlite::params![store_path(&p.root, &path_str)],
                 |r| r.get(0),
             )
             .optional()
@@ -2666,7 +2666,7 @@ fn run_flow_inner(
                     .map_err(|e| e.to_string())?
                     .and_then(|(vid, real_id, committed)| {
                         committed
-                            .map(PathBuf::from)
+                            .map(|c| PathBuf::from(load_path(&p.root, &c)))
                             .filter(|c| c.is_file())
                             .or_else(|| {
                                 let pb = resolve_view_path(p, &vid, &real_id);
@@ -3119,7 +3119,7 @@ pub(crate) fn materialize_payloads(
             .query_row(
                 "SELECT id FROM virtual_bodies
                  WHERE deleted_at IS NULL AND (committed_path = ?1 OR origin_path = ?1)",
-                rusqlite::params![dest_str],
+                rusqlite::params![store_path(&p.root, &dest_str)],
                 |r| r.get(0),
             )
             .optional()
@@ -3172,10 +3172,11 @@ pub(crate) fn materialize_payloads(
         };
         // 出力フォルダ指定時は外部ファイルへの窓（origin_path の仮身）、
         // 指定なしはプロジェクト直下のコミット済み実身（従来どおり）
+        let dest_db = store_path(&p.root, &dest_str);
         let (committed_path, committed_mtime, origin_path) = if external_out {
-            (None, None, Some(dest_str))
+            (None, None, Some(dest_db))
         } else {
-            (Some(dest_str), file_mtime_ms(&dest), None)
+            (Some(dest_db), file_mtime_ms(&dest), None)
         };
         if let Err(e) = p.conn.execute(
             "INSERT INTO virtual_bodies
@@ -3309,7 +3310,8 @@ mod tap_tests {
         assert_eq!(names, vec!["途中.md".to_string()]);
         let path = dir.join("途中.md");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "一回目");
-        let path_str = path.to_string_lossy().to_string();
+        // v1.9.1: DB の保存形（root 基準の相対）で照合する。
+        let path_str = store_path(&p.root, &path.to_string_lossy());
         let count = |p: &Project| -> i64 {
             p.conn
                 .query_row(

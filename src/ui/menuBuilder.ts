@@ -84,6 +84,8 @@ export interface MenuActions {
   cleanCaches: () => void;
   // v1.4.15 データの掃除B（正規化）: どのカードからも参照されない孤立CASデータを削除。
   gcCas: () => void;
+  // v1.9.1: 実体喪失の実身を、今のプロジェクトフォルダの中から探して繋ぎ直す（フォルダごと移動の後など）。
+  repairLinks: () => void;
   setTheme: (key: string) => void;
   // v1.4.16 遊び心: 画面全体の明るさ・コントラストのお手軽調整。
   uiAdjust: (kind: "brighter" | "darker" | "contrastUp" | "contrastDown" | "reset") => void;
@@ -1598,6 +1600,11 @@ export function buildCanvasMenu(
       label: "すべて実身化（持ち出し）...",
       hint: "プロジェクト内のすべての仮身を実身化し、データをプロジェクトフォルダに書き出します。",
       onClick: () => a.commitAll(),
+    },
+    {
+      label: "リンク切れを修復...",
+      hint: "実ファイルが見つからない（薄赤の）実身を、このプロジェクトのフォルダの中から探して繋ぎ直します。プロジェクトをフォルダごと移動した後や、中でファイルを動かした後に。まず件数を確認してから実行します（候補が複数あるもの・見つからないものはそのまま残るので、右クリック「実ファイルを再リンク」か「CASから復元」で個別に対応してください）。",
+      onClick: () => a.repairLinks(),
     },
     // v1.7 P2: 一括更新確認（明示操作なので pull 原則と矛盾しない・計画 §3 P2）。
     {

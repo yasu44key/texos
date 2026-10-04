@@ -95,7 +95,7 @@ pub(crate) fn import_file_into(
                 "SELECT id, real_id FROM virtual_bodies
                  WHERE committed_path = ?1 AND deleted_at IS NULL
                  ORDER BY created_at LIMIT 1",
-                rusqlite::params![path],
+                rusqlite::params![store_path(&p.root, &path)],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -137,7 +137,10 @@ pub(crate) fn import_file_into(
     let stem = src.file_name().and_then(|s| s.to_str()).unwrap_or(&label);
     let display_label = if label.is_empty() { stem } else { &label };
 
-    let committed_path = in_project.then(|| path.clone());
+    // v1.9.1: 内部レーンは root 基準の相対で保存（origin_path も同じ規則＝内部実身の
+    // origin===committed 判定を移動後も保つ）。外部の origin_path は絶対のまま。
+    let stored = store_path(&p.root, &path);
+    let committed_path = in_project.then(|| stored.clone());
     let committed_mtime = if in_project { file_mtime_ms(src) } else { None };
 
     // v1.3.6: 拡張子/MIME は仮身側にも保存する。空ファイル等は実身を共有するため、
@@ -155,7 +158,7 @@ pub(crate) fn import_file_into(
                 x,
                 y,
                 db::now_ms(),
-                path,
+                stored,
                 committed_path,
                 committed_mtime,
                 orig_ext,
@@ -193,7 +196,7 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
 
     let rows = stmt
         .query_map([], |row| {
-            let committed_path: Option<String> = row.get(6)?;
+            let committed_path: Option<String> = load_path_opt(&p.root, row.get(6)?);
             let committed_mtime: Option<i64> = row.get(7)?;
             let folder_ref: Option<String> = row.get(14)?;
             let project_ref: Option<String> = row.get(8)?;
@@ -239,7 +242,7 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
                 memo: row.get(12)?,
                 z_order: row.get(13)?,
                 folder_ref,
-                origin_path: row.get(15)?,
+                origin_path: load_path_opt(&p.root, row.get(15)?),
                 cur_mtime,
                 view_source: None,
                 panel_w: row.get(16)?,
@@ -568,7 +571,9 @@ pub(crate) fn delete_object(id: String, state: State<AppState>) -> Result<(), St
         .flatten()
         .flatten();
     if let Some(cp) = committed {
-        let path = std::path::Path::new(&cp);
+        // cp = DB の保存形（SQL 照合用）／full = 実行機の絶対パス（FS 操作用）。
+        let full = load_path(&p.root, &cp);
+        let path = std::path::Path::new(&full);
         // v1.3.11 問題点3（多層防御）: 同じ実ファイル（committed_path）を指す「生きた」
         // カードが他にもいれば、実ファイルは退避せずカードだけをソフト削除する。問題点1で
         // 通常は実身は1枚に保たれるが、旧データや想定外経路で2枚以上の実身が同じ実体を
@@ -632,7 +637,7 @@ pub(crate) fn restore_object(id: String, state: State<AppState>) -> Result<(), S
     }
 
     if let Some(cp) = &committed {
-        let target = PathBuf::from(cp);
+        let target = PathBuf::from(load_path(&p.root, cp));
         let trash = trash_path(&p.root, &id, &target);
         let mut new_committed: Option<PathBuf> = None; // None = 仮身として復活
         if target.is_file() && !trash.is_file() {
@@ -667,7 +672,7 @@ pub(crate) fn restore_object(id: String, state: State<AppState>) -> Result<(), S
                 p.conn
                     .execute(
                         "UPDATE virtual_bodies SET committed_path = ?1 WHERE id = ?2",
-                        rusqlite::params![dest.to_string_lossy().to_string(), id],
+                        rusqlite::params![store_path(&p.root, &dest.to_string_lossy()), id],
                     )
                     .map_err(|e| e.to_string())?;
             }
@@ -1316,7 +1321,7 @@ pub(crate) fn send_selection_to_project(
                                      WHERE id = ?4",
                                     rusqlite::params![
                                         h,
-                                        dest_file.to_string_lossy().to_string(),
+                                        store_path(&dest_root, &dest_file.to_string_lossy()),
                                         mtime,
                                         new_id
                                     ],
@@ -1337,7 +1342,7 @@ pub(crate) fn send_selection_to_project(
                                      WHERE id = ?3",
                                     rusqlite::params![
                                         h,
-                                        live.to_string_lossy().to_string(),
+                                        store_path(&dest_root, &live.to_string_lossy()),
                                         new_id
                                     ],
                                 )
@@ -1460,7 +1465,8 @@ pub(crate) fn send_selection_to_project(
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                let path = Path::new(&cp);
+                let full = load_path(&p.root, &cp);
+                let path = Path::new(&full);
                 if shared == 0 && path.starts_with(&p.root) && path.is_file() {
                     let trash = trash_path(&p.root, old_id, path);
                     if let Some(parent) = trash.parent() {
@@ -1533,7 +1539,7 @@ pub(crate) fn rename_real(id: String, new_name: String, state: State<AppState>) 
         .flatten()
         .flatten();
     let cp = committed.ok_or("このカードは実身ではありません（仮身は「表示名を変更」を使ってください）")?;
-    let old = PathBuf::from(&cp);
+    let old = PathBuf::from(load_path(&p.root, &cp));
     if !old.is_file() {
         return Err("実ファイルが見つかりません（先に再リンク／CASから復元してください）".into());
     }
@@ -1554,7 +1560,7 @@ pub(crate) fn rename_real(id: String, new_name: String, state: State<AppState>) 
     };
     // 同名なら変更なし（unique_path に渡すと自分自身と衝突して (2) が付くのを防ぐ）。
     if dir.join(&filename) == old {
-        return Ok(cp);
+        return Ok(old.to_string_lossy().to_string());
     }
     let dest = unique_path(dir, &filename);
     std::fs::rename(&old, &dest).map_err(|e| e.to_string())?;
@@ -1573,7 +1579,7 @@ pub(crate) fn rename_real(id: String, new_name: String, state: State<AppState>) 
             "UPDATE virtual_bodies
              SET committed_path = ?1, committed_mtime = ?2, ext = ?3
              WHERE id = ?4",
-            rusqlite::params![dest_str, mtime, new_ext, id],
+            rusqlite::params![store_path(&p.root, &dest_str), mtime, new_ext, id],
         )
         .map_err(|e| e.to_string())?;
     Ok(dest_str)
@@ -1892,9 +1898,10 @@ pub(crate) fn commit_object_inner(p: &Project, id: &str, force: bool) -> Result<
         .query_row(
             "SELECT committed_path FROM virtual_bodies WHERE id = ?1",
             rusqlite::params![id],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .map(|s: String| load_path(&p.root, &s));
 
     // v1.3.6: ファイル名の拡張子・MIME は仮身優先（COALESCE）。空ファイル共有で実身が
     // ods 等に潰れていても、本来の拡張子（.docx 等）で書き出す／開く（.docx.ods を防ぐ）。
@@ -1958,7 +1965,7 @@ pub(crate) fn commit_object_inner(p: &Project, id: &str, force: bool) -> Result<
     p.conn
         .execute(
             "UPDATE virtual_bodies SET committed_path = ?1, committed_mtime = ?2 WHERE id = ?3",
-            rusqlite::params![dest_str, mtime, id],
+            rusqlite::params![store_path(&p.root, &dest_str), mtime, id],
         )
         .map_err(|e| e.to_string())?;
 
@@ -1977,14 +1984,195 @@ pub(crate) fn relink_object(id: String, new_path: String, state: State<AppState>
     if !np.is_file() {
         return Err("選んだファイルが見つかりません".into());
     }
+    relink_object_in(p, &id, &new_path)
+}
+
+pub(crate) fn relink_object_in(p: &Project, id: &str, new_path: &str) -> Result<(), String> {
+    let np = std::path::Path::new(new_path);
     let mtime = file_mtime_ms(np);
+    let stored = store_path(&p.root, new_path);
+    // v1.9.1: 内部実身（origin_path == committed_path）は origin も一緒に付け替える。
+    // 片方だけ変えると内部実身が「外部の戻り先がある」ように見え、「仮身に戻す」
+    // （＝元ファイル削除）が出てしまう。
     p.conn
         .execute(
-            "UPDATE virtual_bodies SET committed_path = ?1, committed_mtime = ?2 WHERE id = ?3",
-            rusqlite::params![new_path, mtime, id],
+            "UPDATE virtual_bodies
+                SET origin_path = CASE WHEN origin_path = committed_path THEN ?1 ELSE origin_path END,
+                    committed_path = ?1, committed_mtime = ?2
+              WHERE id = ?3",
+            rusqlite::params![stored, mtime, id],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// v1.9.1「リンク切れを修復」（整理・書き出し）: 実体喪失の実身を、今のプロジェクトフォルダの
+/// 中から探して繋ぎ直す。プロジェクトをフォルダごと移動した・中でファイルを動かした後の手当て。
+/// 自動では走らせない（作者合意）— 推測を伴うので、件数を見せてから明示的に実行する。
+#[derive(Serialize, Default)]
+pub struct RepairLinksReport {
+    /// 繋ぎ直せる（apply では繋ぎ直した）カード: (表示名, プロジェクト基準の新しい場所)
+    pub fixable: Vec<(String, String)>,
+    /// 候補が複数・他のカードと取り合いになる等で自動では選べないカード
+    pub ambiguous: Vec<String>,
+    /// プロジェクト内に見つからないカード
+    pub missing: Vec<String>,
+}
+
+/// 修復計画を立てる（書き換えない）。探索は2段:
+///   1) 保存パスの先頭から1階層ずつ削り、`root/残り` に実在するか（フォルダごと移動のケース）。
+///      残りが長いほど具体的なので、長い方から試す。
+///   2) 見つからなければ、プロジェクト内を同じファイル名で探す（中で動かしたケース）。
+///      1件だけなら採用、複数なら ambiguous。
+/// `.texos` と内包プロジェクト（`.texos` を持つ子フォルダ）の中は探さない（別プロジェクトの実体）。
+/// 同じ実ファイルを2枚の実身にしない（問題点1）: 生きた実身が既に指している先・計画内で
+/// 先に割り当てた先は候補から外し、ambiguous に回す。
+fn plan_link_repairs(p: &Project) -> Result<(Vec<(String, String, PathBuf)>, RepairLinksReport), String> {
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = p
+            .conn
+            .prepare(
+                "SELECT id, label, committed_path FROM virtual_bodies
+                 WHERE deleted_at IS NULL AND committed_path IS NOT NULL AND committed_path <> ''
+                 ORDER BY created_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        mapped.flatten().collect()
+    };
+    let key = |pb: &Path| -> String {
+        let s = pb.to_string_lossy().replace('/', "\\");
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    };
+    // 生きている実身が今指している実ファイル（取り合い防止）
+    let mut taken: std::collections::HashSet<String> = rows
+        .iter()
+        .map(|(_, _, cp)| PathBuf::from(load_path(&p.root, cp)))
+        .filter(|pb| pb.is_file())
+        .map(|pb| key(&pb))
+        .collect();
+    let broken: Vec<(String, String, PathBuf)> = rows
+        .into_iter()
+        .map(|(id, label, cp)| (id, label, PathBuf::from(load_path(&p.root, &cp))))
+        .filter(|(_, _, pb)| !pb.is_file())
+        .collect();
+
+    let texos = texos_dir(&p.root);
+    let searchable = |pb: &Path| -> bool { pb.is_file() && !path_inside(pb, &texos) };
+    // ファイル名索引は必要になったときに一度だけ作る
+    let mut index: Option<std::collections::HashMap<String, Vec<PathBuf>>> = None;
+    fn walk(dir: &Path, out: &mut std::collections::HashMap<String, Vec<PathBuf>>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                // .texos と、内包プロジェクト（中身はその子プロジェクトのもの）は探さない
+                if ent.file_name() == ".texos" || texos_dir(&path).join("texos.db").exists() {
+                    continue;
+                }
+                walk(&path, out);
+            } else if let Some(n) = path.file_name().and_then(|s| s.to_str()) {
+                let k = if cfg!(windows) { n.to_lowercase() } else { n.to_string() };
+                out.entry(k).or_default().push(path);
+            }
+        }
+    }
+
+    let mut plan: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut report = RepairLinksReport::default();
+    for (id, label, old) in broken {
+        // 1) 先頭を削った残りを今の root に当てる
+        let comps: Vec<String> = old
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+                _ => None,
+            })
+            .collect();
+        let mut found: Option<PathBuf> = None;
+        let mut conflict = false;
+        for k in 0..comps.len() {
+            let mut cand = p.root.clone();
+            for seg in &comps[k..] {
+                cand.push(seg);
+            }
+            if searchable(&cand) {
+                if taken.contains(&key(&cand)) {
+                    conflict = true;
+                } else {
+                    found = Some(cand);
+                }
+                break;
+            }
+        }
+        // 2) 同名検索
+        if found.is_none() && !conflict {
+            if let Some(name) = old.file_name().and_then(|s| s.to_str()) {
+                let idx = index.get_or_insert_with(|| {
+                    let mut m = std::collections::HashMap::new();
+                    walk(&p.root, &mut m);
+                    m
+                });
+                let k = if cfg!(windows) { name.to_lowercase() } else { name.to_string() };
+                let cands: Vec<&PathBuf> = idx
+                    .get(&k)
+                    .map(|v| v.iter().filter(|c| !taken.contains(&key(c))).collect())
+                    .unwrap_or_default();
+                match cands.len() {
+                    0 => conflict = idx.get(&k).is_some_and(|v| !v.is_empty()),
+                    1 => found = Some(cands[0].clone()),
+                    _ => conflict = true,
+                }
+            }
+        }
+        match found {
+            Some(np) => {
+                taken.insert(key(&np));
+                report.fixable.push((label.clone(), store_path(&p.root, &np.to_string_lossy())));
+                plan.push((id, label, np));
+            }
+            None if conflict => report.ambiguous.push(label),
+            None => report.missing.push(label),
+        }
+    }
+    Ok((plan, report))
+}
+
+/// 「リンク切れを修復」の dry-run（確認ダイアログ用・書き換えない）。
+#[tauri::command]
+pub(crate) fn repair_links_scan(state: State<AppState>) -> Result<RepairLinksReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    plan_link_repairs(p).map(|(_, r)| r)
+}
+
+#[cfg(test)]
+fn repair_links_scan_in(p: &Project) -> RepairLinksReport {
+    plan_link_repairs(p).unwrap().1
+}
+
+/// 「リンク切れを修復」の実行。計画は実行時に立て直す（確認中の変化を拾う）。
+/// 繋ぎ直しは手動の「実ファイルを再リンク」と同じ relink_object_in（内部実身の origin も追従）。
+#[tauri::command]
+pub(crate) fn repair_links_apply(state: State<AppState>) -> Result<RepairLinksReport, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    repair_links_apply_in(p)
+}
+
+pub(crate) fn repair_links_apply_in(p: &Project) -> Result<RepairLinksReport, String> {
+    let (plan, mut report) = plan_link_repairs(p)?;
+    let mut done = Vec::new();
+    for ((id, label, np), item) in plan.into_iter().zip(report.fixable.drain(..)) {
+        match relink_object_in(p, &id, &np.to_string_lossy()) {
+            Ok(()) => done.push(item),
+            Err(_) => report.missing.push(label),
+        }
+    }
+    report.fixable = done;
+    Ok(report)
 }
 
 /// v1.3.11 #12: リンクフォルダカードの参照先を選び直す（リネーム・移動でリンク切れに
@@ -2177,7 +2365,7 @@ pub(crate) fn commit_all(dry_run: Option<bool>, state: State<AppState>) -> Resul
                 Ok(Row {
                     id: row.get(0)?,
                     label: row.get(1)?,
-                    committed: row.get(2)?,
+                    committed: load_path_opt(&p.root, row.get(2)?),
                     project_ref: row.get(3)?,
                     url_ref: row.get(4)?,
                     ext: row.get(5)?,
@@ -2326,7 +2514,7 @@ fn resolve_export_paths(p: &Project, ids: &[String]) -> (Vec<String>, ClipboardE
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             );
         let (label, committed, project_ref, url_ref, folder_ref, kind) = match row {
-            Ok(x) => x,
+            Ok((l, c, pr, u, f, k)) => (l, load_path_opt(&p.root, c), pr, u, f, k),
             Err(_) => continue, // 消えた・存在しないIDは黙ってスキップ
         };
 
@@ -2459,7 +2647,8 @@ pub(crate) fn copy_image_to_clipboard(id: String, state: State<AppState>) -> Res
             |r| r.get(0),
         )
         .ok()
-        .flatten();
+        .flatten()
+        .map(|c: String| load_path(&p.root, &c));
     let path = match committed {
         Some(c) if Path::new(&c).exists() => c,
         _ => commit_object_inner(p, &id, false)?,
@@ -2500,8 +2689,11 @@ pub(crate) fn uncommit_object(id: String, state: State<AppState>) -> Result<(), 
         .optional()
         .map_err(|e| e.to_string())?
         .unwrap_or((None, None));
+    // v1.9.1: 保存形（相対/絶対）の違いで同一判定を外さないよう、解決してから比べる。
+    let committed = load_path_opt(&p.root, committed);
+    let origin = load_path_opt(&p.root, origin);
     if let (Some(c), Some(o)) = (&committed, &origin) {
-        if c == o {
+        if path_inside(Path::new(c), Path::new(o)) {
             return Err(
                 "これは取り込み元の実ファイルそのものです。仮身に戻すと元ファイルが失われるため実行できません。\
                  （ファイルごと削除する場合は「削除」を使用してください）"
@@ -2617,7 +2809,7 @@ pub(crate) fn materialize_view(id: String, state: State<AppState>) -> Result<Str
             .map_err(|e| e.to_string())?;
 
     let src = committed
-        .map(PathBuf::from)
+        .map(|c| PathBuf::from(load_path(&p.root, &c)))
         .filter(|c| c.is_file())
         .unwrap_or_else(|| resolve_view_path(p, &id, &real_id));
 
@@ -2679,7 +2871,7 @@ pub(crate) fn convert_office_to_pdf(id: String, state: State<AppState>) -> Resul
                 )
                 .map_err(|e| e.to_string())?;
         let s = committed
-            .map(PathBuf::from)
+            .map(|c| PathBuf::from(load_path(&p.root, &c)))
             .filter(|c| c.is_file())
             .unwrap_or_else(|| resolve_view_path(p, &id, &real_id));
         (s, resolve_ext(stored_ext.as_deref(), &mime))
@@ -2846,5 +3038,86 @@ mod relink_tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&p.root);
+    }
+}
+
+#[cfg(test)]
+mod repair_links_tests {
+    use super::*;
+
+    /// 旧形式（絶対パス）のプロジェクトをフォルダごと移動した状態を再現し、
+    /// 「リンク切れを修復」で繋ぎ直す。作者の実例（創作マインドマップ）と同じ形。
+    #[test]
+    fn repairs_moved_legacy_project() {
+        let a = std::env::temp_dir().join(format!("texos_repair_{}_{}", db::now_ms(), uuid()));
+        std::fs::create_dir_all(a.join("sub")).unwrap();
+        std::fs::create_dir_all(a.join("x")).unwrap();
+        std::fs::create_dir_all(a.join("y")).unwrap();
+        let abs = |rel: &str| a.join(rel).to_string_lossy().to_string();
+        {
+            let p = open_project_at(&a).unwrap();
+            db::insert_real_body(&p.conn, "h", "text/plain", 1, Some("txt")).unwrap();
+            // (id, 移動前の絶対パス, 実ファイルを置く場所(None=置かない))
+            let cards: [(&str, String, Option<&str>); 5] = [
+                ("top", abs("K0376.txt"), Some("K0376.txt")),
+                ("deep", abs("sub/b.md"), Some("sub/b.md")),
+                ("moved", abs("c.txt"), Some("sub/c.txt")),  // 中で動かした
+                ("dup", abs("d.txt"), None),                   // 同名が2つ
+                ("gone", abs("e.txt"), None),                  // どこにも無い
+            ];
+            for (id, old, _) in &cards {
+                p.conn
+                    .execute(
+                        "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, committed_path, origin_path)
+                         VALUES (?1, 'h', ?1, 0, 0, 0, ?2, ?2)",
+                        rusqlite::params![id, old],
+                    )
+                    .unwrap();
+            }
+            // 旧 DB を模すため、開いたときの相対化より後に絶対パスを書いた状態で閉じる
+            for (_, _, at) in &cards {
+                if let Some(rel) = at {
+                    std::fs::write(a.join(rel), "x").unwrap();
+                }
+            }
+            std::fs::write(a.join("x/d.txt"), "1").unwrap();
+            std::fs::write(a.join("y/d.txt"), "2").unwrap();
+        }
+        // 内包プロジェクトの中の同名ファイルは候補にしない
+        let child = a.join("child");
+        drop(open_project_at(&child).unwrap());
+        std::fs::write(child.join("e.txt"), "child").unwrap();
+
+        let b = a.with_file_name(format!("{}_moved", a.file_name().unwrap().to_string_lossy()));
+        std::fs::rename(&a, &b).unwrap();
+        let p = open_project_at(&b).unwrap();
+
+        let scan = repair_links_scan_in(&p);
+        let mut fixable: Vec<String> = scan.fixable.iter().map(|(l, _)| l.clone()).collect();
+        fixable.sort();
+        assert_eq!(fixable, vec!["deep", "moved", "top"]);
+        assert_eq!(scan.ambiguous, vec!["dup".to_string()]);
+        assert_eq!(scan.missing, vec!["gone".to_string()]);
+
+        let done = repair_links_apply_in(&p).unwrap();
+        assert_eq!(done.fixable.len(), 3);
+        let get = |id: &str| -> (Option<String>, Option<String>) {
+            p.conn
+                .query_row(
+                    "SELECT committed_path, origin_path FROM virtual_bodies WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        // 相対で保存し直され、内部実身の origin も追従（origin==committed を保つ）
+        assert_eq!(get("top"), (Some("K0376.txt".into()), Some("K0376.txt".into())));
+        assert_eq!(get("deep"), (Some("sub/b.md".into()), Some("sub/b.md".into())));
+        assert_eq!(get("moved"), (Some("sub/c.txt".into()), Some("sub/c.txt".into())));
+        // 2回目は何も残っていない（修復済みは対象外・繋げないものはそのまま）
+        let again = repair_links_scan_in(&p);
+        assert!(again.fixable.is_empty());
+        assert_eq!(again.ambiguous.len() + again.missing.len(), 2);
+        let _ = std::fs::remove_dir_all(&b);
     }
 }

@@ -724,7 +724,7 @@ pub(crate) fn web_refetch(
                 x + 190.0,
                 y,
                 crate::db::now_ms(),
-                dest_str,
+                crate::project::store_path(&p.root, &dest_str),
                 crate::util::file_mtime_ms(&dest),
                 out.meta
             ],

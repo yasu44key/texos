@@ -741,6 +741,8 @@ pub fn run() {
             commit_object,
             commit_all,
             relink_object,
+            repair_links_scan,
+            repair_links_apply,
             relink_folder,
             relink_project,
             list_inner_folders,

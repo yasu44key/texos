@@ -90,7 +90,7 @@ pub(crate) fn run_launcher(id: String, state: State<AppState>) -> Result<(), Str
             for row in rows {
                 let (vid, real_id, committed) = row.map_err(|e| e.to_string())?;
                 let path = committed
-                    .map(PathBuf::from)
+                    .map(|c| PathBuf::from(load_path(&p.root, &c)))
                     .filter(|c| c.is_file())
                     .unwrap_or_else(|| resolve_view_path(p, &vid, &real_id));
                 paths.push(path);
@@ -327,7 +327,7 @@ pub(crate) fn import_new_project_files(
                 .conn
                 .query_row(
                     "SELECT 1 FROM virtual_bodies WHERE committed_path = ?1 AND deleted_at IS NULL",
-                    rusqlite::params![path_str],
+                    rusqlite::params![store_path(&p.root, &path_str)],
                     |_| Ok(()),
                 )
                 .optional()
@@ -376,7 +376,7 @@ pub(crate) fn drop_into_point(id: String, path: String, state: State<AppState>) 
         .execute(
             "UPDATE virtual_bodies SET real_id = ?1, origin_path = ?2
              WHERE id = ?3 AND kind = 'drop' AND deleted_at IS NULL",
-            rusqlite::params![hash, path, id],
+            rusqlite::params![hash, store_path(&p.root, &path), id],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {

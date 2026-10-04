@@ -143,7 +143,7 @@ fn place_md_card(p: &Project, ai_id: &str, dest: &Path, fname: &str, bytes: &[u8
         .query_row(
             "SELECT id FROM virtual_bodies
              WHERE deleted_at IS NULL AND (committed_path = ?1 OR origin_path = ?1)",
-            rusqlite::params![dest_str],
+            rusqlite::params![store_path(&p.root, &dest_str)],
             |r| r.get(0),
         )
         .optional()
@@ -180,7 +180,7 @@ fn place_md_card(p: &Project, ai_id: &str, dest: &Path, fname: &str, bytes: &[u8
                     fx + 230.0,
                     fy + dy,
                     db::now_ms(),
-                    dest_str,
+                    store_path(&p.root, &dest_str),
                     file_mtime_ms(&dest),
                 ],
             )
