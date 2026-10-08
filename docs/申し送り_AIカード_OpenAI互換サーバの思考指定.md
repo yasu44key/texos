@@ -2,6 +2,22 @@
 
 作成: 2026-10-08（Strata 導入セッションから。別スレッドで着手するための指示書）
 
+> **【完了】2026-10-08 — v1.9.2 としてリリース済み（commit af442e2・push 済み・インストーラ I:\texos_1.9.2_x64-setup.exe）**
+>
+> 決着した論点（ユーザー合意・いずれも推奨案）:
+> - 送る条件 = (B) カード設定「思考の指定を送る（reasoning_effort）」`send_reasoning`（既定オフ）。Strata 専用分岐（A）は作らない
+> - 値の対応 = 使わない→`none`／浅く・中・深く→`low`/`medium`/`high`／使う→送らない（サーバ既定）。未知の値も `none` 扱いで、任意の文字列は送らない
+> - (C) 追加パラメータ `extra_params` = 全サーバ共通で本体トップレベルへマージ。`model` `messages` `stream` `temperature` `think` `reasoning_effort` `options` は拒否（画面は保存不可・実行時はエラー）。実行ログの「送信パラメータ」に残る
+> - システムプロンプトの誤記対策 = API パラメータらしい記述があれば注意書きを出す（送信内容は変えない）
+>
+> 受け入れ条件の結果:
+> - `plan_think` の単体テスト（`plan_generic_openai_sends_only_when_enabled`）・追加パラメータのテスト追加。LM Studio / Ollama の既存テストは変更なしで通過（回帰なし）
+> - Strata 実機（ignored テスト `strata_live_reasoning_effort_and_budget`）: none/low/medium/high とも 400 なし、none で思考が返らないことを確認。ユーザーも実機で思考禁止が効くことを確認
+> - 未確認: `reasoning_budget_tokens` で Strata コンソールの `thinking: … of max` が上限付近で打ち切られる様子（短い質問では見えなかった）
+> - `thinkHint()` 更新済み（「送りません」の文言は削除）
+>
+> 同じリリースでの付随修正: チャットの抜粋書き出しカードをパネルの右外・上辺から空き段へ重ねずに置く（`ai.rs` の `excerpt_dx` / `free_excerpt_dy`）
+
 ## 背景
 - ローカルLLMサーバ **Strata**（`C:\Strata\Strata-main`、`http://127.0.0.1:8080/v1`、OpenAI互換＋Anthropic互換）を導入した。モデル `qwen3.8-flash-next-iq2_xs`（画像入力あり）
 - TexoS の AIカード（サーバー=「OpenAI互換（その他）」）から画像付き対話まで通っている
