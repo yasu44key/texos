@@ -148,6 +148,17 @@ pub struct FilterSpec {
     /// <think>…</think> で混ざるかが分かれるため、両方を受けて分離する。
     #[serde(default)]
     pub think: Option<String>,
+    /// v1.9.2 AI: 汎用 OpenAI互換サーバ（provider="openai"）へ思考の指定を reasoning_effort で
+    /// 送るか。既定 false＝送らない（未知のパラメータや値で 400 を返すサーバがあるため）。
+    /// 送るときは 使わない→"none"・浅く/中/深く→low/medium/high・使う→送らない（サーバ既定）。
+    /// LM Studio / Ollama には効かない（あちらは能力から決まる — plan_think）。
+    #[serde(default)]
+    pub send_reasoning: bool,
+    /// v1.9.2 AI: 追加パラメータ。リクエスト本体のトップレベルへそのままマージする
+    /// JSON オブジェクト（例: Strata の {"reasoning_budget_tokens": 8000}）。全サーバ共通。
+    /// 他の欄が管理するキーは拒否する（check_extra_params）＝送る値の出どころを1つに保つ。
+    #[serde(default)]
+    pub extra_params: Option<serde_json::Map<String, serde_json::Value>>,
     /// v1.8.9 AI: 実行時のコンテキスト長（Ollama の options.num_ctx）。未指定＝キーを送らない
     /// ＝サーバ既定（学習上限よりずっと小さい）。モデルの学習上限（/api/show の
     /// context_length）とは別物。Ollama ネイティブ経路のみ有効（LM Studio はロード時に決まる）。
@@ -1091,6 +1102,38 @@ pub(crate) fn ollama_num_gpu(spec: &FilterSpec) -> Option<i64> {
 // Ollama 0.34 は思考非対応モデルへの think を 400 で拒否する。旧 ollama_think は
 // 「解さないモデルでは無視される」前提だったが、実機ではそうならなかった）。
 
+/// v1.9.2 追加パラメータで上書きさせないキー（本体の組み立てか、他の欄が管理する）。
+/// 画面側（AiSettingsDialog の RESERVED_EXTRA_KEYS）と揃えること。
+pub const AI_RESERVED_EXTRA_KEYS: &[&str] =
+    &["model", "messages", "stream", "temperature", "think", "reasoning_effort", "options"];
+
+/// v1.9.2 追加パラメータの検査（予約キーを含めば理由を返す）。
+pub fn check_extra_params(m: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let bad: Vec<&str> = m
+        .keys()
+        .map(String::as_str)
+        .filter(|k| AI_RESERVED_EXTRA_KEYS.contains(k))
+        .collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "追加パラメータに使えないキーがあります: {}（モデル・温度・思考などは専用の欄で指定してください）",
+            bad.join(", ")
+        ))
+    }
+}
+
+/// v1.9.2 追加パラメータを本体のトップレベルへマージ（変換・対話・全サーバ共通）。
+fn apply_extra_params(body: &mut serde_json::Value, spec: &FilterSpec) -> Result<(), String> {
+    let Some(m) = &spec.extra_params else { return Ok(()) };
+    check_extra_params(m)?;
+    for (k, v) in m {
+        body[k.as_str()] = v.clone();
+    }
+    Ok(())
+}
+
 /// v1.8.9 Ollama の options（temperature / num_gpu / num_ctx）。変換と対話で共用。
 fn ollama_options(spec: &FilterSpec) -> serde_json::Value {
     let mut options = serde_json::Map::new();
@@ -1131,7 +1174,7 @@ fn prepare_ai_run(
             }
         }
     };
-    let plan = plan_think(provider, spec.think.as_deref(), info.as_ref());
+    let plan = plan_think(provider, spec.think.as_deref(), info.as_ref(), spec.send_reasoning);
     notes.extend(plan.note.clone());
     let ollama = !is_openai_compat(provider);
     if !ollama && spec.num_ctx.is_some() {
@@ -1152,6 +1195,7 @@ fn prepare_ai_run(
             num_ctx: if ollama { spec.num_ctx.filter(|n| *n > 0) } else { None },
             num_gpu: if ollama { ollama_num_gpu(spec) } else { None },
             temperature: spec.temperature,
+            extra: spec.extra_params.clone().filter(|m| !m.is_empty()),
         },
         notes,
         thinking_returned: false,
@@ -1379,9 +1423,11 @@ fn run_ai_blocking(
             body["temperature"] = serde_json::json!(t);
         }
         // v1.8.9 LM Studio の深さ指定（gpt-oss 等・レベルを受けるモデルだけ）。
+        // v1.9.2 汎用 OpenAI互換もカードで「送る」にしたときは届く（plan_think）。
         if let Some(e) = &plan.reasoning_effort {
             body["reasoning_effort"] = serde_json::json!(e);
         }
+        apply_extra_params(&mut body, spec)?;
         let resp = client
             .post(format!("{endpoint}/chat/completions"))
             .json(&body)
@@ -1426,6 +1472,7 @@ fn run_ai_blocking(
         if let Some(t) = &plan.ollama_think {
             body["think"] = t.clone();
         }
+        apply_extra_params(&mut body, spec)?;
         let resp = client
             .post(format!("{endpoint}/api/chat"))
             .json(&body)
@@ -1765,9 +1812,11 @@ pub fn run_ai_chat_stream_rec(
             body["temperature"] = serde_json::json!(t);
         }
         // v1.8.9 LM Studio の深さ指定（gpt-oss 等・レベルを受けるモデルだけ）。
+        // v1.9.2 汎用 OpenAI互換もカードで「送る」にしたときは届く（plan_think）。
         if let Some(e) = &plan.reasoning_effort {
             body["reasoning_effort"] = serde_json::json!(e);
         }
+        apply_extra_params(&mut body, spec)?;
         let resp = client
             .post(format!("{endpoint}/chat/completions"))
             .json(&body)
@@ -1827,6 +1876,7 @@ pub fn run_ai_chat_stream_rec(
         if let Some(t) = &plan.ollama_think {
             body["think"] = t.clone();
         }
+        apply_extra_params(&mut body, spec)?;
         let resp = client
             .post(format!("{endpoint}/api/chat"))
             .json(&body)
@@ -2579,7 +2629,7 @@ mod tests {
     #[test]
     fn gpu_and_think_options_map_to_ollama_params() {
         // v1.8.9 think は能力不明（info=None）なら設定どおり送る — 旧 ollama_think と同じ写像。
-        let think = |s: &FilterSpec| crate::ai_models::plan_think("ollama", s.think.as_deref(), None).ollama_think;
+        let think = |s: &FilterSpec| crate::ai_models::plan_think("ollama", s.think.as_deref(), None, false).ollama_think;
         let auto = spec(r#"{"builtin":"ai","model":"m"}"#);
         assert_eq!(ollama_num_gpu(&auto), None, "既定はサーバ任せ＝キーを送らない");
         assert_eq!(think(&auto), None);
@@ -2605,6 +2655,67 @@ mod tests {
         assert_eq!(ollama_options(&ctx), serde_json::json!({"temperature":0.2,"num_ctx":16384}));
         let zero = spec(r#"{"builtin":"ai","model":"m","num_ctx":0}"#);
         assert_eq!(ollama_options(&zero), serde_json::json!({}));
+    }
+
+    #[test]
+    fn extra_params_merge_top_level_and_reject_reserved() {
+        let s = spec(r#"{"builtin":"ai","model":"m","send_reasoning":true,"extra_params":{"reasoning_budget_tokens":2000,"keep_alive":"30m"}}"#);
+        assert!(s.send_reasoning);
+        let mut body = serde_json::json!({"model":"m","stream":false,"keep_alive":"5m"});
+        apply_extra_params(&mut body, &s).unwrap();
+        assert_eq!(body["reasoning_budget_tokens"], 2000);
+        assert_eq!(body["keep_alive"], "30m", "予約外のキーは上書きできる");
+
+        // 未指定・空は何もしない。send_reasoning の既定は false。
+        let none = spec(r#"{"builtin":"ai","model":"m"}"#);
+        assert!(!none.send_reasoning);
+        let mut b = serde_json::json!({"model":"m"});
+        apply_extra_params(&mut b, &none).unwrap();
+        assert_eq!(b, serde_json::json!({"model":"m"}));
+
+        // 他の欄が管理するキーは拒否（本体は変えない）。
+        let bad = spec(r#"{"builtin":"ai","model":"m","extra_params":{"stream":true,"reasoning_effort":"xhigh","x":1}}"#);
+        let mut b = serde_json::json!({"model":"m","stream":false});
+        let e = apply_extra_params(&mut b, &bad).unwrap_err();
+        assert!(e.contains("stream") && e.contains("reasoning_effort") && !e.contains(" x"), "{e}");
+        assert_eq!(b["stream"], false);
+    }
+
+    // 実機検証（ライブの Strata が要る・http://127.0.0.1:8080/v1）。
+    // 実行: `cargo test --lib -- --ignored strata_live --nocapture`
+    #[test]
+    #[ignore = "ライブStrataが必要"]
+    fn strata_live_reasoning_effort_and_budget() {
+        let model = reqwest::blocking::get("http://127.0.0.1:8080/v1/models").unwrap().json::<serde_json::Value>().unwrap()
+            ["data"][0]["id"].as_str().unwrap().to_string();
+        let run = |extra: &str| {
+            let s = spec(&format!(
+                r#"{{"builtin":"ai","provider":"openai","endpoint":"http://127.0.0.1:8080/v1","model":"{model}","timeout_secs":0{extra}}}"#
+            ));
+            let mut rec = None;
+            let t = std::time::Instant::now();
+            let out = run_ai_rec(&s, "17*23は？答えの数字だけ".as_bytes(), &mut rec);
+            let rec = rec.unwrap();
+            eprintln!("{extra:70} {:>5.1}s think={} sent={:?} → {:?}", t.elapsed().as_secs_f32(), rec.thinking_returned, rec.sent, out.as_ref().map(|o| String::from_utf8_lossy(&o.0).trim().to_string()));
+            (out, rec)
+        };
+        // 送らない（既定）: 従来どおり reasoning_effort なし。
+        let (o, r) = run(r#","think":"low""#);
+        assert!(o.is_ok() && r.sent.reasoning_effort.is_none());
+        // 送る: 使わない→none（思考が返らない）・浅く→low・深く→high。どれも 400 にならない。
+        let (o, r) = run(r#","think":"off","send_reasoning":true"#);
+        assert!(o.is_ok());
+        assert_eq!(r.sent.reasoning_effort.as_deref(), Some("none"));
+        assert!(!r.thinking_returned, "none で思考が止まる");
+        for lv in ["low", "medium", "high"] {
+            let (o, r) = run(&format!(r#","think":"{lv}","send_reasoning":true"#));
+            assert!(o.is_ok(), "{lv}: {o:?}");
+            assert_eq!(r.sent.reasoning_effort.as_deref(), Some(lv));
+        }
+        // 追加パラメータ: 思考上限を小さくしても回答まで届く。
+        let (o, r) = run(r#","think":"high","send_reasoning":true,"extra_params":{"reasoning_budget_tokens":64}"#);
+        assert!(o.is_ok(), "{o:?}");
+        assert!(r.sent.extra.is_some());
     }
 
     #[test]

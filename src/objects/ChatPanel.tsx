@@ -22,7 +22,7 @@ interface Props {
   endpoint?: string;
 }
 
-const PANEL_W = 380;
+const PANEL_W = 380; // ai.rs の CHAT_PANEL_W と揃える
 
 export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Props) {
   // v1.4.6 Ollama 未導入PC向けのセットアップ案内（OpenAI準拠カードはスキップ）。
@@ -288,7 +288,8 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
     const indices = [...selected].filter((i) => i < history.length).sort((a, b) => a - b);
     if (indices.length === 0) return;
     setExportMsg(null);
-    invoke<string>("ai_chat_export", { id: objId, indices, withLabels })
+    // v1.9.2 パネル幅を渡す＝抜粋カードをパネルの右外に置かせる（隠れないように）。
+    invoke<string>("ai_chat_export", { id: objId, indices, withLabels, panelW: size.w })
       .then((f) => setExportMsg(`「${f}」に書き出しました（${indices.length}件）`))
       .catch((e) => setError(String(e)));
   };

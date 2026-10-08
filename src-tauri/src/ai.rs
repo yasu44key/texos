@@ -92,7 +92,7 @@ pub(crate) fn upsert_chat_log_card(
     };
     let dest = p.root.join(&fname);
     std::fs::write(&dest, &bytes).map_err(|e| format!("ログ書き出し失敗: {e}"))?;
-    place_md_card(p, ai_id, &dest, &fname, &bytes, 0.0).map(|_| ())
+    place_md_card(p, ai_id, &dest, &fname, &bytes, LOG_DX, 0.0).map(|_| ())
 }
 
 /// ファイル名に使えない文字を落とす（ログ・抜粋の共通）。
@@ -127,9 +127,24 @@ pub(crate) fn render_transcript(ai_label: &str, msgs: &[&ChatMsg], with_labels: 
     md
 }
 
+/// ログカードを置く AI カードからの横オフセット（カード幅 150＋間隔）。
+const LOG_DX: f64 = 230.0;
+/// v1.9.2 抜粋カードの縦の間隔: カード高さ 115（ObjectCard.tsx の CARD_H）＋隙間 20＝重ならない。
+const EXCERPT_DY: f64 = 135.0;
+/// v1.9.2 チャットパネルの既定幅（ChatPanel.tsx の PANEL_W と揃える）。
+const CHAT_PANEL_W: f64 = 380.0;
+
 /// 書き出した MD を実身カードにする: 同じパスのカードがあれば中身差し替え（位置・矢印維持）、
-/// 無ければ AI カードの右（dy だけ下）に作り、AI → カードの flow 矢印を張る。返り値＝カード id。
-fn place_md_card(p: &Project, ai_id: &str, dest: &Path, fname: &str, bytes: &[u8], dy: f64) -> Result<String, String> {
+/// 無ければ AI カードから (dx, dy) ずらして作り、AI → カードの flow 矢印を張る。返り値＝カード id。
+fn place_md_card(
+    p: &Project,
+    ai_id: &str,
+    dest: &Path,
+    fname: &str,
+    bytes: &[u8],
+    dx: f64,
+    dy: f64,
+) -> Result<String, String> {
     let dest_str = dest.to_string_lossy().into_owned();
 
     // 3) CAS + real_body
@@ -177,7 +192,7 @@ fn place_md_card(p: &Project, ai_id: &str, dest: &Path, fname: &str, bytes: &[u8
                     vid,
                     hash,
                     fname,
-                    fx + 230.0,
+                    fx + dx,
                     fy + dy,
                     db::now_ms(),
                     store_path(&p.root, &dest_str),
@@ -220,17 +235,24 @@ pub(crate) fn ai_chat_export(
     id: String,
     indices: Vec<usize>,
     with_labels: bool,
+    panel_w: Option<f64>,
 ) -> Result<String, String> {
     let fname = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-        export_chat_excerpt(p, &id, &indices, with_labels)?
+        export_chat_excerpt(p, &id, &indices, with_labels, panel_w)?
     };
     let _ = app.emit("ai-chat-exported", serde_json::json!({ "id": id, "file": fname }));
     Ok(fname)
 }
 
-pub(crate) fn export_chat_excerpt(p: &Project, id: &str, indices: &[usize], with_labels: bool) -> Result<String, String> {
+pub(crate) fn export_chat_excerpt(
+    p: &Project,
+    id: &str,
+    indices: &[usize],
+    with_labels: bool,
+    panel_w: Option<f64>,
+) -> Result<String, String> {
     let label: String = p
         .conn
         .query_row(
@@ -250,15 +272,60 @@ pub(crate) fn export_chat_excerpt(p: &Project, id: &str, indices: &[usize], with
     let bytes = render_transcript(&label, &picked, with_labels).into_bytes();
 
     let stem = format!("{}の抜粋", sanitize(&label).chars().take(24).collect::<String>());
-    let (fname, n) = (1u32..)
-        .map(|n| (if n == 1 { format!("{stem}.md") } else { format!("{stem}_{n}.md") }, n))
-        .find(|(f, _)| !p.root.join(f).exists())
+    let fname = (1u32..)
+        .map(|n| if n == 1 { format!("{stem}.md") } else { format!("{stem}_{n}.md") })
+        .find(|f| !p.root.join(f).exists())
         .expect("連番は尽きない");
     let dest = p.root.join(&fname);
     std::fs::write(&dest, &bytes).map_err(|e| format!("書き出しに失敗: {e}"))?;
-    // ログカード（AI の右）の下へ、書き出すたびに少しずつずらして並べる。
-    place_md_card(p, id, &dest, &fname, &bytes, 90.0 * n as f64)?;
+    // v1.9.2 チャットパネル（AI カードの真下に開き、幅は利用者が変えられる）に隠れないよう、
+    // パネルの右端より外へ出す。縦はパネル上辺の高さから下へ、空いている段の最初に置く
+    // （ファイルの連番では決めない＝片付けた後・履歴を消した後は上辺から始まり、残っている
+    // カードとは重ならない）。
+    let dx = excerpt_dx(panel_w);
+    let dy = free_excerpt_dy(p, id, dx);
+    place_md_card(p, id, &dest, &fname, &bytes, dx, dy)?;
     Ok(fname)
+}
+
+/// v1.9.2 抜粋カードの縦オフセット: x=AI+dx の列で、パネル上辺（CARD_H+8）から EXCERPT_DY 刻みに
+/// 下へ見て、同じデスクトップのどのカードとも重ならない最初の段。
+fn free_excerpt_dy(p: &Project, ai_id: &str, dx: f64) -> f64 {
+    const CARD_W: f64 = 150.0; // ObjectCard.tsx の CARD_W
+    const CARD_H: f64 = 115.0; // ObjectCard.tsx の CARD_H
+    let top = CARD_H + 8.0; // ChatPanel の上辺（ObjectCard.tsx の top={CARD_H + 8}）
+    let Ok((ax, ay, desk)) = p.conn.query_row(
+        "SELECT pos_x, pos_y, desktop_id FROM virtual_bodies WHERE id = ?1",
+        rusqlite::params![ai_id],
+        |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, Option<String>>(2)?)),
+    ) else {
+        return top;
+    };
+    let others: Vec<(f64, f64)> = p
+        .conn
+        .prepare(
+            "SELECT pos_x, pos_y FROM virtual_bodies
+             WHERE deleted_at IS NULL AND desktop_id IS ?1 AND id <> ?2",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![desk, ai_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    let x = ax + dx;
+    (0..500)
+        .map(|k| top + EXCERPT_DY * k as f64)
+        .find(|dy| {
+            let y = ay + dy;
+            !others.iter().any(|(ox, oy)| (ox - x).abs() < CARD_W && (oy - y).abs() < CARD_H)
+        })
+        .unwrap_or(top)
+}
+
+/// v1.9.2 抜粋カードの横オフセット: パネル幅（不明・不正なら既定幅）＋間隔。ログ位置より左には置かない。
+fn excerpt_dx(panel_w: Option<f64>) -> f64 {
+    let w = panel_w.filter(|w| w.is_finite() && *w > 0.0).unwrap_or(CHAT_PANEL_W);
+    (w + 40.0).max(LOG_DX)
 }
 
 /// v1.4.4 マルチコンテキスト: AIカードへ flow 矢印で繋がった上流カードの内容を
@@ -790,14 +857,14 @@ A
     fn export_picks_selected_in_order_and_never_overwrites() {
         let p = setup();
         // 順不同・重複・範囲外は整える。
-        let f1 = export_chat_excerpt(&p, "ai1", &[3, 1, 1, 99], false).unwrap();
+        let f1 = export_chat_excerpt(&p, "ai1", &[3, 1, 1, 99], false, None).unwrap();
         assert_eq!(f1, "AI対話の抜粋.md");
         assert_eq!(std::fs::read_to_string(p.root.join(&f1)).unwrap(), "答え1
 
 答え2
 ");
 
-        let f2 = export_chat_excerpt(&p, "ai1", &[0, 1], true).unwrap();
+        let f2 = export_chat_excerpt(&p, "ai1", &[0, 1], true, Some(700.0)).unwrap();
         assert_eq!(f2, "AI対話の抜粋_2.md", "既存の抜粋は上書きしない");
         assert!(std::fs::read_to_string(p.root.join(&f2)).unwrap().starts_with("# AI対話
 
@@ -820,7 +887,34 @@ You:
             .unwrap();
         assert_eq!(n, 2);
 
-        assert!(export_chat_excerpt(&p, "ai1", &[], true).is_err(), "未選択はエラー");
+        // v1.9.2 抜粋はチャットパネルの右外へ（既定幅 380／広げた幅 700 に追従）。
+        let x_of = |f: &str| -> f64 {
+            p.conn
+                .query_row("SELECT pos_x FROM virtual_bodies WHERE label = ?1", [f], |r| r.get(0))
+                .unwrap()
+        };
+        let ax: f64 = p.conn.query_row("SELECT pos_x FROM virtual_bodies WHERE id='ai1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(x_of(&f1) - ax, 420.0);
+        assert_eq!(x_of(&f2) - ax, 740.0);
+        let y_of = |f: &str| -> f64 {
+            p.conn
+                .query_row("SELECT pos_y FROM virtual_bodies WHERE label = ?1", [f], |r| r.get(0))
+                .unwrap()
+        };
+        let ay: f64 = p.conn.query_row("SELECT pos_y FROM virtual_bodies WHERE id='ai1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(y_of(&f1) - ay, 123.0, "1枚目はチャットパネルの上辺に揃える");
+        assert_eq!(y_of(&f2) - ay, 123.0, "離れた列（パネル幅が違う）なら同じ段に置ける");
+        // 同じ列に続けて書き出すと1枚分ずつ下へ（重ならない）。
+        let f3 = export_chat_excerpt(&p, "ai1", &[0], true, None).unwrap();
+        assert_eq!(y_of(&f3) - ay, 123.0 + EXCERPT_DY);
+        // 上の段を片付けた（カードを削除・移動した）ら、次はまた上辺から。
+        p.conn.execute("UPDATE virtual_bodies SET deleted_at = 1 WHERE label = ?1", [&f1]).unwrap();
+        let f4 = export_chat_excerpt(&p, "ai1", &[0], true, None).unwrap();
+        assert_eq!(y_of(&f4) - ay, 123.0);
+        assert_eq!(excerpt_dx(Some(100.0)), LOG_DX, "狭くてもログ位置より左にしない");
+        assert_eq!(excerpt_dx(Some(f64::NAN)), 420.0);
+
+        assert!(export_chat_excerpt(&p, "ai1", &[], true, None).is_err(), "未選択はエラー");
         let _ = std::fs::remove_dir_all(&p.root);
     }
 }

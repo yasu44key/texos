@@ -107,6 +107,33 @@ function findInfo(catalog: ModelInfo[], name: string): ModelInfo | undefined {
   return catalog.find((m) => m.name === n) ?? catalog.find((m) => m.name === `${n}:latest`);
 }
 
+/// v1.9.2 追加パラメータで上書きさせないキー。バックエンド flow.rs の AI_RESERVED_EXTRA_KEYS と揃える。
+const RESERVED_EXTRA_KEYS = ["model", "messages", "stream", "temperature", "think", "reasoning_effort", "options"];
+
+/// v1.9.2 追加パラメータ欄の検査。空欄は null（＝送らない）、不正なら error。
+function parseExtra(text: string): { value: Record<string, unknown> | null; error: string | null } {
+  if (!text.trim()) return { value: null, error: null };
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch (e) {
+    return { value: null, error: `JSON として読めません: ${(e as Error).message}` };
+  }
+  if (typeof v !== "object" || v === null || Array.isArray(v))
+    return { value: null, error: '{ "キー": 値 } の形（オブジェクト）で書いてください' };
+  const bad = Object.keys(v).filter((k) => RESERVED_EXTRA_KEYS.includes(k));
+  if (bad.length)
+    return {
+      value: null,
+      error: `使えないキー: ${bad.join(", ")}（モデル・温度・思考などは専用の欄で指定してください）`,
+    };
+  return { value: v as Record<string, unknown>, error: null };
+}
+
+/// v1.9.2 システムプロンプトに API パラメータを書いてしまう誤解の検出（本文として送られるだけで効かない）。
+const PARAM_LIKE =
+  /\b(reasoning_[a-z_]+|max_tokens|max_completion_tokens|top_p|top_k|temperature|enable_thinking|chat_template_kwargs|num_ctx|num_predict)\b"?\s*[:=]/;
+
 function parseServer(v: unknown): Server {
   return v === "openai" || v === "lmstudio" ? v : "ollama";
 }
@@ -155,6 +182,13 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   );
   // v1.8.9 モデルに合わせて思考の値を直したときの説明（黙って変えない）。
   const [thinkAdjusted, setThinkAdjusted] = useState<string | null>(null);
+  // v1.9.2 汎用 OpenAI互換へ思考の指定（reasoning_effort）を送るか。既定オフ。
+  const [sendReasoning, setSendReasoning] = useState(base.send_reasoning === true);
+  // v1.9.2 追加パラメータ（本体トップレベルへマージする JSON）。全サーバ共通。
+  const [extraText, setExtraText] = useState(
+    base.extra_params && typeof base.extra_params === "object" ? JSON.stringify(base.extra_params) : ""
+  );
+  const extra = useMemo(() => parseExtra(extraText), [extraText]);
   // v1.8.9 実行時のコンテキスト長（Ollama の num_ctx）。空欄＝サーバ既定。
   const [numCtx, setNumCtx] = useState(typeof base.num_ctx === "number" ? String(base.num_ctx) : "");
 
@@ -227,6 +261,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     modelsState === "idle" && models.length > 0 && !!model.trim() && !models.includes(model.trim());
 
   const save = () => {
+    if (extra.error) return;
     const spec: Record<string, unknown> = { ...base, builtin: "ai", provider, mode };
     // 空欄時の既定: Ollama は導入案内が gemma3 を入れるのでそれに合わせる。
     // 他サーバーは既定名が存在しないので、取得済み一覧の先頭を使う。
@@ -248,6 +283,11 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     else delete spec.gpu;
     if (think !== "off") spec.think = think;
     else delete spec.think;
+    // v1.9.2 送る設定は汎用 OpenAI互換のときだけ意味を持つ（他サーバでは落とす）。
+    if (provider === "openai" && sendReasoning) spec.send_reasoning = true;
+    else delete spec.send_reasoning;
+    if (extra.value && Object.keys(extra.value).length) spec.extra_params = extra.value;
+    else delete spec.extra_params;
     // v1.8.9 num_ctx は Ollama のみ（LM Studio はロード時に決まる）。
     const nc = parseInt(numCtx, 10);
     if (provider === "ollama" && numCtx.trim() !== "" && !Number.isNaN(nc) && nc > 0) spec.num_ctx = nc;
@@ -496,9 +536,22 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
                 </option>
               ))}
             </select>
+            {provider === "openai" && (
+              <label
+                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginTop: 4 }}
+                title={
+                  "オンにすると、思考欄の値を OpenAI の reasoning_effort として送ります。\n" +
+                  "使わない→none／浅く→low／中→medium／深く→high（使う→送らずサーバ既定）。\n" +
+                  "未知のパラメータや値を 400 で拒否するサーバがあるため、既定はオフです。"
+                }
+              >
+                <input type="checkbox" checked={sendReasoning} onChange={(e) => setSendReasoning(e.target.checked)} />
+                思考の指定を送る（reasoning_effort）
+              </label>
+            )}
             {thinkAdjusted && <div style={{ fontSize: 11, color: "#e0a35c", marginTop: 3 }}>{thinkAdjusted}</div>}
             <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginTop: 3 }}>
-              {thinkHint(provider, think, info)}
+              {thinkHint(provider, think, info, sendReasoning)}
             </div>
           </div>
         )}
@@ -542,13 +595,21 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
 
         {row(
           "システム\nプロンプト",
-          <textarea
-            style={{ ...inp(), resize: "vertical", minHeight: 64, fontFamily: "inherit" }}
-            value={system}
-            rows={4}
-            onChange={(e) => setSystem(e.target.value)}
-            placeholder="（空欄可）AIの役割・口調・出力形式の指示"
-          />
+          <div>
+            <textarea
+              style={{ ...inp(), resize: "vertical", minHeight: 64, fontFamily: "inherit" }}
+              value={system}
+              rows={4}
+              onChange={(e) => setSystem(e.target.value)}
+              placeholder="（空欄可）AIの役割・口調・出力形式の指示"
+            />
+            {PARAM_LIKE.test(system) && (
+              <div style={{ fontSize: 11, color: "#e0a35c", marginTop: 3 }}>
+                ここに書いた内容は本文として AI に送られるだけで、API のパラメータとしては効きません —
+                パラメータは下の「追加パラメータ」欄へ
+              </div>
+            )}
+          </div>
         )}
 
         {row(
@@ -583,6 +644,30 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
           </div>
         )}
 
+        {row(
+          "追加\nパラメータ",
+          <div>
+            <textarea
+              style={{ ...inp(), resize: "vertical", minHeight: 32, fontFamily: "monospace", fontSize: 12 }}
+              value={extraText}
+              rows={2}
+              onChange={(e) => setExtraText(e.target.value)}
+              placeholder='（空欄可）例: {"reasoning_budget_tokens": 8000}'
+              title={
+                "リクエスト本体のトップレベルへそのまま加える JSON（サーバ独自の拡張を使うとき）。\n" +
+                "例: Strata の思考上限 {\"reasoning_budget_tokens\": 8000}（0=上限なし）。\n" +
+                "model・messages・stream・temperature・think・reasoning_effort・options は\n" +
+                "専用の欄が管理するので書けません。サーバが知らないキーは 400 になることがあります。"
+              }
+            />
+            <div
+              style={{ fontSize: 11, marginTop: 3, color: extra.error ? "#e0a35c" : "var(--panel-muted, #8a93a8)" }}
+            >
+              {extra.error ?? "サーバ独自のパラメータをそのまま送ります（全サーバ共通・実行ログに残ります）"}
+            </div>
+          </div>
+        )}
+
         {mode === "chat" &&
           row(
             "ログ保存名",
@@ -598,7 +683,12 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
           <button onClick={onCancel} style={btn("#2a3346", "#aeb8cc")}>
             キャンセル
           </button>
-          <button onClick={save} style={btn("#3a6fb0", "#ffffff")}>
+          <button
+            onClick={save}
+            disabled={!!extra.error}
+            title={extra.error ? "追加パラメータを直すと保存できます" : undefined}
+            style={{ ...btn("#3a6fb0", "#ffffff"), opacity: extra.error ? 0.5 : 1 }}
+          >
             保存
           </button>
         </div>
@@ -648,14 +738,20 @@ function capabilityView(m: ModelInfo, mode: "chat" | "transform") {
 }
 
 /// v1.8.9 思考欄の下の説明（実際に何を送るか）。判定の本体はバックエンドの plan_think。
-function thinkHint(provider: Server, think: string, info: ModelInfo | undefined): string {
+function thinkHint(provider: Server, think: string, info: ModelInfo | undefined, sendReasoning: boolean): string {
+  // v1.9.2 汎用 OpenAI互換は「思考の指定を送る」のときだけ reasoning_effort を送る。
+  if (provider === "openai" && sendReasoning) {
+    if (think === "off") return 'reasoning_effort="none" を送ります（思考を止める。非対応のサーバは 400 になります）';
+    if (think === "on") return "深さはサーバ既定に任せます（reasoning_effort は送りません）";
+    return `reasoning_effort="${think}" を送ります`;
+  }
   if (think === "off") {
     if (info?.thinking_mode.kind === "levels")
       return "このモデル（gpt-oss 系）は思考を止められません。深さを指定しなければサーバ既定で思考します";
     return "思考型モデルが本文に混ぜてくる <think>…</think> は、この設定に関わらず常に取り除きます";
   }
   if (provider === "openai")
-    return "OpenAI互換（汎用）サーバには思考の指定を送りません。返ってきた思考は分離して表示します";
+    return "このままでは送りません — 送るには上の「思考の指定を送る」をオンに。返ってきた思考は分離して表示します";
   if (provider === "lmstudio") {
     if (think === "on") return "思考の使う／使わないは LM Studio 側の設定に従います（API からは送りません）";
     return `深さは reasoning_effort="${think}" として送ります`;

@@ -117,6 +117,8 @@ interface ModelInfo {
 - `tools`: カードのツールスイッチON かつ `tools != no` のときのみ付与。
 - `think`: カードのthinkingスイッチON かつ `thinking != no` のときのみ付与。値は `thinkingMode` に従う（boolean / levels）。
 - `num_ctx`: カード設定値があれば `options.num_ctx` に付与。
+- 汎用 OpenAI互換（`provider="openai"`・能力を返さない）（v1.9.2）: カード設定 `send_reasoning` がオンのときだけ `reasoning_effort` を付与する。使わない→`"none"`、浅く/中/深く→`low`/`medium`/`high`、使う→付与しない（サーバ既定）。既定オフの理由は、未知のパラメータや値を 400 で拒否するサーバがあるため。LM Studio と Ollama は従来どおり能力で決める。
+- 追加パラメータ `extra_params`（v1.9.2・全サーバ共通）: JSON オブジェクトを本体のトップレベルへマージする（例: Strata の `reasoning_budget_tokens`）。他の欄が管理するキー（`model` `messages` `stream` `temperature` `think` `reasoning_effort` `options`）は拒否する（画面では保存時、実行時はエラー）。送った値は実行ログの「送信パラメータ」に残す。
 - `unknown` のモデルでAPIがパラメータ非対応エラーを返した場合: 自動リトライしない。エラーを表示し、実行ログに記録する。理由: リトライで条件が変わると、ログ上の実行条件と実際の実行が乖離し、再現性が崩れるため。
 
 ### 4.6 実行ログへの記録

@@ -202,7 +202,7 @@ pub(crate) fn think_choices(mode: &ThinkingMode) -> Vec<String> {
 pub(crate) struct ThinkPlan {
     /// Ollama /api/chat の think（true / "low" 等）。None＝キーを送らない。
     pub ollama_think: Option<serde_json::Value>,
-    /// OpenAI互換（LM Studio）の reasoning_effort。None＝送らない。
+    /// OpenAI互換（LM Studio・汎用は送る設定のとき）の reasoning_effort。None＝送らない。
     pub reasoning_effort: Option<String>,
     /// 設定値どおりに送らなかった理由（実行ログに残す）。
     pub note: Option<String>,
@@ -213,7 +213,15 @@ pub(crate) struct ThinkPlan {
 /// 原則（仕様 4.5・決定 (b)）: 利用者が選んだ値を送る。ただし能力が no のときは送らない
 /// （Ollama は 400 を返す）。unknown のときは設定どおり送り、非対応エラーが返っても
 /// 自動リトライしない（リトライで条件が変わると、ログ上の条件と実際が食い違うため）。
-pub(crate) fn plan_think(provider: &str, requested: Option<&str>, info: Option<&ModelInfo>) -> ThinkPlan {
+///
+/// `send_generic`（v1.9.2・カード設定 send_reasoning）: 汎用 OpenAI互換へ reasoning_effort を
+/// 送るか。汎用サーバは能力を返さず、未知の値で 400 を返すものもあるので、既定は送らない。
+pub(crate) fn plan_think(
+    provider: &str,
+    requested: Option<&str>,
+    info: Option<&ModelInfo>,
+    send_generic: bool,
+) -> ThinkPlan {
     #[derive(PartialEq)]
     enum Req {
         Off,
@@ -230,6 +238,23 @@ pub(crate) fn plan_think(provider: &str, requested: Option<&str>, info: Option<&
     let only_levels = matches!(mode, ThinkingMode::Levels { .. });
     let mut plan = ThinkPlan::default();
 
+    // v1.9.2 汎用 OpenAI互換: 送る設定のときだけ。値は OpenAI 仕様の範囲に限る
+    // （"none" は gpt-5.1 以降・Strata 等が解する。"使う"＝サーバ既定に任せて送らない）。
+    if provider == "openai" {
+        if !send_generic {
+            if req != Req::Off {
+                plan.note = Some("OpenAI互換（汎用）サーバには思考の指定を送りません（「思考の指定を送る」がオフ）".into());
+            }
+            return plan;
+        }
+        match req {
+            Req::Off => plan.reasoning_effort = Some("none".into()),
+            Req::On => plan.note = Some("「使う」は深さをサーバ既定に任せます（reasoning_effort は送りません）".into()),
+            Req::Level(l) => plan.reasoning_effort = Some(l),
+        }
+        return plan;
+    }
+
     if req == Req::Off {
         if only_levels {
             plan.note = Some("このモデル（gpt-oss 系）は思考を止められません。サーバ既定の深さで思考します".into());
@@ -242,10 +267,7 @@ pub(crate) fn plan_think(provider: &str, requested: Option<&str>, info: Option<&
     }
 
     if crate::flow::is_openai_compat(provider) {
-        if provider != "lmstudio" {
-            plan.note = Some("OpenAI互換（汎用）サーバには思考の指定を送りません".into());
-            return plan;
-        }
+        // ここに来るのは LM Studio（汎用 openai は上で処理済み）。
         let accepts = |l: &str| match &mode {
             ThinkingMode::Levels { levels } | ThinkingMode::BooleanOrLevels { levels } => {
                 levels.iter().any(|x| x == l)
@@ -305,6 +327,9 @@ pub struct SentParams {
     pub num_gpu: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// v1.9.2 追加パラメータ（本体トップレベルへマージしたもの）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// AI 実行1回分の再現条件（仕様 4.6）。同じ名前でも `ollama pull` で中身が入れ替わるので
@@ -375,6 +400,9 @@ impl AiRunRecord {
         }
         if let Some(t) = self.sent.temperature {
             sent.push(format!("temperature {t}"));
+        }
+        if let Some(m) = &self.sent.extra {
+            sent.push(format!("追加 {}", serde_json::Value::Object(m.clone())));
         }
         v.push(("送信パラメータ".into(), sent.join("・")));
         v.push((
@@ -869,27 +897,27 @@ mod tests {
     #[test]
     fn plan_ollama_sends_user_choice_but_not_to_unsupported() {
         let yes = info("ollama", ThinkingMode::BooleanOrLevels { levels: levels_vec() }, Tri::Yes);
-        assert_eq!(plan_think("ollama", Some("high"), Some(&yes)).ollama_think, Some(serde_json::json!("high")));
-        assert_eq!(plan_think("ollama", Some("on"), Some(&yes)).ollama_think, Some(serde_json::json!(true)));
-        assert_eq!(plan_think("ollama", Some("off"), Some(&yes)), ThinkPlan::default());
+        assert_eq!(plan_think("ollama", Some("high"), Some(&yes), false).ollama_think, Some(serde_json::json!("high")));
+        assert_eq!(plan_think("ollama", Some("on"), Some(&yes), false).ollama_think, Some(serde_json::json!(true)));
+        assert_eq!(plan_think("ollama", Some("off"), Some(&yes), false), ThinkPlan::default());
 
         let no = info("ollama", ThinkingMode::None, Tri::No);
-        let p = plan_think("ollama", Some("on"), Some(&no));
+        let p = plan_think("ollama", Some("on"), Some(&no), false);
         assert_eq!(p.ollama_think, None, "非対応モデルに送ると 400 になる");
         assert!(p.note.is_some());
 
         // 能力不明（取得失敗・古い Ollama）は設定どおり送る。
-        assert_eq!(plan_think("ollama", Some("low"), None).ollama_think, Some(serde_json::json!("low")));
+        assert_eq!(plan_think("ollama", Some("low"), None, false).ollama_think, Some(serde_json::json!("low")));
     }
 
     #[test]
     fn plan_gpt_oss_maps_on_to_medium() {
         let g = info("ollama", ThinkingMode::Levels { levels: levels_vec() }, Tri::Yes);
-        let p = plan_think("ollama", Some("on"), Some(&g));
+        let p = plan_think("ollama", Some("on"), Some(&g), false);
         assert_eq!(p.ollama_think, Some(serde_json::json!("medium")));
         assert!(p.note.is_some());
-        assert_eq!(plan_think("ollama", Some("low"), Some(&g)).ollama_think, Some(serde_json::json!("low")));
-        let off = plan_think("ollama", Some("off"), Some(&g));
+        assert_eq!(plan_think("ollama", Some("low"), Some(&g), false).ollama_think, Some(serde_json::json!("low")));
+        let off = plan_think("ollama", Some("off"), Some(&g), false);
         assert_eq!(off.ollama_think, None);
         assert!(off.note.is_some(), "止められないことを記録する");
     }
@@ -897,19 +925,41 @@ mod tests {
     #[test]
     fn plan_lmstudio_uses_reasoning_effort_for_levels_only() {
         let g = info("lmstudio", ThinkingMode::Levels { levels: levels_vec() }, Tri::Yes);
-        assert_eq!(plan_think("lmstudio", Some("high"), Some(&g)).reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(plan_think("lmstudio", Some("on"), Some(&g)).reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(plan_think("lmstudio", Some("high"), Some(&g), false).reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(plan_think("lmstudio", Some("on"), Some(&g), false).reasoning_effort.as_deref(), Some("medium"));
 
         let b = info("lmstudio", ThinkingMode::Boolean, Tri::Yes);
-        let p = plan_think("lmstudio", Some("on"), Some(&b));
+        let p = plan_think("lmstudio", Some("on"), Some(&b), false);
         assert_eq!(p.reasoning_effort, None, "on/off は LM Studio 側の設定に従う");
         assert!(p.note.is_some());
-        assert_eq!(plan_think("lmstudio", Some("high"), Some(&b)).reasoning_effort, None);
-        assert_eq!(plan_think("lmstudio", Some("high"), Some(&b)).ollama_think, None);
+        assert_eq!(plan_think("lmstudio", Some("high"), Some(&b), false).reasoning_effort, None);
+        assert_eq!(plan_think("lmstudio", Some("high"), Some(&b), false).ollama_think, None);
 
-        // 汎用 OpenAI互換には何も送らない（従来どおり）。
-        let p = plan_think("openai", Some("high"), None);
+        // LM Studio は send_reasoning に左右されない（能力で決まる）。
+        assert_eq!(plan_think("lmstudio", Some("on"), Some(&b), true).reasoning_effort, None);
+    }
+
+    #[test]
+    fn plan_generic_openai_sends_only_when_enabled() {
+        // オフ（既定）: 何も送らない（従来どおり）。指定していたら注記を残す。
+        let p = plan_think("openai", Some("high"), None, false);
         assert_eq!((p.ollama_think, p.reasoning_effort), (None, None));
+        assert!(p.note.is_some());
+        assert_eq!(plan_think("openai", Some("off"), None, false), ThinkPlan::default());
+
+        // オン: 浅く/中/深く→low/medium/high、使わない→none、使う→送らない（サーバ既定）。
+        let effort = |t: Option<&str>| plan_think("openai", t, None, true).reasoning_effort;
+        assert_eq!(effort(Some("low")).as_deref(), Some("low"));
+        assert_eq!(effort(Some("medium")).as_deref(), Some("medium"));
+        assert_eq!(effort(Some("high")).as_deref(), Some("high"));
+        assert_eq!(effort(Some("off")).as_deref(), Some("none"));
+        assert_eq!(effort(None).as_deref(), Some("none"), "未設定＝使わない");
+        let on = plan_think("openai", Some("on"), None, true);
+        assert_eq!(on.reasoning_effort, None);
+        assert!(on.note.is_some());
+        // 未知の値は「使わない」扱い＝none（任意の文字列をそのまま送って 400 にしない）。
+        assert_eq!(effort(Some("xhigh")).as_deref(), Some("none"));
+        assert_eq!(plan_think("openai", Some("high"), None, true).ollama_think, None);
     }
 
     #[test]

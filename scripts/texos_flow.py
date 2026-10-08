@@ -242,6 +242,7 @@ class Project:
            model: str | None = None, provider: str | None = None,
            endpoint: str | None = None, gpu: str | None = None,
            think: str | None = None, num_ctx: int | None = None,
+           send_reasoning: bool = False, extra_params: dict | None = None,
            memo: str | None = None) -> str:
         """AIフィルタカード（builtin:"ai" transform）。
 
@@ -260,6 +261,13 @@ class Project:
              深さ指定のみで、"on" は "medium" として送られる。
         num_ctx: None（既定・Ollama の既定長）| 整数（実行時のコンテキスト長・トークン）。
              長い資料を渡すときに増やす。Ollama ネイティブのみ有効。
+        send_reasoning: False（既定）| True。provider="openai"（汎用 OpenAI互換）のときだけ効き、
+             think を reasoning_effort として送る（"off"→"none"・"low"/"medium"/"high"→そのまま・
+             "on"→送らずサーバ既定）。未知の値で 400 を返すサーバがあるので既定は送らない。
+        extra_params: None | dict。リクエスト本体のトップレベルへそのまま加える（全サーバ共通）。
+             例: Strata の思考上限 {"reasoning_budget_tokens": 8000}。model/messages/stream/
+             temperature/think/reasoning_effort/options は書けない（実行時エラーになる）。
+             思考の上限などの API パラメータを system に書いても効かない（本文として送られるだけ）。
         """
         spec = {"builtin": "ai", "provider": provider or self.provider,
                 "mode": "transform", "model": model or self.model,
@@ -276,6 +284,10 @@ class Project:
             spec["think"] = think
         if num_ctx:
             spec["num_ctx"] = num_ctx
+        if send_reasoning:
+            spec["send_reasoning"] = True
+        if extra_params:
+            spec["extra_params"] = extra_params
         return self._filter(label, spec, x, y, memo)
 
     def cat(self, label: str, x: float, y: float, *, separator: str = "rule",
