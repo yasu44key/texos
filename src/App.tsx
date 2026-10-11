@@ -1278,11 +1278,11 @@ function App() {
         create("OUT", { op: "out" });
         return;
       }
-      if (builtin === "op_timer" || builtin === "op_watch") {
+      if (builtin === "op_timer" || builtin === "op_watch" || builtin === "op_voice") {
         setBuiltinDlg({
           id: null,
           builtin,
-          label: builtin === "op_timer" ? "タイマ" : "ウォッチャ",
+          label: builtin === "op_timer" ? "タイマ" : builtin === "op_watch" ? "ウォッチャ" : "音声",
           // v1.5.5: 停止状態で生成（構成中の誤発火防止・実機FB）。配線後に「▶ 稼働開始」。
           // paused はフォーム外キーなのでダイアログの base として温存される。
           spec: '{"paused":true}',
@@ -2068,6 +2068,24 @@ function App() {
         console.error("toggle_op_paused failed", e);
         setConfirm({
           title: "稼働状態を切り替えられませんでした",
+          message: String(e),
+          okLabel: "OK",
+          onConfirm: () => setConfirm(null),
+        });
+      }
+    },
+    [refresh]
+  );
+
+  // v1.10 音声カード: 発話の受け皿カードを右隣に置く（既にあればそれを使う）。
+  const handlePlaceVoiceInbox = useCallback(
+    async (id: string) => {
+      try {
+        await invoke<string>("voice_ensure_inbox", { id });
+        await refresh();
+      } catch (e) {
+        setConfirm({
+          title: "受け皿カードを置けませんでした",
           message: String(e),
           okLabel: "OK",
           onConfirm: () => setConfirm(null),
@@ -5841,6 +5859,7 @@ function App() {
         runFlow: handleRunFlow,
         evaluateFlow: handleEvaluateFlow,
         toggleOpPause: handleToggleOpPause,
+        placeVoiceInbox: handlePlaceVoiceInbox,
         // v1.5.6 WS-M M1: 図形ロック・モジュール化・IN/OUT 溶解。
         shapeToggleLock: handleShapeToggleLock,
         modularizeShape: handleModularizeShape,
@@ -6719,6 +6738,15 @@ function App() {
                 });
                 pushUndo([{ kind: "delete", ids: [vid] }]);
                 if (dlg.create.linkFrom) await linkNewNode(dlg.create.linkFrom, vid);
+                // v1.10: 音声カードは発話の受け皿カード（書き出し先ファイル）を右隣に置く
+                // ＝フローの入力にどこから矢印を引けばよいかが見える。
+                if (dlg.builtin === "op_voice") {
+                  try {
+                    await invoke<string>("voice_ensure_inbox", { id: vid });
+                  } catch (e) {
+                    console.error("voice_ensure_inbox failed", e);
+                  }
+                }
               }
               await refresh();
             } catch (e) {

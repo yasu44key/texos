@@ -24,7 +24,7 @@ const DEFAULT_DEBOUNCE: u64 = 2;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct OpSpec {
-    /// "trigger"（設置型▶）| "timer" | "watch"
+    /// "trigger"（設置型▶）| "timer" | "watch" | "voice"（v1.10 音声反射カード・voice.rs）
     pub op: String,
     /// timer: 周期秒。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,6 +127,8 @@ pub(crate) fn parse_op_spec(spec: &str) -> Result<OpSpec, String> {
         // v1.8.3: path は任意。空欄＝プロジェクトフォルダ、相対パス＝プロジェクト基準
         // （resolve_project_path）。既定でプロジェクトを見る＝「ここに置いたら動く」。
         "watch" => {}
+        // v1.10 音声反射カード: 稼働中だけ音声プロセスを持つ（voice.rs）。設定キーは extra に温存。
+        "voice" => {}
         other => return Err(format!("未知のオペレーション種別です: {other}")),
     }
     Ok(s)
@@ -272,6 +274,29 @@ pub(crate) fn toggle_op_paused(id: String, state: State<AppState>) -> Result<boo
         .map_err(|e| e.to_string())?
         .ok_or("opカードが見つかりません")?;
     let mut spec = parse_op_spec(&spec_json)?;
+    // v1.10: マイクは1つ＝稼働できる音声カードはプロジェクトに1枚（§3.1）。
+    if spec.op == "voice" && spec.paused {
+        let others: Vec<String> = {
+            let mut stmt = p
+                .conn
+                .prepare(
+                    "SELECT filter_ref FROM virtual_bodies
+                     WHERE kind = 'op' AND deleted_at IS NULL AND id <> ?1 AND filter_ref IS NOT NULL",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        if others
+            .iter()
+            .filter_map(|j| parse_op_spec(j).ok())
+            .any(|s| s.op == "voice" && !s.paused)
+        {
+            return Err("別の音声カードが稼働中です（マイクは1つなので、先にそちらを停止してください）".into());
+        }
+    }
     spec.paused = !spec.paused;
     let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
     p.conn
@@ -552,6 +577,8 @@ pub(crate) fn start_op_scheduler(app: tauri::AppHandle) {
         loop {
             std::thread::sleep(Duration::from_secs(1));
             tick(&app, &mut rt);
+            // v1.10: 音声カードの生死を突き合わせる（稼働中なら音声プロセスを持つ）。
+            crate::voice::voice_tick(&app);
         }
     });
 }

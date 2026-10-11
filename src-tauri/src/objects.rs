@@ -1663,7 +1663,45 @@ pub(crate) fn create_relation(
         )
         .map_err(|e| e.to_string())?;
     // 重複でスキップされたときに「最後に挿入された無関係な行のid」を返さない。
-    Ok((inserted > 0).then(|| p.conn.last_insert_rowid()))
+    let new_id = (inserted > 0).then(|| p.conn.last_insert_rowid());
+    // v1.10: 音声カード → ファイルカードの矢印は「書き出し」（発話の受け皿を決める線）。
+    if let Some(rid) = new_id {
+        if kind == "req" {
+            let from_voice = p
+                .conn
+                .query_row(
+                    "SELECT filter_ref FROM virtual_bodies WHERE id = ?1 AND kind = 'op'",
+                    rusqlite::params![from_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .flatten()
+                .and_then(|s| ops::parse_op_spec(&s).ok())
+                .map(|s| s.op == "voice")
+                .unwrap_or(false);
+            let to_file = p
+                .conn
+                .query_row(
+                    "SELECT 1 FROM virtual_bodies WHERE id = ?1 AND committed_path IS NOT NULL
+                       AND COALESCE(kind, 'file') = 'file'",
+                    rusqlite::params![to_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some();
+            if from_voice && to_file {
+                let _ = p.conn.execute(
+                    "UPDATE relations SET attrs = '{\"role\":\"inbox\"}' WHERE id = ?1",
+                    rusqlite::params![rid],
+                );
+            }
+        }
+    }
+    Ok(new_id)
 }
 
 #[tauri::command]

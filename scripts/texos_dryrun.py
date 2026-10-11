@@ -43,6 +43,7 @@ UNSUPPORTED = {
     "web_fetch": "Web取得", "web_feed": "フィード取得", "web_capture": "ページ保存",
     "web_search": "Web検索（SearXNG デーモンが要る）",
     "to_url": "URLカード化", "speak": "読み上げ", "import_new": "新規カードの登録",
+    "voice_send": "会話へ送る（稼働中の会話コマンドが要る）",
     "select": "セレクタ",
 }
 _AGG_CMD = re.compile(r"\{in\*\}|\{in([2-9]|[1-9]\d+)\}")
@@ -96,6 +97,10 @@ class DryRun:
                     spec = json.loads(ref)
                 except ValueError:
                     spec = {}
+            # v1.9.1 以降の TexoS はプロジェクト内のパスを root 基準の相対で保存する
+            # （開いた時に絶対→相対へ直す）。ここで root に繋いで読む。
+            if cpath and not os.path.isabs(cpath):
+                cpath = os.path.join(self.root, cpath)
             self.cards[cid] = dict(label=label or "", kind=kind or "", spec=spec,
                                    note=note, path=cpath, ext=ext, mime=mime)
         self.edges: list[tuple[str, str, str | None]] = []

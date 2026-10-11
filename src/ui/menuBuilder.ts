@@ -37,6 +37,8 @@ export interface MenuActions {
   toggleEmitMid: (id: string, currentSpec: string) => void;
   // v1.5.5: タイマ/ウォッチャの稼働/停止トグル（構成中の誤発火防止スイッチ）。
   toggleOpPause: (id: string) => void;
+  /** v1.10 音声カード: 発話の受け皿カード（書き出し先ファイル）を右隣に置く。 */
+  placeVoiceInbox: (id: string) => void;
   // v1.3.11 ランチャー（一般プログラム/cmd/PowerShell の登録・起動）
   addLauncher: (builtin: string, x: number, y: number) => void;
   runLauncher: (id: string) => void;
@@ -512,7 +514,7 @@ export function buildObjectMenu(
         const s = JSON.parse(obj.filter_ref ?? "{}");
         return {
           opKind: typeof s.op === "string" ? s.op : null,
-          opSched: s.op === "timer" || s.op === "watch",
+          opSched: s.op === "timer" || s.op === "watch" || s.op === "voice",
           opPaused: s.paused === true,
         };
       } catch {
@@ -525,7 +527,7 @@ export function buildObjectMenu(
       if (opKind !== null) return { eligible: false, on: false };
       try {
         const s = JSON.parse(obj.filter_ref ?? "{}");
-        const passthru = ["select", "tap", "ask", "loop", "import_new", "speak"];
+        const passthru = ["select", "tap", "ask", "loop", "import_new", "speak", "voice_send"];
         const eligible = typeof s.shell !== "string" && !passthru.includes(s.builtin);
         return { eligible, on: s.emit_mid === "on" };
       } catch {
@@ -534,7 +536,8 @@ export function buildObjectMenu(
     })();
     return [
       { label: `⚗「${obj.label}」`, onClick: () => {}, disabled: true },
-      ...(opKind !== "in"
+      // v1.10: 音声カードは話しかけて発火する（▶実行の対象ではない）。
+      ...(opKind !== "in" && opKind !== "voice"
         ? [{ label: "▶ フローを実行", onClick: () => a.runFlow(targetId) }]
         : []),
       ...(opSched
@@ -545,6 +548,15 @@ export function buildObjectMenu(
                 ? "自動発火を開始します（タイマは今から間隔を数え、ウォッチャは今の状態を基準に監視します）。"
                 : "自動発火を止めます。フローの構成中の誤発火を防げます（手動の実行は可能なまま）。",
               onClick: () => a.toggleOpPause(targetId),
+            },
+          ]
+        : []),
+      ...(opKind === "voice"
+        ? [
+            {
+              label: "発話の受け皿カードを置く",
+              hint: "発話の中身が書き出されるファイル（設定の「発話の書き出し先」・既定 音声/発話.txt）のカードを右隣に置きます。既にあればそれを使います。フローの入力へはこのカードから矢印を引きます。",
+              onClick: () => a.placeVoiceInbox(targetId),
             },
           ]
         : []),
@@ -1406,7 +1418,7 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
         ]),
     },
     {
-      label: "発行（トリガ・タイマ・ウォッチャ）...",
+      label: "発行（トリガ・タイマ・ウォッチャ・音声）...",
       onClick: () =>
         a.openSubmenu([
           {
@@ -1423,6 +1435,16 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
             label: "ウォッチャ（ファイル監視で発行）...",
             hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
             onClick: () => a.addFilter("op_watch"),
+          },
+          {
+            label: "音声（話しかけて発行・声で報告）...",
+            hint: "稼働中はマイクで聞き取り、リクエスト矢印の先のカード名（言い回し）を含む発話でそのフローを実行し、完了・失敗を声で報告します。言い回しを除いた中身は書き出し先のファイル（既定 音声/発話.txt）に入ります。",
+            onClick: () => a.addFilter("op_voice"),
+          },
+          {
+            label: "会話へ送る（テキストを会話コマンドへ）",
+            hint: "フローの終端に置くと、流れてきたテキストを話しかけたのと同じ扱いで稼働中の会話コマンドへ渡します。音声ファイル→文字起こし→ここ、で録音も扱えます。",
+            onClick: () => a.addFilter("voice_send"),
           },
         ]),
     },

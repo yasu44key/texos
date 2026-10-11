@@ -19,6 +19,8 @@ function edgeLabel(attrs?: string | null): string | null {
     else if (a.role === "previous") parts.push("前周");
     // v1.8 ③問い合わせ: 答えの箱（付箋 → 問い合わせカード）。
     else if (a.role === "answer") parts.push("答え");
+    // v1.10 音声カード → 受け皿ファイル: 発話の中身の書き出し先。
+    else if (a.role === "inbox") parts.push("書き出し");
     if (a.when === "success") parts.push("成功時");
     else if (a.when === "failure") parts.push("失敗時");
     if (a.carry === "none") parts.push("信号のみ");
@@ -191,7 +193,7 @@ export function LinkLayer({
           ? "arrowhead-flow"
           : "arrowhead";
         // v1.5.3 WS-P1: 条件付き矢印は中点にラベル（成功時/失敗時・信号のみ 等）。
-        const label = isFlow ? edgeLabel(r.attrs) : null;
+        const label = isFlow || isReq ? edgeLabel(r.attrs) : null;
         const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
         return (
           <g key={r.id}>

@@ -223,6 +223,18 @@ impl Jobs {
             }
         }
     }
+    /// v1.10 音声反射カード「全部止めて」: 指定の終端カードの Flow ジョブだけ cancel。
+    /// 返り値 = cancel を立てたジョブ数。
+    pub fn cancel_cards(&self, cards: &[String]) -> usize {
+        let mut n = 0;
+        for j in self.map.lock().unwrap().values() {
+            if j.kind == JobKind::Flow && j.card.as_ref().map(|c| cards.contains(c)).unwrap_or(false) {
+                j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                n += 1;
+            }
+        }
+        n
+    }
     pub fn list(&self) -> Vec<JobInfo> {
         let mut v: Vec<JobInfo> = self
             .map
@@ -290,6 +302,8 @@ struct SemState {
 
 pub struct Permit {
     sem: std::sync::Arc<FairSemaphore>,
+    /// v1.10: 録音デバイスの permit に添える音声カードのマイク譲渡（drop で返す）。
+    pub(crate) mic_yield: Option<voice::MicYield>,
 }
 
 impl Drop for Permit {
@@ -319,7 +333,7 @@ impl FairSemaphore {
         let mut st = self.state.lock().unwrap();
         if st.active < self.permits && st.queue.is_empty() {
             st.active += 1;
-            Some(Permit { sem: self.clone() })
+            Some(Permit { sem: self.clone(), mic_yield: None })
         } else {
             None
         }
@@ -338,7 +352,7 @@ impl FairSemaphore {
             let mut st = self.state.lock().unwrap();
             if st.active < self.permits && st.queue.is_empty() {
                 st.active += 1;
-                return Ok(Permit { sem: self.clone() });
+                return Ok(Permit { sem: self.clone(), mic_yield: None });
             }
             my = st.next_ticket;
             st.next_ticket += 1;
@@ -358,7 +372,7 @@ impl FairSemaphore {
                 st.active += 1;
                 drop(st);
                 self.cv.notify_all();
-                return Ok(Permit { sem: self.clone() });
+                return Ok(Permit { sem: self.clone(), mic_yield: None });
             }
             let (g, _) = self
                 .cv
@@ -638,6 +652,8 @@ mod web;
 // v1.8.7: 実行トレース（デバッグモード）— ノード単位の実行記録を .texos/logs へ。
 mod trace;
 pub(crate) use trace::*;
+// v1.10: 音声反射カード（op:"voice"）。glob 再エクスポートせず crate::voice:: で参照。
+mod voice;
 pub(crate) use ai::*;
 pub(crate) use clipboard_in::*;
 pub(crate) use filters::*;
@@ -718,6 +734,11 @@ pub fn run() {
             get_media_data_url,
             create_relation,
             list_relations,
+            // v1.10 音声反射カード
+            voice::voice_status,
+            voice::voice_retry,
+            voice::voice_ensure_inbox,
+            voice::voice_send_text,
             delete_relation,
             set_relation_attrs,
             list_flow_inputs,

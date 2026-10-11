@@ -458,7 +458,8 @@ impl FilterSpec {
         // v1.5.15 実機FB: speak など「呼ぶだけ」で完結する builtin も出力ゼロが正常
         // （終端の「入力がありません」案内の対象外にする）。
         // v1.6: import_new（新規カードを登録）はカードを自分で作る＝出力ペイロードなしが正常。
-        if matches!(self.builtin.as_deref(), Some("speak") | Some("import_new")) {
+        // v1.10: voice_send（会話へ送る）も渡すだけで出力なし。
+        if matches!(self.builtin.as_deref(), Some("speak") | Some("import_new") | Some("voice_send")) {
             return true;
         }
         matches!(self.node_kind(), NodeKind::Generator | NodeKind::External)

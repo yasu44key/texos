@@ -443,13 +443,14 @@ pub(crate) fn save_module_library(
         if project_ref.is_some() {
             continue;
         }
-        // タイマ/ウォッチャは停止状態で持ち出す（新環境の誤発火防止・v1.5.5 の流儀）。
+        // タイマ/ウォッチャ/音声は停止状態で持ち出す（新環境の誤発火防止・v1.5.5 の流儀）。
         // fired_count もリセット（部品としてまっさらに）。IN/OUT/トリガは対象外。
         let filter_ref = filter_ref.map(|spec| {
             if kind.as_deref() == Some("op") {
                 if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&spec) {
                     let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
-                    if matches!(op, "timer" | "watch") {
+                    // v1.10: 音声カードも停止状態で（持ち出し先でいきなりマイクを開かない）。
+                    if matches!(op, "timer" | "watch" | "voice") {
                         if let Some(o) = v.as_object_mut() {
                             o.insert("paused".into(), serde_json::Value::Bool(true));
                             o.remove("fired_count");

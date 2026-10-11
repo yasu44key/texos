@@ -38,6 +38,10 @@ NOTE_SENTINEL = "note:sentinel"
 DROP_SENTINEL = "drop:empty"
 LAUNCHER_SENTINEL = "launcher:sentinel"
 OP_SENTINEL = "op:empty"
+# 発行（リクエスト）側の op。flow ではなく request() で繋ぐ。
+REQUEST_OPS = ("trigger", "timer", "watch", "voice")
+# 出力カードを作らない内蔵（flow.rs is_self_contained と同じ）。
+NO_OUTPUT_BUILTINS = ("speak", "import_new", "voice_send")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS real_bodies (
@@ -130,6 +134,7 @@ class Project:
         self._shapes: list[tuple] = []
         self._files: list[tuple[str, bytes, str]] = []   # (path, bytes, card_id)
         self._bundles: list[tuple[str, str, tuple[str, ...]]] = []  # 同梱プログラム
+        self._reqs: list[tuple[str, str, dict | None]] = []  # リクエスト矢印 (op, 先, attrs)
         self._view = None
 
     # ---------------------------------------------------------------- カード
@@ -140,7 +145,8 @@ class Project:
         cid = uuid.uuid4().hex
         path = os.path.join(self.root, name)
         self._files.append((path, text if isinstance(text, bytes) else text.encode("utf-8"), cid))
-        self._cards[cid] = dict(label=name, kind="file", spec=None, x=x, y=y,
+        # サブフォルダ指定（例 "音声/発話.txt"）可。カード名はファイル名だけ（TexoS の取り込みと同じ）。
+        self._cards[cid] = dict(label=os.path.basename(name), kind="file", spec=None, x=x, y=y,
                                 memo=memo, path=path,
                                 ext=name.rsplit(".", 1)[-1] if "." in name else None)
         return cid
@@ -243,8 +249,11 @@ class Project:
            endpoint: str | None = None, gpu: str | None = None,
            think: str | None = None, num_ctx: int | None = None,
            send_reasoning: bool = False, extra_params: dict | None = None,
-           memo: str | None = None) -> str:
+           seq: int | None = None, memo: str | None = None) -> str:
         """AIフィルタカード（builtin:"ai" transform）。
+
+        seq: None（既定・prefix の固定名で毎回上書き）| 開始番号（prefix1, prefix2 … と
+             実行のたびに新しいカードを作る＝溜まっていく。規約 §3-4）。
 
         **通常入力は1本にすること**（複数繋ぐと入力ごとにファンアウトする → cat() で束ねる）。
 
@@ -278,6 +287,8 @@ class Project:
             spec["endpoint"] = endpoint
         if prefix:
             spec["prefix"] = prefix
+        if seq is not None:
+            spec["seq"] = seq
         if gpu:
             spec["gpu"] = gpu
         if think:
@@ -387,14 +398,33 @@ class Project:
 
     def op(self, label: str, x: float, y: float, *, kind: str,
            memo: str | None = None, **params) -> str:
-        """任意の op カード。`kind` は in / out / trigger / timer / watch。
+        """任意の op カード。`kind` は in / out / trigger / timer / watch / voice。
 
-        トリガ・タイマ・ウォッチャは**発行（リクエスト）側**で、pull の評価には出てこない
-        （▶ を押す代わりに下流のフィルタを走らせる仕掛け）。フローの矢印では繋がない。
+        トリガ・タイマ・ウォッチャ・音声は**発行（リクエスト）側**で、pull の評価には出てこない
+        （▶ を押す代わりに下流のフィルタを走らせる仕掛け）。フローの矢印では繋がず、
+        `request()` で繋ぐ。タイマ・ウォッチャ・音声は**停止状態で作る**（paused=True。
+        TexoS の UI と同じ＝開いた途端に発火・マイクを開かない。人が「▶ 稼働開始」を押す）。
         """
-        if kind not in ("in", "out", "trigger", "timer", "watch"):
-            raise BuildError(f'op の kind は in/out/trigger/timer/watch のみ（指定: {kind}）')
-        return self._op(label, {"op": kind, **params}, x, y, memo)
+        if kind not in REQUEST_OPS + ("in", "out"):
+            raise BuildError(f'op の kind は in/out/trigger/timer/watch/voice のみ（指定: {kind}）')
+        spec = {"op": kind, **params}
+        if kind in ("timer", "watch", "voice"):
+            spec.setdefault("paused", True)
+        return self._op(label, spec, x, y, memo)
+
+    def voice(self, label: str, x: float, y: float, *, mode: str = "command",
+              say_out: str = "音声/発話.txt", memo: str | None = None, **params) -> str:
+        """音声反射カード（v1.10・docs/V1.10_音声反射カード計画.md）。
+
+        稼働中はマイクで聞き取り、`request()` で繋いだ先のフィルタを実行して声で報告する。
+        - mode="command": 発話がカード名（または request の say=）を含むとき、そのカードだけ。
+          言い回しを除いた中身が say_out へ入る（「メモして 牛乳」→「牛乳」）。
+        - mode="dictation": 発話のたびに全文を say_out へ入れ、繋いだ先を全部実行する。
+        フロー側は **say_out の実身カード**（`file(say_out, "", ...)` で作る）を入力にする。
+        """
+        if mode not in ("command", "dictation"):
+            raise BuildError(f'voice の mode は command / dictation のみ（指定: {mode}）')
+        return self.op(label, x, y, kind="voice", memo=memo, mode=mode, say_out=say_out, **params)
 
     def _op(self, label, spec, x, y, memo) -> str:
         cid = uuid.uuid4().hex
@@ -431,6 +461,34 @@ class Project:
             )
         self._edges.append((src, dst, role))
 
+    def request(self, src: str, dst: str, *, say: str | list[str] | None = None) -> None:
+        """リクエスト矢印（kind='req'・破線）。発行側の op（トリガ/タイマ/ウォッチャ/音声）から、
+        実行させたいフィルタカードへ。データは運ばない（▶ を代わりに押すだけ）。
+
+        say= は音声カード用の言い回し（省略時は先のカード名が言い回し）。
+
+        音声カードからファイルカード（file()）へ引くと「書き出し」の矢印になり、
+        **それが発話の中身の受け皿**になる（v1.10・voice.rs inbox_path）。
+        """
+        for c in (src, dst):
+            if c not in self._cards:
+                raise BuildError(f"未知のカードid: {c}")
+        sc, dc = self._cards[src], self._cards[dst]
+        if sc["kind"] != "op" or sc["spec"].get("op") not in REQUEST_OPS:
+            raise BuildError(f"[{sc['label']}] リクエスト矢印の元は トリガ/タイマ/ウォッチャ/音声 だけです")
+        is_voice = sc["spec"].get("op") == "voice"
+        if dc["kind"] == "file" and is_voice:
+            if say is not None:
+                raise BuildError("受け皿（ファイル）への矢印に say= は付けられません")
+            self._reqs.append((src, dst, {"role": "inbox"}))
+            return
+        if dc["kind"] != "filter":
+            raise BuildError(f"[{dc['label']}] リクエスト矢印の先は処理カード（filter）だけです"
+                             "（音声カードからはファイルカード＝受け皿も可）")
+        if say is not None and not is_voice:
+            raise BuildError("say= は音声カードからの矢印にだけ付けられます")
+        self._reqs.append((src, dst, {"say": [say] if isinstance(say, str) else say} if say else None))
+
     def shape(self, x, y, w, h, label="", fill="#4a90d9", opacity=0.15) -> None:
         self._shapes.append((x, y, w, h, label, fill, opacity))
 
@@ -461,6 +519,16 @@ class Project:
     def validate(self) -> list[str]:
         """壊れた配線を例外に、もったいない配線を警告に。"""
         errs, warns = [], []
+        # 発行側の op はデータレーン（flow）に出てこない — 繋ぐのは request()。
+        for f, t, _r in self._edges:
+            for c in (f, t):
+                cc = self._cards[c]
+                if cc["kind"] == "op" and cc["spec"].get("op") in REQUEST_OPS:
+                    errs.append(f"[{cc['label']}] 発行側の op は flow() では繋げません（request() を使う）")
+        for cid, c in self._cards.items():
+            if c["kind"] == "op" and c["spec"].get("op") == "voice" and not any(
+                    f == cid for f, _t, _s in self._reqs):
+                warns.append(f"[{c['label']}] 音声カードからのリクエスト矢印がありません（話しても何も起きない）")
         ins = self._inputs_of()
         targets = self._all_targets()
         outs = {f for f, _, _ in self._edges}
@@ -540,7 +608,8 @@ class Project:
                     f"[{c['label']}] AIカードに指示がありません"
                     f"（system= を書くか、役割の付箋を role=\"system\" で繋いでください）"
                 )
-            if cid not in outs and not spec.get("prefix"):
+            # 出力カードを作らない内蔵（読み上げ・新規カード登録・会話へ送る）は名前が要らない。
+            if cid not in outs and not spec.get("prefix") and b not in NO_OUTPUT_BUILTINS:
                 warns.append(
                     f"[{c['label']}] 終端カードに prefix がありません。"
                     f"出力名が「入力名_フィルタ名」になります"
@@ -648,7 +717,9 @@ class Project:
                     "ai": "md", "web_fetch": "md", "web_search": "md", "md_codeblock": "txt",
                 }.get(b) or ("txt" if (b or "").startswith("text_") else
                              "md" if b else "bin")
-                if "{out*}" in (spec.get("cmd") or ""):
+                if b in NO_OUTPUT_BUILTINS:
+                    r.append((c["label"], "（出力カードなし）"))
+                elif "{out*}" in (spec.get("cmd") or ""):
                     r.append((c["label"], f"（書き出したファイル名のまま複数）"))
                 else:
                     r.append((c["label"], f"{pre}.{ext}" if pre else "（入力名_フィルタ名）"))
@@ -716,6 +787,7 @@ class Project:
         # committed_path と origin_path の両方を実体へ、mtime も記録）
         written = {}
         for path, data, cid in self._files:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(data)
             h = hashlib.sha256(data).hexdigest()
@@ -776,6 +848,12 @@ class Project:
             attrs = json.dumps({"role": role}) if role else None
             conn.execute("INSERT INTO relations (from_id,to_id,kind,created_at,attrs)"
                          " VALUES (?,?,'flow',?,?)", (f, t_, base + i, attrs))
+        # リクエスト矢印（kind='req'）。発行順は矢印を引いた順（ops.rs fire_prepare と同じ）。
+        base2 = base + len(self._edges)
+        for i, (f, t_, a_) in enumerate(self._reqs):
+            attrs = json.dumps(a_, ensure_ascii=False) if a_ else None
+            conn.execute("INSERT INTO relations (from_id,to_id,kind,created_at,attrs)"
+                         " VALUES (?,?,'req',?,?)", (f, t_, base2 + i, attrs))
         for x, y, w, h, label, fill, op in self._shapes:
             conn.execute(
                 "INSERT INTO shapes (id,kind,pos_x,pos_y,width,height,rotation,fill,"
@@ -789,7 +867,8 @@ class Project:
 
         if verbose:
             print(f"作成: {self.root}")
-            print(f"  カード {len(self._cards)} 枚 / 矢印 {len(self._edges)} 本")
+            print(f"  カード {len(self._cards)} 枚 / 矢印 {len(self._edges)} 本"
+                  + (f" / リクエスト矢印 {len(self._reqs)} 本" if self._reqs else ""))
             for _src, dest_name, _ig in self._bundles:
                 print(f"  同梱: .texos/filters/{dest_name}/")
             for label, out in self.terminals():

@@ -129,6 +129,17 @@ pub(crate) fn execute_node(
                     stderr: String::new(),
                 })
             }
+            // v1.10 会話へ送る: 入力テキストを、話しかけたのと同じ扱いで稼働中の会話コマンドへ。
+            // 渡すだけ（出力カードなし）。会話側の処理は音声カードのスレッドで続く。
+            else if b == "voice_send" {
+                let text = String::from_utf8_lossy(inputs[0].0).to_string();
+                crate::voice::voice_inject(None, &text, "card")?;
+                Ok(NodeRun {
+                    outputs: Vec::new(),
+                    exit_code: None,
+                    stderr: String::new(),
+                })
+            }
             // v1.7 P1: web_fetch はネットワークを使う別経路（AI と同系・同期 blocking）。
             // 入力なし（パラメータ欄 URL）も許すので inputs は Option で渡す。
             // 語幹（ページタイトル）とメタ JSON を返す拡張契約のため run_builtin に乗せない。
@@ -396,11 +407,15 @@ fn acquire_node_permits(
         let name = flow::dshow_audio_device(spec.cmd.as_deref().unwrap_or(""))
             .unwrap_or_else(|| "既定デバイス".to_string());
         let sem = state.resources.device_sem(&name);
-        permits.push(sem.try_acquire().ok_or_else(|| {
+        let mut permit = sem.try_acquire().ok_or_else(|| {
             format!(
                 "録音デバイス「{name}」は使用中です。実行中の録音を「停止」してからもう一度実行してください"
             )
-        })?);
+        })?;
+        // v1.10: 録音カード優先（音声反射カード計画 §5-4）。音声カードにマイクを手放させ、
+        // 録音が終わって permit が落ちたら開き直させる。
+        permit.mic_yield = Some(crate::voice::voice_mic_yield());
+        permits.push(permit);
     }
     // 2) ai（AI/T2i）: 正規化エンドポイント単位（既定許可数1）。
     let endpoint = match kind {

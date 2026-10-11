@@ -16,6 +16,7 @@ const GlbPreview = lazy(() =>
   import("./GlbPreview").then((m) => ({ default: m.GlbPreview }))
 );
 import { isTextMime, type RunAlert } from "../model";
+import { VoiceStatus } from "./VoiceStatus";
 
 // Fixed card geometry so link endpoints are predictable from (x, y) alone.
 export const CARD_W = 150;
@@ -230,6 +231,14 @@ const FILTER_TYPE_STYLES = {
     badge: "⚡ ウォッチャ",
     run: "",
   },
+  // v1.10 音声反射カード: 発行系の仲間（琥珀）。稼働トグルのみ・▶なし。
+  op_voice: {
+    bg: "var(--card-bg-op, #2c1e10)",
+    border: "#8a6230",
+    text: "var(--card-op-text, #f0c070)",
+    badge: "🎙 音声",
+    run: "",
+  },
   // v1.5.6 WS-M M1（§9）: IN/OUT バーチャルカード＝データレーンの口（発行系ではないので
   // 琥珀ではなく青系＝ドロップポイントの親戚として見せる）。OUT だけ ▶（さかのぼり実行）。
   op_in: {
@@ -254,7 +263,7 @@ function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_
     const s = JSON.parse(ref);
     // v1.5.4 WS-P2: op カード（トリガ/タイマ/ウォッチャ）は op キーで見分ける。
     // v1.5.6 WS-M M1: IN/OUT バーチャルカードも同じ器（op:"in"/"out"）。
-    if (["trigger", "timer", "watch", "in", "out"].includes(s.op)) {
+    if (["trigger", "timer", "watch", "voice", "in", "out"].includes(s.op)) {
       return `op_${s.op}` as keyof typeof FILTER_TYPE_STYLES;
     }
     if (typeof s.shell === "string") return "shell";
@@ -283,6 +292,16 @@ function opPausedOf(ref: string | null | undefined): boolean {
     return JSON.parse(ref ?? "{}").paused === true;
   } catch {
     return false;
+  }
+}
+
+// v1.10: 音声カードの聞き取りしきい値（レベルバーの目盛り。既定は voice.rs と同じ 0.012）。
+function voiceThresholdOf(ref: string | null | undefined): number {
+  try {
+    const t = Number(JSON.parse(ref ?? "{}").threshold);
+    return Number.isFinite(t) && t > 0 ? t : 0.012;
+  } catch {
+    return 0.012;
   }
 }
 
@@ -337,7 +356,7 @@ export function ObjectCard({
   const ftype = filterTypeOf(filterRef);
   const fstyle = FILTER_TYPE_STYLES[ftype];
   // v1.5.5: タイマ/ウォッチャの稼働状態（面のトグルボタン）。トリガは手動▶のみなので対象外。
-  const isOpSched = ftype === "op_timer" || ftype === "op_watch";
+  const isOpSched = ftype === "op_timer" || ftype === "op_watch" || ftype === "op_voice";
   const opPaused = isOpSched && opPausedOf(filterRef);
   const isAiChat = aiModeOf(filterRef) === "chat"; // v1.4.1 対話パネルを持つAIカード
   const isT2i = isT2iOf(filterRef); // v1.4.17 インライン生成パネルを持つ画像生成カード
@@ -999,6 +1018,11 @@ export function ObjectCard({
           zIndex: 2,
         }}
       />
+
+      {/* v1.10 音声反射カード: 稼働中はカードの下に状態パネル（状態・入力レベル・直近の発話）。 */}
+      {ftype === "op_voice" && !opPaused && (
+        <VoiceStatus id={id} top={CARD_H + 8} threshold={voiceThresholdOf(filterRef)} />
+      )}
 
       {/* expansion — anchored to this card, moves with it */}
       {expanded && isAiChat && (

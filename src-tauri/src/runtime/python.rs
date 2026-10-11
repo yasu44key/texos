@@ -62,7 +62,35 @@ pub(crate) const ENV_REQUIREMENTS: &[(&str, &[&str])] = &[(
         // peft 無しの既存 env を「壊れている」と誤判定させない）。
         "peft",
     ],
+), (
+    // v1.10 音声反射カード（python/voice_server.py）。torch 不要（faster-whisper は CTranslate2）。
+    "voice",
+    &["faster-whisper", "sounddevice", "numpy"],
 )];
+
+/// torch を入れる環境か（index-url 切替の別枠導入が要るのは生成系だけ）。
+fn env_needs_torch(name: &str) -> bool {
+    name == "t2i"
+}
+
+/// 環境ごとの import 検証。t2i は従来の check_deps（cuda 判定つき）、voice は
+/// voice_server.py の import と一致させる。Ok(cuda) = 依存あり。
+fn check_env_deps(name: &str, py: &str) -> Result<bool, ()> {
+    if name != "voice" {
+        return check_deps(py);
+    }
+    let mut d = std::process::Command::new(py);
+    d.args(["-c", "import faster_whisper, sounddevice, numpy"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        d.creation_flags(0x0800_0000);
+    }
+    match d.output() {
+        Ok(o) if o.status.success() => Ok(false),
+        _ => Err(()),
+    }
+}
 
 pub(crate) fn runtime_root(app_data: &Path) -> PathBuf {
     app_data.join("runtime")
@@ -387,24 +415,32 @@ pub(crate) fn ensure_env(
         25,
     )?;
     let py = env_python(app_data, name).to_string_lossy().to_string();
-    run_uv(
-        app,
-        app_data,
-        name,
-        &["pip", "install", "--python", &py, "--index-url", torch_index, "torch"],
-        "torch をインストール中…（数GB・時間がかかります）",
-        35,
-    )?;
+    if env_needs_torch(name) {
+        run_uv(
+            app,
+            app_data,
+            name,
+            &["pip", "install", "--python", &py, "--index-url", torch_index, "torch"],
+            "torch をインストール中…（数GB・時間がかかります）",
+            35,
+        )?;
+    }
     let mut args: Vec<&str> = vec!["pip", "install", "--python", &py];
     args.extend_from_slice(reqs);
-    run_uv(app, app_data, name, &args, "生成ライブラリをインストール中…", 80)?;
+    run_uv(app, app_data, name, &args, "ライブラリをインストール中…", 80)?;
     emit_env_progress(app, name, "環境を検証中…", 95);
-    match check_deps(&py) {
+    match check_env_deps(name, &py) {
         Ok(cuda) => {
             emit_env_progress(
                 app,
                 name,
-                if cuda { "完了（GPU 有効）" } else { "完了（CPU 動作）" },
+                if !env_needs_torch(name) {
+                    "完了"
+                } else if cuda {
+                    "完了（GPU 有効）"
+                } else {
+                    "完了（CPU 動作）"
+                },
                 100,
             );
             Ok(())

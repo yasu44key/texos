@@ -739,6 +739,11 @@ p.save()
 `ask()` `loop()` `builtin()` `program()` `launcher()` `bundle()` `op_in()` `op_out()`
 `flow(…, role=)` `shape()` `view()` `save()`。ここに無いものは発明しないこと。
 
+発行側（トリガ/タイマ/ウォッチャ/音声）は `op(…, kind=)` と **`request(op, 先, say=)`**（リクエスト矢印）で
+繋ぐ — `flow()` で繋ぐと例外。音声カードは `voice(…, mode="command"|"dictation", say_out=)`。
+フローの入力には say_out の実身（`file("音声/発話.txt", "", …)`）を使う。手本＝`scripts/build_voice_demo.py`
+（v1.10・`docs/V1.10_音声反射カード計画.md`）。
+
 `ai()` の `system=` は**省略できる**（既定は空）。役割を付箋にして
 `flow(付箋, ai, role="system")` で渡すのが基本形で、そのとき system は書かなくてよい。
 ただし**役割の矢印も system も無い AI カードは指示ゼロ**なので `save()` が警告する。

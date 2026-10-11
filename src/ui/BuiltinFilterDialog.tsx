@@ -224,6 +224,17 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     ],
     note: "各入力の同じ行番号を横に並べて結合します（列の組み立て）。順序は矢印の接続順、行数が違う入力は空欄で埋めます。",
   },
+  // v1.10 会話へ送る（voice.rs voice_inject）: 入力テキストを稼働中の会話コマンドへ。
+  voice_send: {
+    title: "会話へ送る（テキストを会話コマンドへ）",
+    fixed: { accept_mime: "text/*" },
+    fields: [],
+    note:
+      "流れてきたテキストを、話しかけたのと同じ扱いで稼働中の会話コマンド（音声カード）へ渡します。" +
+      "AI が会話履歴ごと受け取り、返事を読み上げ、頼まれた分岐を実行します。" +
+      "音声ファイル → 文字起こし → ここ、のように前段で変換すれば、マイク以外の入力も同じ脳で扱えます。" +
+      "渡すだけで出力カードは作りません。会話コマンドが稼働していないとエラーになります。",
+  },
   speak: {
     // v1.5.15 L2 OSアダプタ・ビルトイン第1弾（標準フィルタ充実検討 §4）。
     title: "読み上げ（speak）",
@@ -780,6 +791,176 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
         default: 100,
         min: 0,
         hint: "ヒューズ: 累計がこの回数に達したら止まります（0=無制限。無制限は明示設定のみ）。",
+      },
+    ],
+  },
+  // v1.10 音声反射カード（docs/V1.10_音声反射カード計画.md）。バックエンドは voice.rs が読む
+  // （say_out / hush_words / cancel_words / ack / report / whisper_model / device / threshold /
+  //  interrupt_threshold / silence / min_interval / max_fires）。
+  op_voice: {
+    title: "音声（話しかけて発行・声で報告）",
+    opCard: true,
+    fixed: { op: "voice" },
+    note:
+      "稼働中はマイクで聞き取り、リクエスト矢印の先のフローを実行して、完了・失敗を声で報告します。" +
+      "発話の中身は実行の直前に書き出し先のファイル（右隣の受け皿カード）へ入ります — フロー側はそのカードを入力にしてください。" +
+      "作成直後は一時停止の状態です。配線が終わったらカードの「▶ 稼働開始」で聞き取りを始めます（マイクは1つなので稼働できる音声カードは1枚）。",
+    fields: [
+      {
+        key: "mode",
+        label: "発火のしかた",
+        type: "select",
+        default: "command",
+        options: [
+          { value: "command", label: "コマンド（カード名＝言い回しを含む発話で、そのカードだけ）" },
+          { value: "dictation", label: "口述（発話のたびに矢印の先を全部・全文を渡す）" },
+        ],
+        hint:
+          "コマンド: 「メモして 牛乳を買う」→「メモして」カードに「牛乳を買う」を渡して実行。" +
+          "口述: 話し終えるたびに全文を書き出し先へ入れ、つないだカードを全部実行（AI 整形・フィルタ処理を自動で）。",
+      },
+      {
+        key: "classifier",
+        label: "コマンドの判定",
+        type: "select",
+        default: "ai",
+        options: [
+          { value: "ai", label: "AI と会話（履歴を踏まえて返事し、頼まれたらカードを実行）" },
+          { value: "phrase", label: "文字で照合（カード名を含むか・速いが聞き違いに弱い）" },
+        ],
+        hint:
+          "AI: VoiceAssistantAgent と同じく発話のたびに会話履歴ごと渡して返事を読み上げ、矢印の先のカード名（＋カードのコメント）から" +
+          "頼まれたものを実行します。「メモして」→ 話す →「以上」のような区切りも会話の流れで判断します（「リセット」で会話を消去）。" +
+          "AI が応答しないときは文字照合で続けます。口述モードでは使いません。",
+      },
+      {
+        key: "ai_model",
+        label: "判定に使うモデル（Ollama）",
+        type: "text",
+        default: "gemma4:latest",
+        hint: "軽いモデルほど速い。稼働開始のときに読み込んでおきます（30分保持）。",
+      },
+      {
+        key: "ai_endpoint",
+        label: "Ollama のアドレス",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=http://localhost:11434",
+      },
+      {
+        key: "say_out",
+        label: "発話の書き出し先",
+        type: "text",
+        default: "音声/発話.txt",
+        hint: "プロジェクトフォルダからの相対パス。発火のたびに中身で上書きします（固定名）。",
+      },
+      {
+        key: "hush_words",
+        label: "読み上げを止める言葉",
+        type: "text",
+        asList: true,
+        default: "止めて,ストップ,静かに",
+        hint: "スーパーバイザー語（矢印なしで常に効く・発話全体が一致したとき）。カンマ区切り。",
+      },
+      {
+        key: "reset_words",
+        label: "会話をリセットする言葉",
+        type: "text",
+        asList: true,
+        default: "リセット,会話をリセット,話題をリセット,最初からやり直して",
+        hint: "AI との会話履歴を消します（AI を通さず即時）。カンマ区切り。",
+      },
+      {
+        key: "cancel_words",
+        label: "実行を中止する言葉",
+        type: "text",
+        asList: true,
+        default: "全部止めて,中止して",
+        hint: "音声から起動した実行中のフローを中断し、読み上げも止めます。カンマ区切り。",
+      },
+      {
+        key: "ack",
+        label: "受け付けの返事",
+        type: "select",
+        default: "auto",
+        options: [
+          { value: "auto", label: "自動（コマンドは返事・口述は黙る）" },
+          { value: "on", label: "返事をする（「○○、始めます」）" },
+          { value: "off", label: "返事をしない" },
+        ],
+      },
+      {
+        key: "report",
+        label: "結果の報告",
+        type: "select",
+        default: "fired",
+        options: [
+          { value: "fired", label: "音声で起動したフローの完了・失敗を報告" },
+          { value: "none", label: "報告しない" },
+        ],
+      },
+      {
+        key: "whisper_model",
+        label: "音声認識モデル",
+        type: "select",
+        default: "base",
+        options: [
+          { value: "tiny", label: "tiny（最速・精度低め）" },
+          { value: "base", label: "base（標準）" },
+          { value: "small", label: "small（精度高め・やや遅い）" },
+          { value: "medium", label: "medium（高精度・遅い）" },
+        ],
+        hint: "初回の稼働開始時に自動でダウンロードします（ネット接続が必要）。",
+      },
+      {
+        key: "device",
+        label: "入力デバイス",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=既定のマイク（番号または名前の一部）",
+      },
+      {
+        key: "threshold",
+        label: "聞き取りの音量しきい値",
+        type: "number",
+        float: true,
+        default: 0.012,
+        min: 0.001,
+        hint: "これを超えたら発話とみなします（RMS・dB ではありません）。雑音を拾うなら上げます。",
+      },
+      {
+        key: "interrupt_threshold",
+        label: "読み上げ中の割り込みしきい値",
+        type: "number",
+        float: true,
+        default: 0.04,
+        min: 0.001,
+        hint: "読み上げ中はスピーカーの声を拾わないよう高めにします。割り込めないなら下げます。",
+      },
+      {
+        key: "silence",
+        label: "発話の終わり（無音秒）",
+        type: "number",
+        float: true,
+        default: 1.2,
+        min: 0.2,
+        hint: "この秒数静かになったら1発話の終わりとみなします。",
+      },
+      {
+        key: "min_interval",
+        label: "発火間隔の下限（秒）",
+        type: "number",
+        default: 1,
+        min: 0,
+        hint: "ヒューズ: これより短い間隔では発火しません。",
+      },
+      {
+        key: "max_fires",
+        label: "累計発火数の上限",
+        type: "number",
+        default: 0,
+        min: 0,
+        hint: "0=無制限（音声カードの既定）。",
       },
     ],
   },

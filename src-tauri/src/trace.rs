@@ -356,6 +356,7 @@ pub(crate) fn trace_kind_name(spec: &flow::FilterSpec, passthrough: bool) -> Str
         Some("ask") => return "問い合わせ".into(),
         Some("loop") => return "反復".into(),
         Some("import_new") => return "新規カードを登録".into(),
+        Some("voice_send") => return "会話へ送る".into(),
         _ => {}
     }
     match spec.node_kind() {
