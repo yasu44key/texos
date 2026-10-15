@@ -123,6 +123,14 @@ def main() -> int:
         n1 = m.ok("create_note", project=proj, text="りんご", x=40, y=40, request_id=rid)
         n1b = m.ok("create_note", project=proj, text="りんご", x=40, y=40, request_id=rid)
         check("冪等: 同じ request_id は作り直さない", n1b["card_id"] == n1["card_id"] and n1b.get("replayed") is True)
+        # 同じ request_id を別の内容・別のプロジェクトに使い回したら、成功（replayed）にしない（v1.11.0 検証で発見）。
+        m.err("create_note", "request_id_conflict", project=proj, text="別の内容", x=40, y=40, request_id=rid)
+        check("冪等: 同じ request_id で別の本文は request_id_conflict", True)
+        m.err("create_note", "request_id_conflict", project=str(Path(proj).parent / "存在しない別プロジェクト"),
+              text="りんご", x=40, y=40, request_id=rid)
+        check("冪等: 同じ request_id で別のプロジェクトは request_id_conflict", True)
+        n1c = m.ok("create_note", project=proj.replace("\\", "/") + "/", text="りんご", x=40, y=40, request_id=rid)
+        check("冪等: パスの書き方違いは同じ要求として再送扱い", n1c["card_id"] == n1["card_id"] and n1c.get("replayed") is True)
         role = m.ok("create_note", project=proj, x=40, y=200,
                     text="役割（ここを書き換える）\n入力された日本語の単語を英語に訳し、英単語を大文字で1語だけ出力する。"
                          "説明・記号・引用符は書かない。")

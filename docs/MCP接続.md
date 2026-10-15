@@ -101,6 +101,9 @@ claude mcp add texos --scope user -e PYTHONUTF8=1 -- python C:\Users\yoshi\dev\t
   `{"error":{"code","message","details?"}}`。
 - **`request_id`（冪等キー）**: `create_note` `create_card` `connect` `import_file` `run_card` で使える。
   同じキーの再送は作り直さず、1回目の結果を `replayed:true` で返す（TexoS の再起動で消える・直近1000件）。
+  ただし同じキーで**引数が1回目と違う**（対象プロジェクト・本文・座標など。キーの順番とパスの書き方の違いは
+  同じとみなす）なら `request_id_conflict`、再送時に**開いているプロジェクトが違えば** `project_mismatch` で断る
+  （v1.11.1・検証レポートの指摘「別内容・別プロジェクトの再送が成功扱いになる」の修正）。
   `connect` はキーが無くても、同じ矢印が既にあればそれを返す（`already_existed`）。
 
 ### 状態取得（読み取り専用）
@@ -170,7 +173,8 @@ claude mcp add texos --scope user -e PYTHONUTF8=1 -- python C:\Users\yoshi\dev\t
 `invalid_params` `unauthorized` `mcp_disabled` `no_project` `project_mismatch` `not_found`
 `unsupported_card_type` `unsupported_setting` `invalid_spec` `busy` `not_runnable` `not_text`
 `not_readable` `too_large` `ai_unreachable` `import_failed` `run_failed` `unknown_job`
-`unknown_method` `request_too_large` `invalid_json` `internal`、MCP サーバー側で `texos_unavailable`。
+`unknown_method` `request_too_large` `invalid_json` `request_id_conflict` `internal`、
+MCP サーバー側で `texos_unavailable`。
 
 ---
 
@@ -222,6 +226,15 @@ claude mcp add texos --scope user -e PYTHONUTF8=1 -- python C:\Users\yoshi\dev\t
 9. UI から MCP を無効化 → `mcp.json` 削除・パイプも閉じる・`texos_unavailable`。その状態で UI のカード操作は通常どおり — 確認
 - UNDO: エージェントの作成・配線が Ctrl+Z で戻ることを確認（下の注意も参照）。
 
+### 受入検証（v1.11.0 リリースビルド・別の検証者）
+
+`docs/TexoS_v1.11.0_検証レポート.md`。専用プロジェクト `TexoS_MCP受入検証_20261015`・Ollama gemma3:latest で
+通しテスト **29/29 成功**。追加で日本語・絵文字本文の分割取得、内蔵カードの作成と設定更新、矢印の条件更新、
+切断と再接続、長文生成の中断（約1秒で `cancelled`・出力なし）、画面反映（付箋からの矢印が通常色）を確認。
+指摘 P2「同じ `request_id` を別内容・別プロジェクトに使うと成功扱いになる」は v1.11.1 で修正し、
+通しテストに回帰項目を追加した（§3 の `request_id`）。インストーラの導入・更新・削除、再起動後の復元、
+別クライアントの設定 UI は未検証。
+
 ### 未確認・注意
 
 - **AI 変換カードの中断**（解決済み）: `cancel_job` は UI の中断ボタンと同じ処理。当初 AI 変換
@@ -237,7 +250,7 @@ claude mcp add texos --scope user -e PYTHONUTF8=1 -- python C:\Users\yoshi\dev\t
   行った作成＋配線は Ctrl+Z 1回でまとめて戻る。
 - 本文・設定・矢印属性の変更は UNDO 対象外（UI でも対象外）。
 - 付箋を UI で編集中に MCP が同じ付箋を書き換えた場合の競合は未対策（後勝ち）。
-- macOS / Linux（Unix ソケット）は未検証。リリースビルド・インストーラ経由の起動は未検証（デバッグビルドで確認）。
+- macOS / Linux（Unix ソケット）は未検証。インストーラ経由の導入は未検証（リリースビルドは受入検証で確認）。
 - Claude Code の `/mcp` からの接続は、同じ stdio 経路をテストスクリプトで代行した。Claude Code に登録しての対話操作は未実施。
 
 ---
@@ -247,7 +260,6 @@ claude mcp add texos --scope user -e PYTHONUTF8=1 -- python C:\Users\yoshi\dev\t
 - 対応しない: カードの完全削除（ソフト削除も未提供）、バイナリ本文の取得、プロジェクトの作成・切り替え、
   外部プログラム／シェル／画像生成等の作成・設定変更、任意 SQL・任意コマンド、ラベル変更、図形。
 - 次の候補:
-  - AI 変換の中断を即時にする（ストリーミング化して中断フラグを見る。対話モードは既に対応済み）。
   - カードのソフト削除（UI の削除＝復活の呪文と同じ）とラベル変更。
   - モジュール JSON の読み込み（規約 §7 の本筋）を MCP から呼べるようにする。
   - 進捗の購読（MCP の notifications/progress で `job:progress` を流す）。
@@ -255,11 +267,10 @@ claude mcp add texos --scope user -e PYTHONUTF8=1 -- python C:\Users\yoshi\dev\t
 
 ---
 
-## 7. 調査で分かった既知の UI 問題（未修正・記録のみ）
+## 7. 調査で分かった既知の UI 問題
 
-- **付箋→処理カードの矢印が赤く出る**: `App.tsx` の `invalidFlowIds` が矢印の出所を `objects`
-  （`list_objects`）だけで引いている。v1.4.17 で付箋は `list_notes` 側へ分かれたため、付箋発の矢印は
-  常に「フロー入力にできないノード」扱いで赤になる（コメントも v1.4.17 以前の前提のまま）。
-  実行系（`flow_run.rs`）は付箋を text/plain の定数として正しく流すので、実行は成功する。
-  直すなら、出所が付箋なら `mimeMatches(accept, "text/plain")` で判定する。
-- ズーム後の座標ずれ・モデル読込後にダイアログが伸びる件は、今回は原因を調べていない。
+- **付箋→処理カードの矢印が赤く出る** — **v1.11.0 で修正済み**（受入検証で通常色を確認）。原因は
+  `App.tsx` の `invalidFlowIds` が矢印の出所を `objects`（`list_objects`）だけで引いていたこと。
+  v1.4.17 で付箋は `list_notes` 側へ分かれたため、付箋発の矢印は常に赤だった。いまは付箋を
+  text/plain として `mimeMatches` で判定する（`preflight.rs` の付箋の型特例と同じ規則）。
+- ズーム後の座標ずれ・モデル読込後にダイアログが伸びる件は未調査。

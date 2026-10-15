@@ -110,7 +110,8 @@ struct Bridge {
     token: Mutex<String>,
     endpoint: Mutex<String>,
     /// 冪等キャッシュ: "method\0request_id" → 結果。
-    idem: Mutex<(HashMap<String, Value>, VecDeque<String>)>,
+    /// 値は (要求の指紋, 結果)。指紋で「同じ要求の再送」と「request_id の使い回し」を見分ける。
+    idem: Mutex<(HashMap<String, (String, Value)>, VecDeque<String>)>,
     /// request_id 付きの変更を直列化する（同じ request_id の同時再送で二重にしない）。
     idem_lock: Mutex<()>,
     /// MCP から起動したジョブ（実行中は Job を握り、完了後は結果を残す）。
@@ -519,7 +520,37 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// 要求の指紋: request_id を除いた引数を、キー順を揃え project を正規化して文字列にする。
+fn request_fingerprint(params: &Value) -> String {
+    fn canon(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                let mut out = Map::new();
+                for k in keys {
+                    out.insert(k.clone(), canon(&m[k]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(canon).collect()),
+            other => other.clone(),
+        }
+    }
+    let mut p = params.clone();
+    if let Some(m) = p.as_object_mut() {
+        m.remove("request_id");
+        let pr = m.get("project").and_then(Value::as_str).map(|s| norm_root(Path::new(s)));
+        if let Some(pr) = pr {
+            m.insert("project".into(), json!(pr));
+        }
+    }
+    canon(&p).to_string()
+}
+
 /// 変更系の冪等化: 同じ method＋request_id の2回目以降は、1回目の結果を replayed:true で返す。
+/// ただし再送でも ①中身（対象プロジェクト・本文・座標…）が1回目と違えば request_id_conflict、
+/// ②いま開いているプロジェクトが指定と違えば project_mismatch で断る（成功と誤認させない）。
 fn idempotent(b: &Bridge, method: &str, params: &Value, f: impl FnOnce() -> R) -> R {
     let rid = match params.get("request_id").and_then(Value::as_str) {
         Some(r) if !r.is_empty() => r.to_string(),
@@ -527,14 +558,25 @@ fn idempotent(b: &Bridge, method: &str, params: &Value, f: impl FnOnce() -> R) -
     };
     let _serial = b.idem_lock.lock().unwrap();
     let key = format!("{method}\u{0}{rid}");
-    if let Some(v) = b.idem.lock().unwrap().0.get(&key) {
-        let mut v = v.clone();
+    let fp = request_fingerprint(params);
+    let hit = b.idem.lock().unwrap().0.get(&key).cloned();
+    if let Some((first_fp, mut v)) = hit {
+        if first_fp != fp {
+            return Err(McpErr::new(
+                "request_id_conflict",
+                "この request_id は別の内容の要求に使われています（再送なら1回目と同じ引数で、新しい要求なら新しい request_id で送ってください）",
+            )
+            .with(json!({ "request_id": rid, "method": method, "first_result": v })));
+        }
+        if let Some(want) = params.get("project").and_then(Value::as_str) {
+            with_project(b, Some(want), |_| Ok(()))?;
+        }
         v["replayed"] = json!(true);
         return Ok(v);
     }
     let out = f()?;
     let mut g = b.idem.lock().unwrap();
-    g.0.insert(key.clone(), out.clone());
+    g.0.insert(key.clone(), (fp, out.clone()));
     g.1.push_back(key);
     while g.1.len() > IDEM_KEEP {
         if let Some(old) = g.1.pop_front() {
@@ -610,17 +652,19 @@ fn p_usize(params: &Value, key: &str, default: usize, max: usize) -> usize {
 // --- プロジェクトの照合 ------------------------------------------------------
 
 /// 2つのプロジェクトルートが同じ場所か（区切り・末尾・大小（Windows）を吸収）。
-pub(crate) fn same_root(a: &Path, b: &Path) -> bool {
-    fn norm(p: &Path) -> String {
-        let s = p.to_string_lossy().replace('/', "\\");
-        let s = s.trim_end_matches('\\').to_string();
-        if cfg!(windows) {
-            s.to_lowercase()
-        } else {
-            s.replace('\\', "/")
-        }
+/// プロジェクトルートの比較用の正規形（区切り・末尾・大小（Windows）を吸収）。
+fn norm_root(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('/', "\\");
+    let s = s.trim_end_matches('\\').to_string();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s.replace('\\', "/")
     }
-    if norm(a) == norm(b) {
+}
+
+pub(crate) fn same_root(a: &Path, b: &Path) -> bool {
+    if norm_root(a) == norm_root(b) {
         return true;
     }
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -1740,6 +1784,18 @@ mod tests {
         assert_eq!(card_type("op", Some(r#"{"op":"out"}"#)), "op:out");
         assert!(mcp_editable("builtin:text_concat"));
         assert!(!mcp_editable("program"));
+    }
+
+    #[test]
+    fn fingerprint_ignores_request_id_key_order_and_path_form() {
+        let a = json!({ "project": r"C:\Prj\A", "text": "x", "x": 1, "y": 2, "request_id": "r1" });
+        let b = json!({ "y": 2, "x": 1, "text": "x", "project": "c:/prj/a/", "request_id": "r2" });
+        assert_eq!(request_fingerprint(&a), request_fingerprint(&b));
+        // 対象プロジェクト・本文が違えば別の要求（同じ request_id の使い回しを見分ける）。
+        let other_prj = json!({ "project": r"C:\Prj\B", "text": "x", "x": 1, "y": 2 });
+        let other_text = json!({ "project": r"C:\Prj\A", "text": "y", "x": 1, "y": 2 });
+        assert_ne!(request_fingerprint(&a), request_fingerprint(&other_prj));
+        assert_ne!(request_fingerprint(&a), request_fingerprint(&other_text));
     }
 
     #[test]
