@@ -217,12 +217,13 @@ def main() -> int:
         m.ok("cancel_job", job_id=js["job_id"])
         jsv = m.ok("get_job", job_id=js["job_id"], wait_seconds=5)
         check("キャンセル要求が受理される", jsv["status"] in ("cancelling", "cancelled"), jsv["status"])
-        # AI 変換は一括 HTTP 呼び出しなので、LLM の応答が返るまで止まらない（既存の制約・UI の中断も同じ）。
+        # AI 変換は受信をストリームにしてあり、中断要求から数秒で止まる（応答の完走を待たない）。
         while jsv["status"] in ("running", "cancelling") and time.time() - c0 < 600:
             jsv = m.ok("get_job", job_id=js["job_id"], wait_seconds=30)
         check("キャンセルで終わり、出力カードを作らない",
               jsv["status"] == "cancelled" and not jsv.get("output_cards"),
               f"{jsv['status']} / 中断要求から {time.time() - c0:.0f} 秒")
+        check("中断要求から 10 秒以内に止まる", time.time() - c0 < 10, f"{time.time() - c0:.1f} 秒")
 
 
         lc = m.ok("list_cards", project=proj, limit=2)

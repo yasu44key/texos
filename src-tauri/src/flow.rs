@@ -1355,18 +1355,22 @@ pub(crate) fn strip_think_blocks(text: &str) -> String {
 /// 記録を取らない版（実機検証テスト用）。
 #[cfg(test)]
 pub fn run_ai(spec: &FilterSpec, input: &[u8]) -> Result<(Vec<u8>, String, String), String> {
-    run_ai_rec(spec, input, &mut None)
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    run_ai_rec(spec, input, &cancel, &mut None)
 }
 
 /// v1.8.9 run_ai ＋実行条件の記録。rec には送信前に雛形が入る（失敗しても残る＝
 /// 非対応エラーの実行条件もログに書ける）。
+/// v1.11 cancel（中断ボタン／MCP cancel_job）が立てば接続を閉じて Err("中断されました")。
+/// 以前は一括 HTTP で応答完走まで止まらなかった → 受信をストリームにして行ごとに見る。
 pub fn run_ai_rec(
     spec: &FilterSpec,
     input: &[u8],
+    cancel: &std::sync::atomic::AtomicBool,
     rec: &mut Option<crate::ai_models::AiRunRecord>,
 ) -> Result<(Vec<u8>, String, String), String> {
     std::thread::scope(|s| {
-        s.spawn(|| run_ai_blocking(spec, input, rec))
+        s.spawn(|| run_ai_blocking(spec, input, cancel, rec))
             .join()
             .map_err(|_| "AI実行スレッドが異常終了しました".to_string())?
     })
@@ -1375,6 +1379,7 @@ pub fn run_ai_rec(
 fn run_ai_blocking(
     spec: &FilterSpec,
     input: &[u8],
+    cancel: &std::sync::atomic::AtomicBool,
     rec: &mut Option<crate::ai_models::AiRunRecord>,
 ) -> Result<(Vec<u8>, String, String), String> {
     let provider = spec.provider.as_deref().unwrap_or("ollama");
@@ -1394,9 +1399,6 @@ fn run_ai_blocking(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    // タイムアウト: 未指定/0 = 無制限（生成系共通契約 — gen_client）。
-    let client = gen_client(spec.timeout_secs)?;
-
     let mut messages = Vec::new();
     if let Some(s) = system {
         messages.push(serde_json::json!({ "role": "system", "content": s }));
@@ -1407,94 +1409,23 @@ fn run_ai_blocking(
     let (plan, record) = prepare_ai_run(spec, provider, model);
     let r = rec.insert(record);
 
-    let content = if is_openai_compat(provider) {
-        let endpoint = spec
-            .endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("http://localhost:1234/v1")
-            .trim_end_matches('/');
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-        });
-        if let Some(t) = spec.temperature {
-            body["temperature"] = serde_json::json!(t);
+    // 本文は生のまま全部つなぎ、最後に <think> をまとめて落とす（一括時代と同じ結果）。
+    // 別フィールドで来る思考（message.thinking / reasoning_content）は読み捨てて記録だけ。
+    let mut content = String::new();
+    let mut thinking = false;
+    let cancelled = stream_ai_chat(spec, provider, model, &plan, &messages, cancel, &mut |k, t| {
+        match k {
+            ChatChunk::Content => content.push_str(t),
+            ChatChunk::Thinking => thinking = true,
         }
-        // v1.8.9 LM Studio の深さ指定（gpt-oss 等・レベルを受けるモデルだけ）。
-        // v1.9.2 汎用 OpenAI互換もカードで「送る」にしたときは届く（plan_think）。
-        if let Some(e) = &plan.reasoning_effort {
-            body["reasoning_effort"] = serde_json::json!(e);
-        }
-        apply_extra_params(&mut body, spec)?;
-        let resp = client
-            .post(format!("{endpoint}/chat/completions"))
-            .json(&body)
-            .send()
-            .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
-        let status = resp.status();
-        let text = resp.text().map_err(|e| format!("AI応答の読み取りに失敗: {e}"))?;
-        if !status.is_success() {
-            return Err(api_error_text(status, &text));
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("AI応答の解析に失敗: {e}"))?;
-        let msg = &v["choices"][0]["message"];
-        let th = msg["reasoning_content"].as_str().or_else(|| msg["reasoning"].as_str());
-        if th.is_some_and(|t| !t.is_empty()) {
-            r.thinking_returned = true;
-        }
-        msg["content"]
-            .as_str()
-            .ok_or("AI応答に content がありません")?
-            .to_string()
-    } else {
-        let endpoint = spec
-            .endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("http://localhost:11434")
-            .trim_end_matches('/');
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-            // モデルをVRAMに5分常駐 → 連続実行でロード待ちを避ける（効率化）。
-            "keep_alive": "5m",
-            "options": ollama_options(spec),
-        });
-        // v1.8.6 Thinking。変換モードでは思考を捨てるので、本来 think は不要だが、
-        // 思考型モデルは think を渡さないと本文に <think> を混ぜてくる方が多い。
-        // 明示的に分離させたうえで message.thinking を読み捨てるのが確実。
-        // v1.8.9 送る値は能力に応じて plan_think が決める（非対応モデルには送らない）。
-        if let Some(t) = &plan.ollama_think {
-            body["think"] = t.clone();
-        }
-        apply_extra_params(&mut body, spec)?;
-        let resp = client
-            .post(format!("{endpoint}/api/chat"))
-            .json(&body)
-            .send()
-            .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
-        let status = resp.status();
-        let text = resp.text().map_err(|e| format!("AI応答の読み取りに失敗: {e}"))?;
-        if !status.is_success() {
-            // Ollama はエラーを {"error":"..."} で返す
-            return Err(api_error_text(status, &text));
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("AI応答の解析に失敗: {e}"))?;
-        if v["message"]["thinking"].as_str().is_some_and(|t| !t.is_empty()) {
-            r.thinking_returned = true;
-        }
-        v["message"]["content"]
-            .as_str()
-            .ok_or("AI応答に content がありません")?
-            .to_string()
-    };
+    })?;
+    if thinking {
+        r.thinking_returned = true;
+    }
+    if cancelled {
+        // 「中断＝出力は破棄」の既存契約（書きかけは返さない）。
+        return Err("中断されました".into());
+    }
 
     // v1.8.6 変換カードの出力は下流のフィルタが食べる → 思考は必ず落とす。
     // think を解さないサーバや、think を無視して本文に混ぜるモデルへの保険でもある。
@@ -1743,60 +1674,25 @@ fn emit_content(
     }
 }
 
-/// v1.4.1 チャット: ストリーミング応答。messages は system を含む会話履歴全体。
-/// on_token はトークン断片ごとに呼ばれる（UIへ逐次表示する）。完成した本文を返す。
-/// 呼び出し側は tokio 文脈外の素のOSスレッドで実行すること（run_ai と同じ理由 —
-/// reqwest::blocking の内部ランタイム drop パニックを避ける）。cancel で途中停止。
-///
-/// v1.8.6 Thinking: on_token は断片の種別（ChatChunk::Content / Thinking）を受け取る。
-/// 戻り値の本文には **思考は含まれない** — 思考は表示だけして履歴にもログにも残さない、
-/// という方針（コンテキストを食わせない・次ターンへ送らない）をここで保証する。
-#[cfg(test)]
-pub fn run_ai_chat_stream(
+/// v1.11 AI のストリーム受信の本体（対話と変換で共用）。送信本体の組み立て・送信・
+/// SSE / NDJSON の解読までを行い、届いた断片を on_delta へ渡す:
+///   Content ＝本文の生の断片（<think> タグの分離は呼び出し側）
+///   Thinking ＝別フィールドで届いた思考（message.thinking / reasoning_content）
+/// cancel を見たら応答を drop して接続を閉じ Ok(true)（＝中断）を返す。完走は Ok(false)。
+/// tokio 文脈外のスレッドから呼ぶこと（reqwest::blocking）。
+fn stream_ai_chat(
     spec: &FilterSpec,
+    provider: &str,
+    model: &str,
+    plan: &crate::ai_models::ThinkPlan,
     messages: &[serde_json::Value],
     cancel: &std::sync::atomic::AtomicBool,
-    on_token: &mut dyn FnMut(ChatChunk, &str),
-) -> Result<String, String> {
-    run_ai_chat_stream_rec(spec, messages, cancel, on_token, &mut None)
-}
-
-/// v1.8.9 run_ai_chat_stream ＋実行条件の記録（rec は送信前に入る＝失敗時も残る）。
-pub fn run_ai_chat_stream_rec(
-    spec: &FilterSpec,
-    messages: &[serde_json::Value],
-    cancel: &std::sync::atomic::AtomicBool,
-    outer_on_token: &mut dyn FnMut(ChatChunk, &str),
-    rec: &mut Option<crate::ai_models::AiRunRecord>,
-) -> Result<String, String> {
+    on_delta: &mut dyn FnMut(ChatChunk, &str),
+) -> Result<bool, String> {
     use std::io::BufRead;
     use std::sync::atomic::Ordering;
-    let provider = spec.provider.as_deref().unwrap_or("ollama");
-    let model = spec
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or("AIフィルタにモデルが指定されていません")?;
     // ストリーミングは長時間。生成系共通契約（未指定/0 = 無制限・cancel で停止）。
     let client = gen_client(spec.timeout_secs)?;
-
-    // v1.8.9 能力の確認と思考パラメータの決定（記録の雛形はここで rec へ）。
-    let (plan, record) = prepare_ai_run(spec, provider, model);
-    *rec = Some(record);
-    // 応答に思考が含まれていたかを記録する（中身は保存しない）。
-    let saw_thinking = std::cell::Cell::new(false);
-    let mut on_token_rec = |k: ChatChunk, t: &str| {
-        if k == ChatChunk::Thinking {
-            saw_thinking.set(true);
-        }
-        outer_on_token(k, t)
-    };
-    let on_token: &mut dyn FnMut(ChatChunk, &str) = &mut on_token_rec;
-
-    let mut full = String::new();
-    // 本文に混ざる <think>…</think> の分離器（チャンク境界で割れても落とさない）。
-    let mut sp = ThinkSplitter::new();
     if is_openai_compat(provider) {
         // OpenAI準拠: SSE（"data: {...}" 行、終端は [DONE]）
         let endpoint = spec
@@ -1823,6 +1719,9 @@ pub fn run_ai_chat_stream_rec(
             .json(&body)
             .send()
             .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
         if !resp.status().is_success() {
             // v1.8.9 本文の理由まで出す（従来はステータスだけで原因が分からなかった）。
             let status = resp.status();
@@ -1830,7 +1729,7 @@ pub fn run_ai_chat_stream_rec(
         }
         for line in std::io::BufReader::new(resp).lines() {
             if cancel.load(Ordering::Relaxed) {
-                break;
+                return Ok(true); // resp を drop ＝接続を閉じる → サーバ側の生成も止まる
             }
             let line = line.map_err(|e| format!("ストリーム読み取り失敗: {e}"))?;
             let data = match line.trim().strip_prefix("data:") {
@@ -1841,6 +1740,10 @@ pub fn run_ai_chat_stream_rec(
                 break;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                // ストリーム途中のエラー通知（{"error":{"message":…}}）を空応答にしない。
+                if let Some(m) = v["error"]["message"].as_str().or_else(|| v["error"].as_str()) {
+                    return Err(format!("AI APIエラー: {m}"));
+                }
                 let delta = &v["choices"][0]["delta"];
                 // v1.8.6 思考を別フィールドで返すサーバ（LM Studio 等）。キー名は
                 // reasoning_content / reasoning の二派があるので両方見る。
@@ -1849,12 +1752,12 @@ pub fn run_ai_chat_stream_rec(
                     .or_else(|| delta["reasoning"].as_str())
                 {
                     if !th.is_empty() {
-                        on_token(ChatChunk::Thinking, th);
+                        on_delta(ChatChunk::Thinking, th);
                     }
                 }
                 if let Some(tok) = delta["content"].as_str() {
                     if !tok.is_empty() {
-                        emit_content(tok, &mut sp, &mut full, on_token);
+                        on_delta(ChatChunk::Content, tok);
                     }
                 }
             }
@@ -1883,6 +1786,9 @@ pub fn run_ai_chat_stream_rec(
             .json(&body)
             .send()
             .map_err(|e| ai_conn_err(provider, endpoint, &e))?;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
         if !resp.status().is_success() {
             // v1.8.9 本文の理由まで出す（"… does not support thinking" 等）。
             let status = resp.status();
@@ -1890,7 +1796,7 @@ pub fn run_ai_chat_stream_rec(
         }
         for line in std::io::BufReader::new(resp).lines() {
             if cancel.load(Ordering::Relaxed) {
-                break;
+                return Ok(true); // resp を drop ＝接続を閉じる → サーバ側の生成も止まる
             }
             let line = line.map_err(|e| format!("ストリーム読み取り失敗: {e}"))?;
             let line = line.trim();
@@ -1904,12 +1810,12 @@ pub fn run_ai_chat_stream_rec(
                 // v1.8.6 思考は message.thinking に分かれて来る（think 指定時）。
                 if let Some(th) = v["message"]["thinking"].as_str() {
                     if !th.is_empty() {
-                        on_token(ChatChunk::Thinking, th);
+                        on_delta(ChatChunk::Thinking, th);
                     }
                 }
                 if let Some(tok) = v["message"]["content"].as_str() {
                     if !tok.is_empty() {
-                        emit_content(tok, &mut sp, &mut full, on_token);
+                        on_delta(ChatChunk::Content, tok);
                     }
                 }
                 if v["done"].as_bool().unwrap_or(false) {
@@ -1918,6 +1824,64 @@ pub fn run_ai_chat_stream_rec(
             }
         }
     }
+    Ok(false)
+}
+
+/// v1.4.1 チャット: ストリーミング応答。messages は system を含む会話履歴全体。
+/// on_token はトークン断片ごとに呼ばれる（UIへ逐次表示する）。完成した本文を返す。
+/// 呼び出し側は tokio 文脈外の素のOSスレッドで実行すること（run_ai と同じ理由 —
+/// reqwest::blocking の内部ランタイム drop パニックを避ける）。cancel で途中停止。
+///
+/// v1.8.6 Thinking: on_token は断片の種別（ChatChunk::Content / Thinking）を受け取る。
+/// 戻り値の本文には **思考は含まれない** — 思考は表示だけして履歴にもログにも残さない、
+/// という方針（コンテキストを食わせない・次ターンへ送らない）をここで保証する。
+#[cfg(test)]
+pub fn run_ai_chat_stream(
+    spec: &FilterSpec,
+    messages: &[serde_json::Value],
+    cancel: &std::sync::atomic::AtomicBool,
+    on_token: &mut dyn FnMut(ChatChunk, &str),
+) -> Result<String, String> {
+    run_ai_chat_stream_rec(spec, messages, cancel, on_token, &mut None)
+}
+
+/// v1.8.9 run_ai_chat_stream ＋実行条件の記録（rec は送信前に入る＝失敗時も残る）。
+pub fn run_ai_chat_stream_rec(
+    spec: &FilterSpec,
+    messages: &[serde_json::Value],
+    cancel: &std::sync::atomic::AtomicBool,
+    outer_on_token: &mut dyn FnMut(ChatChunk, &str),
+    rec: &mut Option<crate::ai_models::AiRunRecord>,
+) -> Result<String, String> {
+    let provider = spec.provider.as_deref().unwrap_or("ollama");
+    let model = spec
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("AIフィルタにモデルが指定されていません")?;
+
+    // v1.8.9 能力の確認と思考パラメータの決定（記録の雛形はここで rec へ）。
+    let (plan, record) = prepare_ai_run(spec, provider, model);
+    *rec = Some(record);
+    // 応答に思考が含まれていたかを記録する（中身は保存しない）。
+    let saw_thinking = std::cell::Cell::new(false);
+    let mut on_token_rec = |k: ChatChunk, t: &str| {
+        if k == ChatChunk::Thinking {
+            saw_thinking.set(true);
+        }
+        outer_on_token(k, t)
+    };
+    let on_token: &mut dyn FnMut(ChatChunk, &str) = &mut on_token_rec;
+
+    let mut full = String::new();
+    // 本文に混ざる <think>…</think> の分離器（チャンク境界で割れても落とさない）。
+    let mut sp = ThinkSplitter::new();
+    // 中断時は書きかけまでを返す（対話の既存挙動。呼び出し側が cancel を見て扱う）。
+    stream_ai_chat(spec, provider, model, &plan, messages, cancel, &mut |k, t| match k {
+        ChatChunk::Content => emit_content(t, &mut sp, &mut full, on_token),
+        ChatChunk::Thinking => on_token(ChatChunk::Thinking, t),
+    })?;
     // 保留中の端切れ（未完のタグ・中断時の書きかけ）を取りこぼさない。
     if let Some((kind, t)) = sp.flush() {
         if kind == ChatChunk::Content {
@@ -2510,6 +2474,47 @@ mod tests {
     // 同期 run_ai を呼ぶ。修正前はここで reqwest::blocking の内部ランタイム drop が
     // 「Cannot drop a runtime in a context where blocking is not allowed」でパニックして
     // アプリごと落ちた。thread::scope で素のOSスレッドに逃がす修正が効いていれば通る。
+    // v1.11 変換モードの中断: 長い生成の途中で cancel を立てると、応答の完走を待たずに
+    // 数秒で Err("中断されました") が返ること。実行:
+    // `cargo test --lib -- --ignored ai_live_transform_cancel --nocapture`
+    // （モデルは TEXOS_TEST_MODEL で差し替え可・既定 gemma4:latest）
+    #[test]
+    #[ignore = "ライブOllamaが必要"]
+    fn ai_live_transform_cancel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let model = std::env::var("TEXOS_TEST_MODEL").unwrap_or("gemma4:latest".into());
+        let s = spec(&format!(r#"{{"builtin":"ai","provider":"ollama","model":"{model}"}}"#));
+        // 先に1回走らせてモデルをロードしておく（ロード待ちと生成中の中断を区別する）。
+        // 思考型モデルなら思考が本文から落ちていること（thinking_returned で確認）も見える。
+        let mut wrec = None;
+        let (warm, _, _) =
+            run_ai_rec(&s, "「はい」とだけ答えよ。".as_bytes(), &AtomicBool::new(false), &mut wrec)
+                .unwrap();
+        let warm = String::from_utf8_lossy(&warm).into_owned();
+        eprintln!("ウォームアップ: {} / 思考={}", warm.trim(), wrec.unwrap().thinking_returned);
+        assert!(!warm.contains("<think"), "思考が本文に混ざった");
+        let cancel = AtomicBool::new(false);
+        let mut rec = None;
+        let t0 = std::time::Instant::now();
+        let res = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            run_ai_rec(
+                &s,
+                "日本の歴史を縄文時代から令和まで、各時代5000字以上で詳しく書け。".as_bytes(),
+                &cancel,
+                &mut rec,
+            )
+        });
+        let after_cancel = t0.elapsed().as_secs_f32() - 3.0;
+        eprintln!("中断要求から {after_cancel:.2} 秒で戻った: {res:?}");
+        assert!(after_cancel < 3.0, "中断が遅い: {after_cancel:.1} 秒");
+        assert_eq!(res.err().as_deref(), Some("中断されました"));
+        assert!(rec.is_some(), "中断時も実行条件の記録は残る");
+    }
+
     #[test]
     #[ignore = "ライブOllamaが必要"]
     fn ai_inside_tokio_runtime_does_not_panic() {
@@ -2695,7 +2700,7 @@ mod tests {
             ));
             let mut rec = None;
             let t = std::time::Instant::now();
-            let out = run_ai_rec(&s, "17*23は？答えの数字だけ".as_bytes(), &mut rec);
+            let out = run_ai_rec(&s, "17*23は？答えの数字だけ".as_bytes(), &std::sync::atomic::AtomicBool::new(false), &mut rec);
             let rec = rec.unwrap();
             eprintln!("{extra:70} {:>5.1}s think={} sent={:?} → {:?}", t.elapsed().as_secs_f32(), rec.thinking_returned, rec.sent, out.as_ref().map(|o| String::from_utf8_lossy(&o.0).trim().to_string()));
             (out, rec)

@@ -1025,7 +1025,7 @@ mod tests {
         let spec: crate::flow::FilterSpec =
             serde_json::from_str(r#"{"builtin":"ai","model":"gemma3:latest","think":"on"}"#).unwrap();
         let mut rec = None;
-        let out = crate::flow::run_ai_rec(&spec, "1+1は？数字だけ".as_bytes(), &mut rec).unwrap();
+        let out = crate::flow::run_ai_rec(&spec, "1+1は？数字だけ".as_bytes(), &std::sync::atomic::AtomicBool::new(false), &mut rec).unwrap();
         let rec = rec.unwrap();
         eprintln!("gemma3: {} / {:?}", String::from_utf8_lossy(&out.0), rec);
         assert_eq!(rec.sent.think, None);
@@ -1041,7 +1041,7 @@ mod tests {
         )
         .unwrap();
         let mut rec = None;
-        let out = crate::flow::run_ai_rec(&spec, "17*23は？答えだけ".as_bytes(), &mut rec).unwrap();
+        let out = crate::flow::run_ai_rec(&spec, "17*23は？答えだけ".as_bytes(), &std::sync::atomic::AtomicBool::new(false), &mut rec).unwrap();
         let rec = rec.unwrap();
         eprintln!("gpt-oss: {} / {:?}", String::from_utf8_lossy(&out.0), rec);
         assert_eq!(rec.sent.reasoning_effort.as_deref(), Some("medium"), "「使う」は medium");

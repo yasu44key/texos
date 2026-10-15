@@ -219,13 +219,14 @@ pub(crate) fn execute_node(
             // v1.4.0 AIフィルタは builtin だがネットワークを使う別経路（同期blocking）。
             // v1.8.9 実行条件（digest・能力・実際に送ったパラメータ）を成否に関わらず記録。
             let mut rec = None;
-            let res = flow::run_ai_rec(spec, inputs[0].0, &mut rec);
+            // v1.11 cancel を渡す＝受信中に中断されれば接続を閉じて即 Err（応答完走を待たない）。
+            let res = flow::run_ai_rec(spec, inputs[0].0, cancel, &mut rec);
             if let Some(r) = rec {
                 job.trace.ai(card, r);
             }
             let (bytes, ext, mime) = res?;
-            // v1.5.1 WS-B: 実行中に中断された場合は応答を破棄する（HTTP は途中で切れないため
-            // 完走後にここで判定。「中断＝出力は破棄」の既存契約に合わせる）。
+            // v1.5.1 WS-B: 完走と中断がすれ違った場合も応答を破棄する
+            // （「中断＝出力は破棄」の既存契約に合わせる）。
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err("中断されました".into());
             }

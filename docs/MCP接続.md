@@ -224,9 +224,12 @@ claude mcp add texos --scope user -e PYTHONUTF8=1 -- python C:\Users\yoshi\dev\t
 
 ### 未確認・注意
 
-- **AI 変換カードの中断は即時ではない。** `cancel_job` は UI の中断ボタンと同じ処理だが、AI 変換
-  （`flow.rs: run_ai_rec`）は一括 HTTP 呼び出しで途中に中断フラグを見ないため、LLM の応答が返るまで
-  止まらない（実測：中断要求から 53 秒で `cancelled`）。既存の挙動で、MCP 固有ではない。
+- **AI 変換カードの中断**（解決済み）: `cancel_job` は UI の中断ボタンと同じ処理。当初 AI 変換
+  （`flow.rs: run_ai_rec`）は一括 HTTP 呼び出しで中断フラグを見ず、LLM の応答が返るまで止まらなかった
+  （実測：中断要求から 53 秒で `cancelled`）。受信をストリームにして行ごとに中断を見るよう修正
+  （対話と共通の `stream_ai_chat`）。ライブ Ollama で中断要求から 0.1 秒未満で戻ることを確認
+  （`cargo test --lib -- --ignored ai_live_transform_cancel`）。残る隙間は「最初の1トークンが出るまで」
+  （長い入力の読み込み中）で、その間は最初の行が届いた時点で止まる。
   外部プログラムは既存の監視ループがツリーごと止める（今回 MCP からは外部プログラムカードを作れないため実機未確認）。
 - **AI エンドポイントは同時1つ・超過は即拒否**（既存の資源セマフォ）。AI を使う実行が走っている間に
   別の AI 実行を始めると、その段は「使用中です」で `completed_with_errors` になる。実測で確認。
