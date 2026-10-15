@@ -2528,6 +2528,20 @@ pub(crate) fn run_flow(
 /// ジョブ台帳への登録・job:started/done/failed の emit まで含む＝呼び出し元はスレッドに
 /// 乗せるだけでパネル表示と Stop-all が効く。
 pub(crate) fn run_flow_for(id: &str, app: &tauri::AppHandle) -> Result<FlowReport, String> {
+    run_flow_job(id, app, None, |_| {})
+}
+
+/// run_flow_for の拡張（v1.11 MCP 接続）。
+/// - `expect_root`: 指定されていれば、終端カードを読む同じ短ロックの中で「いま開いている
+///   プロジェクト」がそれと一致することを確かめる（不一致はエラー・ジョブを作らない）。
+///   照合と登録の間にプロジェクトが切り替わっても別プロジェクトで走らない。
+/// - `on_registered`: ジョブ台帳に載った直後に1回呼ぶ（非同期実行の呼び出し元へ job を渡す）。
+pub(crate) fn run_flow_job(
+    id: &str,
+    app: &tauri::AppHandle,
+    expect_root: Option<&Path>,
+    on_registered: impl FnOnce(&std::sync::Arc<Job>),
+) -> Result<FlowReport, String> {
     use tauri::Manager;
     let state: State<AppState> = app.state();
     let id = id.to_string();
@@ -2539,6 +2553,11 @@ pub(crate) fn run_flow_for(id: &str, app: &tauri::AppHandle) -> Result<FlowRepor
     // それ以外の op（トリガ/タイマ/ウォッチャ/IN）は run_flow の終端にしない。
     let (fx, fy, flabel, fref, root): (f64, f64, String, Option<String>, PathBuf) =
         with_db(state.inner(), |p| {
+            if let Some(want) = expect_root {
+                if !crate::mcp_bridge::same_root(&p.root, want) {
+                    return Err(crate::mcp_bridge::PROJECT_MISMATCH.into());
+                }
+            }
             let (fx, fy, flabel, fref): (f64, f64, String, Option<String>) = p
                 .conn
                 .query_row(
@@ -2567,6 +2586,7 @@ pub(crate) fn run_flow_for(id: &str, app: &tauri::AppHandle) -> Result<FlowRepor
         .jobs
         .register_flow(&id, &flabel, &root.to_string_lossy())?;
     let _guard = JobGuard::new(&state.jobs, job.id);
+    on_registered(&job);
     // v1.8.7 実行トレース: ログの書き出し名（日時_ラベル_job）をここで確定する。
     job.trace.begin_run(&root, &flabel, job.id);
     // card 付き（パネルが録音対応/停止コマンドを spec から引く）。

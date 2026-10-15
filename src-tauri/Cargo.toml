@@ -75,6 +75,9 @@ windows = { version = "0.61", features = [
   "Win32_System_JobObjects",
   "Win32_System_Memory",
   "Win32_System_Ole",
+  # v1.11 MCP 接続: ローカル IPC（名前付きパイプ）。ConnectNamedPipe の引数型が IO 側。
+  "Win32_System_IO",
+  "Win32_System_Pipes",
   # v1.4.28 WS3: GlobalMemoryStatusEx（RAM 総量検出）。
   "Win32_System_SystemInformation",
   "Win32_System_SystemServices",

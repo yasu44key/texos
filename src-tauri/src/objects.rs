@@ -177,6 +177,11 @@ pub(crate) fn list_objects(state: State<AppState>) -> Result<Vec<VirtualBodyInfo
         Some(p) => p,
         None => return Ok(vec![]),
     };
+    list_objects_in(p)
+}
+
+/// list_objects の本体（v1.11 MCP 接続と共用）。
+pub(crate) fn list_objects_in(p: &Project) -> Result<Vec<VirtualBodyInfo>, String> {
     let mut stmt = p
         .conn
         .prepare(
@@ -437,13 +442,18 @@ pub(crate) fn save_card_thumbnail(
 pub(crate) fn move_object(id: String, x: f64, y: f64, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    move_object_in(p, &id, x, y)?;
+    Ok(())
+}
+
+/// move_object の本体。返り値＝更新した行数。
+pub(crate) fn move_object_in(p: &Project, id: &str, x: f64, y: f64) -> Result<usize, String> {
     p.conn
         .execute(
             "UPDATE virtual_bodies SET pos_x = ?1, pos_y = ?2 WHERE id = ?3",
             rusqlite::params![x, y, id],
         )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize)]
@@ -1592,11 +1602,21 @@ pub(crate) fn create_relation(
     kind: Option<String>,
     state: State<AppState>,
 ) -> Result<Option<i64>, String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    create_relation_in(p, from_id, to_id, kind)
+}
+
+/// create_relation の本体（v1.11 MCP 接続と共用）。返り値 None＝同じ矢印が既にある。
+pub(crate) fn create_relation_in(
+    p: &Project,
+    from_id: String,
+    to_id: String,
+    kind: Option<String>,
+) -> Result<Option<i64>, String> {
     if from_id == to_id {
         return Err("cannot link an object to itself".into());
     }
-    let guard = state.current.lock().unwrap();
-    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     // v1.4 オートフロー⑤: フィルタカードに入る/出る矢印は自動的にフロー
     // （新しい矢印種のUIは作らない — 確定方針1）。
     let kind = kind.unwrap_or_else(|| {
@@ -1711,6 +1731,10 @@ pub(crate) fn list_relations(state: State<AppState>) -> Result<Vec<RelationInfo>
         Some(p) => p,
         None => return Ok(vec![]),
     };
+    list_relations_in(p)
+}
+
+pub(crate) fn list_relations_in(p: &Project) -> Result<Vec<RelationInfo>, String> {
     let mut stmt = p
         .conn
         // Soft-deleted cards keep their relation rows (for restore); hide
@@ -1755,6 +1779,18 @@ pub(crate) fn set_relation_attrs(
 ) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    set_relation_attrs_in(p, id, when, carry, port, role)
+}
+
+/// set_relation_attrs の本体（v1.11 MCP 接続と共用）。
+pub(crate) fn set_relation_attrs_in(
+    p: &Project,
+    id: i64,
+    when: Option<String>,
+    carry: Option<String>,
+    port: Option<i64>,
+    role: Option<String>,
+) -> Result<(), String> {
     let cur: Option<String> = p
         .conn
         .query_row(
@@ -1888,14 +1924,18 @@ pub(crate) fn set_input_order(relation_ids: Vec<i64>, state: State<AppState>) ->
 pub(crate) fn delete_relation(id: i64, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-    // v1.3.2: soft delete（restore_relation で復活）。
+    delete_relation_in(p, id)?;
+    Ok(())
+}
+
+/// delete_relation の本体。v1.3.2: soft delete（restore_relation で復活）。返り値＝更新した行数。
+pub(crate) fn delete_relation_in(p: &Project, id: i64) -> Result<usize, String> {
     p.conn
         .execute(
             "UPDATE relations SET deleted_at = ?1 WHERE id = ?2",
             rusqlite::params![db::now_ms(), id],
         )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 /// v1.3.2: 矢印リンクの復活の呪文 (Ctrl+Z)。

@@ -33,6 +33,8 @@ export interface MenuActions {
   showTrace: (id: string, label: string) => void;
   // v1.8.7 デバッグモード（実行ログに中身・stderr まで記録）のトグル。
   toggleDebugTrace: () => void;
+  // v1.11 MCP 接続（AIエージェントからの操作口）の有効/無効トグル。
+  toggleMcp: () => void;
   // v1.8.7 途中出力スイッチ（emit_mid）: パイプラインの途中でも出力をキャンバスへ出す。
   toggleEmitMid: (id: string, currentSpec: string) => void;
   // v1.5.5: タイマ/ウォッチャの稼働/停止トグル（構成中の誤発火防止スイッチ）。
@@ -1053,6 +1055,8 @@ interface CanvasMenuCtx {
   showReqArrows: boolean;
   /// v1.8.7: デバッグモード（実行ログの詳細記録）のオン/オフ（トグル表示用）。
   debugTrace: boolean;
+  /// v1.11: MCP 接続（AIエージェントからの操作口）のオン/オフ（トグル表示用）。
+  mcpEnabled: boolean;
 }
 
 // v1.4.16: UIカラーの連続比較用サブメニュー。選んでもメニューは閉じず（keepOpen）、
@@ -1716,6 +1720,13 @@ export function buildCanvasMenu(
       label: (ctx.debugTrace ? "✓ " : "　") + "デバッグモード（実行ログに中身を記録）",
       hint: "オンにすると、フロー実行時に各カードが受け取った入力・出した結果の中身（テキスト先頭4KB）や外部コマンドの stderr までログに残します。カード右クリック「実行ログを見る」で確認できます。オフでも成否・所要時間・データ名は記録されます。",
       onClick: () => a.toggleDebugTrace(),
+    },
+    {
+      // v1.11 MCP 接続: 同じPCの AI エージェント（Claude Code 等）から、開いているプロジェクトの
+      // カード作成・配線・実行を受け付ける。既定オフ。オフにすると口ごと閉じる。
+      label: (ctx.mcpEnabled ? "✓ " : "　") + "AIエージェント接続（MCP）を受け付ける",
+      hint: "オンにすると、同じPCの AI エージェント（Claude Code 等）が MCP 経由でこのプロジェクトのカードを作成・配線・実行できます。ネットワークには公開しません（名前付きパイプ＋トークン）。外部プログラムを呼ぶフローを実行されることがあるので、使うときだけオンにしてください。",
+      onClick: () => a.toggleMcp(),
     },
 
     {

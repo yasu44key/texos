@@ -150,9 +150,20 @@ pub(crate) fn create_op_card(
     y: f64,
     state: &AppState,
 ) -> Result<String, String> {
-    parse_op_spec(&spec)?;
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    create_op_card_in(p, label, spec, x, y)
+}
+
+/// create_op_card の本体（v1.11 MCP 接続と共用）。
+pub(crate) fn create_op_card_in(
+    p: &Project,
+    label: String,
+    spec: String,
+    x: f64,
+    y: f64,
+) -> Result<String, String> {
+    parse_op_spec(&spec)?;
     p.conn
         .execute(
             "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
@@ -174,9 +185,14 @@ pub(crate) fn create_op_card(
 
 /// op カードの spec 更新（update_filter から委譲）。
 pub(crate) fn update_op_card(id: &str, spec: &str, state: &AppState) -> Result<(), String> {
-    parse_op_spec(spec)?;
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    update_op_card_in(p, id, spec)
+}
+
+/// update_op_card の本体（v1.11 MCP 接続と共用）。
+pub(crate) fn update_op_card_in(p: &Project, id: &str, spec: &str) -> Result<(), String> {
+    parse_op_spec(spec)?;
     let n = p
         .conn
         .execute(

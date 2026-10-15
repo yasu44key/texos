@@ -27,9 +27,23 @@ pub(crate) fn create_filter(
     if ops::is_op_spec(&spec) {
         return ops::create_op_card(label, spec, x, y, state.inner());
     }
-    flow::parse_spec(&spec)?; // 保存前に検証（壊れたJSONをDBに入れない）
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    create_filter_in(p, label, spec, x, y)
+}
+
+/// create_filter の本体（v1.11 MCP 接続と共用）。op の spec も受けて kind='op' で作る。
+pub(crate) fn create_filter_in(
+    p: &Project,
+    label: String,
+    spec: String,
+    x: f64,
+    y: f64,
+) -> Result<String, String> {
+    if ops::is_op_spec(&spec) {
+        return ops::create_op_card_in(p, label, spec, x, y);
+    }
+    flow::parse_spec(&spec)?; // 保存前に検証（壊れたJSONをDBに入れない）
     // sentinel real body (URLカードと同じ方式: 全フィルタカードで共有)
     let real_id = "filter:sentinel".to_string();
     p.conn
@@ -436,9 +450,17 @@ pub(crate) fn update_filter(id: String, spec: String, state: State<AppState>) ->
     if ops::is_op_spec(&spec) {
         return ops::update_op_card(&id, &spec, state.inner());
     }
-    flow::parse_spec(&spec)?;
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    update_filter_in(p, &id, &spec)
+}
+
+/// update_filter の本体（v1.11 MCP 接続と共用）。op の spec は op カードへ。
+pub(crate) fn update_filter_in(p: &Project, id: &str, spec: &str) -> Result<(), String> {
+    if ops::is_op_spec(spec) {
+        return ops::update_op_card_in(p, id, spec);
+    }
+    flow::parse_spec(spec)?;
     let n = p
         .conn
         .execute(

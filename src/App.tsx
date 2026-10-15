@@ -176,6 +176,13 @@ function App() {
   useEffect(() => {
     void invoke("set_trace_detail", { on: debugTrace }).catch(() => {});
   }, [debugTrace]);
+  // v1.11 MCP 接続（AIエージェントからの操作口）: 正本はバックエンドの設定（config.json）。
+  const [mcpEnabled, setMcpEnabled] = useState<boolean>(false);
+  useEffect(() => {
+    invoke<{ enabled: boolean }>("mcp_status")
+      .then((s) => setMcpEnabled(s.enabled))
+      .catch(() => {});
+  }, []);
 
   // v1.8.7: カードの実行ログダイアログ（trace=null は「まだ記録なし」）。
   const [traceDlg, setTraceDlg] = useState<{ label: string; trace: CardTrace | null } | null>(null);
@@ -588,6 +595,25 @@ function App() {
     loadStacks,
     clearHistory,
   } = useUndo({ objectsRef, notesRef, shapesRef, setObjects, setNotes, setShapes, refresh });
+
+  // v1.11 MCP 接続: エージェントが加えた変更を面へ反映する。同じプロジェクトを開いているときだけ、
+  // UI 操作と同じ UNDO 記録を積み（作成→削除・移動→元の位置・切断→復活）、結果カードは緑シグナル。
+  useEffect(() => {
+    let alive = true;
+    let un: (() => void) | null = null;
+    void listen<{ project: string; undo: UndoAction[]; touched: string[] }>("mcp:changed", (e) => {
+      if (projectPathRef.current !== e.payload.project) return;
+      if (e.payload.undo?.length) pushUndo(e.payload.undo);
+      if (e.payload.touched?.length) {
+        setTouched((prev) => new Set([...prev, ...e.payload.touched]));
+      }
+      void refresh();
+    }).then((u) => (alive ? (un = u) : u()));
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, [pushUndo, refresh]);
 
   // Windows: swap in the custom OLE drop target (files + URL drops).
   useEffect(() => {
@@ -5979,6 +6005,18 @@ function App() {
               })
             );
         },
+        toggleMcp: () => {
+          invoke<{ enabled: boolean; endpoint?: string | null }>("mcp_set_enabled", { on: !mcpEnabled })
+            .then((st) => setMcpEnabled(st.enabled))
+            .catch((e) =>
+              setConfirm({
+                title: "MCP 接続を切り替えられませんでした",
+                message: String(e),
+                okLabel: "OK",
+                onConfirm: () => setConfirm(null),
+              })
+            );
+        },
         toggleDebugTrace: () =>
           setDebugTrace((v) => {
             const nv = !v;
@@ -6166,6 +6204,7 @@ function App() {
             shapeSnap,
             showReqArrows,
             debugTrace,
+            mcpEnabled,
           },
           actions
         );
@@ -6258,6 +6297,7 @@ function App() {
       showCardHints,
       shapeSnap,
       debugTrace,
+      mcpEnabled,
       handleShowTrace,
       expanded,
       notes,

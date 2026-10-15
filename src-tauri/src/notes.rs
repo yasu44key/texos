@@ -15,6 +15,11 @@ use tauri::{Emitter, Manager, State};
 pub(crate) fn create_note(text: String, x: f64, y: f64, state: State<AppState>) -> Result<String, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    create_note_in(p, text, x, y)
+}
+
+/// create_note の本体（v1.11 MCP 接続: UI と MCP が同じ処理を呼ぶため State ロックと分離）。
+pub(crate) fn create_note_in(p: &Project, text: String, x: f64, y: f64) -> Result<String, String> {
     let id = uuid();
     p.conn
         .execute(
@@ -86,6 +91,10 @@ pub(crate) fn list_notes(state: State<AppState>) -> Result<Vec<NoteInfo>, String
         Some(p) => p,
         None => return Ok(vec![]),
     };
+    list_notes_in(p)
+}
+
+pub(crate) fn list_notes_in(p: &Project) -> Result<Vec<NoteInfo>, String> {
     let mut stmt = p
         .conn
         .prepare(
@@ -119,26 +128,36 @@ pub(crate) fn list_notes(state: State<AppState>) -> Result<Vec<NoteInfo>, String
 pub(crate) fn update_note(id: String, text: String, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    update_note_in(p, &id, &text)?;
+    Ok(())
+}
+
+/// update_note の本体。返り値＝更新した行数（0＝その付箋は無い）。
+pub(crate) fn update_note_in(p: &Project, id: &str, text: &str) -> Result<usize, String> {
     p.conn
         .execute(
             "UPDATE virtual_bodies SET note_text = ?1, label = ?2 WHERE id = ?3 AND kind = 'note'",
-            rusqlite::params![text, note_label(&text), id],
+            rusqlite::params![text, note_label(text), id],
         )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub(crate) fn move_note(id: String, x: f64, y: f64, state: State<AppState>) -> Result<(), String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    move_note_in(p, &id, x, y)?;
+    Ok(())
+}
+
+/// move_note の本体。返り値＝更新した行数。
+pub(crate) fn move_note_in(p: &Project, id: &str, x: f64, y: f64) -> Result<usize, String> {
     p.conn
         .execute(
             "UPDATE virtual_bodies SET pos_x = ?1, pos_y = ?2 WHERE id = ?3 AND kind = 'note'",
             rusqlite::params![x, y, id],
         )
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -362,6 +381,10 @@ pub struct ViewText {
 pub(crate) fn read_view_text(id: String, state: State<AppState>) -> Result<ViewText, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    read_view_text_in(p, &id)
+}
+
+pub(crate) fn read_view_text_in(p: &Project, id: &str) -> Result<ViewText, String> {
     let real_id: String = p
         .conn
         .query_row(
@@ -370,7 +393,7 @@ pub(crate) fn read_view_text(id: String, state: State<AppState>) -> Result<ViewT
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    let src = resolve_view_path(p, &id, &real_id);
+    let src = resolve_view_path(p, id, &real_id);
     let bytes = std::fs::read(&src).map_err(|e| e.to_string())?;
     let (text, encoding) = decode_text_bytes(&bytes);
     Ok(ViewText { text, encoding })

@@ -103,6 +103,8 @@ pub struct Job {
     pub t23d_active: std::sync::atomic::AtomicBool,
     /// job:progress のスロットル（~10/s・凍結 §11.6）用の最終 emit 時刻。
     pub progress_at: Mutex<std::time::Instant>,
+    /// v1.11 MCP 接続: 最新の進捗（note, percent）。イベントを購読できない外部（get_job）が読む。
+    pub progress: Mutex<(Option<String>, Option<u32>)>,
     /// v1.8.7 実行トレース: このジョブで評価したノードの記録（終了時に .texos/logs へ）。
     pub trace: Trace,
 }
@@ -149,6 +151,7 @@ impl Jobs {
             t2i_active: std::sync::atomic::AtomicBool::new(false),
             t23d_active: std::sync::atomic::AtomicBool::new(false),
             progress_at: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            progress: Mutex::new((None, None)),
             trace: Trace::new(),
         })
     }
@@ -263,6 +266,15 @@ pub(crate) fn emit_job_progress(
     percent: Option<u32>,
 ) {
     use tauri::Emitter;
+    {
+        let mut cur = job.progress.lock().unwrap();
+        if let Some(n) = note {
+            cur.0 = Some(n.to_string());
+        }
+        if percent.is_some() {
+            cur.1 = percent;
+        }
+    }
     {
         let mut last = job.progress_at.lock().unwrap();
         let now = std::time::Instant::now();
@@ -542,6 +554,9 @@ struct Config {
     /// v2.0 t23d: 現在選択中の 3D モデル名（既定 hunyuan3d-2）。
     #[serde(default)]
     t23d_model: Option<String>,
+    /// v1.11 MCP 接続（AIエージェントからの操作口）。既定オフ＝口を開かない。
+    #[serde(default)]
+    mcp_enabled: bool,
 }
 #[derive(Serialize)]
 pub struct ProjectInfo {
@@ -654,6 +669,8 @@ mod trace;
 pub(crate) use trace::*;
 // v1.10: 音声反射カード（op:"voice"）。glob 再エクスポートせず crate::voice:: で参照。
 mod voice;
+// v1.11: MCP 接続（AIエージェントからの操作口・ローカル IPC）。crate::mcp_bridge:: で参照。
+mod mcp_bridge;
 pub(crate) use ai::*;
 pub(crate) use clipboard_in::*;
 pub(crate) use filters::*;
@@ -707,6 +724,8 @@ pub fn run() {
             // v1.5.4 WS-P2: オペ層スケジューラ（タイマ/ウォッチャの発火判定・tick 1秒・
             // 現在開いているプロジェクトの op カードだけが対象）。
             start_op_scheduler(app.handle().clone());
+            // v1.11 MCP 接続: 設定でオンのときだけローカル IPC の口を開く（既定オフ）。
+            mcp_bridge::init(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -893,6 +912,8 @@ pub fn run() {
             set_shape_z,
             delete_shape,
             os_icon::get_os_icon,
+            mcp_bridge::mcp_status,
+            mcp_bridge::mcp_set_enabled,
             install_drop_target
         ])
         .run(tauri::generate_context!())
