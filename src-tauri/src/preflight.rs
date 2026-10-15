@@ -527,7 +527,9 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
                 continue; // 空のドロップポイント（中身が入るまで保留）
             }
             // v1.7 P2: URLカードは url_ref 文字列を text/plain で供給する（実行契約）。
-            if from.mime == crate::project::URL_MIME {
+            // 付箋（kind='note'）も本文を text/plain で供給する（実身センチネルの
+            // text/vnd.texos.note ではなく実行時の型で照合。App.tsx invalidFlowIds と同じ規則）。
+            if from.mime == crate::project::URL_MIME || from.kind == "note" {
                 "text/plain".into()
             } else {
                 from.mime.clone()
@@ -1110,6 +1112,30 @@ mod tests {
             vec![("img", "grep")],
         );
         let f = inspect(&g, Path::new(""), Path::new("."), Path::new("."));
+        assert!(f.iter().any(|x| x.category == "型不一致"));
+    }
+
+    #[test]
+    fn note_supplies_text_plain() {
+        // 付箋は実行時に本文を text/plain で供給する（実身センチネルの text/vnd.texos.note ではない）。
+        // text/plain 厳密受入には通り、image/* 受入には型不一致。
+        let ok = graph_of(
+            vec![
+                node("n", "付箋", "note", None, "text/vnd.texos.note"),
+                node("f", "F", "filter", Some(r#"{"builtin":"text_grep","accept_mime":"text/plain"}"#), ""),
+            ],
+            vec![("n", "f")],
+        );
+        let f = inspect(&ok, Path::new(""), Path::new("."), Path::new("."));
+        assert!(!f.iter().any(|x| x.category == "型不一致"));
+        let ng = graph_of(
+            vec![
+                node("n", "付箋", "note", None, "text/vnd.texos.note"),
+                node("f", "F", "filter", Some(r#"{"builtin":"text_grep","accept_mime":"image/*"}"#), ""),
+            ],
+            vec![("n", "f")],
+        );
+        let f = inspect(&ng, Path::new(""), Path::new("."), Path::new("."));
         assert!(f.iter().any(|x| x.category == "型不一致"));
     }
 
