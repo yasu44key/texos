@@ -6437,8 +6437,9 @@ function App() {
   // v1.4 オートフロー: 接続時型チェック（確定方針3）。フィルタへ入る flow 矢印の
   // 入力MIMEが accept_mime に合わない場合は赤矢印で警告（実行前に分かる）。
   // 上流がフィルタなら「そのフィルタの出力MIME」で照合（連鎖対応）。
-  // 空のドロップポイントは保留（中身が入った時点で判定）。付箋は入力不可＝赤。
+  // 空のドロップポイントは保留（中身が入った時点で判定）。
   const objById = new Map(objects.map((o) => [o.id, o]));
+  const noteIds = new Set(notes.map((n) => n.id));
   const invalidFlowIds = new Set<number>();
   for (const r of relations) {
     if (r.kind !== "flow") continue;
@@ -6450,9 +6451,15 @@ function App() {
     } catch {
       /* 壊れた定義は全受け入れ扱い（実行時にエラーで分かる） */
     }
+    // v1.4.17 以降、付箋は list_notes 側（objects に居ない）。付箋は本文を text/plain で
+    // 供給する定数カード（実行契約。バックエンド preflight.rs の型特例と同じ規則を保つこと）。
+    if (noteIds.has(r.from_id)) {
+      if (!mimeMatches(accept, "text/plain")) invalidFlowIds.add(r.id);
+      continue;
+    }
     const src = objById.get(r.from_id);
     if (!src) {
-      invalidFlowIds.add(r.id); // 付箋など、フロー入力にできないノード
+      invalidFlowIds.add(r.id); // フロー入力にできない（見つからない）ノード
       continue;
     }
     if (src.kind === "filter" || src.filter_ref) {
