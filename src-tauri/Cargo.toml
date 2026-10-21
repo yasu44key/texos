@@ -2,7 +2,7 @@
 name = "texos"
 version = "1.11.2"
 description = "TexoS - 織り紡ぐ者たち"
-authors = ["you"]
+authors = ["Yoshiki Yasunaga"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

@@ -1,7 +1,90 @@
-# Tauri + React + Typescript
+# TexoS（織り紡ぐ者たち）
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+ファイル・画像・テキスト・URL を「カード」としてキャンバスに置き、矢印で関係を結んで考えるための
+データ駆動型の思考ツール（Windows デスクトップアプリ）。
+アプリがデータを抱え込むのではなく、データが主役。矢印でつないだカードは、そのまま
+**押せば動く処理の流れ（フロー）** にもなる — テキスト処理・AI・画像生成・Web 取得までを、
+カードを並べるだけで組み立てられる。
 
-## Recommended IDE Setup
+![キャンバス](docs/images/03_canvas_overview.png)
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- 対応: Windows 10 / 11（x64）
+- 作者: 安永ヨシキ（X: @YasunagaYoshiki） & Claude Code
+- ライセンス: MIT
+- 技術: Tauri 2 + React / TypeScript + Rust（SQLite）
+
+## インストール
+
+1. [Releases](https://github.com/yasu44key/texos/releases) から `texos_<版>_x64-setup.exe` をダウンロードして実行
+2. 起動したら「＋ 新規プロジェクト」で空のフォルダを選ぶ（プロジェクトは1つのフォルダに自己完結し、
+   フォルダごとコピーすれば別の PC にも持ち運べる）
+3. ファイルをウィンドウにドラッグ＆ドロップして始める。操作は [docs/MANUAL.md](docs/MANUAL.md)
+
+**TexoS 単体では追加のインストールは要らない。** テキスト処理・連結・差分・画像のリサイズと形式変換・
+文字コード変換・Web 取得は内蔵で動く。AI や音声認識などは、使いたくなった分だけ足す
+（入手先と導入方法は [docs/外部依存プログラム一覧.md](docs/外部依存プログラム一覧.md)。
+Ollama・ffmpeg・Whisper などはアプリが導入を案内する）。
+
+## 主な機能
+
+- **キャンバス** — ファイル・画像・音声・動画・PDF・Office 文書・3D モデル・URL をカードとして配置。
+  ダブルクリックでその場でプレビュー・テキスト編集。付箋（コメント）、図形によるグループ化、
+  整列・スナップ、検索（Ctrl+F）、Undo/Redo、ゴミ箱。位置と倍率はプロジェクトごとに自動保存
+- **非破壊の取り込み** — 取り込んだ元ファイルは触らない「仮身（参照）」として扱い、編集した時点で
+  プロジェクト内の「実身」になる。カードの状態は色ドットで一目でわかる。一時閲覧は使い捨てコピーで安全に
+- **オートフロー** — カードを矢印でつなぐと処理の流れになり、▶ で実行。データの型（MIME）を見て
+  つなぎ間違いを知らせる。並行実行・背景ジョブパネル・中断、実行せずに検査する運用前評価
+- **内蔵カード** — grep・置換・head/tail・sort・cut・連結・diff・paste などの Unix 流テキスト処理、
+  文字コード変換、画像のリサイズ・形式変換、読み上げ、選択・分岐（select / tap）、
+  人に判断を仰ぐ（ask）、納得するまで練り直す（loop）
+- **外部プログラム・シェルカード** — 手持ちのコマンドラインツール、コマンドプロンプト / PowerShell、
+  C / Java / Python などをカードとして組み込む。プログラムをプロジェクトに同梱して持ち運べる
+- **AI カード** — Ollama・LM Studio・OpenAI 互換サーバーの LLM で変換・対話。思考の表示、
+  モデルの得意分野に合わせた選択、GPU に載るなら GPU を使う
+- **生成カード** — 内蔵の画像生成（Text-To-Image、NVIDIA GPU）と ComfyUI ワークフローの実行、
+  画像から 3D モデル生成（Hunyuan3D-2）と 3D ビューア
+- **情報収集** — Web ページの取得・スクリーンショット、RSS/Atom から記事カード群、
+  Web 検索（SearXNG）、URL のカード化と更新の追跡
+- **音声** — 音声の文字起こし（Whisper）、話しかけるとフローが動いて結果を声で返す音声反射カード
+- **発行系** — トリガ・タイマ・フォルダの監視でフローを自動で起動
+- **モジュールと共有** — 組んだフローをロックしてモジュール化、IN/OUT で部品として再利用、
+  ライブラリに保存してプロジェクト間で共有。サブプロジェクトの内包・分岐・リンク
+- **記法カード** — キャンバスを人と AI の共通の記法として使う（Markdown のコードブロックなど）
+- **ドラッグアウト** — カードを Explorer や他のアプリへそのまま渡す。クリップボードの出し入れ
+- **AI エージェント接続（MCP）** — 起動中の TexoS を、同じ PC の AI エージェント（Claude Code など）が
+  MCP 経由で操作できる。カード・矢印の作成から実行・結果の取得まで。既定はオフ、
+  ネットワークには出さない（名前付きパイプ＋トークン）。詳しくは [docs/MCP接続.md](docs/MCP接続.md)
+
+## ドキュメント
+
+- [docs/MANUAL.md](docs/MANUAL.md) — 簡易マニュアル（画面と基本操作）
+- [docs/更新履歴.md](docs/更新履歴.md) — バージョンごとの変更点
+- [docs/外部依存プログラム一覧.md](docs/外部依存プログラム一覧.md) — 外部ツールの入手先と導入方法
+- [docs/ユーザーズチップス.md](docs/ユーザーズチップス.md) — フィルタ（カード）の組み方のレシピ
+- [docs/AIエージェント向け_フロー構築規約.md](docs/AIエージェント向け_フロー構築規約.md) —
+  AI にフローを組ませるときに添付する規約（足場は `scripts/texos_flow.py` / `scripts/texos_dryrun.py`）
+- [docs/カード化プログラム作成規約.md](docs/カード化プログラム作成規約.md) — 自作プログラムをカードにする規約
+
+`docs/` にはこのほか、各バージョンの設計メモ・検討記録をそのまま残している。
+
+## ブランチ
+
+- `main` — 開発版。次のバージョンの作業が入る
+- `v1.11-stable` など `v*-stable` — リリース版。大きな改変はここから分けて別のリリースにする
+
+## ソースからビルド
+
+[Rust](https://www.rust-lang.org/)・[Node.js](https://nodejs.org/)・Tauri 2 の
+[前提環境](https://v2.tauri.app/start/prerequisites/)（WebView2・MSVC ビルドツール）が必要。
+
+```bash
+npm install
+npm run tauri dev      # 開発起動
+npm run tauri build    # インストーラ（NSIS）を作る
+```
+
+## ライセンス
+
+- TexoS（このリポジトリ）は **MIT** です（[LICENSE](LICENSE)）
+- AI モデル・画像生成モデル・ffmpeg・Whisper・ComfyUI などの外部プログラムやモデルは TexoS に**含まれていません**。
+  それぞれのライセンスに従って各自で入手してください
