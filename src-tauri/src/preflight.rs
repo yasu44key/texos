@@ -738,6 +738,7 @@ fn inspect_dependencies(g: &Graph, app_data: &Path, filters_dir: &Path, f: &mut 
                     }
                 }
             }
+            flow::NodeKind::T2i if crate::comfy::is_comfy(&spec) => {}
             flow::NodeKind::T2i => {
                 if !t2i_checked {
                     t2i_checked = true;

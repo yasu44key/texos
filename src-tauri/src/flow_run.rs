@@ -237,8 +237,11 @@ pub(crate) fn execute_node(
             // 集約ノードなので inputs に複数（プロンプト＋元画像）が来る。AI 同様ネットワーク別経路。
             let mut prompt: Option<&[u8]> = None;
             let mut init: Option<&[u8]> = None;
+            // ComfyUI バックエンドは画像を複数受ける（image_1, image_2 … へ矢印順に）。
+            let mut images: Vec<&[u8]> = Vec::new();
             for (bytes, _ext, mime) in inputs {
                 if mime.starts_with("image/") {
+                    images.push(*bytes);
                     if init.is_none() {
                         init = Some(*bytes);
                     }
@@ -263,6 +266,30 @@ pub(crate) fn execute_node(
                     )
                 }
             };
+            // ComfyUI バックエンド: 外部の ComfyUI に投げる。中断は job.cancel をポーリング中に見て
+            // 自分の prompt_id だけ /interrupt する（自前デーモンの /cancel は使わない）。
+            if crate::comfy::is_comfy(spec) {
+                // VRAM 排他（設計メモ §4-2）: ローカルの ComfyUI を使う前に自前デーモンを下ろす。
+                if crate::comfy::is_local(&crate::comfy::effective_endpoint(spec)) {
+                    free_own_gpu_daemons();
+                }
+                let prompt = String::from_utf8_lossy(prompt).to_string();
+                let r = crate::comfy::run(spec, &prompt, &images, cancel)?;
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("中断されました".into());
+                }
+                let mut stderr = format!("ComfyUI seed={}", r.seed);
+                for n in &r.notes {
+                    stderr.push_str(&format!("\n注意: {n}"));
+                }
+                return Ok(NodeRun {
+                    outputs: vec![(r.bytes, r.ext, r.mime, None, None)],
+                    exit_code: None,
+                    stderr,
+                });
+            }
+            // 自前デーモンで生成する前に、ローカルの ComfyUI が握っている VRAM を空けさせる。
+            crate::comfy::free_local();
             // v1.5.2 WS-C: 生成 HTTP 中だけ t2i_active を点灯 — break_flow はこれを見て
             // デーモンへ /cancel を送る（並行時に他ジョブの生成を誤って止めない）。
             job.t2i_active.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -292,6 +319,7 @@ pub(crate) fn execute_node(
             )?;
             // t2i と同じ契約: 生成 HTTP 中だけ点灯 — break_flow はこれを見てデーモンへ
             // /cancel を送る（並行時に他ジョブの生成を誤って止めない）。
+            crate::comfy::free_local(); // ローカル ComfyUI の VRAM を空けさせる（排他）
             job.t23d_active.store(true, std::sync::atomic::Ordering::Relaxed);
             let run = flow::run_t23d(spec, image);
             job.t23d_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -421,6 +449,7 @@ fn acquire_node_permits(
     // 2) ai（AI/T2i）: 正規化エンドポイント単位（既定許可数1）。
     let endpoint = match kind {
         NodeKind::Ai => Some(flow::effective_ai_endpoint(spec)),
+        NodeKind::T2i if crate::comfy::is_comfy(spec) => Some(crate::comfy::effective_endpoint(spec)),
         NodeKind::T2i => Some(format!("http://127.0.0.1:{}", flow::T2I_PORT)),
         NodeKind::T23d => Some(format!("http://127.0.0.1:{}", flow::T23D_PORT)),
         _ => None,
@@ -437,7 +466,11 @@ fn acquire_node_permits(
     // 2.5) gpu（v1.7.2 t23d）: t2i / t23d は単一 VRAM を取り合うため生成を直列化する
     //（生成カード群企画 §3 の GPU 資源・粒度は「生成中だけロック」。texture 込みの t23d は
     // 16GB 常駐なので、SDXL 等との同時実行は共倒れになる）。超過は ai と同じ即拒否。
-    if matches!(kind, NodeKind::T2i | NodeKind::T23d) {
+    // ComfyUI が別の PC にあるなら、この PC の GPU は使わない＝gpu 枠を取らない。
+    let remote_comfy = kind == NodeKind::T2i
+        && crate::comfy::is_comfy(spec)
+        && !crate::comfy::is_local(&crate::comfy::effective_endpoint(spec));
+    if matches!(kind, NodeKind::T2i | NodeKind::T23d) && !remote_comfy {
         permits.push(state.resources.gpu.try_acquire().ok_or_else(|| {
             "GPU は使用中です。実行中の画像生成・3D生成の完了を待つか中断してください"
                 .to_string()
@@ -452,6 +485,18 @@ fn acquire_node_permits(
         permits.push(p);
     }
     Ok(permits)
+}
+
+/// ComfyUI（ローカル）で生成する前に、TexoS 自前の GPU 常駐デーモン（t2i / t23d）を下ろす
+/// （VRAM 排他・docs/ComfyUIバックエンド設計.md §4-2）。自前デーモンには外から解放する口が無いので
+/// 停止で代用する（次に自前で生成するときは ensure_server が起こし直す）。
+fn free_own_gpu_daemons() {
+    if crate::runtime::t2i::t2i_running() {
+        crate::runtime::t2i::t2i_kill_on_port();
+    }
+    if crate::runtime::t23d::t23d_running() {
+        crate::runtime::t23d::t23d_kill_on_port();
+    }
 }
 
 /// v1.7 P2: 取得系譜（URLカード→取得実身・relations kind='fetched'）。
@@ -2650,7 +2695,7 @@ fn run_flow_inner(
 
     // v1.5 Text-To-Image: 終端が t2i カードなら生成デーモンを先に起こしておく（▶実行を
     // 「ただ押せば動く」に）。best-effort — 起動できなければ run_t2i が分かりやすく案内する。
-    if term_spec.node_kind() == flow::NodeKind::T2i {
+    if term_spec.node_kind() == flow::NodeKind::T2i && !crate::comfy::is_comfy(&term_spec) {
         let _ = t2i_ensure_server(&state.app_data, state.inner());
     }
     // v2.0 t23d: 同じく終端が t23d ならデーモンを先に起こす（best-effort）。

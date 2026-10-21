@@ -33,7 +33,7 @@ arboard = "3"
 regex = "1"
 # v1.4.0 AIフィルタ（builtin:"ai"）: Ollama/OpenAI準拠への同期HTTP。
 # v1.4.8 で rustls-tls を追加（Whisper 自動導入の GitHub/HuggingFace ダウンロードが https のため）。
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 # v1.4.8: whisper.cpp リリース zip（Windowsバイナリ）の展開用。
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # v1.4.13: 仮身（読み取り専用閲覧）の非UTF-8テキストをデコードして表示する。

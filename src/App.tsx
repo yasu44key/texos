@@ -6951,6 +6951,19 @@ function App() {
       {t2iSetup && (
         <T2iSetupDialog
           onCancel={() => setT2iSetup(null)}
+          onUseComfy={() => {
+            const dlg = t2iSetup;
+            setT2iSetup(null);
+            setT2iDlg({
+              id: null,
+              label: "画像生成",
+              spec: JSON.stringify({ builtin: "t2i", backend: "comfyui", accept_mime: "*/*", output_ext: "png" }),
+              models: [],
+              known: [],
+              assets: { loras: [], embeddings: [], vae: [] },
+              create: { x: dlg.x, y: dlg.y, linkFrom: dlg.linkFrom },
+            });
+          }}
           onReady={(s) => {
             const dlg = t2iSetup;
             setT2iSetup(null);

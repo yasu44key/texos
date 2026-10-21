@@ -1,4 +1,5 @@
 mod cas;
+mod comfy;
 #[cfg(windows)]
 mod clipboard_out;
 mod db;
@@ -859,6 +860,8 @@ pub fn run() {
             t2i_reveal_model_dir,
             t2i_delete_model,
             t2i_inspect,
+            comfy::comfy_check,
+            comfy::comfy_analyze,
             save_card_thumbnail,
             t23d_status,
             t23d_set_engine,

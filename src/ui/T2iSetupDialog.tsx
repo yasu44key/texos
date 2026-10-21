@@ -83,9 +83,11 @@ interface Props {
   onCancel: () => void;
   /** 準備完了（依存OK＋モデル1つ以上＋サーバー稼働）で押せる。最新 status を渡す。 */
   onReady: (status: T2iStatus) => void;
+  /** 自前エンジンを整えずに外部の ComfyUI で作る（docs/ComfyUIバックエンド設計.md）。 */
+  onUseComfy?: () => void;
 }
 
-export function T2iSetupDialog({ onCancel, onReady }: Props) {
+export function T2iSetupDialog({ onCancel, onReady, onUseComfy }: Props) {
   const [st, setSt] = useState<T2iStatus | null>(null);
   const [spec, setSpec] = useState<SpecInfo | null>(null);
   const [model, setModel] = useState("sd1.5");
@@ -639,6 +641,11 @@ export function T2iSetupDialog({ onCancel, onReady }: Props) {
         )}
 
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+          {onUseComfy && (
+            <button style={{ ...btnGhost, marginRight: "auto" }} onClick={onUseComfy} title="起動中の ComfyUI にワークフローを投げて生成する">
+              ComfyUI で作る（外部サーバ）…
+            </button>
+          )}
           <button style={btnGhost} onClick={onCancel}>
             閉じる
           </button>

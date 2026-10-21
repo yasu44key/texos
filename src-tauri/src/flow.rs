@@ -204,6 +204,20 @@ pub struct FilterSpec {
     /// Clip skip（A1111 流。1=スキップなし・2=penultimate。SD/SDXL のみ有効）。
     #[serde(default)]
     pub clip_skip: Option<u32>,
+    // --- ComfyUI バックエンド（docs/ComfyUIバックエンド設計.md）。`endpoint` は AI と共用
+    //     （空＝http://127.0.0.1:8188）。lora/vae/sampler/clip_skip はワークフロー側の責務で使わない。---
+    /// t2i の生成バックエンド。未指定 / "diffusers"＝自前デーモン、"comfyui"＝外部 ComfyUI。
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// ComfyUI の API 形式ワークフロー JSON（UI 形式は取り込み時に拒否）。
+    #[serde(default)]
+    pub comfy_workflow: Option<serde_json::Value>,
+    /// 差し込み口（slot → ノード/入力）。
+    #[serde(default)]
+    pub comfy_bindings: Option<Vec<crate::comfy::ComfyBinding>>,
+    /// 画像を取り出す出力ノード ID（空＝outputs の最初の画像）。
+    #[serde(default)]
+    pub comfy_output: Option<String>,
     /// v1.4.17 インラインパネルの追加プロンプト。接続テキスト入力の後ろに ", " で連結される。
     /// 入力が無ければこれ単独がプロンプトになる（パネルだけで生成できる）。
     #[serde(default)]

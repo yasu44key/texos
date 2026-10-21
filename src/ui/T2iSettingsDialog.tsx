@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ComfyT2iForm } from "./ComfyT2iForm";
 
 // v1.5 Text-To-Image（builtin:"t2i"）のパラメータ設定ダイアログ。
 // AiSettingsDialog と同じ流儀＝新規作成・既存編集で共通。プロンプト本体は接続した
@@ -26,6 +27,8 @@ export interface T2iSpec {
   output_ext?: string;
   /** v1.4.17 インラインパネルの追加プロンプト。編集はパネル側（ここではパススルー保持のみ）。 */
   prompt?: string;
+  /** 生成エンジン。未指定＝内蔵 diffusers デーモン、"comfyui"＝外部 ComfyUI（ComfyT2iForm）。 */
+  backend?: string;
 }
 
 // サンプラー選択肢（t2i_server.py の SAMPLERS と対応）。空＝モデル既定(DPM++)。
@@ -47,9 +50,11 @@ interface Props {
   onSave: (label: string, spec: string) => void;
   /** モデル取得などのセットアップを開く（未取得時の導線）。 */
   onOpenSetup?: () => void;
+  /** 新規作成で最初から ComfyUI を選んでおく（セットアップの「ComfyUI で作る」から）。 */
+  initialBackend?: "comfyui";
 }
 
-export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [], assets = { loras: [], embeddings: [], vae: [] }, onCancel, onSave, onOpenSetup }: Props) {
+export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [], assets = { loras: [], embeddings: [], vae: [] }, onCancel, onSave, onOpenSetup, initialBackend }: Props) {
   const init: T2iSpec = (() => {
     try {
       return { ...(JSON.parse(initialSpec) as T2iSpec) };
@@ -59,6 +64,7 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
   })();
 
   const [label, setLabel] = useState(initialLabel);
+  const [backend, setBackend] = useState(init.backend === "comfyui" || initialBackend === "comfyui" ? "comfyui" : "diffusers");
   const [model, setModel] = useState(init.model || models[0] || "sd1.5");
   const [negative, setNegative] = useState(init.negative ?? "");
   const [steps, setSteps] = useState(String(init.steps ?? 25));
@@ -150,6 +156,28 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
     onSave(label.trim() || "画像生成", JSON.stringify(spec));
   };
 
+  if (backend === "comfyui") {
+    return (
+      <div style={overlay} onMouseDown={onCancel}>
+        <div onMouseDown={(e) => e.stopPropagation()} style={{ ...panel, width: 620 }}>
+          <div style={{ fontSize: 15, marginBottom: 4, textAlign: "center" }}>画像生成（ComfyUI）の設定</div>
+          <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginBottom: 14, textAlign: "center" }}>
+            接続したテキスト（プロンプト）・画像 → ComfyUI のワークフロー → 画像（PNG実身）。
+          </div>
+          <ComfyT2iForm
+            init={init as unknown as Record<string, unknown>}
+            label={label}
+            setLabel={setLabel}
+            onCancel={onCancel}
+            onSave={onSave}
+            onSwitchBackend={() => setBackend("diffusers")}
+            styles={{ row, lab, inp, cell, cellRow, cellLab, cellInp, note, btn, btnGhost, linkBtn }}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={overlay} onMouseDown={onCancel}>
       <div onMouseDown={(e) => e.stopPropagation()} style={panel}>
@@ -163,6 +191,14 @@ export function T2iSettingsDialog({ initialLabel, initialSpec, models, known = [
         <label style={row}>
           <span style={lab}>表示名</span>
           <input style={inp} value={label} onChange={(e) => setLabel(e.target.value)} />
+        </label>
+
+        <label style={row}>
+          <span style={lab}>生成エンジン</span>
+          <select style={inp} value="diffusers" onChange={(e) => e.target.value === "comfyui" && setBackend("comfyui")}>
+            <option value="diffusers">TexoS 内蔵（diffusers デーモン）</option>
+            <option value="comfyui">ComfyUI（外部サーバ）</option>
+          </select>
         </label>
 
         <label style={row}>
