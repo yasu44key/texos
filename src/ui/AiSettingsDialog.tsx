@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SpecInfo } from "./T2iSetupDialog";
 
@@ -56,10 +56,6 @@ const DEFAULT_ENDPOINT: Record<Server, string> = {
   openai: "http://localhost:1234/v1",
 };
 
-/// 既定エンドポイントのいずれか（＝ユーザーが自分で決めた宛先ではない）か。
-/// サーバー切替時にこれを消して既定に戻す＝「LM Studio にしたのに宛先は 11434 のまま」を防ぐ。
-const isDefaultEndpoint = (v: string) =>
-  Object.values(DEFAULT_ENDPOINT).includes(v.trim().replace(/\/+$/, ""));
 
 // v1.8.9 モデル能力（バックエンド ai_models::ModelInfo の写し）。
 // 能力は「機能の有無」であり、精度・品質は表さない（表示でも品質を示唆しない）。
@@ -159,11 +155,15 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
   const [provider, setProvider] = useState<Server>(parseServer(base[K("provider")]));
   const [endpoint, setEndpoint] = useState(s(K("endpoint")));
 
-  // サーバーを替えたら、宛先が「前のサーバーの既定」のままなら空に戻す（＝新しい既定が効く）。
-  // 手で入れた宛先（遠隔・別ポート）は尊重して残す。
+  // サーバーを替えたら、宛先も新しいサーバーの既定に切り替えて欄に見せる（2026-10-24 ユーザー:
+  // Strata の 8080 を入れたまま Ollama に替えると宛先が残った）。この画面で一度使ったサーバーへ戻したときは、
+  // そのサーバーで使っていた宛先（遠隔・別ポート）を戻す＝手で入れた宛先を失わない。
+  const endpointMemo = useRef<Partial<Record<Server, string>>>({});
   const changeServer = (next: Server) => {
+    if (next === provider) return;
+    endpointMemo.current[provider] = endpoint;
     setProvider(next);
-    setEndpoint((cur) => (isDefaultEndpoint(cur) ? "" : cur));
+    setEndpoint(endpointMemo.current[next] || DEFAULT_ENDPOINT[next]);
   };
   const [model, setModel] = useState(s(K("model"), "gemma3:latest"));
   const [system, setSystem] = useState(s("system"));
