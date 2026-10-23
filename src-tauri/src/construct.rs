@@ -152,6 +152,43 @@ fn bottom_of(p: &Project) -> f64 {
     (cards + 160.0).max(shapes)
 }
 
+/// この PC 固有の値を埋める（texos_plan.py PRESETS の {{WHISPER_CLI}} {{WHISPER_MODEL}} {{MIC_DEVICE}}）。
+/// 見つからないものは注意として返す（カードは置く＝導入したあと設定を直せば動く）。
+fn resolve_presets(app_data: &Path, c: &mut Checked) -> Vec<String> {
+    let mut notes = Vec::new();
+    let uses = |key: &str| c.cards.iter().any(|k| k.spec.as_ref().map(|s| s.to_string().contains(key)).unwrap_or(false));
+    let (need_whisper, need_mic) = (uses("{{WHISPER_"), uses("{{MIC_DEVICE}}"));
+    let cli = whisper_cli_path(app_data);
+    let model_name = read_config(app_data).whisper_model.unwrap_or_else(|| "small".to_string());
+    let model = whisper_models_dir(app_data).join(format!("ggml-{model_name}.bin"));
+    if need_whisper && !(cli.is_file() && model.is_file()) {
+        notes.push("Whisper が未導入です。メニュー「Whisper 文字起こし」で導入してから、このカードを置き直すか設定の path・cmd を直してください".into());
+    }
+    let mic = if need_mic { proc::list_audio_devices().ok().and_then(|d| d.into_iter().next()) } else { None };
+    if need_mic && mic.is_none() {
+        notes.push("マイクが見つかりません（ffmpeg で dshow の音声デバイスを列挙できない）。録音カードの cmd の audio= を直してください".into());
+    }
+    let (cli_s, model_s) = (cli.to_string_lossy().to_string(), model.to_string_lossy().to_string());
+    for k in c.cards.iter_mut() {
+        let Some(spec) = k.spec.as_mut().and_then(|s| s.as_object_mut()) else { continue };
+        for key in ["path", "cmd"] {
+            if let Some(v) = spec.get(key).and_then(|v| v.as_str()).map(str::to_string) {
+                let mut v = v.replace("{{WHISPER_CLI}}", &cli_s).replace("{{WHISPER_MODEL}}", &model_s);
+                if let Some(m) = &mic {
+                    v = v.replace("{{MIC_DEVICE}}", m);
+                }
+                spec.insert(key.into(), serde_json::Value::String(v));
+            }
+        }
+        if spec.get("record").and_then(|r| r.as_bool()) == Some(true) {
+            let dev = mic.clone().unwrap_or_else(|| "（マイク名）".into());
+            spec.insert("note".into(), serde_json::Value::String(format!(
+                "マイク録音（{dev}）。▶実行で録音開始 → 実行中パネルの「停止」で終了し WAV を確定（16kHz mono・Whisper 直結可）。")));
+        }
+    }
+    notes
+}
+
 struct Placed {
     objects: Vec<String>,
     notes: Vec<String>,
@@ -356,7 +393,7 @@ pub(crate) fn run_construct(
             "検査で次の問題が見つかりました。直した設計図の JSON 全体をもう一度出してください。\n{}",
             problems.iter().map(|e| format!("- {e}")).collect::<Vec<_>>().join("\n")) }));
     }
-    let Some((checked, plan)) = last else {
+    let Some((mut checked, plan)) = last else {
         let md = format!("# 構築できませんでした\n\n## 依頼\n\n{request}\n\n## 検査の記録\n\n{}\n", log.join("\n"));
         return EvalOut {
             payloads: vec![payload(md, &stem)],
@@ -367,6 +404,8 @@ pub(crate) fn run_construct(
             failed_inputs: vec![],
         };
     };
+    let preset_notes = resolve_presets(&app_data, &mut checked);
+    checked.warnings.extend(preset_notes);
     let draft = xs(&extra, "apply") == Some("draft");
     // 冒頭の1文＝結果（音声カードはレポートの最初の段落を読み上げる・計画 §5 ③）。
     let run_names: Vec<String> = checked.terminals.iter().map(|(l, _)| format!("「{l}」")).collect();

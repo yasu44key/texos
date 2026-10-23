@@ -37,6 +37,24 @@ CARD_CALLS = {
 # 設計図の作法として書かせない引数（座標は並べる側・幅などは見た目）。
 DROP_KEYS = {"call", "id", "x", "y"}
 
+# この PC 固有の値（Whisper の場所・モデル・マイク名）が要るカード。AI には名前だけ書かせ、
+# 中身は TexoS の UI と同じ設定にする（App.tsx whisperSpec / to_wav16k / mic_record:）。
+# {{WHISPER_CLI}} {{WHISPER_MODEL}} {{MIC_DEVICE}} は並べる側（construct.rs resolve_presets）が埋める。
+PRESETS = {
+    "whisper": lambda c: dict(
+        name="whisper-cli.exe", path="{{WHISPER_CLI}}", mode="command",
+        cmd='-m "{{WHISPER_MODEL}}" -f {in} -otxt -of {out_noext} -l ' + str(c.get("lang") or "ja"),
+        output_ext="txt", accept_mime="audio/*", timeout_secs=1800),
+    "to_wav16k": lambda c: dict(
+        name="ffmpeg.exe", mode="command", cmd="-y -i {in} -ar 16000 -ac 1 -vn {out}",
+        output_ext="wav", accept_mime="audio/*", timeout_secs=600),
+    "mic_record": lambda c: dict(
+        name="ffmpeg.exe", mode="generator",
+        cmd='-hide_banner -f dshow -i "audio={{MIC_DEVICE}}" -ar 16000 -ac 1 -y {out}',
+        output_ext="wav", accept_mime="audio/*", timeout_secs=0),
+}
+PRESET_EXTRA = {"mic_record": {"record": True, "stop_cmd": "q"}}
+
 
 def layout(cards, edges):
     """矢印の深さで列（左→右）、同じ深さは置いた順に縦。戻り矢印（previous）は辿らない。"""
@@ -99,9 +117,25 @@ def main():
             except BuildError as e:
                 errors.append(f"{where}: {e}")
             continue
+        if name in PRESETS:
+            cid_key = c.get("id")
+            if not cid_key or cid_key in ids:
+                errors.append(f"{where}: id が無いか重複しています（{cid_key!r}）")
+                continue
+            if "label" not in c:
+                errors.append(f"{where}（{cid_key}）: {name} には label が要ります")
+                continue
+            kw = PRESETS[name](c)
+            if c.get("prefix"):
+                kw["prefix"] = c["prefix"]
+            vid = p.program(c["label"], 0, 0, **kw)
+            p._cards[vid]["spec"].update(PRESET_EXTRA.get(name, {}))
+            ids[cid_key] = vid
+            keys[vid] = cid_key
+            continue
         if name not in CARD_CALLS:
             errors.append(f"{where}: call「{name}」は使えません（使えるもの: "
-                          f"{', '.join(list(CARD_CALLS) + ['flow'])}）")
+                          f"{', '.join(list(CARD_CALLS) + list(PRESETS) + ['flow'])}）")
             continue
         cid_key = c.get("id")
         if not cid_key or cid_key in ids:

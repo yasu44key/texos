@@ -39,7 +39,20 @@
 - Web: `web_search`（入力テキスト＝検索語 → 結果一覧 Markdown）・`web_fetch`（入力の URL → 本文 Markdown）・
   `web_feed`（RSS → 記事カード）・`web_capture`（URL → PNG）・`to_url`（テキスト中の URL → URL カード）
 - 画像: `img_resize`（`width`）・`img_convert`（`format`）
-- 読み上げ: `speak`（入力を声で読む・出力なし）
+- 読み上げ: `speak`（入力テキストを声で読む・出力なし）
+
+### 音声（専用の call — この PC の Whisper・マイクの設定は TexoS が入れる）
+
+| call | 引数 | 何をするカードか |
+|---|---|---|
+| `mic_record` | `label` | マイク録音。▶ で録音開始 → 実行中パネルの「停止」で WAV を確定（入力なし） |
+| `whisper` | `label`, [`lang`（既定 `ja`）], [`prefix`] | Whisper 文字起こし。**音声の入力**（WAV）→ テキスト |
+| `to_wav16k` | `label` | 音声・動画を Whisper 用の WAV（16kHz mono）に変換（m4a・mp4 などを Whisper に通すとき前に挟む） |
+
+- **付箋（note）や file では音声を作れない。** 付箋が運ぶのはテキストだけ。マイクから話すなら `mic_record` を最上流に置く。
+- **人があとでファイルをつなぐ入口は `op_in`**（IN カード）。手元の音声・動画ファイルを使う依頼なら
+  `op_in`（label 例「ここに音声ファイルをつなぐ」）→ `to_wav16k` → `whisper` と組む。`mic_record` を代わりに置かない。
+  画像・文書など他のファイルも同じ（入口は `op_in`）。
 
 ## 守る決まり（破ると検査で差し戻される）
 
@@ -57,6 +70,22 @@
    Windows に `awk` `sed` `grep` `sh` は無い — テキスト処理は内蔵（builtin）を使う。
 6. 矢印を循環させない（反復は `loop` を使う）。
 7. 依頼に書かれていない URL・ファイルパス・コマンドを作らない。分からない値は付箋に「（ここに入力）」と書いて残す。
+
+## 例0: 話した日本語を英訳して読み上げる
+
+```json
+{ "title": "日本語音声の英訳読み上げ",
+  "calls": [
+    { "call": "mic_record", "id": "rec", "label": "マイク録音" },
+    { "call": "whisper", "id": "stt", "label": "Whisper 文字起こし" },
+    { "call": "note", "id": "role", "text": "役割：翻訳者\n日本語を自然な英語に訳し、英語だけを出す" },
+    { "call": "ai", "id": "en", "label": "英語に翻訳", "prefix": "英訳" },
+    { "call": "builtin", "id": "say", "label": "英語を読み上げる", "name": "speak" },
+    { "call": "flow", "from": "rec", "to": "stt" },
+    { "call": "flow", "from": "stt", "to": "en" },
+    { "call": "flow", "from": "role", "to": "en", "role": "system" },
+    { "call": "flow", "from": "en", "to": "say" } ] }
+```
 
 ## 例1: Web で調べてレポートにまとめる
 
