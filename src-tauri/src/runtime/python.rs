@@ -152,7 +152,7 @@ fn check_deps(py: &str) -> Result<bool, ()> {
 }
 
 /// PATH のシステム Python（python / py / python3）を探す。戻り値は sys.executable。
-fn find_system_python() -> Option<String> {
+pub(crate) fn find_system_python() -> Option<String> {
     for cand in ["python", "py", "python3"] {
         let mut c = std::process::Command::new(cand);
         c.args(["-c", "import sys; sys.stdout.write(sys.executable)"]);

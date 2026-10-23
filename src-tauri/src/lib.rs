@@ -108,6 +108,9 @@ pub struct Job {
     pub progress: Mutex<(Option<String>, Option<u32>)>,
     /// v1.8.7 実行トレース: このジョブで評価したノードの記録（終了時に .texos/logs へ）。
     pub trace: Trace,
+    /// v1.12 ①: 音声カードから発火したときの依頼文（(カードid, 本文)）。そのカードの入力収集で
+    /// 差し込む（flow_run.rs inject_prompt）。受け皿ファイルを経由せずに AI カードへ届ける。
+    pub prompt: Mutex<Option<(String, String)>>,
 }
 
 /// list_jobs の返却行（背景ジョブパネルの復元用）。
@@ -154,6 +157,7 @@ impl Jobs {
             progress_at: Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(1)),
             progress: Mutex::new((None, None)),
             trace: Trace::new(),
+            prompt: Mutex::new(None),
         })
     }
     /// Chat の登録（排他なし — 同一エンドポイントの同時実行は ai セマフォが拒否する）。
@@ -670,6 +674,10 @@ mod trace;
 pub(crate) use trace::*;
 // v1.10: 音声反射カード（op:"voice"）。glob 再エクスポートせず crate::voice:: で参照。
 mod voice;
+// v1.12: 思考役（Strata → LM Studio）。声の窓口から使う。crate::thinker:: で参照。
+mod thinker;
+// v1.12 ④: コンストラクタ（builtin:"construct"）。crate::construct:: で参照。
+mod construct;
 // v1.11: MCP 接続（AIエージェントからの操作口・ローカル IPC）。crate::mcp_bridge:: で参照。
 mod mcp_bridge;
 pub(crate) use ai::*;

@@ -833,19 +833,62 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
           "頼まれたものを実行します。「メモして」→ 話す →「以上」のような区切りも会話の流れで判断します（「リセット」で会話を消去）。" +
           "AI が応答しないときは文字照合で続けます。口述モードでは使いません。",
       },
+      // v1.12 思考役（docs/V1.12_声の窓口と思考役計画.md）。voice.rs thinker_conf が読む。
       {
-        key: "ai_model",
-        label: "判定に使うモデル（Ollama）",
-        type: "text",
-        default: "gemma4:latest",
-        hint: "軽いモデルほど速い。稼働開始のときに読み込んでおきます（30分保持）。",
+        key: "think_backend",
+        label: "思考役（じっくり考える問いの回し先）",
+        type: "select",
+        default: "auto",
+        options: [
+          { value: "auto", label: "自動（Strata → 止まっていれば LM Studio）" },
+          { value: "strata", label: "Strata だけ" },
+          { value: "lmstudio", label: "LM Studio だけ" },
+          { value: "off", label: "使わない（その場の返事だけ）" },
+        ],
+        hint:
+          "重い問いは窓口が「考えておきます」と返して思考役へ回し、答えの要約を後から声で報告します（全文は発話ログの隣の 思考.md）。" +
+          "考えている間も会話は続けられます。Claude へは自動では回しません。",
       },
       {
-        key: "ai_endpoint",
-        label: "Ollama のアドレス",
+        key: "think_words",
+        label: "思考役へ回す合図の言葉",
+        type: "text",
+        asList: true,
+        default: "よく考えて,じっくり,詳しく,比べて,比較して,調べて,検討して",
+        hint: "AI がその場で答えようとしても、これらを含む発話は思考役へ回します（応答用の軽いモデルは自分で答えがちなため）。カンマ区切り。",
+      },
+      {
+        key: "think_effort",
+        label: "Strata の思考の深さ",
+        type: "select",
+        default: "medium",
+        options: [
+          { value: "low", label: "浅い（速い）" },
+          { value: "medium", label: "ふつう" },
+          { value: "high", label: "深い（遅い）" },
+        ],
+      },
+      {
+        key: "lmstudio_model",
+        label: "LM Studio で使うモデル",
         type: "text",
         optional: true,
-        placeholder: "空欄=http://localhost:11434",
+        placeholder: "空欄=読み込み済みの最初のモデル",
+        hint: "読み込み済みのモデルだけを使います（未読み込みのモデルを勝手に載せることはしません）。",
+      },
+      {
+        key: "strata_endpoint",
+        label: "Strata のアドレス",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=http://127.0.0.1:8080",
+      },
+      {
+        key: "lmstudio_endpoint",
+        label: "LM Studio のアドレス",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=http://127.0.0.1:1234",
       },
       {
         key: "say_out",
@@ -1056,6 +1099,8 @@ interface Props {
   onCancel: () => void;
   /** v1.8.3: 開いているプロジェクトのフルパス。"dir" 欄の相対化に使う（無ければ絶対のまま）。 */
   projectRoot?: string | null;
+  /** v1.12: 音声カードの「応答 AI の設定…」（AI カードと同じ設定画面を開く）。編集時だけ渡される。 */
+  onOpenAi?: () => void;
 }
 
 /** スキーマ＋spec から各フィールドの初期文字列値を作る（JSON⇄フォーム往復でも共用）。 */
@@ -1072,7 +1117,7 @@ function initVals(schema: BuiltinSchema | undefined, base: Record<string, unknow
   return v;
 }
 
-export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave, onCancel, projectRoot }: Props) {
+export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave, onCancel, projectRoot, onOpenAi }: Props) {
   const schema = BUILTIN_SCHEMAS[builtin];
 
   const parseSpec = (s?: string): Record<string, unknown> => {
@@ -1211,6 +1256,15 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
       >
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
           <div style={{ fontSize: 15 }}>{schema.opCard ? "オペレーションカードの設定" : "ビルトインフィルタの設定"}</div>
+          {onOpenAi && (
+            <button
+              style={{ ...smallBtn(), fontSize: 11, marginLeft: "auto", marginRight: 6 }}
+              title="応答 AI（サーバー・モデル・思考・温度）を AI カードと同じ画面で設定します。この画面の変更は保存されません"
+              onClick={onOpenAi}
+            >
+              🤖 応答 AI の設定…
+            </button>
+          )}
           {/* v1.4.29 ⑤+: フォーム⇄JSON の切替。JSON は機微な設定（フォーム外のキー）用。 */}
           <button
             style={{ ...smallBtn(), fontSize: 11 }}

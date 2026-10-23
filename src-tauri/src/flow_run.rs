@@ -1160,6 +1160,16 @@ pub(crate) fn eval_filter(
     let CollectedInputs { edges, role_system, role_answer } =
         collect_input_edges(state, app, p, fid, visited, memo, report, job, ctx)?;
 
+    // v1.12 ④ コンストラクタ（builtin:"construct"）: 依頼から設計図を AI に書かせ、検査して、
+    // プロジェクトへカードを並べる（import_new と同じく「プロジェクト DB への作用」なので eval 側で完結）。
+    if spec.builtin.as_deref() == Some("construct") {
+        job.trace.inputs(fid, &edges.iter().flat_map(|e| e.payloads.clone()).collect::<Vec<_>>());
+        let out = crate::construct::run_construct(
+            app, p, fid, &spec, spec_json.as_deref(), &edges, role_system.as_deref(), job, report,
+        );
+        return finish_eval(p, job, fid, visited, memo, 0, out);
+    }
+
     let mut produced = Vec::new();
 
     // セレクタ（§5.4.1）: 実行せず「最初に有データを返した枝」を採用。no-data 吸収を内包し、
@@ -1745,7 +1755,71 @@ fn collect_input_edges(
         }
         edges.push(apply_edge(&up, attrs, vlabel, report));
     }
+    // v1.12 ①: 音声カードから届いた依頼文を、発火先カードの入力として差し込む。
+    let pending = job.prompt.lock().unwrap().as_ref().filter(|(c, _)| c == fid).map(|(_, t)| t.clone());
+    if let Some(text) = pending {
+        if inject_prompt(&mut edges, &text) {
+            job.trace.note(fid, "音声からの依頼", &text);
+        }
+    }
     Ok(CollectedInputs { edges, role_system, role_answer })
+}
+
+/// v1.12 ①（V1.12 計画 §4）: 依頼文を入力へ入れる。差し込んだら true。
+/// - 通常入力が無い → 依頼文が唯一の入力（text/plain）。
+/// - テキストの入力がある → それぞれの頭に【依頼】を付ける（入力を1本増やすと AI カードが
+///   ファンアウトして2回走る・規約 §3-1）。
+/// - 依頼文と同じ中身の入力がある（受け皿ファイルを入力にした従来のフロー）→ 何もしない。
+pub(crate) fn inject_prompt(edges: &mut Vec<EdgeOut>, text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let is_text = |pl: &FlowPayload| pl.mime.starts_with("text/") || pl.mime == "application/json";
+    let live = |e: &EdgeOut| !e.nodata && !e.payloads.is_empty();
+    let dup = edges
+        .iter()
+        .filter(|e| live(e))
+        .flat_map(|e| e.payloads.iter())
+        .any(|pl| is_text(pl) && String::from_utf8_lossy(&pl.bytes).trim() == text);
+    if dup {
+        return false;
+    }
+    let mut touched = false;
+    for e in edges.iter_mut().filter(|e| !e.nodata) {
+        for pl in e.payloads.iter_mut().filter(|pl| is_text(pl)) {
+            let body = String::from_utf8_lossy(&pl.bytes).into_owned();
+            pl.bytes = format!("【依頼】
+{text}
+
+【資料】
+{body}").into_bytes();
+            touched = true;
+        }
+    }
+    if !touched && !edges.iter().any(|e| live(e)) {
+        edges.push(EdgeOut {
+            payloads: vec![FlowPayload {
+                bytes: text.as_bytes().to_vec(),
+                ext: "txt".into(),
+                mime: "text/plain".into(),
+                stem: "依頼".into(),
+                meta: None,
+            }],
+            nodata: false,
+            failure: false,
+        });
+        touched = true;
+    }
+    touched
+}
+
+/// v1.12 ①: 依頼文つきで実行する（音声カードからの発火）。
+pub(crate) fn run_flow_with_prompt(id: &str, app: &tauri::AppHandle, prompt: &str) -> Result<FlowReport, String> {
+    let (card, text) = (id.to_string(), prompt.to_string());
+    run_flow_job(id, app, None, move |job| {
+        *job.prompt.lock().unwrap() = Some((card, text));
+    })
 }
 
 /// v1.8 ④反復カード（`builtin:"loop"`）の実行（計画 §4 案B — DAG を保つ反復）。
@@ -4078,5 +4152,47 @@ mod emit_mid_tests {
         assert!(r.created.is_empty(), "AI チャットの文脈評価では出さない");
         assert!(!dir.join("fixed.exe").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod inject_prompt_tests {
+    use super::*;
+
+    fn text(s: &str) -> EdgeOut {
+        EdgeOut {
+            payloads: vec![FlowPayload {
+                bytes: s.as_bytes().to_vec(),
+                ext: "txt".into(),
+                mime: "text/plain".into(),
+                stem: "x".into(),
+                meta: None,
+            }],
+            nodata: false,
+            failure: false,
+        }
+    }
+
+    #[test]
+    fn no_inputs_gets_the_request_as_only_input() {
+        let mut e: Vec<EdgeOut> = Vec::new();
+        assert!(inject_prompt(&mut e, "アナログ時計を作って"));
+        assert_eq!(e.len(), 1);
+        assert_eq!(String::from_utf8_lossy(&e[0].payloads[0].bytes), "アナログ時計を作って");
+    }
+
+    #[test]
+    fn text_inputs_get_the_request_prefixed_not_a_new_input() {
+        let mut e = vec![text("資料の本文")];
+        assert!(inject_prompt(&mut e, "要約して"));
+        assert_eq!(e.len(), 1, "入力を増やすと AI カードがファンアウトする");
+        assert_eq!(String::from_utf8_lossy(&e[0].payloads[0].bytes), "【依頼】\n要約して\n\n【資料】\n資料の本文");
+    }
+
+    #[test]
+    fn inbox_flow_is_left_alone() {
+        let mut e = vec![text("牛乳を買う")];
+        assert!(!inject_prompt(&mut e, "牛乳を買う"));
+        assert_eq!(String::from_utf8_lossy(&e[0].payloads[0].bytes), "牛乳を買う");
     }
 }

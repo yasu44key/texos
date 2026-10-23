@@ -10,6 +10,9 @@ interface Props {
   initialSpec: string;
   onSave: (label: string, specJson: string) => void;
   onCancel: () => void;
+  /** v1.12 ④: "construct" ＝コンストラクタカード（builtin:"construct"）を同じ画面で設定する
+   * （モデルの入れ替え・調整を AI カードと同じ使い勝手に・2026-10-23 ユーザー）。 */
+  variant?: "ai" | "construct" | "voice";
 }
 
 // v1.7.3 サーバー選択を3択に。"lmstudio" と "openai" はワイヤ形式が同じ（バックエンドの
@@ -138,7 +141,11 @@ function parseServer(v: unknown): Server {
   return v === "openai" || v === "lmstudio" ? v : "ollama";
 }
 
-export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }: Props) {
+export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, variant = "ai" }: Props) {
+  const isConstruct = variant === "construct";
+  // v1.12: "voice" ＝音声カードの応答用 AI（設定キーは ai_ 接頭辞・voice.rs ai_conf が読む）。
+  const isVoice = variant === "voice";
+  const K = (n: string) => (isVoice ? `ai_${n}` : n);
   const base = useMemo<Record<string, unknown>>(() => {
     try {
       return JSON.parse(initialSpec || "{}");
@@ -149,8 +156,8 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   const s = (k: string, d = "") => (typeof base[k] === "string" ? (base[k] as string) : d);
 
   const [title, setTitle] = useState(initialLabel);
-  const [provider, setProvider] = useState<Server>(parseServer(base.provider));
-  const [endpoint, setEndpoint] = useState(s("endpoint"));
+  const [provider, setProvider] = useState<Server>(parseServer(base[K("provider")]));
+  const [endpoint, setEndpoint] = useState(s(K("endpoint")));
 
   // サーバーを替えたら、宛先が「前のサーバーの既定」のままなら空に戻す（＝新しい既定が効く）。
   // 手で入れた宛先（遠隔・別ポート）は尊重して残す。
@@ -158,10 +165,10 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     setProvider(next);
     setEndpoint((cur) => (isDefaultEndpoint(cur) ? "" : cur));
   };
-  const [model, setModel] = useState(s("model", "gemma3:latest"));
+  const [model, setModel] = useState(s(K("model"), "gemma3:latest"));
   const [system, setSystem] = useState(s("system"));
   const [temperature, setTemperature] = useState(
-    typeof base.temperature === "number" ? String(base.temperature) : ""
+    typeof base[K("temperature")] === "number" ? String(base[K("temperature")]) : ""
   );
   // v1.4.12 制限時間（秒）。v1.7.4: 生成系共通契約に統一 — 空欄=0=無制限（変換も対話も）。
   const [timeoutSecs, setTimeoutSecs] = useState(
@@ -171,6 +178,13 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     base.mode === "chat" ? "chat" : "transform"
   );
   const [logName, setLogName] = useState(s("log_name")); // v1.4.5 ログ保存名（chat）
+  // v1.12 ④ コンストラクタ固有（construct.rs が読む）。
+  const [cardModel, setCardModel] = useState(s("card_model"));
+  const [apply, setApply] = useState<"place" | "draft">(base.apply === "draft" ? "draft" : "place");
+  const [maxRetries, setMaxRetries] = useState(
+    typeof base.max_retries === "number" ? String(base.max_retries) : "3"
+  );
+  const [prefix, setPrefix] = useState(s("prefix", isConstruct ? "構築レポート" : ""));
   // v1.8.6 GPU の使い方（Ollama のみ）。既定 "auto" = キーを書かない＝サーバ任せ
   // （＝VRAM に載る層は GPU。旧来の「VRAM が少ないから CPU」という既定は廃止）。
   const [gpu, setGpu] = useState<"auto" | "max" | "cpu">(
@@ -178,7 +192,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   );
   // v1.8.6 Thinking（思考）モード。off / on / low / medium / high。
   const [think, setThink] = useState<string>(
-    typeof base.think === "string" && base.think !== "" ? (base.think as string) : "off"
+    typeof base[K("think")] === "string" && base[K("think")] !== "" ? (base[K("think")] as string) : "off"
   );
   // v1.8.9 モデルに合わせて思考の値を直したときの説明（黙って変えない）。
   const [thinkAdjusted, setThinkAdjusted] = useState<string | null>(null);
@@ -186,7 +200,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
   const [sendReasoning, setSendReasoning] = useState(base.send_reasoning === true);
   // v1.9.2 追加パラメータ（本体トップレベルへマージする JSON）。全サーバ共通。
   const [extraText, setExtraText] = useState(
-    base.extra_params && typeof base.extra_params === "object" ? JSON.stringify(base.extra_params) : ""
+    base[K("extra_params")] && typeof base[K("extra_params")] === "object" ? JSON.stringify(base[K("extra_params")]) : ""
   );
   const extra = useMemo(() => parseExtra(extraText), [extraText]);
   // v1.8.9 実行時のコンテキスト長（Ollama の num_ctx）。空欄＝サーバ既定。
@@ -262,7 +276,36 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
 
   const save = () => {
     if (extra.error) return;
-    const spec: Record<string, unknown> = { ...base, builtin: "ai", provider, mode };
+    if (isVoice) {
+      // 音声カードは op カード: 他の設定（言い回し・しきい値など）はそのまま、ai_* だけ差し替える。
+      const v: Record<string, unknown> = { ...base, ai_provider: provider };
+      v.ai_model = model.trim() || (provider === "ollama" ? "gemma3:latest" : models[0] ?? "");
+      if (endpoint.trim()) v.ai_endpoint = endpoint.trim();
+      else delete v.ai_endpoint;
+      if (think !== "off") v.ai_think = think;
+      else delete v.ai_think;
+      const t = parseFloat(temperature);
+      if (temperature.trim() !== "" && !Number.isNaN(t)) v.ai_temperature = t;
+      else delete v.ai_temperature;
+      if (extra.value && Object.keys(extra.value).length) v.ai_extra_params = extra.value;
+      else delete v.ai_extra_params;
+      onSave(title.trim() || "音声", JSON.stringify(v));
+      return;
+    }
+    const spec: Record<string, unknown> = isConstruct
+      ? { ...base, builtin: "construct", provider }
+      : { ...base, builtin: "ai", provider, mode };
+    if (isConstruct) {
+      delete spec.mode;
+      if (cardModel.trim()) spec.card_model = cardModel.trim();
+      else delete spec.card_model;
+      if (apply === "draft") spec.apply = "draft";
+      else delete spec.apply;
+      const r = parseInt(maxRetries, 10);
+      spec.max_retries = Number.isFinite(r) ? Math.min(6, Math.max(1, r)) : 3;
+      if (prefix.trim()) spec.prefix = prefix.trim();
+      else delete spec.prefix;
+    }
     // 空欄時の既定: Ollama は導入案内が gemma3 を入れるのでそれに合わせる。
     // 他サーバーは既定名が存在しないので、取得済み一覧の先頭を使う。
     spec.model = model.trim() || (provider === "ollama" ? "gemma3:latest" : models[0] ?? "");
@@ -276,7 +319,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     const to = parseInt(timeoutSecs, 10);
     if (timeoutSecs.trim() !== "" && !Number.isNaN(to) && to >= 0) spec.timeout_secs = to;
     else delete spec.timeout_secs;
-    if (mode === "chat" && logName.trim()) spec.log_name = logName.trim();
+    if (!isConstruct && mode === "chat" && logName.trim()) spec.log_name = logName.trim();
     else delete spec.log_name;
     // v1.8.6 既定値はキーごと落とす（spec を小さく保つ＝JSON編集でも読める）。
     if (gpu !== "auto" && provider === "ollama") spec.gpu = gpu;
@@ -293,9 +336,9 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
     if (provider === "ollama" && numCtx.trim() !== "" && !Number.isNaN(nc) && nc > 0) spec.num_ctx = nc;
     else delete spec.num_ctx;
     // 接続時型チェック・出力の既定（未設定なら補う）。
-    if (!spec.accept_mime) spec.accept_mime = mode === "chat" ? "*/*" : "text/*";
+    if (!spec.accept_mime) spec.accept_mime = !isConstruct && mode === "chat" ? "*/*" : "text/*";
     if (!spec.output_ext) spec.output_ext = "md";
-    onSave(title.trim() || `AI: ${spec.model}`, JSON.stringify(spec));
+    onSave(title.trim() || (isConstruct ? "コンストラクタ" : `AI: ${spec.model}`), JSON.stringify(spec));
   };
 
   return (
@@ -330,15 +373,29 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
         }}
       >
         <div style={{ fontSize: 15, marginBottom: 14, textAlign: "center" }}>
-          🤖 AIカードの設定
+          {isConstruct ? "🏗 コンストラクタの設定" : isVoice ? "🎙 音声カードの応答 AI" : "🤖 AIカードの設定"}
         </div>
+        {isVoice && (
+          <div style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", marginBottom: 12, lineHeight: 1.5 }}>
+            話しかけた内容を聞いて、返事をし、どのカードへ流すかを決める AI です。速さが大事なので軽いモデル向き
+            （gemma3 は約 0.3 秒）。Strata など OpenAI 互換も選べますが、裏で考えている最中は順番待ちになります。
+            返事は形を決めた JSON で受け取ります（Ollama は format、OpenAI 互換は response_format）。
+          </div>
+        )}
+        {isConstruct && (
+          <div style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", marginBottom: 12, lineHeight: 1.5 }}>
+            つないだ依頼（付箋・音声カードからの発話）を読み、AI がカードの設計図を書きます。配線の決まり
+            （scripts/texos_flow.py の検査）で確かめ、違反は理由ごと AI に返して直させてから、いまのプロジェクトの
+            いちばん下に枠で囲んで並べます。並べたカードは実行しません（▶ は人が押す）。
+          </div>
+        )}
 
         {row(
           "タイトル",
           <input style={inp()} value={title} onChange={(e) => setTitle(e.target.value)} />
         )}
 
-        {row(
+        {!isConstruct && !isVoice && row(
           "モード",
           <div style={{ display: "flex", gap: 18 }}>
             {(
@@ -484,7 +541,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             </div>
           )}
 
-        {provider === "ollama" &&
+        {provider === "ollama" && !isVoice &&
           row(
             "GPU",
             <div>
@@ -536,7 +593,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
                 </option>
               ))}
             </select>
-            {provider === "openai" && (
+            {provider === "openai" && !isVoice && (
               <label
                 style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginTop: 4 }}
                 title={
@@ -556,7 +613,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
           </div>
         )}
 
-        {provider === "ollama" &&
+        {provider === "ollama" && !isVoice &&
           row(
             "コンテキスト長",
             <div>
@@ -593,15 +650,19 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
             </div>
           )}
 
-        {row(
-          "システム\nプロンプト",
+        {!isVoice && row(
+          isConstruct ? "追加の\n作法" : "システム\nプロンプト",
           <div>
             <textarea
               style={{ ...inp(), resize: "vertical", minHeight: 64, fontFamily: "inherit" }}
               value={system}
               rows={4}
               onChange={(e) => setSystem(e.target.value)}
-              placeholder="（空欄可）AIの役割・口調・出力形式の指示"
+              placeholder={
+                isConstruct
+                  ? "（空欄可）設計の作法を足す。構築の要点は組み込み済み。役割の付箋をつないでも同じ"
+                  : "（空欄可）AIの役割・口調・出力形式の指示"
+              }
             />
             {PARAM_LIKE.test(system) && (
               <div style={{ fontSize: 11, color: "#e0a35c", marginTop: 3 }}>
@@ -628,7 +689,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
           </div>
         )}
 
-        {row(
+        {!isVoice && row(
           "制限時間",
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <input
@@ -668,7 +729,51 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel }
           </div>
         )}
 
-        {mode === "chat" &&
+        {isConstruct && (
+          <>
+            {row(
+              "並べる AI\nカードの\nモデル",
+              <div>
+                <input
+                  style={inp()}
+                  value={cardModel}
+                  onChange={(e) => setCardModel(e.target.value)}
+                  list="construct-card-models"
+                  placeholder="空欄=上と同じモデル（接続先・アドレスも同じ）"
+                />
+                <datalist id="construct-card-models">
+                  {models.map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+              </div>
+            )}
+            {row(
+              "実行したら",
+              <select style={inp()} value={apply} onChange={(e) => setApply(e.target.value as "place" | "draft")}>
+                <option value="place">カードを並べる（UNDO で一度に戻せる）</option>
+                <option value="draft">案だけ出す（構築レポートに設計図と検査結果）</option>
+              </select>
+            )}
+            {row(
+              "差し戻す\n回数の上限",
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  style={{ ...inp(), width: 100 }}
+                  value={maxRetries}
+                  onChange={(e) => setMaxRetries(e.target.value)}
+                  inputMode="numeric"
+                />
+                <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
+                  検査で違反が見つかったら AI に直させる回数（1〜6）
+                </span>
+              </div>
+            )}
+            {row("レポートの\n名前", <input style={inp()} value={prefix} onChange={(e) => setPrefix(e.target.value)} />)}
+          </>
+        )}
+
+        {!isConstruct && !isVoice && mode === "chat" &&
           row(
             "ログ保存名",
             <input

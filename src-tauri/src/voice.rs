@@ -371,15 +371,56 @@ fn targets_of(conn: &rusqlite::Connection, card: &str) -> Vec<Target> {
     match rows {
         Ok(rows) => rows
             .filter_map(|r| r.ok())
-            .map(|(id, label, attrs, memo)| Target {
-                phrases: phrases_of(&label, attrs.as_deref()),
-                id,
-                label,
-                memo: memo.filter(|m| !m.trim().is_empty()),
+            .map(|(id, label, attrs, memo)| {
+                // v1.12 ②: カードのコメントが無ければ、そのカードにつながる役割の付箋を説明に使う。
+                let memo = memo.filter(|m| !m.trim().is_empty()).or_else(|| role_note_of(conn, &id));
+                Target { phrases: phrases_of(&label, attrs.as_deref()), id, label, memo }
             })
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// v1.12 ②: カードへ役割（role:"system"）の矢印でつながる付箋の本文。
+fn role_note_of(conn: &rusqlite::Connection, card: &str) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT v.note_text, rel.attrs FROM relations rel
+             JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+             WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL AND v.kind = 'note'
+             ORDER BY rel.created_at",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![card], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)))
+        .ok()?;
+    for (text, attrs) in rows.flatten() {
+        if flow::parse_edge_attrs(attrs.as_deref()).role.as_deref() == Some("system") {
+            if let Some(t) = text.filter(|t| !t.trim().is_empty()) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// 選択肢の説明: 冒頭の段落（空行まで）を1行にして最大 160 字。1行目がカード名と同じ見出しなら飛ばす
+/// （役割の付箋は「プログラミング／自然言語を…」のように見出しから書かれることが多い）。
+fn describe(label: &str, memo: &str) -> String {
+    let mut lines: Vec<&str> = memo.lines().map(str::trim).collect();
+    while lines.first().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.remove(0);
+    }
+    if lines.len() > 1 && normalize(lines[0]) == normalize(label) {
+        lines.remove(0);
+    }
+    let para: Vec<&str> = lines.into_iter().take_while(|l| !l.is_empty()).collect();
+    let one = para.join(" ");
+    let mut out: String = one.chars().take(160).collect();
+    if one.chars().count() > 160 {
+        out.push('…');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -389,23 +430,99 @@ fn targets_of(conn: &rusqlite::Connection, card: &str) -> Vec<Target> {
 // 選択肢の外は物理的に出ない。LLM が応答しなければ文字照合へ戻る。
 // ---------------------------------------------------------------------------
 
-const DEFAULT_AI_MODEL: &str = "gemma4:latest";
+/// v1.12: 応答用は gemma3（Strata と GPU を分け合うと gemma4 は載らない・V1.12 計画 §3.2）。
+const DEFAULT_AI_MODEL: &str = "gemma3:latest";
 const DEFAULT_AI_ENDPOINT: &str = "http://localhost:11434";
 /// 振り分け用モデルを載せたままにする時間（反射の速さのため・稼働開始で先読みする）。
 const AI_KEEP_ALIVE: &str = "30m";
 
-/// AI 振り分けの (endpoint, model)。classifier="phrase" なら None（文字照合だけ）。
-fn ai_conf(spec: &OpSpec) -> Option<(String, String)> {
+/// 応答用 AI（窓口）の接続。v1.12: AI カードと同じく Ollama / LM Studio / OpenAI 互換（Strata など）を選べる
+/// （2026-10-23 ユーザー: モデルの入れ替え・調整を AI カードと同じ使い勝手に）。
+/// カード設定のキーは ai_ 接頭辞（ai_provider / ai_model / ai_endpoint / ai_think / ai_temperature / ai_extra_params）。
+#[derive(Clone, Debug)]
+struct FrontAi {
+    /// "ollama" / "lmstudio" / "openai"。
+    provider: String,
+    /// Ollama は http://host:11434、OpenAI 互換は /v1 まで（AI カードと同じ流儀）。
+    ep: String,
+    model: String,
+    /// "off"（既定）/ "on" / "low" / "medium" / "high"。
+    think: String,
+    temperature: f64,
+    /// リクエスト本体のトップレベルへ足す（AI カードの extra_params と同じ）。
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl FrontAi {
+    #[cfg(test)]
+    fn ollama(model: &str) -> Self {
+        FrontAi {
+            provider: "ollama".into(),
+            ep: DEFAULT_AI_ENDPOINT.into(),
+            model: model.into(),
+            think: "off".into(),
+            temperature: 0.0,
+            extra: Default::default(),
+        }
+    }
+    fn is_ollama(&self) -> bool {
+        !matches!(self.provider.as_str(), "lmstudio" | "openai")
+    }
+}
+
+/// AI 振り分けの接続。classifier="phrase" なら None（文字照合だけ）。
+fn ai_conf(spec: &OpSpec) -> Option<FrontAi> {
     if extra_str(spec, "classifier").as_deref() == Some("phrase") {
         return None;
     }
-    let ep = extra_str(spec, "ai_endpoint").unwrap_or_else(|| DEFAULT_AI_ENDPOINT.into());
+    let provider = extra_str(spec, "ai_provider").unwrap_or_else(|| "ollama".into());
+    let default_ep = if matches!(provider.as_str(), "lmstudio" | "openai") { "http://localhost:1234/v1" } else { DEFAULT_AI_ENDPOINT };
+    let ep = extra_str(spec, "ai_endpoint").unwrap_or_else(|| default_ep.into());
     let model = extra_str(spec, "ai_model").unwrap_or_else(|| DEFAULT_AI_MODEL.into());
-    Some((ep.trim_end_matches('/').to_string(), model))
+    let temperature = spec.extra.get("ai_temperature").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let extra = spec.extra.get("ai_extra_params").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    Some(FrontAi {
+        provider,
+        ep: ep.trim_end_matches('/').to_string(),
+        model,
+        think: extra_str(spec, "ai_think").unwrap_or_else(|| "off".into()),
+        temperature,
+        extra,
+    })
+}
+
+/// v1.12 思考役の設定（カード設定から）。think_backend="off" なら「じっくり考える」を出さない。
+fn thinker_conf(spec: &OpSpec) -> crate::thinker::Conf {
+    crate::thinker::Conf {
+        backend: extra_str(spec, "think_backend").unwrap_or_else(|| "auto".into()),
+        strata: extra_str(spec, "strata_endpoint")
+            .unwrap_or_else(|| crate::thinker::DEFAULT_STRATA.into())
+            .trim_end_matches('/')
+            .to_string(),
+        lmstudio: extra_str(spec, "lmstudio_endpoint")
+            .unwrap_or_else(|| crate::thinker::DEFAULT_LMSTUDIO.into())
+            .trim_end_matches('/')
+            .to_string(),
+        lmstudio_model: extra_str(spec, "lmstudio_model").unwrap_or_default(),
+        effort: extra_str(spec, "think_effort").unwrap_or_else(|| "medium".into()),
+    }
+}
+
+/// 1ターンで AI に選ばせてよいもの。
+#[derive(Clone, Copy)]
+struct TurnOpts {
+    /// 「じっくり考える」（思考役へ回す）を選択肢に入れる。
+    think: bool,
+    /// 組み込み行動（止める・中止・リセット）を選択肢に入れる。
+    sys: bool,
 }
 
 /// 会話エージェントの指示（system）。コマンドの説明はカード名・言い方の例・カードのコメントから作る。
-fn agent_prompt(targets: &[Target], pending: Option<(&str, &[String])>) -> String {
+///
+/// 聞き取り中の状態は system に入れる（2026-10-23 実測: 状態を発話の頭へ移して system を固定にすると、
+/// Strata の会話キャッシュは効きやすくなるが、gemma3 が聞き取り中のルールと取り違えて
+/// 「以上」の前に実行する・英訳を会話にする、が出た。既定の gemma3 の正確さを優先する）。
+fn agent_prompt(targets: &[Target], pending: Option<(&str, &[String])>, opts: TurnOpts) -> String {
     let mut s = String::from(
         "あなたは TexoS の音声アシスタントです。入力はユーザーの発話を音声認識した文字列です。\
          音声認識は同じ読みの別の字に化けます（例: メモ→目も、英訳→駅役）。読みが近ければ\
@@ -424,19 +541,34 @@ fn agent_prompt(targets: &[Target], pending: Option<(&str, &[String])>) -> Strin
             s.push_str(&format!("（言い方の例: {}）", others.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("、")));
         }
         if let Some(m) = &t.memo {
-            s.push_str(&format!(": {}", m.lines().next().unwrap_or("").trim()));
+            let d = describe(&t.label, m);
+            if !d.is_empty() {
+                s.push_str(&format!(": {d}"));
+            }
         }
         s.push('\n');
     }
+    if targets.is_empty() {
+        s.push_str("（なし）\n");
+    }
     match pending {
-        None => s.push_str(&format!(
-            "\naction の選び方:\n\
-             - {ACT_RUN}: 頼む言葉と中身が一度に来たとき（例: メモして、牛乳を買う）。command にコマンド名、\
-               content に中身（頼む言葉は除く・ユーザーが話した内容だけ）。\n\
-             - {ACT_WAIT}: 頼む言葉だけで中身がまだ無いとき（例: メモして）。command に待つコマンド名を入れ、\
-               reply で短く促す（例: どうぞ。終わったら以上と言ってください）。\n\
-             - {ACT_CHAT}: コマンドと関係ない話・質問・説明。自然に短く返事する。\n"
-        )),
+        None => {
+            s.push_str(&format!(
+                "\naction の選び方:\n\
+                 - {ACT_RUN}: 頼む言葉と中身が一度に来たとき（例: メモして、牛乳を買う）。command にコマンド名、\
+                   content に中身（頼む言葉は除く・ユーザーが話した内容だけ）。\n\
+                 - {ACT_WAIT}: 頼む言葉だけで中身がまだ無いとき（例: メモして）。command に待つコマンド名を入れ、\
+                   reply で短く促す（例: どうぞ。終わったら以上と言ってください）。\n\
+                 - {ACT_CHAT}: コマンドと関係ない話・質問・説明。自然に短く返事する。\n"
+            ));
+            if opts.think {
+                s.push_str(&format!(
+                    "- {ACT_THINK}: その場で短く答えるには重い問い（比べて選ぶ・設計や計画を考える・理由を詳しく説明する・\
+                       長い文章を書く）や、ユーザーが「よく考えて」「ちゃんと調べて」と頼んだとき。command は なし。\
+                       content に考えてほしい問いを、話の流れを補って1〜2文で書く。reply は「考えておきます」程度の短い返事。\n"
+                ));
+            }
+        }
         Some((label, parts)) => {
             s.push_str(&format!(
                 "\nいまの状態: ユーザーは「{label}」の中身を話している途中です。ここまでの中身:\n"
@@ -457,8 +589,10 @@ fn agent_prompt(targets: &[Target], pending: Option<(&str, &[String])>) -> Strin
             ));
         }
     }
-    for (name, _, desc) in SYS_ACTIONS {
-        s.push_str(&format!("- {name}: {desc}。reply は空でよい。\n"));
+    if opts.sys {
+        for (name, _, desc) in SYS_ACTIONS {
+            s.push_str(&format!("- {name}: {desc}。reply は空でよい。\n"));
+        }
     }
     s
 }
@@ -481,11 +615,46 @@ enum SysAction {
 const ACT_RUN: &str = "コマンドを実行";
 const ACT_WAIT: &str = "続きを待つ";
 const ACT_CHAT: &str = "会話";
+/// v1.12: 思考役（Strata → LM Studio）へ回す。
+const ACT_THINK: &str = "じっくり考える";
 const SYS_ACTIONS: &[(&str, SysAction, &str)] = &[
     ("読み上げを止める", SysAction::Hush, "読み上げや返事を止めてほしい・黙ってほしい（止めて・ストップ・静かに など）"),
     ("実行を中止する", SysAction::Cancel, "実行中の処理そのものをやめてほしい（全部止めて・中止して・キャンセル など）"),
     ("会話をリセットする", SysAction::Reset, "これまでの会話を忘れて最初からにしてほしい（リセット・やり直して など）"),
 ];
+
+/// v1.12: 思考役へ回す合図の言葉（既定）。gemma3 は「じっくり考える」をほとんど選ばず自分で短く
+/// 答えてしまった（実測 2026-10-23）ので、会話と判定されてもこれらを含めば思考役へ回す。
+const DEFAULT_THINK_WORDS: &[&str] = &["よく考えて", "じっくり", "詳しく", "比べて", "比較して", "調べて", "検討して"];
+
+/// 会話と判定された発話でも、合図の言葉があれば「じっくり考える」に格上げする（中身は発話全文）。
+fn promote_think(out: &mut AgentOut, text: &str, words: &[String]) {
+    // 「実行」「待つ」でもコマンド名が無い（なし）なら実際には会話と同じ扱い（実測 2026-10-23: gemma3 が
+    // 「…よく考えて教えて」を action=実行・command=なし で返した）。
+    let chat_like = out.action == ACT_CHAT || ((out.action == ACT_RUN || out.action == ACT_WAIT) && out.cmd.is_none());
+    if out.sys.is_some() || !chat_like {
+        return;
+    }
+    let t = folded(text);
+    if words.iter().any(|w| !w.is_empty() && t.contains(&folded(w))) {
+        out.action = ACT_THINK.into();
+        out.content = text.trim().to_string();
+        out.reply = "考えておきます".into();
+    }
+}
+
+/// v1.12: AI が組み込み行動を選んだときの裏付け。発話にそれらしい言葉が無ければ選び直させる
+/// （実測 2026-10-23: gemma3 は「英語で要約して」「文字数を数えて、…」を「実行を中止する」にした。
+/// 中止は実行中のフローを止めるので、取り違えの害が大きい）。
+fn sys_backed(a: SysAction, text: &str) -> bool {
+    let t = folded(text);
+    let stems: &[&str] = match a {
+        SysAction::Hush => &["止め", "とめ", "ストップ", "すとっぷ", "静か", "しずか", "黙", "だま", "やめ", "待って", "まって"],
+        SysAction::Cancel => &["止め", "とめ", "中止", "ちゅうし", "キャンセル", "きゃんせる", "やめ", "ストップ", "すとっぷ"],
+        SysAction::Reset => &["リセット", "りせっと", "やり直", "やりなお", "最初から", "さいしょから", "忘れ", "わすれ"],
+    };
+    stems.iter().any(|s| t.contains(&folded(s)))
+}
 
 /// 1ターンの結果: 読み上げる返事と、実行するコマンド（targets の添字・本文）か組み込み行動。
 struct AgentOut {
@@ -516,12 +685,31 @@ fn bounded_history(h: &[(String, String)]) -> Vec<(String, String)> {
 /// 会話エージェントの1ターン（VoiceAssistantAgent の respond に、コマンドの選択を足したもの）。
 /// command は enum の制約付き出力（矢印の先のカード名＋none）＝選択肢の外は出ない。
 fn agent_turn(
-    ep: &str,
-    model: &str,
+    ai: &FrontAi,
     history: &[(String, String)],
     text: &str,
     targets: &[Target],
     pending: Option<(&str, &[String])>,
+    opts: TurnOpts,
+) -> Result<AgentOut, String> {
+    let out = agent_turn_once(ai, history, text, targets, pending, opts)?;
+    match out.sys {
+        // 裏付けの無い組み込み行動は捨て、組み込み行動を外して選び直させる（§sys_backed）。
+        Some(a) if opts.sys && !sys_backed(a, text) => {
+            eprintln!("[voice] AI の {a:?} は発話に裏付けが無いので選び直し: {text}");
+            agent_turn_once(ai, history, text, targets, pending, TurnOpts { sys: false, ..opts })
+        }
+        _ => Ok(out),
+    }
+}
+
+fn agent_turn_once(
+    ai: &FrontAi,
+    history: &[(String, String)],
+    text: &str,
+    targets: &[Target],
+    pending: Option<(&str, &[String])>,
+    opts: TurnOpts,
 ) -> Result<AgentOut, String> {
     let mut labels: Vec<String> = Vec::new();
     for t in targets {
@@ -532,51 +720,99 @@ fn agent_turn(
     let mut commands = labels.clone();
     commands.push("なし".into());
     let mut actions: Vec<String> = vec![ACT_RUN.into(), ACT_WAIT.into(), ACT_CHAT.into()];
-    actions.extend(SYS_ACTIONS.iter().map(|(n, _, _)| n.to_string()));
-    let mut messages = vec![serde_json::json!({ "role": "system", "content": agent_prompt(targets, pending) })];
+    if opts.think && pending.is_none() {
+        actions.push(ACT_THINK.into());
+    }
+    if opts.sys {
+        actions.extend(SYS_ACTIONS.iter().map(|(n, _, _)| n.to_string()));
+    }
+    let mut messages =
+        vec![serde_json::json!({ "role": "system", "content": agent_prompt(targets, pending, opts) })];
     for (role, content) in bounded_history(history) {
         messages.push(serde_json::json!({ "role": role, "content": content }));
     }
     messages.push(serde_json::json!({ "role": "user", "content": text }));
-    let mut body = serde_json::json!({
-        "model": model,
-        "stream": false,
-        "keep_alive": AI_KEEP_ALIVE,
-        // 思考を切る（実測: 思考ありの gemma4 は format を外れた素の文を返すことがあった）。
-        "think": false,
-        "format": {
-            "type": "object",
-            // 並び順＝生成順。行動を先に決めさせ、返事は最後（返事に引っ張られて欄を外さない）。
-            "properties": {
-                "action": { "type": "string", "enum": actions },
-                "command": { "type": "string", "enum": commands },
-                "content": { "type": "string" },
-                "reply": { "type": "string" }
-            },
-            "required": ["action", "command", "content", "reply"]
+    // 並び順＝生成順。行動を先に決めさせ、返事は最後（返事に引っ張られて欄を外さない）。
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": actions },
+            "command": { "type": "string", "enum": commands },
+            "content": { "type": "string" },
+            "reply": { "type": "string" }
         },
-        "options": { "temperature": 0, "num_predict": 400, "num_ctx": 8192 },
-        "messages": messages
+        "required": ["action", "command", "content", "reply"],
+        "additionalProperties": false
     });
+    let thinking = ai.think != "off";
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(if thinking { 180 } else { 60 }))
         .build()
         .map_err(|e| e.to_string())?;
-    let url = format!("{ep}/api/chat");
-    let mut resp = client.post(&url).json(&body).send().map_err(|e| format!("AI に接続できません: {e}"))?;
-    if !resp.status().is_success() {
-        // think を知らない古いサーバ・モデル向けにもう一度（think 抜き）。
-        if let Some(o) = body.as_object_mut() {
-            o.remove("think");
-        }
-        resp = client.post(&url).json(&body).send().map_err(|e| format!("AI に接続できません: {e}"))?;
+    let content = if ai.is_ollama() {
+        let mut body = serde_json::json!({
+            "model": ai.model,
+            "stream": false,
+            "keep_alive": AI_KEEP_ALIVE,
+            // 既定は思考を切る（実測: 思考ありの gemma4 は format を外れた素の文を返すことがあった）。
+            "think": match ai.think.as_str() { "off" => serde_json::json!(false), "on" => serde_json::json!(true), l => serde_json::json!(l) },
+            "format": schema,
+            "options": { "temperature": ai.temperature, "num_predict": if thinking { 4000 } else { 400 }, "num_ctx": 8192 },
+            "messages": messages
+        });
+        merge_extra(&mut body, &ai.extra);
+        let url = format!("{}/api/chat", ai.ep);
+        let mut resp = client.post(&url).json(&body).send().map_err(|e| format!("AI に接続できません: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("AI がエラーを返しました（{}）", resp.status()));
+            // think を知らない古いサーバ・モデル向けにもう一度（think 抜き）。
+            if let Some(o) = body.as_object_mut() {
+                o.remove("think");
+            }
+            resp = client.post(&url).json(&body).send().map_err(|e| format!("AI に接続できません: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("AI がエラーを返しました（{}）", resp.status()));
+            }
         }
-    }
-    let v: serde_json::Value = resp.json().map_err(|e| format!("AI の応答を読めません: {e}"))?;
-    let content = v.pointer("/message/content").and_then(|c| c.as_str()).unwrap_or("");
+        let v: serde_json::Value = resp.json().map_err(|e| format!("AI の応答を読めません: {e}"))?;
+        v.pointer("/message/content").and_then(|c| c.as_str()).unwrap_or("").to_string()
+    } else {
+        // OpenAI 互換（LM Studio / Strata など）: response_format の json_schema で形を縛る
+        // （Strata は strict に従う・2026-10-23 実測）。
+        let mut body = serde_json::json!({
+            "model": ai.model,
+            "stream": false,
+            "temperature": ai.temperature,
+            "max_tokens": if thinking { 4000 } else { 400 },
+            "response_format": { "type": "json_schema",
+                "json_schema": { "name": "voice_turn", "strict": true, "schema": schema } },
+            "messages": messages
+        });
+        // 汎用 OpenAI 互換（Strata など）は思考の深さを reasoning_effort で（"on" はサーバ既定に任せて送らない）。
+        // LM Studio には送らない。
+        if ai.provider == "openai" && ai.think != "on" {
+            let effort = if ai.think == "off" { "none" } else { ai.think.as_str() };
+            body["reasoning_effort"] = serde_json::Value::String(effort.into());
+        }
+        merge_extra(&mut body, &ai.extra);
+        let url = format!("{}/chat/completions", ai.ep);
+        let mut resp = client.post(&url).json(&body).send().map_err(|e| format!("AI に接続できません: {e}"))?;
+        if !resp.status().is_success() {
+            // json_schema・reasoning_effort を知らないサーバ向けにもう一度（json_object・思考指定なし）。
+            if let Some(o) = body.as_object_mut() {
+                o.remove("reasoning_effort");
+                o.insert("response_format".into(), serde_json::json!({ "type": "json_object" }));
+            }
+            resp = client.post(&url).json(&body).send().map_err(|e| format!("AI に接続できません: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("AI がエラーを返しました（{}）", resp.status()));
+            }
+        }
+        let v: serde_json::Value = resp.json().map_err(|e| format!("AI の応答を読めません: {e}"))?;
+        v.pointer("/choices/0/message/content").and_then(|c| c.as_str()).unwrap_or("").to_string()
+    };
+    let content = strip_think_tags(&content);
+    let content = content.as_str();
     let a = parse_agent(content, &labels);
     let sys = SYS_ACTIONS.iter().find(|(n, _, _)| *n == a.action).map(|(_, x, _)| *x);
     let cmd = targets.iter().position(|t| t.label == a.command);
@@ -624,6 +860,31 @@ fn parse_agent(content: &str, labels: &[String]) -> AgentRaw {
     }
 }
 
+/// 追加パラメータ（ai_extra_params）を本体へ足す。管理しているキーは上書きさせない（AI カードと同じ）。
+fn merge_extra(body: &mut serde_json::Value, extra: &serde_json::Map<String, serde_json::Value>) {
+    const RESERVED: &[&str] =
+        &["model", "messages", "stream", "temperature", "think", "reasoning_effort", "options", "format", "response_format"];
+    if let Some(o) = body.as_object_mut() {
+        for (k, v) in extra {
+            if !RESERVED.contains(&k.as_str()) {
+                o.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+/// 本文に混ざった <think>…</think> を落とす（思考モデルの OpenAI 互換サーバ向け）。
+fn strip_think_tags(s: &str) -> String {
+    let mut out = s.to_string();
+    while let (Some(a), Some(b)) = (out.find("<think>"), out.find("</think>")) {
+        if b < a {
+            break;
+        }
+        out.replace_range(a..b + "</think>".len(), "");
+    }
+    out
+}
+
 /// 稼働開始時に振り分け用モデルを先に載せる（1発目の待ちを消す・失敗は黙って無視）。
 fn warm_up(ep: String, model: String) {
     std::thread::spawn(move || {
@@ -647,6 +908,32 @@ pub(crate) struct CardStatus {
     state: String,
     message: String,
     last: String,
+    /// v1.12 思考役の状態の1行（thinker_line）。
+    thinker: String,
+}
+
+/// 思考役の状態の表示（パネルと控えで同じ文言）。
+fn thinker_line(v: &serde_json::Value) -> String {
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let head = s("head");
+    if head.is_empty() {
+        return "🧠 思考役なし（Strata も LM Studio も使えません）".into();
+    }
+    let state = match s("state").as_str() {
+        "idle" | "ready" => "待機中",
+        "reading" => "読み込み中",
+        "generating" => "生成中",
+        other => return format!("🧠 {head}：{other}"),
+    };
+    let mut line = format!("🧠 {head}：{state}");
+    if n("queued") > 0 {
+        line.push_str(&format!("（{}件待ち）", n("queued")));
+    }
+    if n("busy") > 0 {
+        line.push_str(&format!("・考え中 {}件", n("busy")));
+    }
+    line
 }
 
 fn status_cache() -> &'static Mutex<HashMap<String, CardStatus>> {
@@ -665,6 +952,7 @@ fn emit_event(app: &tauri::AppHandle, card: &str, mut v: serde_json::Value) {
                 st.message = s("message");
             }
             Some("error") => st.message = s("message"),
+            Some("thinker") => st.thinker = thinker_line(&v),
             Some("utterance") => st.last = format!("「{}」", s("text")),
             Some("speaking") => st.last = format!("🔊 {}", s("text")),
             Some("reflex") => match s("kind").as_str() {
@@ -675,6 +963,8 @@ fn emit_event(app: &tauri::AppHandle, card: &str, mut v: serde_json::Value) {
                     let n = v.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
                     st.last = format!("📝 {}：聞き取り中（{n}件）— 「以上」で確定", s("label"));
                 }
+                "think" => st.last = format!("🧠 考え中：{}", s("text")),
+                "thought" => st.last = format!("🧠 {}", s("text")),
                 "reset" => st.last = "（会話をリセット）".into(),
                 "nomatch" => st.last = format!("「{}」（該当なし）", s("text")),
                 "hush" => st.last = "（読み上げ停止）".into(),
@@ -1007,6 +1297,15 @@ pub(crate) fn voice_tick(app: &tauri::AppHandle) {
         stop_proc(app, &mut g);
         return;
     };
+    // v1.12: 思考役の状態を見回る（状態パネルの「🧠 Strata：生成中（2件待ち）」）。
+    {
+        static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap();
+        if g.proc.is_some() && last.map(|t| t.elapsed() >= THINKER_POLL).unwrap_or(true) {
+            *last = Some(Instant::now());
+            emit_thinker(app, &id, &thinker_conf(&spec));
+        }
+    }
     let args = proc_args(&spec, &hot);
     let sig = args.join(" ");
     if let Some(p) = g.proc.as_mut() {
@@ -1028,8 +1327,9 @@ pub(crate) fn voice_tick(app: &tauri::AppHandle) {
         Ok(()) => {
             g.backoff = None;
             if extra_str(&spec, "mode").as_deref() != Some("dictation") {
-                if let Some((ep, model)) = ai_conf(&spec) {
-                    warm_up(ep, model);
+                // 先読みは Ollama だけ（OpenAI 互換は読み込み済みのモデルを使う）。
+                if let Some(ai) = ai_conf(&spec).filter(|a| a.is_ollama()) {
+                    warm_up(ai.ep, ai.model);
                 }
             }
         }
@@ -1101,6 +1401,7 @@ fn log_utterance(card: &str, root: &Path, role: &str, text: &str, extra: serde_j
         }
         match role {
             "supervisor" => lines.push(format!("  - ⏹ {}", g("action"))),
+            "think" => lines.push(format!("  - 🧠 思考役へ：{}", g("question"))),
             "gather" if extra.get("start").is_some() => lines.push(format!("  - 📝 {}：聞き取り開始", g("target"))),
             "gather" => lines.push(format!("  - 📝 {}：追記", g("target"))),
             "command" | "dictation" => {
@@ -1252,6 +1553,184 @@ fn run_sys_action(app: &tauri::AppHandle, card: &str, root_p: &Path, text: &str,
     }
 }
 
+/// v1.12 ③: 実行結果の読み上げ文（出力の冒頭）と、発話ログに残す1行（ファイル名＋冒頭）。
+fn result_summary(root: &Path, r: &FlowReport) -> (String, String) {
+    let ids: Vec<&String> = r.created.iter().chain(r.updated.iter()).collect();
+    let Ok(p) = open_project_at(root) else { return (String::new(), String::new()) };
+    for id in ids {
+        let row: Option<(Option<String>, String)> = p
+            .conn
+            .query_row(
+                "SELECT committed_path, label FROM virtual_bodies WHERE id = ?1 AND deleted_at IS NULL",
+                rusqlite::params![id],
+                |x| Ok((x.get(0)?, x.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let Some((Some(path), name)) = row else { continue };
+        let full = PathBuf::from(load_path(root, &path));
+        let text = std::fs::read(&full).ok().and_then(|b| String::from_utf8(b).ok());
+        return match text {
+            Some(t) => {
+                let head = speakable_head(&t, 120);
+                (head.clone(), format!("{name}：{}", short(&head, 80)))
+            }
+            None => (format!("{name}を作りました"), name),
+        };
+    }
+    match r.outputs.first() {
+        Some(o) => (format!("{o}を作りました"), o.clone()),
+        None => (String::new(), String::new()),
+    }
+}
+
+/// 読み上げ用の冒頭: コードブロック・見出し記号・箇条書き記号・強調を落とし、最初の段落を最大 n 字
+/// （句点で切れるならそこで切る）。
+fn speakable_head(text: &str, n: usize) -> String {
+    let mut in_code = false;
+    let mut para: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let l = raw.trim();
+        if l.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        if l.is_empty() || l.starts_with('|') || l.starts_with("---") {
+            if !para.is_empty() {
+                break;
+            }
+            continue;
+        }
+        // 見出しだけを読み上げても意味が無いので飛ばす（本文の最初の段落を読む）。
+        if l.starts_with('#') {
+            continue;
+        }
+        let l = l.trim_start_matches(['-', '*', '>', '・']).trim();
+        let l = l.replace("**", "").replace('`', "");
+        if !l.is_empty() {
+            para.push(l);
+        }
+    }
+    let one = para.join(" ");
+    let cut: String = one.chars().take(n).collect();
+    if one.chars().count() <= n {
+        return cut;
+    }
+    match cut.rfind('。') {
+        Some(i) if i > 0 => cut[..i + '。'.len_utf8()].to_string(),
+        _ => format!("{cut}…"),
+    }
+}
+
+/// v1.12 思考の結果の置き場（発話ログと同じフォルダ・追記）。
+const THINK_MD_NAME: &str = "思考.md";
+/// 思考役に頼んで答えを待っている件数（アプリ全体・窓口は1枚）。
+static THINKING: AtomicUsize = AtomicUsize::new(0);
+
+/// 思考役（Strata → LM Studio）に問いを渡し、答えが来たら全文を 思考.md へ、要約を声で報告する。
+/// 待ちは別スレッド（窓口の会話は止めない＝裏で考えている間もおしゃべりは続く）。
+fn start_think(
+    app: &tauri::AppHandle,
+    card: &str,
+    root_p: &Path,
+    conf: crate::thinker::Conf,
+    question: String,
+    hist: &[(String, String)],
+) {
+    // 「それ」「さっきの件」を解くための抜粋（直近 6 件・各 300 字まで）。丸ごとは渡さない（§4.3）。
+    let context: String = hist
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|(r, c)| {
+            let who = if r == "user" { "ユーザー" } else { "窓口" };
+            format!("{who}: {}", c.chars().take(300).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (app, card, root_p) = (app.clone(), card.to_string(), root_p.to_path_buf());
+    THINKING.fetch_add(1, Ordering::SeqCst);
+    emit_thinker(&app, &card, &conf);
+    std::thread::spawn(move || {
+        let res = crate::thinker::think(&conf, &question, &context);
+        THINKING.fetch_sub(1, Ordering::SeqCst);
+        // 停止・切替の後に届いた答えも 思考.md には残す（考えた分は捨てない）。声は稼働中のときだけ。
+        let live = rt().lock().unwrap().proc.as_ref().map(|p| p.card == card).unwrap_or(false);
+        match res {
+            Ok(a) => {
+                let md = rt()
+                    .lock()
+                    .unwrap()
+                    .log_ctx
+                    .get(&card)
+                    .map(|c| c.0.with_file_name(THINK_MD_NAME))
+                    .unwrap_or_else(|| root_p.join(THINK_MD_NAME));
+                let entry = format!(
+                    "## {} {}\n\n{}\n\n— {}（{}・{:.0}秒）\n\n",
+                    md_time(),
+                    question,
+                    a.full,
+                    a.head,
+                    a.model,
+                    a.secs
+                );
+                if let Some(dir) = md.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let fresh = !md.exists();
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&md) {
+                    if fresh {
+                        let _ = writeln!(f, "# 思考\n");
+                    }
+                    let _ = write!(f, "{entry}");
+                }
+                md_append(&card, &format!("- {} 🧠 {}：{}", md_time(), a.head, short(&a.summary, 80)));
+                // 窓口の会話にも要約を残す（続けて「それって…」と聞けるように）。
+                rt().lock().unwrap().history.entry(card.clone()).or_default().push((
+                    "assistant".into(),
+                    format!("（思考役の答え: {question} → {}）", a.summary),
+                ));
+                emit_event(&app, &card, serde_json::json!({ "ev": "reflex", "kind": "thought",
+                    "text": a.summary, "label": a.head }));
+                if live {
+                    say(&card, &format!("考えがまとまりました。{}", a.summary), "normal");
+                }
+            }
+            Err(e) => {
+                md_append(&card, &format!("- {} 🧠 ✗ {}", md_time(), short(&e, 80)));
+                emit_event(&app, &card, serde_json::json!({ "ev": "reflex", "kind": "thought", "text": e, "error": true }));
+                if live {
+                    say(&card, &format!("考えられませんでした。{}", short(&e, 40)), "urgent");
+                }
+            }
+        }
+        emit_thinker(&app, &card, &conf);
+    });
+}
+
+/// 状態パネルへ思考役の状態を送る（ネットワークを引くので呼び出し側は別スレッドで）。
+fn emit_thinker(app: &tauri::AppHandle, card: &str, conf: &crate::thinker::Conf) {
+    if !conf.enabled() {
+        return;
+    }
+    let (app, card, conf) = (app.clone(), card.to_string(), conf.clone());
+    std::thread::spawn(move || {
+        let s = crate::thinker::status(&conf);
+        emit_event(&app, &card, serde_json::json!({ "ev": "thinker", "head": s.head, "state": s.state,
+            "queued": s.queued, "busy": THINKING.load(Ordering::SeqCst) }));
+    });
+}
+
+/// 思考役の見回り間隔（voice_tick は 1 秒ごと）。
+const THINKER_POLL: Duration = Duration::from_secs(5);
+
 fn handle_utterance(app: &tauri::AppHandle, card: &str, root: &str, text: &str, source: &'static str) {
     let root_p = Path::new(root);
     // 停止・切替の後に届いた発話は捨てる。
@@ -1306,7 +1785,8 @@ fn handle_utterance(app: &tauri::AppHandle, card: &str, root: &str, text: &str, 
         }
         (targets.iter().collect(), text.to_string(), None)
     } else {
-        if targets.is_empty() {
+        // v1.12: AI と会話する設定なら矢印が無くても話せる（ふだんは質問に答えるだけ・V1.12 §1）。
+        if targets.is_empty() && !use_ai {
             log_utterance(card, root_p, "unmatched", text, serde_json::json!({}));
             return;
         }
@@ -1315,7 +1795,7 @@ fn handle_utterance(app: &tauri::AppHandle, card: &str, root: &str, text: &str, 
         let mut via = "phrase";
         let mut picked: Option<(&Target, String, Option<String>)> = None;
         let mut ai_ok = false;
-        if let Some((ep, model)) = ai_conf(&spec) {
+        if let Some(ai) = ai_conf(&spec) {
             emit_event(app, card, serde_json::json!({ "ev": "reflex", "kind": "classifying", "text": text }));
             let (hist, pending) = {
                 let mut g = rt().lock().unwrap();
@@ -1325,8 +1805,13 @@ fn handle_utterance(app: &tauri::AppHandle, card: &str, root: &str, text: &str, 
                 (g.history.get(card).cloned().unwrap_or_default(), g.pending.get(card).cloned())
             };
             let pend_arg = pending.as_ref().map(|p| (p.label.as_str(), p.parts.as_slice()));
-            match agent_turn(&ep, &model, &hist, text, &targets, pend_arg) {
-                Ok(out) => {
+            let tconf = thinker_conf(&spec);
+            let opts = TurnOpts { think: tconf.enabled(), sys: true };
+            match agent_turn(&ai, &hist, text, &targets, pend_arg, opts) {
+                Ok(mut out) => {
+                    if opts.think && pending.is_none() {
+                        promote_think(&mut out, text, &extra_list(&spec, "think_words", DEFAULT_THINK_WORDS));
+                    }
                     ai_ok = true;
                     via = "ai";
                     let remember = |assistant: String| {
@@ -1391,6 +1876,20 @@ fn handle_utterance(app: &tauri::AppHandle, card: &str, root: &str, text: &str, 
                             emit_event(app, card, serde_json::json!({ "ev": "reflex", "kind": "reply", "text": text }));
                             return;
                         }
+                    } else if out.action == ACT_THINK && tconf.enabled() {
+                        // v1.12: 思考役へ回す。返事（考えておきます）はすぐ、答えは後から報告。
+                        let question = if out.content.trim().is_empty() { text.to_string() } else { out.content.trim().to_string() };
+                        let busy = THINKING.load(Ordering::SeqCst);
+                        let mut reply = if out.reply.is_empty() { "考えておきます".to_string() } else { out.reply.clone() };
+                        if busy > 0 {
+                            reply.push_str(&format!("。前に{busy}件考えています"));
+                        }
+                        speak_reply(&reply);
+                        remember(format!("{reply}（思考役に依頼: {question}）"));
+                        log_utterance(card, root_p, "think", text, serde_json::json!({ "via": "ai", "reply": reply, "question": question }));
+                        emit_event(app, card, serde_json::json!({ "ev": "reflex", "kind": "think", "text": question }));
+                        start_think(app, card, root_p, tconf, question, &hist);
+                        return;
                     } else if out.action == ACT_RUN && out.cmd.is_some() && !out.content.trim().is_empty() {
                         // 頼む言葉と中身が一度に来た → すぐ実行。
                         let i = out.cmd.unwrap();
@@ -1514,10 +2013,18 @@ fn handle_utterance(app: &tauri::AppHandle, card: &str, root: &str, text: &str, 
     let report = extra_str(&spec, "report").unwrap_or_else(|| "fired".into());
     for t in fire {
         rt().lock().unwrap().fired.insert(t.id.clone());
-        let (app2, card2, tid, label, report) =
-            (app.clone(), card.to_string(), t.id.clone(), t.label.clone(), report.clone());
+        let (app2, card2, tid, label, report, prompt, root2) = (
+            app.clone(),
+            card.to_string(),
+            t.id.clone(),
+            t.label.clone(),
+            report.clone(),
+            content.clone(),
+            root_p.to_path_buf(),
+        );
         std::thread::spawn(move || {
-            let res = run_flow_for(&tid, &app2);
+            // v1.12 ①: 発話の中身を発火先カードへの入力として直接渡す（受け皿ファイルは従来どおり書く）。
+            let res = run_flow_with_prompt(&tid, &app2, &prompt);
             if report == "none" {
                 if let Err(e) = &res {
                     md_append(&card2, &format!("- {} ✗ {label}: {}", md_time(), short(e, 60)));
@@ -1525,6 +2032,14 @@ fn handle_utterance(app: &tauri::AppHandle, card: &str, root: &str, text: &str, 
                 return;
             }
             let (msg, pri, mark) = match &res {
+                // v1.12 ③: 結果の中身の冒頭も読み上げる（report:"brief" は従来どおり「終わりました」だけ）。
+                Ok(r) if r.errors.is_empty() && report != "brief" => {
+                    let (spoken, detail) = result_summary(&root2, r);
+                    if !detail.is_empty() {
+                        md_append(&card2, &format!("  - 📄 {detail}"));
+                    }
+                    (format!("{label}、終わりました。{spoken}"), "normal", "✓")
+                }
                 Ok(r) if r.errors.is_empty() => (format!("{label}、終わりました"), "normal", "✓"),
                 Ok(r) => (format!("{label}でエラーがありました。{}", short(&r.errors[0], 40)), "urgent", "✗"),
                 Err(e) => (format!("{label}は実行できませんでした。{}", short(e, 40)), "urgent", "✗"),
@@ -1621,11 +2136,11 @@ mod tests {
             phrases: vec!["メモして".into(), "覚えて".into()],
             memo: Some("内容をメモに残す".into()),
         }];
-        let p = agent_prompt(&t, None);
+        let p = agent_prompt(&t, None, TurnOpts { think: true, sys: true });
         assert!(p.contains("- メモして（言い方の例: 覚えて）: 内容をメモに残す"));
         assert!(p.contains("- 読み上げを止める:"));
         let parts = vec!["明日は10時に歯医者".to_string()];
-        let p = agent_prompt(&t, Some(("メモして", &parts)));
+        let p = agent_prompt(&t, Some(("メモして", &parts)), TurnOpts { think: true, sys: true });
         assert!(p.contains("「メモして」の中身を話している途中"));
         assert!(p.contains("・明日は10時に歯医者"));
     }
@@ -1677,7 +2192,7 @@ mod tests {
             for text in *lines {
                 let t0 = Instant::now();
                 let pa = pend.as_ref().map(|(l, p)| (l.as_str(), p.as_slice()));
-                let out = agent_turn(DEFAULT_AI_ENDPOINT, &model, &hist, text, &t, pa).expect("Ollama");
+                let out = agent_turn(&live_ai(&model), &hist, text, &t, pa, TurnOpts { think: true, sys: true }).expect("Ollama");
                 // handle_utterance と同じ状態遷移（発火の代わりに印字）。
                 let mut did = String::new();
                 if let Some(a) = out.sys {
@@ -1738,13 +2253,23 @@ mod tests {
             ("文字数を数えて、吾輩は猫である", "実行 count"),
             ("今日は何曜日だっけ", "会話"),
             ("ちょっと止めて", "Hush"),
+            // v1.12 思考役へ回す問い／その場で答える問い。
+            ("音声アシスタントの返事を速く感じさせる方法を、よく考えて教えて", "考える"),
+            ("ローカルLLMとクラウドのAIの使い分けについて、利点と欠点を比べて詳しく説明して", "考える"),
+            ("こんにちは、調子はどう？", "会話"),
         ];
+        let model = std::env::var("VOICE_LIVE_MODEL").unwrap_or_else(|_| DEFAULT_AI_MODEL.into());
+        println!("model = {model}");
         let mut miss = 0;
         for (text, want) in cases {
             let t0 = Instant::now();
-            let out = agent_turn(DEFAULT_AI_ENDPOINT, DEFAULT_AI_MODEL, &[], text, &t, None).expect("Ollama");
+            let mut out = agent_turn(&live_ai(&model), &[], text, &t, None, TurnOpts { think: true, sys: true }).expect("Ollama");
+            let words: Vec<String> = DEFAULT_THINK_WORDS.iter().map(|s| s.to_string()).collect();
+            promote_think(&mut out, text, &words);
             let got = if let Some(a) = out.sys {
                 format!("{a:?}")
+            } else if out.action == ACT_THINK {
+                "考える".to_string()
             } else if out.action == ACT_RUN && out.cmd.is_some() && !out.content.trim().is_empty() {
                 format!("実行 {}", t[out.cmd.unwrap()].id)
             } else if (out.action == ACT_WAIT || out.action == ACT_RUN) && out.cmd.is_some() {
@@ -1759,6 +2284,128 @@ mod tests {
             println!("{:5.2}s {} 「{text}」 → {got}（期待 {want}）中身「{}」", t0.elapsed().as_secs_f32(), if ok { "○" } else { "×" }, out.content);
         }
         println!("外れ {miss} 件");
+    }
+
+    #[test]
+    fn speakable_head_skips_markup() {
+        let t = "# 要約
+
+**結論**：明日は晴れです。気温は25度。
+
+- 詳細1
+";
+        assert_eq!(speakable_head(t, 120), "結論：明日は晴れです。気温は25度。");
+        let t = "```python
+print(1)
+```
+明日は晴れです。気温は25度。風は弱い。";
+        assert_eq!(speakable_head(t, 12), "明日は晴れです。");
+        assert_eq!(speakable_head("- 牛乳を買う
+- 卵", 50), "牛乳を買う 卵");
+    }
+
+    #[test]
+    fn describe_skips_heading_and_keeps_first_paragraph() {
+        let m = "プログラミング
+自然言語を最適な言語を使って
+プログラミングしソースコードを保存します。
+
+細則…";
+        assert_eq!(describe("プログラミング", m), "自然言語を最適な言語を使って プログラミングしソースコードを保存します。");
+        assert_eq!(describe("要約", "長めの話を3行に要約する"), "長めの話を3行に要約する");
+    }
+
+    #[test]
+    fn sys_action_needs_backing_words() {
+        // 実測で gemma3 が「中止」にした発話は裏付けなし → 選び直し。
+        assert!(!sys_backed(SysAction::Cancel, "英語で要約して"));
+        assert!(!sys_backed(SysAction::Cancel, "文字数を数えて、吾輩は猫である"));
+        assert!(sys_backed(SysAction::Cancel, "全部キャンセルして"));
+        assert!(sys_backed(SysAction::Hush, "ちょっと止めてください"));
+        assert!(sys_backed(SysAction::Reset, "最初からやり直そう"));
+    }
+
+    /// 実機テストの応答用 AI。VOICE_LIVE_PROVIDER（ollama/lmstudio/openai）・VOICE_LIVE_ENDPOINT で切替。
+    fn live_ai(model: &str) -> FrontAi {
+        let mut a = FrontAi::ollama(model);
+        if let Ok(p) = std::env::var("VOICE_LIVE_PROVIDER") {
+            a.provider = p;
+        }
+        if let Ok(e) = std::env::var("VOICE_LIVE_ENDPOINT") {
+            a.ep = e;
+        }
+        a
+    }
+
+    #[test]
+    fn front_ai_reads_card_settings() {
+        let s = parse_op_spec(r#"{"op":"voice"}"#).unwrap();
+        let a = ai_conf(&s).unwrap();
+        assert_eq!(
+            (a.provider.as_str(), a.ep.as_str(), a.model.as_str(), a.think.as_str()),
+            ("ollama", DEFAULT_AI_ENDPOINT, DEFAULT_AI_MODEL, "off")
+        );
+        let s = parse_op_spec(
+            r#"{"op":"voice","ai_provider":"openai","ai_endpoint":"http://127.0.0.1:8080/v1/","ai_model":"swift","ai_temperature":0.3}"#,
+        )
+        .unwrap();
+        let a = ai_conf(&s).unwrap();
+        assert!(!a.is_ollama());
+        assert_eq!(a.ep, "http://127.0.0.1:8080/v1");
+        assert_eq!(a.temperature, 0.3);
+        let mut body = serde_json::json!({ "model": "swift" });
+        let extra = serde_json::json!({ "reasoning_budget_tokens": 100, "model": "x" });
+        merge_extra(&mut body, extra.as_object().unwrap());
+        assert_eq!(body["reasoning_budget_tokens"], 100);
+        assert_eq!(body["model"], "swift", "管理しているキーは上書きさせない");
+        let s = parse_op_spec(r#"{"op":"voice","ai_provider":"lmstudio"}"#).unwrap();
+        assert_eq!(ai_conf(&s).unwrap().ep, "http://localhost:1234/v1");
+    }
+
+    #[test]
+    fn think_words_promote_chat_only() {
+        let words: Vec<String> = DEFAULT_THINK_WORDS.iter().map(|s| s.to_string()).collect();
+        let mk = |action: &str| AgentOut {
+            reply: "はい".into(),
+            action: action.into(),
+            cmd: None,
+            content: String::new(),
+            sys: None,
+        };
+        let mut o = mk(ACT_CHAT);
+        promote_think(&mut o, "使い分けを詳しく説明して", &words);
+        assert_eq!(o.action, ACT_THINK);
+        assert_eq!(o.content, "使い分けを詳しく説明して");
+        let mut o = mk(ACT_CHAT);
+        promote_think(&mut o, "こんにちは", &words);
+        assert_eq!(o.action, ACT_CHAT);
+        // コマンドの実行は格上げしない。
+        let mut o = mk(ACT_RUN);
+        o.cmd = Some(0);
+        promote_think(&mut o, "メモして、詳しく調べる", &words);
+        assert_eq!(o.action, ACT_RUN);
+        // コマンド名の無い「実行」は会話と同じ扱い → 格上げ。
+        let mut o = mk(ACT_RUN);
+        promote_think(&mut o, "よく考えて教えて", &words);
+        assert_eq!(o.action, ACT_THINK);
+    }
+
+    #[test]
+    fn prompt_without_targets_still_talks_and_thinks() {
+        let p = agent_prompt(&[], None, TurnOpts { think: true, sys: true });
+        assert!(p.contains("（なし）"));
+        assert!(p.contains(ACT_THINK));
+        let p = agent_prompt(&[], None, TurnOpts { think: false, sys: false });
+        assert!(!p.contains(ACT_THINK));
+        assert!(!p.contains("実行を中止する"));
+    }
+
+    #[test]
+    fn thinker_line_reads_status() {
+        let v = serde_json::json!({ "head": "Strata", "state": "generating", "queued": 2, "busy": 1 });
+        assert_eq!(thinker_line(&v), "🧠 Strata：生成中（2件待ち）・考え中 1件");
+        let v = serde_json::json!({ "head": "", "state": "down" });
+        assert!(thinker_line(&v).contains("思考役なし"));
     }
 
     #[test]

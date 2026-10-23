@@ -18,7 +18,27 @@ type VoiceEvent = {
   content?: string;
   /** utterance の出どころ（mic / text=パネルの欄 / card=会話へ送るカード）。 */
   source?: string;
+  /** v1.12 thinker: 思考役の頭（Strata / LM Studio / 空＝使えない）・状態・順番待ち・考え中の件数。 */
+  head?: string;
+  queued?: number;
+  busy?: number;
+  error?: boolean;
 };
+
+// v1.12 思考役の状態の1行（voice.rs thinker_line と同じ文言）。
+const THINKER_STATE: Record<string, string> = {
+  idle: "待機中",
+  ready: "待機中",
+  reading: "読み込み中",
+  generating: "生成中",
+};
+function thinkerLine(v: VoiceEvent): string {
+  if (!v.head) return "🧠 思考役なし（Strata も LM Studio も使えません）";
+  let line = `🧠 ${v.head}：${THINKER_STATE[v.state ?? ""] ?? v.state ?? ""}`;
+  if (v.queued) line += `（${v.queued}件待ち）`;
+  if (v.busy) line += `・考え中 ${v.busy}件`;
+  return line;
+}
 
 const STATE_LABEL: Record<string, string> = {
   starting: "起動中…",
@@ -59,20 +79,22 @@ export function VoiceStatus({
   const [last, setLast] = useState<string>("");
   const [speaking, setSpeaking] = useState(false);
   const [build, setBuild] = useState<string | null>(null);
+  const [thinker, setThinker] = useState<string>("");
   // v1.10: テキスト欄（話しかけたのと同じ扱いで会話へ入れる・voice_send_text）。
   const [draft, setDraft] = useState("");
   const [sendErr, setSendErr] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
-    void invoke<{ state: string; message: string; last: string } | null>("voice_status", { card: id }).then(
-      (s) => {
-        if (!alive || !s) return;
-        if (s.state) setState(s.state);
-        setMessage(s.message);
-        setLast(s.last);
-      }
-    );
+    void invoke<{ state: string; message: string; last: string; thinker: string } | null>("voice_status", {
+      card: id,
+    }).then((s) => {
+      if (!alive || !s) return;
+      if (s.state) setState(s.state);
+      setMessage(s.message);
+      setLast(s.last);
+      setThinker(s.thinker);
+    });
     const un = listen<VoiceEvent>("voice:event", (e) => {
       const v = e.payload;
       if (v.card !== id) return;
@@ -85,6 +107,9 @@ export function VoiceStatus({
           break;
         case "error":
           setMessage(v.message ?? "");
+          break;
+        case "thinker":
+          setThinker(thinkerLine(v));
           break;
         case "level":
           setLevel(v.rms ?? 0);
@@ -103,6 +128,8 @@ export function VoiceStatus({
           if (v.kind === "fire") setLast(`→ ${v.label}（${v.content ?? ""}）`);
           else if (v.kind === "classifying") setLast(`「${v.text ?? ""}」→ 考え中…`);
           else if (v.kind === "reply") setLast(`「${v.text ?? ""}」`);
+          else if (v.kind === "think") setLast(`🧠 考え中：${v.text ?? ""}`);
+          else if (v.kind === "thought") setLast(`🧠 ${v.text ?? ""}`);
           else if (v.kind === "reset") setLast("（会話をリセット）");
           else if (v.kind === "nomatch") setLast(`「${v.text ?? ""}」（該当なし）`);
           else if (v.kind === "hush") setLast("（読み上げ停止）");
@@ -190,7 +217,7 @@ export function VoiceStatus({
             style={{
               width: `${toPct(level)}%`,
               height: "100%",
-              background: level >= threshold ? "#e06060" : "#8a6230",
+              background: level >= threshold ? "#e06060" : "#7a5ab0",
               borderRadius: 3,
               transition: "width 0.15s",
             }}
@@ -220,7 +247,7 @@ export function VoiceStatus({
             fontSize: 12,
             fontWeight: 600,
             color: "#fff",
-            background: "#8a6230",
+            background: "#7a5ab0",
             border: "none",
             borderRadius: 5,
             cursor: "pointer",
@@ -234,6 +261,14 @@ export function VoiceStatus({
         <div style={{ color: "#ff9a9a", wordBreak: "break-all" }}>{message}</div>
       )}
       {last && <div style={{ wordBreak: "break-all", opacity: 0.9 }}>{last}</div>}
+      {thinker && (
+        <div
+          title="思考役（じっくり考える問いを回す先）。Strata → LM Studio の順に使えるものを選びます"
+          style={{ opacity: 0.75, fontSize: 11 }}
+        >
+          {thinker}
+        </div>
+      )}
       {canType && (
         <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
           <input
@@ -263,7 +298,7 @@ export function VoiceStatus({
               fontSize: 12,
               padding: "2px 8px",
               color: "#fff",
-              background: "#8a6230",
+              background: "#7a5ab0",
               border: "none",
               borderRadius: 4,
               cursor: draft.trim() ? "pointer" : "default",

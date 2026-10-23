@@ -199,6 +199,14 @@ const FILTER_TYPE_STYLES = {
     badge: "✨ ジェネレータ",
     run: "▶ 生成",
   },
+  // v1.12 ④ コンストラクタ: 処理系の仲間（緑）だが、押すと「カードを並べる」ので名前とボタンで見分ける。
+  construct: {
+    bg: "var(--card-bg-filter, #14281e)",
+    border: "#3a7a5a",
+    text: "var(--card-filter-text, #7fd8b0)",
+    badge: "🏗 コンストラクタ",
+    run: "▶ 構築",
+  },
   // シェルカード統合（2026-07-06）: cmd/PowerShell カード。従来は「⚙ フィルタ」表示で
   // 見分けがつかなかった。配色はコマンド系を流用（テーマ変数の追加を避ける）。
   shell: {
@@ -231,11 +239,12 @@ const FILTER_TYPE_STYLES = {
     badge: "⚡ ウォッチャ",
     run: "",
   },
-  // v1.10 音声反射カード: 発行系の仲間（琥珀）。稼働トグルのみ・▶なし。
+  // v1.10 音声反射カード: 稼働トグルのみ・▶なし。v1.12 で「声の窓口」（常駐して人と話すカード）に
+  // なったので、発行系の琥珀から外して紫（どの種別も使っていない色）にする。
   op_voice: {
-    bg: "var(--card-bg-op, #2c1e10)",
-    border: "#8a6230",
-    text: "var(--card-op-text, #f0c070)",
+    bg: "var(--card-bg-live, #221a30)",
+    border: "#7a5ab0",
+    text: "var(--card-live-text, #c8a8f0)",
     badge: "🎙 音声",
     run: "",
   },
@@ -267,6 +276,7 @@ function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_
       return `op_${s.op}` as keyof typeof FILTER_TYPE_STYLES;
     }
     if (typeof s.shell === "string") return "shell";
+    if (s.builtin === "construct") return "construct";
     if (!s.builtin && (s.type === "command" || s.type === "generator")) return s.type;
   } catch {
     // 壊れたJSONはフィルタ扱いで表示だけ続行（編集ダイアログ側で直せる）

@@ -1232,6 +1232,14 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
         a.openSubmenu([
           { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog") },
           { label: "AI変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat") },
+          // v1.12 ④（docs/V1.12_声の窓口と思考役計画.md §6）
+          {
+            label: "コンストラクタ（依頼からカードフローを組む）...",
+            hint:
+              "つないだ依頼を読み、AI がカードの設計図を書いて、配線の決まりで検査し、このプロジェクトに並べます。" +
+              "音声カードからリクエスト矢印でつなげば「〜するフローを構築して」と話すだけで並びます。",
+            onClick: () => a.addFilter("construct"),
+          },
           { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i") },
           // v2.0 t23d: G層2例目（Hunyuan3D-2・V2.0_t23d設計.md）。
           {

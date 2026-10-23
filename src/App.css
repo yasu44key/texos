@@ -91,6 +91,9 @@
   --card-filter-text: #1f7a55;
   --card-filter-cmd-text: #1d7777;
   --card-filter-gen-text: #9a6a1f;
+  /* v1.12 声の窓口（音声カード）＝紫（淡色面では濃色の文字）。 */
+  --card-bg-live: #efe7fa;
+  --card-live-text: #6a3fb0;
   --card-drop-text: #1f6db5;
   --card-launcher-text: #1f7a55;
   /* ビュワー系パネル（ライト追従）。設定ダイアログは対象外で暗色固定のまま。 */
@@ -228,6 +231,9 @@
   --card-filter-text: #8fe0bd;
   --card-filter-cmd-text: #8fe0e0;
   --card-filter-gen-text: #ecc88a;
+  /* v1.12 声の窓口（音声カード）＝紫。 */
+  --card-bg-live: #3a3048;
+  --card-live-text: #d0b4f4;
   --card-drop-text: #8fc0e8;
   --card-launcher-text: #8fe0bd;
   --panel-bg: #2c313e;
@@ -291,6 +297,9 @@
   --card-filter-text: #1f6b4a;
   --card-filter-cmd-text: #1d6a6a;
   --card-filter-gen-text: #8a5e1a;
+  /* v1.12 声の窓口（音声カード）＝紫（淡色面では濃色の文字）。 */
+  --card-bg-live: #efe7fa;
+  --card-live-text: #6a3fb0;
   --card-drop-text: #1f5fa0;
   --card-launcher-text: #1f6b4a;
   --panel-bg: #e4e7ec;
@@ -355,6 +364,9 @@
   --card-filter-text: #1f7a55;
   --card-filter-cmd-text: #1d7777;
   --card-filter-gen-text: #9a6a1f;
+  /* v1.12 声の窓口（音声カード）＝紫（淡色面では濃色の文字）。 */
+  --card-bg-live: #efe7fa;
+  --card-live-text: #6a3fb0;
   --card-drop-text: #1f6db5;
   --card-launcher-text: #1f7a55;
   --panel-bg: #ffffff;
@@ -582,6 +594,9 @@
   --card-filter-text: #1f6b4a;
   --card-filter-cmd-text: #1d6a6a;
   --card-filter-gen-text: #8a5e1a;
+  /* v1.12 声の窓口（音声カード）＝紫（淡色面では濃色の文字）。 */
+  --card-bg-live: #efe7fa;
+  --card-live-text: #6a3fb0;
   --card-drop-text: #1f5fa0;
   --card-launcher-text: #1f6b4a;
   --panel-bg: #e8eae6;
@@ -630,6 +645,9 @@
   --card-filter-text: #2a6a42;
   --card-filter-cmd-text: #1d6a62;
   --card-filter-gen-text: #8a5e1a;
+  /* v1.12 声の窓口（音声カード）＝紫（淡色面では濃色の文字）。 */
+  --card-bg-live: #efe7fa;
+  --card-live-text: #6a3fb0;
   --card-drop-text: #2a5a8a;
   --card-launcher-text: #2a6a42;
   --panel-bg: #f0e9da;

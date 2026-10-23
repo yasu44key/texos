@@ -553,6 +553,17 @@ class Project:
                 cmd, mode = spec.get("cmd") or "", spec.get("type")
                 if not spec.get("name") and not cmd:
                     errs.append(f"[{c['label']}] プログラム名も cmd もありません")
+                # 規約 §3-13（2026-08-27 実機）: cmd は引数だけ。先頭にプログラム名を書くと
+                # 「…\gcc.exe gcc.exe …」になり、エラーにならず 0 バイトの出力が静かに出来る。
+                # 2026-10-23 コンストラクタ（Strata）も踏んだので検査で弾く。
+                nm = os.path.basename(str(spec.get("name") or "")).lower()
+                head = cmd.strip().split(" ", 1)[0].strip('"').replace("\\", "/").rsplit("/", 1)[-1].lower()
+                if nm and head and head in (nm, os.path.splitext(nm)[0]):
+                    errs.append(
+                        f"[{c['label']}] cmd の先頭にプログラム名（{head}）があります。"
+                        f"cmd に書くのは**引数だけ**です（name={spec.get('name')} が実行されます）。"
+                        f"例: name=\"gcc.exe\", cmd='\"{{in}}\" -o \"{{out}}\"'"
+                    )
                 if not _AGG_CMD.search(cmd) and "{in" in cmd and n > 1:
                     errs.append(
                         f"[{c['label']}] 入力が {n} 本ありますが cmd は `{{in}}` だけです。"

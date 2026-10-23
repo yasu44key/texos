@@ -253,6 +253,8 @@ function App() {
     label: string;
     spec: string;
     create?: { x: number; y: number; linkFrom?: string };
+    /** v1.12 ④: コンストラクタも同じ設定画面（モデルの入れ替え・調整を AI カードと同じに）。 */
+    variant?: "ai" | "construct" | "voice";
   } | null>(null);
   // v1.4.8 ①: Whisper セットアップダイアログ（未導入時に開く。作成位置を保持）。
   const [whisperDlg, setWhisperDlg] = useState<{
@@ -1316,6 +1318,25 @@ function App() {
         });
         return;
       }
+      if (builtin === "construct") {
+        // v1.12 ④ コンストラクタ: 既定は Strata（OpenAI 互換）。AI カードと同じ設定画面で作成。
+        setAiDlg({
+          variant: "construct",
+          id: null,
+          label: "コンストラクタ",
+          spec: JSON.stringify({
+            builtin: "construct",
+            provider: "openai",
+            model: "swift-1.5-iq2_xs",
+            endpoint: "http://127.0.0.1:8080/v1",
+            accept_mime: "text/*",
+            output_ext: "md",
+            prefix: "構築レポート",
+          }),
+          create: { x: canvasX, y: canvasY, linkFrom },
+        });
+        return;
+      }
       if (builtin === "ai_dialog" || builtin === "ai_chat") {
         // v1.4.1 AIカードの作成は専用設定ダイアログで（モデル/システム/温度を一括設定）。
         // 作成・編集で同じダイアログ＝システムプロンプトも複数行で書ける。
@@ -2188,6 +2209,10 @@ function App() {
       // v1.4.1 AIカードは専用設定ダイアログ。
       if (builtin === "ai") {
         setAiDlg({ id, label, spec: current });
+        return;
+      }
+      if (builtin === "construct") {
+        setAiDlg({ id, label, spec: current, variant: "construct" });
         return;
       }
       // v1.5 Text-To-Image カードも専用設定ダイアログ（取得済みモデル一覧を添えて開く）。
@@ -6764,6 +6789,16 @@ function App() {
           initialSpec={builtinDlg.spec}
           // v1.8.3: フォルダ欄の「参照…」でプロジェクト配下を選んだら相対パスに畳む。
           projectRoot={projectPathRef.current}
+          // v1.12: 音声カードは応答 AI を AI カードと同じ設定画面で（編集時だけ）。
+          onOpenAi={
+            builtinDlg.builtin === "op_voice" && builtinDlg.id
+              ? () => {
+                  const dlg = builtinDlg;
+                  setBuiltinDlg(null);
+                  setAiDlg({ id: dlg.id, label: dlg.label, spec: dlg.spec ?? "{}", variant: "voice" });
+                }
+              : undefined
+          }
           onCancel={() => setBuiltinDlg(null)}
           onSave={async (label, spec) => {
             const dlg = builtinDlg;
@@ -6866,6 +6901,7 @@ function App() {
         <AiSettingsDialog
           initialLabel={aiDlg.label}
           initialSpec={aiDlg.spec}
+          variant={aiDlg.variant}
           onCancel={() => setAiDlg(null)}
           onSave={async (label, spec) => {
             const dlg = aiDlg;
