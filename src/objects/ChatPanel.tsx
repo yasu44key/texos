@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { panelMouseDown } from "./panelResize";
 
 // v1.4.1 AIチャット（builtin:"ai" mode:"chat"）の会話パネル。
 // 履歴は backend の .texos/chats/<id>.json が source of truth。送信→
@@ -304,7 +305,7 @@ export function ChatPanel({ objId, label, top, onClose, provider, endpoint }: Pr
 
   return (
     <div
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={panelMouseDown}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",

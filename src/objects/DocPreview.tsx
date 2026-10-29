@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import * as XLSX from "xlsx";
 import mammoth from "mammoth";
-import { usePanelResize, cornerHandleStyle } from "./panelResize";
+import { usePanelResize, cornerHandleStyle, panelMouseDown } from "./panelResize";
 
 // HTML 化（第1階層）で扱う拡張子。それ以外の doc 系は LibreOffice→PDF（第2階層）。
 const HTML_EXTS = ["docx", "xlsx", "xls", "ods", "csv", "tsv"];
@@ -83,7 +83,7 @@ export function DocPreview({
   return (
     <div
       ref={panelRef}
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={panelMouseDown}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",

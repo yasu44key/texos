@@ -15,6 +15,7 @@ import io
 import json
 import os
 import sys
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from texos_flow import BuildError, Project  # noqa: E402
@@ -57,7 +58,8 @@ PRESET_EXTRA = {"mic_record": {"record": True, "stop_cmd": "q"}}
 
 
 def layout(cards, edges):
-    """矢印の深さで列（左→右）、同じ深さは置いた順に縦。戻り矢印（previous）は辿らない。"""
+    """矢印の深さで列（左→右）、同じ深さは置いた順に縦。戻り矢印（previous）は辿らない。
+    既存のカード（existing）は置かないので、行を取らず、列も新しいカードだけで 0 から数える。"""
     ins = {cid: [] for cid in cards}
     for f, t, role in edges:
         if role != "previous":
@@ -79,10 +81,15 @@ def layout(cards, edges):
     for f, t, role in edges:
         if role in ("system", "answer") and cards[f]["kind"] == "note":
             depth[f] = max(0, depth[t] - 1)
+    fresh = [c for c in cards if not cards[c].get("existing")]
+    base = min((depth[c] for c in fresh), default=0)
     rows = {}
     pos = {}
     for c in cards:  # dict は挿入順＝設計図の順
-        col = depth[c]
+        if cards[c].get("existing"):
+            pos[c] = (0.0, 0.0)
+            continue
+        col = depth[c] - base
         r = rows.get(col, 0)
         rows[col] = r + 1
         pos[c] = (col * 340.0, r * 200.0)
@@ -100,6 +107,8 @@ def main():
                 provider=req.get("provider") or "ollama")
     ids = {}       # 設計図の id → ビルダーのカード id
     keys = {}      # ビルダーのカード id → 設計図の id
+    # v1.12: いまのプロジェクトにあるファイルカード（ref → {label, mime}）。call "existing" で使う。
+    existing = {e["ref"]: e for e in (req.get("existing") or []) if e.get("ref")}
     for i, c in enumerate(plan["calls"]):
         where = f"calls[{i}]"
         if not isinstance(c, dict) or "call" not in c:
@@ -116,6 +125,26 @@ def main():
                 p.flow(src, dst, role=c.get("role"))
             except BuildError as e:
                 errors.append(f"{where}: {e}")
+            continue
+        if name == "existing":
+            cid_key, ref = c.get("id"), c.get("ref")
+            if not cid_key or cid_key in ids:
+                errors.append(f"{where}: id が無いか重複しています（{cid_key!r}）")
+                continue
+            if ref not in existing:
+                have = ", ".join(f"{r}={e['label']}" for r, e in list(existing.items())[:12]) or "（一覧なし）"
+                errors.append(f"{where}（{cid_key}）: ref「{ref}」は一覧にありません（あるもの: {have}）")
+                continue
+            e = existing[ref]
+            vid = uuid.uuid4().hex
+            label = str(e.get("label") or ref)
+            # 既存の実身カードとして検査に参加させる（置かない＝ファイルも作らない）。
+            p._cards[vid] = dict(label=label, kind="file", spec=None, x=0, y=0, memo=None,
+                                 path=os.path.join(p.root, label),
+                                 ext=label.rsplit(".", 1)[-1] if "." in label else None,
+                                 existing=ref)
+            ids[cid_key] = vid
+            keys[vid] = cid_key
             continue
         if name in PRESETS:
             cid_key = c.get("id")
@@ -135,7 +164,7 @@ def main():
             continue
         if name not in CARD_CALLS:
             errors.append(f"{where}: call「{name}」は使えません（使えるもの: "
-                          f"{', '.join(list(CARD_CALLS) + list(PRESETS) + ['flow'])}）")
+                          f"{', '.join(list(CARD_CALLS) + list(PRESETS) + ['existing', 'flow'])}）")
             continue
         cid_key = c.get("id")
         if not cid_key or cid_key in ids:
@@ -189,7 +218,9 @@ def main():
         if c["kind"] == "note":
             out["note_text"] = c.get("note_text", "")
             out["style"] = c.get("style")
-        if c["kind"] == "file":
+        if c.get("existing"):
+            out["existing"] = c["existing"]
+        elif c["kind"] == "file":
             rel = os.path.relpath(c["path"], root)
             data = next(b for (path, b, fid) in p._files if fid == vid)
             out["file"] = {"name": rel.replace("\\", "/"), "text": data.decode("utf-8", "replace")}

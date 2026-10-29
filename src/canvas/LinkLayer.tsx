@@ -46,8 +46,8 @@ interface LinkLayerProps {
   /** Temporary line while dragging a new link (canvas coords). */
   tempLine?: { x1: number; y1: number; x2: number; y2: number } | null;
   onDeleteRelation?: (id: number) => void;
-  /** v1.5.3 WS-P1: flow 矢印のクリック（条件メニューを開く）。未指定なら削除にフォールバック。 */
-  onFlowRelationClick?: (r: RelationInfo, clientX: number, clientY: number) => void;
+  /** 矢印の右クリック（向きを反転／flow は通過条件・運ぶもの・役割の設定メニュー）。 */
+  onRelationContextMenu?: (r: RelationInfo, clientX: number, clientY: number) => void;
   /** v1.4 オートフロー: 型チェック不合格のフロー矢印（赤で警告表示）。 */
   invalidIds?: Set<number>;
   /** v1.5.4 WS-P2: リクエスト矢印（kind='req'）の表示。false で非表示（発行は動き続ける）。 */
@@ -76,7 +76,7 @@ export function LinkLayer({
   relations,
   tempLine,
   onDeleteRelation,
-  onFlowRelationClick,
+  onRelationContextMenu,
   invalidIds,
   showReq = true,
 }: LinkLayerProps) {
@@ -99,6 +99,14 @@ export function LinkLayer({
         zIndex: 0,
       }}
     >
+      {/* マウスを乗せた矢印を赤く＝左クリックで消える対象を見せる（当たり判定は
+          透明の太線なので、g:hover で見える線と矢じりを赤に差し替える）。 */}
+      <style>{`
+        .texos-rel:hover .texos-rel-line {
+          stroke: var(--arrow-bad, #d96a6a) !important;
+          marker-end: url(#arrowhead-bad);
+        }
+      `}</style>
       <defs>
         <marker
           id="arrowhead"
@@ -196,7 +204,7 @@ export function LinkLayer({
         const label = isFlow || isReq ? edgeLabel(r.attrs) : null;
         const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
         return (
-          <g key={r.id}>
+          <g key={r.id} className="texos-rel">
             {/* invisible fat line for easier clicking */}
             {/* data-rel-id: ドラッグ中はカードと同じ命令的DOM更新で端点を追従させる（v1.4.17） */}
             <line
@@ -207,16 +215,22 @@ export function LinkLayer({
               y2={p2.y}
               stroke="transparent"
               strokeWidth={12}
-              style={{ pointerEvents: "stroke", cursor: "pointer" }}
-              onClick={(e) => {
-                // v1.5.3 WS-P1: flow 矢印は条件メニュー（削除/通過条件/運ぶもの）、
-                // リンク矢印は従来どおりクリック=削除。
-                if (isFlow && onFlowRelationClick) onFlowRelationClick(r, e.clientX, e.clientY);
-                else onDeleteRelation?.(r.id);
+              style={{ pointerEvents: "stroke" }}
+              onClick={() => {
+                // 左クリック＝即削除（flow もリンクも共通・Undo で戻せる）。設定は右クリック。
+                onDeleteRelation?.(r.id);
+              }}
+              onContextMenu={(e) => {
+                // 右クリック＝矢印メニュー（向きを反転／flow はさらに通過条件・運ぶもの・役割）。
+                // キャンバス側の右クリックメニューに抜けないよう止める。
+                e.preventDefault();
+                e.stopPropagation();
+                onRelationContextMenu?.(r, e.clientX, e.clientY);
               }}
             />
             <line
               data-rel-id={r.id}
+              className="texos-rel-line"
               x1={p1.x}
               y1={p1.y}
               x2={p2.x}
@@ -230,6 +244,7 @@ export function LinkLayer({
             />
             {label && (
               <text
+                data-rel-label={r.id}
                 x={mid.x}
                 y={mid.y - 6}
                 textAnchor="middle"

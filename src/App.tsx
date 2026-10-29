@@ -394,6 +394,21 @@ function App() {
     (n: NoteInfo) => noteSizesRef.current.get(n.id) ?? noteSize(n),
     []
   );
+  // 開いたパネル（プレビュー/エディタ/チャット等）を含むカードの実寸（キャンバス座標）。
+  // パネルはカード div の絶対配置の子なので、子の offset 範囲の和で測る（offset 系は
+  // ズームの transform に影響されない）。未描画なら本体サイズ。矩形選択・フォーカス用。
+  const measuredCardSize = useCallback((id: string) => {
+    let w = CARD_W, h = CARD_H;
+    const el = document.querySelector<HTMLElement>(`[data-object-id="${CSS.escape(id)}"]`);
+    if (el) {
+      for (const c of Array.from(el.children)) {
+        if (!(c instanceof HTMLElement) || c.offsetParent !== el) continue;
+        w = Math.max(w, c.offsetLeft + c.offsetWidth);
+        h = Math.max(h, c.offsetTop + c.offsetHeight);
+      }
+    }
+    return { w, h };
+  }, []);
   const handleNoteMeasure = useCallback((id: string, w: number, h: number) => {
     setNoteSizes((prev) => {
       const cur = prev.get(id);
@@ -438,7 +453,7 @@ function App() {
     handleClearSelection,
     handleCardSelectOnly,
     handleNoteSelectOnly,
-  } = useSelection({ objectsRef, notesRef, shapesRef, measuredNoteSize });
+  } = useSelection({ objectsRef, notesRef, shapesRef, measuredNoteSize, measuredCardSize });
 
   const refresh = useCallback(async () => {
     try {
@@ -680,7 +695,7 @@ function App() {
     setSelectedShapes(new Set(shapeHits.map((s) => s.id)));
     // 送った物の外接矩形へビューを寄せる（fitTo が余白を付ける）。
     const boxes = [
-      ...cards.map((o) => ({ x: o.pos_x, y: o.pos_y, w: CARD_W, h: CARD_H })),
+      ...cards.map((o) => ({ x: o.pos_x, y: o.pos_y, ...measuredCardSize(o.id) })),
       ...noteHits.map((n) => {
         const sz = measuredNoteSize(n);
         return { x: n.pos_x, y: n.pos_y, w: sz.w, h: sz.h };
@@ -692,7 +707,7 @@ function App() {
     const maxX = Math.max(...boxes.map((b) => b.x + b.w));
     const maxY = Math.max(...boxes.map((b) => b.y + b.h));
     canvasApi.current?.fitTo({ x: minX, y: minY, w: maxX - minX, h: maxY - minY });
-  }, [project, view, objects, notes, shapes, measuredNoteSize, setSelected, setSelectedNotes, setSelectedShapes]);
+  }, [project, view, objects, notes, shapes, measuredNoteSize, measuredCardSize, setSelected, setSelectedNotes, setSelectedShapes]);
 
   // v1.3-①: apply / persist the UI color preset.
   useEffect(() => {
@@ -1152,11 +1167,40 @@ function App() {
     }
   }, [pushUndo]);
 
-  // v1.5.3 WS-P1（オペ層 §5.4.2）: flow 矢印のクリック＝条件メニュー（削除は項目に降格）。
-  // when=通過条件（成功時/失敗時/常に）・carry=運ぶもの。設定は relations.attrs へ
-  // マージ書き込み（NULL=従来）。リンク矢印（kind='link'）は従来どおりクリック=削除。
-  const handleFlowRelationClick = useCallback(
+  // 矢印の向きを反転＝逆向きを新規作成して元を削除（UNDO 一手で両方戻る）。
+  // 通過条件・運ぶもの・役割・入力順は元の上流/下流に結びついた設定なので引き継がない。
+  const handleReverseRelation = useCallback(async (r: RelationInfo) => {
+    if (relationsRef.current.some((x) => x.from_id === r.to_id && x.to_id === r.from_id && x.kind === r.kind)) {
+      return; // 逆向きが既にある
+    }
+    try {
+      const rid = await invoke<number | null>("create_relation", { fromId: r.to_id, toId: r.from_id, kind: r.kind });
+      if (rid == null) return;
+      await invoke("delete_relation", { id: r.id });
+      pushUndo([
+        { kind: "deleteRelations", ids: [rid] },
+        { kind: "restoreRelations", ids: [r.id] },
+      ]);
+      setRelations(await invoke<RelationInfo[]>("list_relations"));
+    } catch (e) {
+      console.error("reverse relation failed", e);
+    }
+  }, [pushUndo]);
+
+  // 矢印の右クリック: 先頭に「向きを反転」。flow 矢印はさらに条件メニュー
+  // （v1.5.3 WS-P1・オペ層 §5.4.2）: when=通過条件（成功時/失敗時/常に）・carry=運ぶもの。
+  // 設定は relations.attrs へマージ書き込み（NULL=従来）。
+  const handleRelationContextMenu = useCallback(
     (r: RelationInfo, clientX: number, clientY: number) => {
+      const reverseItem = {
+        label: "矢印の向きを反転",
+        hint: "矢印の向きを逆にします。フロー矢印の通過条件・運ぶもの・役割は既定に戻ります。",
+        onClick: () => void handleReverseRelation(r),
+      };
+      if (r.kind !== "flow") {
+        setMenu({ x: clientX, y: clientY, items: [reverseItem] });
+        return;
+      }
       let attrs: { when?: string; carry?: string; role?: string } = {};
       try {
         attrs = JSON.parse(r.attrs ?? "{}");
@@ -1176,6 +1220,8 @@ function App() {
         x: clientX,
         y: clientY,
         items: [
+          reverseItem,
+          { label: "", onClick: () => {}, divider: true },
           { label: "フロー矢印の通過条件", onClick: () => {}, disabled: true },
           { label: check(when === "always", "常に（既定）"), onClick: () => setAttrs({ when: "always" }) },
           {
@@ -1238,16 +1284,10 @@ function App() {
               "「>」で始まる行は質問の控えとして扱い、答えには含めません。",
             onClick: () => setAttrs({ role: "answer" }),
           },
-          { label: "", onClick: () => {}, divider: true },
-          {
-            label: "矢印を削除",
-            danger: true,
-            onClick: () => void handleDeleteRelation(r.id),
-          },
         ],
       });
     },
-    [handleDeleteRelation]
+    [handleReverseRelation]
   );
 
   // --- v1.4 オートフロー⑤ ----------------------------------------------------
@@ -4207,6 +4247,12 @@ function App() {
             ln.setAttribute("x2", String(p2.x));
             ln.setAttribute("y2", String(p2.y));
           });
+        // 条件ラベル（成功時/失敗時 等）も中点へ追従させる（LinkLayer と同じ mid・y-6）。
+        const lb = document.querySelector<SVGTextElement>(`text[data-rel-label="${r.id}"]`);
+        if (lb) {
+          lb.setAttribute("x", String((p1.x + p2.x) / 2));
+          lb.setAttribute("y", String((p1.y + p2.y) / 2 - 6));
+        }
       }
     },
     [measuredNoteSize]
@@ -4832,7 +4878,7 @@ function App() {
     const selNs = notesRef.current.filter((n) => selectedNotesRef.current.has(n.id));
     if (!selCards.length && !selNs.length) return;
     const boxes = [
-      ...selCards.map((o) => ({ x: o.pos_x, y: o.pos_y, w: CARD_W, h: CARD_H })),
+      ...selCards.map((o) => ({ x: o.pos_x, y: o.pos_y, ...measuredCardSize(o.id) })),
       ...selNs.map((n) => {
         const sz = measuredNoteSize(n);
         return { x: n.pos_x, y: n.pos_y, w: sz.w, h: sz.h };
@@ -4865,7 +4911,7 @@ function App() {
     } catch (e) {
       console.error("create_shape (around selection) failed", e);
     }
-  }, [measuredNoteSize, pushUndo, refresh, setSelectedShapes, shapeSnap]);
+  }, [measuredNoteSize, measuredCardSize, pushUndo, refresh, setSelectedShapes, shapeSnap]);
 
   const handleShapeGeomEnd = useCallback(
     async (id: string, x: number, y: number, w: number, h: number) => {
@@ -5229,8 +5275,8 @@ function App() {
     for (const c of cards) {
       minX = Math.min(minX, c.pos_x);
       minY = Math.min(minY, c.pos_y);
-      maxX = Math.max(maxX, c.pos_x + CARD_W);
-      maxY = Math.max(maxY, c.pos_y + CARD_H);
+      maxX = Math.max(maxX, c.pos_x + measuredCardSize(c.id).w);
+      maxY = Math.max(maxY, c.pos_y + measuredCardSize(c.id).h);
     }
     for (const n of ns) {
       const sz = measuredNoteSize(n);
@@ -5268,7 +5314,7 @@ function App() {
     } catch (e) {
       console.error("fit shape failed", e);
     }
-  }, [cardsOnShape, notesOnShape, measuredNoteSize, pushUndo, applyShapeGeoms, shapeSnap]);
+  }, [cardsOnShape, notesOnShape, measuredNoteSize, measuredCardSize, pushUndo, applyShapeGeoms, shapeSnap]);
 
   const handleShapeLabel = useCallback(
     (id: string, current: string) => {
@@ -5558,11 +5604,11 @@ function App() {
   // v1.5.12 UIの気づき３-③: 自動レイアウト（重なり解消）は廃止。ペア毎の押し出し反復は
   // 連鎖して縦に暴走する欠陥があり、役割は「格子状に整列」（順序で詰め直し・重なり構造ゼロ）が引き継ぐ。
 
-  // Bounding box of all cards (incl. expanded panels) and notes — 全体を表示用.
+  // Bounding box of all cards (incl. expanded panels, 実測) and notes — 全体を表示用.
   const getContentBounds = useCallback(() => {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const o of objectsRef.current) {
-      const s = layoutSize(o);
+      const s = measuredCardSize(o.id);
       minX = Math.min(minX, o.pos_x);
       minY = Math.min(minY, o.pos_y);
       maxX = Math.max(maxX, o.pos_x + s.w);
@@ -5584,7 +5630,7 @@ function App() {
     if (minX === Infinity) return null;
     return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layoutSize, notes]);
+  }, [measuredCardSize, notes]);
 
   // Bounding box of the selected cards/notes — 選択範囲にフォーカス用.
   const getSelectionBounds = useCallback(() => {
@@ -5594,7 +5640,7 @@ function App() {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const o of objectsRef.current) {
       if (!sel.has(o.id)) continue;
-      const s = layoutSize(o);
+      const s = measuredCardSize(o.id);
       minX = Math.min(minX, o.pos_x);
       minY = Math.min(minY, o.pos_y);
       maxX = Math.max(maxX, o.pos_x + s.w);
@@ -5610,7 +5656,7 @@ function App() {
     }
     if (minX === Infinity) return null;
     return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
-  }, [layoutSize]);
+  }, [measuredCardSize]);
 
   const handleFocusSelection = useCallback(() => {
     canvasApi.current?.fitTo(getSelectionBounds());
@@ -5627,7 +5673,7 @@ function App() {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       for (const o of objectsRef.current) {
         if (!cs.has(o.id)) continue;
-        const s = layoutSize(o);
+        const s = measuredCardSize(o.id);
         minX = Math.min(minX, o.pos_x);
         minY = Math.min(minY, o.pos_y);
         maxX = Math.max(maxX, o.pos_x + s.w);
@@ -5644,7 +5690,7 @@ function App() {
       if (minX === Infinity) return;
       canvasApi.current?.fitTo({ x: minX, y: minY, w: maxX - minX, h: maxY - minY });
     },
-    [layoutSize, measuredNoteSize, setSelected, setSelectedNotes]
+    [measuredCardSize, measuredNoteSize, setSelected, setSelectedNotes]
   );
 
   // ゴミ箱からの復活後: refresh のコミットを待ってから該当カードへフォーカス
@@ -6543,7 +6589,7 @@ function App() {
           relations={relations}
           tempLine={linkDrag}
           onDeleteRelation={handleDeleteRelation}
-          onFlowRelationClick={handleFlowRelationClick}
+          onRelationContextMenu={handleRelationContextMenu}
           invalidIds={invalidFlowIds}
           showReq={showReqArrows}
         />

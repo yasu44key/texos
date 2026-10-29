@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { panelMouseDown } from "./panelResize";
 
 interface Props {
   objId: string;
@@ -21,7 +22,7 @@ export function AudioPlayer({ objId, label, top, onClose }: Props) {
 
   return (
     <div
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={panelMouseDown}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",

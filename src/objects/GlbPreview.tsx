@@ -4,7 +4,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
-import { usePanelResize, cornerHandleStyle } from "./panelResize";
+import { usePanelResize, cornerHandleStyle, panelMouseDown } from "./panelResize";
 
 interface Props {
   objId: string;
@@ -175,7 +175,7 @@ export function GlbPreview({
   return (
     <div
       ref={panelRef}
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={panelMouseDown}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",

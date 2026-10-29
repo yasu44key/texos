@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { panelMouseDown } from "./panelResize";
 
 // v1.4.17 画像生成カード（builtin:"t2i"）のインライン生成パネル。ChatPanel と同じ流儀で
 // カード下に展開（ダブルクリックでトグル）。ポジティブ（追加プロンプト）とネガティブを
@@ -81,7 +82,7 @@ export function T2iPanel({ objId, label, top, filterRef, onClose, onRun, onSaved
 
   return (
     <div
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={panelMouseDown}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",

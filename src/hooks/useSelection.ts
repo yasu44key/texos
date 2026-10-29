@@ -3,7 +3,6 @@
 // （UNDO・座標適用と結合しているため）。
 import { useCallback, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
-import { CARD_W, CARD_H } from "../objects/ObjectCard";
 import type { NoteInfo, VirtualBodyInfo } from "../model";
 import type { ShapeInfo } from "../objects/ShapeCard";
 
@@ -13,9 +12,11 @@ interface UseSelectionDeps {
   shapesRef: MutableRefObject<ShapeInfo[]>;
   // 実測サイズ（ResizeObserver）優先のコメント寸法。
   measuredNoteSize: (n: NoteInfo) => { w: number; h: number };
+  // 開いたパネルを含むカードの実寸（パネルに掛かる矩形でも選択できるように）。
+  measuredCardSize: (id: string) => { w: number; h: number };
 }
 
-export function useSelection({ objectsRef, notesRef, shapesRef, measuredNoteSize }: UseSelectionDeps) {
+export function useSelection({ objectsRef, notesRef, shapesRef, measuredNoteSize, measuredCardSize }: UseSelectionDeps) {
   // Rubber-band selection (group move).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const selectedRef = useRef<Set<string>>(selected);
@@ -33,13 +34,15 @@ export function useSelection({ objectsRef, notesRef, shapesRef, measuredNoteSize
   const handleSelectRect = useCallback(
     (rect: { x: number; y: number; w: number; h: number }, mode: "replace" | "add" | "toggle") => {
       const hit = objectsRef.current
-        .filter(
-          (o) =>
+        .filter((o) => {
+          const s = measuredCardSize(o.id);
+          return (
             o.pos_x < rect.x + rect.w &&
-            o.pos_x + CARD_W > rect.x &&
+            o.pos_x + s.w > rect.x &&
             o.pos_y < rect.y + rect.h &&
-            o.pos_y + CARD_H > rect.y
-        )
+            o.pos_y + s.h > rect.y
+          );
+        })
         .map((o) => o.id);
       // v1.3.1: notes join the rubber-band selection too.
       const hitNotes = notesRef.current
@@ -80,7 +83,7 @@ export function useSelection({ objectsRef, notesRef, shapesRef, measuredNoteSize
       setSelectedNotes((prev) => apply(prev, hitNotes));
       setSelectedShapes((prev) => apply(prev, hitShapes));
     },
-    [objectsRef, notesRef, shapesRef, measuredNoteSize]
+    [objectsRef, notesRef, shapesRef, measuredNoteSize, measuredCardSize]
   );
 
   // v1.3 メモ２追加: Ctrl+クリックで選択を個別にトグル（追加／解除）。

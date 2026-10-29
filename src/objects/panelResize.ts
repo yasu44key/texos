@@ -90,3 +90,22 @@ export const cornerHandleStyle: React.CSSProperties = {
   cursor: "nwse-resize",
   zIndex: 2,
 };
+
+// パネルの中で「掴んでもカードを動かさない」もの＝それ自体に操作がある部品。
+const PANEL_NO_DRAG =
+  "button, input, textarea, select, a, label, audio, video, iframe, canvas, [contenteditable], [data-panel-nodrag]";
+
+/**
+ * 開いたパネルの根の onMouseDown。操作の付いていない地の部分（見出し・余白・画像など）を
+ * 掴んだらイベントをカードへ通す＝カード本体と同じドラッグ（単体/群/Ctrl コピー）になる。
+ * ボタン・入力欄・3D/動画・選択できる文字（user-select:text）・スクロールバーは従来どおり止める。
+ */
+export function panelMouseDown(e: React.MouseEvent<HTMLElement>) {
+  const t = e.target as HTMLElement;
+  const onScrollbar =
+    (t.scrollHeight > t.clientHeight && e.nativeEvent.offsetX >= t.clientWidth) ||
+    (t.scrollWidth > t.clientWidth && e.nativeEvent.offsetY >= t.clientHeight);
+  const selectable = getComputedStyle(t).userSelect === "text";
+  if (!t.closest(PANEL_NO_DRAG) && !selectable && !onScrollbar) return;
+  e.stopPropagation();
+}

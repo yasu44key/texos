@@ -65,7 +65,8 @@ interface Props {
   selected?: boolean;
   /** Ctrl+click: toggle this card in/out of the selection (v1.3 メモ２追加). */
   onToggleSelect?: (id: string) => void;
-  /** v1.4.12: Ctrl+左ドラッグでこのカードの仮身（化身）をドロップ位置に作る。(id, clientX, clientY) */
+  /** v1.4.12: Ctrl+左ドラッグでこのカードの仮身（化身）をドロップ位置に作る。
+   *  clientX/Y＝新カード左上の画面座標（ゴーストの左上＝見えていた位置に落ちる）。 */
   onCtrlClone?: (id: string, clientX: number, clientY: number) => void;
   /** v1.4.12: Alt+クリックで関係矢印の連結成分（つながり）をまるごと選択。 */
   onSelectConnected?: (id: string, additive?: boolean) => void;
@@ -480,7 +481,9 @@ export function ObjectCard({
         window.removeEventListener("mouseup", onCtrlUp);
         document.body.style.cursor = "";
         removeGhost();
-        if (dragged && onCtrlClone) onCtrlClone(id, me.clientX, me.clientY);
+        // 落とす位置＝ゴーストの左上（掴んだ相対位置を差し引く）。ポインタ位置を左上に
+        // すると、掴んだ分だけ右下へずれて見える。
+        if (dragged && onCtrlClone) onCtrlClone(id, me.clientX - grabX, me.clientY - grabY);
         else onToggleSelect?.(id);
       };
       window.addEventListener("mousemove", onCtrlMove);

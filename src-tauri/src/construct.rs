@@ -64,6 +64,55 @@ struct PlanCard {
     note_text: Option<String>,
     style: Option<serde_json::Value>,
     file: Option<PlanFile>,
+    /// v1.12: いまのプロジェクトにあるファイルカードを使う（一覧の ref）。置かずに矢印だけ引く。
+    #[serde(default)]
+    existing: Option<String>,
+}
+
+/// いまのプロジェクトにあるファイルカード（AI に見せる一覧の1行）。
+#[derive(Clone)]
+struct ExFile {
+    r: String,
+    id: String,
+    label: String,
+    mime: String,
+}
+
+/// AI に見せる既存のファイルカード（新しい順・上限 80 枚）。URL・フォルダ・プロジェクトの窓は除く。
+fn existing_files(p: &Project) -> Vec<ExFile> {
+    let Ok(mut st) = p.conn.prepare(
+        "SELECT v.id, v.label, COALESCE(v.mime_type, r.mime_type, '') FROM virtual_bodies v
+         JOIN real_bodies r ON r.id = v.real_id
+         WHERE v.deleted_at IS NULL AND COALESCE(v.kind, 'file') = 'file'
+           AND v.url_ref IS NULL AND v.project_ref IS NULL AND v.folder_ref IS NULL
+           AND (v.committed_path IS NOT NULL OR v.origin_path IS NOT NULL)
+         ORDER BY v.created_at DESC LIMIT 80",
+    ) else {
+        return Vec::new();
+    };
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)));
+    match rows {
+        Ok(rows) => rows
+            .flatten()
+            .enumerate()
+            .map(|(i, (id, label, mime))| ExFile { r: format!("F{}", i + 1), id, label, mime })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// AI への依頼文（依頼＋いまのプロジェクトのファイルカード一覧）。実行時と実機テストで同じものを使う。
+fn user_message(request: &str, existing: &[ExFile]) -> String {
+    let mut s = format!("依頼:\n{request}\n\n");
+    if !existing.is_empty() {
+        s.push_str("いまのプロジェクトにあるファイルカード（依頼が使うものがあれば existing の ref で使う）:\n");
+        for e in existing {
+            s.push_str(&format!("- {} {}（{}）\n", e.r, e.label, if e.mime.is_empty() { "種類不明" } else { &e.mime }));
+        }
+        s.push('\n');
+    }
+    s.push_str("設計図の JSON だけを出してください。");
+    s
 }
 
 #[derive(serde::Deserialize)]
@@ -91,7 +140,13 @@ fn python_exe(app_data: &Path) -> Option<PathBuf> {
 }
 
 /// 設計図を texos_plan.py で検査する。
-fn check_plan(app_data: &Path, plan: &serde_json::Value, spec: &flow::FilterSpec, extra: &serde_json::Value) -> Result<Checked, String> {
+fn check_plan(
+    app_data: &Path,
+    plan: &serde_json::Value,
+    spec: &flow::FilterSpec,
+    extra: &serde_json::Value,
+    existing: &[ExFile],
+) -> Result<Checked, String> {
     let home = app_data.join("construct");
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     std::fs::write(home.join("texos_plan.py"), PLAN_PY).map_err(|e| e.to_string())?;
@@ -103,6 +158,7 @@ fn check_plan(app_data: &Path, plan: &serde_json::Value, spec: &flow::FilterSpec
         "model": xs(extra, "card_model").or(spec.model.as_deref()).unwrap_or("gemma3:latest"),
         "provider": xs(extra, "card_provider").or(spec.provider.as_deref()).unwrap_or("ollama"),
         "endpoint": xs(extra, "card_endpoint").or(spec.endpoint.as_deref()),
+        "existing": existing.iter().map(|e| serde_json::json!({ "ref": e.r, "label": e.label, "mime": e.mime })).collect::<Vec<_>>(),
     });
     let mut c = std::process::Command::new(&py);
     c.arg("-I").arg(home.join("texos_plan.py")).current_dir(&home);
@@ -190,6 +246,8 @@ fn resolve_presets(app_data: &Path, c: &mut Checked) -> Vec<String> {
 }
 
 struct Placed {
+    /// 使った既存のカード（新しく置いていない）。
+    used: Vec<String>,
     objects: Vec<String>,
     notes: Vec<String>,
     relations: Vec<i64>,
@@ -204,15 +262,16 @@ fn notify(app: &tauri::AppHandle, root: &Path, undo: serde_json::Value, touched:
 }
 
 /// 検査を通った設計図を、コンストラクタの下（いまある全カードの下端の下）へ枠で囲んで並べる。
-fn place(app: &tauri::AppHandle, p: &Project, fid: &str, c: &Checked) -> Result<Placed, String> {
+fn place(app: &tauri::AppHandle, p: &Project, fid: &str, c: &Checked, existing: &[ExFile]) -> Result<Placed, String> {
     let fx: f64 = p
         .conn
         .query_row("SELECT pos_x FROM virtual_bodies WHERE id = ?1", rusqlite::params![fid], |r| r.get(0))
         .map_err(|e| e.to_string())?;
     let (ox, oy) = (fx, bottom_of(p) + 160.0);
-    let w = c.cards.iter().map(|k| k.x).fold(0.0, f64::max) + 300.0 + 80.0;
-    let h = c.cards.iter().map(|k| k.y).fold(0.0, f64::max) + 180.0 + 100.0;
-    let mut placed = Placed { objects: vec![], notes: vec![], relations: vec![], shapes: vec![] };
+    let fresh = || c.cards.iter().filter(|k| k.existing.is_none());
+    let w = fresh().map(|k| k.x).fold(0.0, f64::max) + 300.0 + 80.0;
+    let h = fresh().map(|k| k.y).fold(0.0, f64::max) + 180.0 + 100.0;
+    let mut placed = Placed { used: vec![], objects: vec![], notes: vec![], relations: vec![], shapes: vec![] };
 
     // 枠（図形）に設計図の名前。
     let sid = uuid();
@@ -227,6 +286,13 @@ fn place(app: &tauri::AppHandle, p: &Project, fid: &str, c: &Checked) -> Result<
 
     let mut ids: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for k in &c.cards {
+        // 既存のカードは置かない（矢印だけ引く）。
+        if let Some(r) = &k.existing {
+            let e = existing.iter().find(|e| &e.r == r).ok_or_else(|| format!("既存のカード {r} が見つかりません"))?;
+            ids.insert(k.key.as_str(), e.id.clone());
+            placed.used.push(e.label.clone());
+            continue;
+        }
         let (x, y) = (ox + k.x, oy + k.y);
         let id = match k.kind.as_str() {
             "note" => {
@@ -348,6 +414,7 @@ pub(crate) fn run_construct(
     }
     let state: State<AppState> = app.state();
     let app_data = state.app_data.clone();
+    let existing = existing_files(p);
     let retries = extra.get("max_retries").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_RETRIES).clamp(1, 6);
     let mut system = GUIDE.to_string();
     // 追加の作法: 設定画面の欄（spec.system）と役割の付箋（role:"system"）。両方あれば両方足す。
@@ -361,7 +428,7 @@ pub(crate) fn run_construct(
     }
     let mut messages = vec![
         serde_json::json!({ "role": "system", "content": system }),
-        serde_json::json!({ "role": "user", "content": format!("依頼:\n{request}\n\n設計図の JSON だけを出してください。") }),
+        serde_json::json!({ "role": "user", "content": user_message(&request, &existing) }),
     ];
     let mut log: Vec<String> = Vec::new();
     let mut last: Option<(Checked, serde_json::Value)> = None;
@@ -376,7 +443,7 @@ pub(crate) fn run_construct(
         };
         let problems: Vec<String> = match extract_json(&answer) {
             Err(e) => vec![e],
-            Ok(plan) => match check_plan(&app_data, &plan, spec, &extra) {
+            Ok(plan) => match check_plan(&app_data, &plan, spec, &extra, &existing) {
                 Err(e) => return EvalOut::failed(vec![e], None, vec![]),
                 Ok(c) if c.ok => {
                     last = Some((c, plan));
@@ -414,13 +481,20 @@ pub(crate) fn run_construct(
         format!("案を作りました（並べていません）。カード {} 枚の設計です。{run_hint}", checked.cards.len())
     } else {
         emit_job_progress(app, job, Some("カードを並べています"), None);
-        match place(app, p, fid, &checked) {
-            Ok(pl) => format!(
-                "カード {} 枚・付箋 {} 枚・矢印 {} 本を並べました。{run_hint}",
-                pl.objects.len(),
-                pl.notes.len(),
-                pl.relations.len()
-            ),
+        match place(app, p, fid, &checked, &existing) {
+            Ok(pl) => {
+                let used = if pl.used.is_empty() {
+                    String::new()
+                } else {
+                    format!("既存の{}を入力につなぎました。", pl.used.iter().map(|l| format!("「{l}」")).collect::<Vec<_>>().join("・"))
+                };
+                format!(
+                    "カード {} 枚・付箋 {} 枚・矢印 {} 本を並べました。{used}{run_hint}",
+                    pl.objects.len(),
+                    pl.notes.len(),
+                    pl.relations.len()
+                )
+            }
             Err(e) => return EvalOut::failed(vec![format!("並べる途中で失敗しました: {e}")], None, vec![]),
         }
     };
@@ -509,9 +583,19 @@ mod tests {
         let app_data = std::env::temp_dir().join("texos_construct_live");
         let req = std::env::var("CONSTRUCT_LIVE_REQUEST")
             .unwrap_or_else(|_| "生成AIの最新動向をWebで調べて、要点をレポートにまとめるフローを構築して".into());
+        let existing: Vec<ExFile> = std::env::var("CONSTRUCT_LIVE_EXISTING")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .enumerate()
+            .map(|(i, s)| {
+                let (l, m) = s.split_once(':').unwrap_or((s, ""));
+                ExFile { r: format!("F{}", i + 1), id: format!("id{i}"), label: l.trim().into(), mime: m.trim().into() }
+            })
+            .collect();
         let mut messages = vec![
             serde_json::json!({ "role": "system", "content": GUIDE }),
-            serde_json::json!({ "role": "user", "content": format!("依頼:\n{req}\n\n設計図の JSON だけを出してください。") }),
+            serde_json::json!({ "role": "user", "content": user_message(&req, &existing) }),
         ];
         let cancel = std::sync::atomic::AtomicBool::new(false);
         for round in 1..=3 {
@@ -521,7 +605,9 @@ mod tests {
             let problems = match extract_json(&answer) {
                 Err(e) => vec![e],
                 Ok(plan) => {
-                    let c = check_plan(&app_data, &plan, &spec, &serde_json::Value::Null).expect("検査役");
+                    let c = check_plan(&app_data, &plan, &spec, &serde_json::Value::Null, &existing).expect("検査役");
+                    let used: Vec<&String> = c.cards.iter().filter_map(|k| k.existing.as_ref()).collect();
+                    println!("既存のカードを使った: {used:?}");
                     if c.ok {
                         println!("検査 OK: {} 枚・矢印 {} 本・注意 {:?}・終端 {:?}", c.cards.len(), c.edges.len(), c.warnings, c.terminals);
                         return;

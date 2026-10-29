@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { usePanelResize, widthHandleStyle, cornerHandleStyle } from "./panelResize";
+import { usePanelResize, widthHandleStyle, cornerHandleStyle, panelMouseDown } from "./panelResize";
 
 interface Props {
   objId: string;
@@ -43,7 +43,7 @@ export function MediaPreview({
   return (
     <div
       ref={panelRef}
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={panelMouseDown}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",

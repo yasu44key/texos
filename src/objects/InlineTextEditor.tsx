@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { panelMouseDown } from "./panelResize";
 
 interface Props {
   /** committed file path to edit (edit mode). Omitted in read-only view mode. */
@@ -114,7 +115,7 @@ export function InlineTextEditor({
     <div
       ref={panelRef}
       // Anchored to the card origin; do not start a card drag from inside.
-      onMouseDown={(e) => e.stopPropagation()}
+      onMouseDown={panelMouseDown}
       onDoubleClick={(e) => e.stopPropagation()}
       style={{
         position: "absolute",
