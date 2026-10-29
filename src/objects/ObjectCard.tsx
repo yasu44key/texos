@@ -17,6 +17,7 @@ const GlbPreview = lazy(() =>
 );
 import { isTextMime, type RunAlert } from "../model";
 import { VoiceStatus } from "./VoiceStatus";
+import { startCtrlCloneDrag } from "./ctrlCloneDrag";
 
 // Fixed card geometry so link endpoints are predictable from (x, y) alone.
 export const CARD_W = 150;
@@ -435,59 +436,12 @@ export function ObjectCard({
     // Ctrl+クリック = 選択に個別追加／解除。Ctrl+左ドラッグ = この場に仮身（化身）を作る。
     // クリックとドラッグは移動量で区別する（4px 超で化身、未満で選択トグル）。
     if (e.ctrlKey || e.metaKey) {
-      const sx = e.clientX;
-      const sy = e.clientY;
-      // v1.4.29 ①: ドラッグ中は半透明のカードゴーストをポインタに追従表示する（「この場に
-      // コピーしている」実感）。実カードを cloneNode して見た目そのままのゴーストにし、掴んだ
-      // 相対位置（grab）とキャンバス倍率（scale）を保って画面上のサイズ・位置を一致させる。
-      const cardEl = e.currentTarget as HTMLElement;
-      const rect = cardEl.getBoundingClientRect();
-      const grabX = sx - rect.left;
-      const grabY = sy - rect.top;
-      const layer = cardEl.closest<HTMLElement>("[data-canvas-layer]");
-      const scale = parseFloat(layer?.style.getPropertyValue("--canvas-scale") || "1") || 1;
-      let dragged = false;
-      let ghost: HTMLElement | null = null;
-      const moveGhost = (mx: number, my: number) => {
-        if (ghost) ghost.style.transform = `translate(${mx - grabX}px, ${my - grabY}px) scale(${scale})`;
-      };
-      const removeGhost = () => {
-        ghost?.remove();
-        ghost = null;
-      };
-      const onCtrlMove = (me: globalThis.MouseEvent) => {
-        if (!dragged && Math.hypot(me.clientX - sx, me.clientY - sy) > 4) {
-          dragged = true;
-          document.body.style.cursor = "copy";
-          const g = cardEl.cloneNode(true) as HTMLElement;
-          g.style.position = "fixed";
-          g.style.left = "0";
-          g.style.top = "0";
-          g.style.margin = "0";
-          g.style.transformOrigin = "0 0";
-          g.style.opacity = "0.55";
-          g.style.pointerEvents = "none";
-          g.style.transition = "none";
-          g.style.zIndex = "2147483647";
-          document.body.appendChild(g);
-          ghost = g;
-          moveGhost(me.clientX, me.clientY);
-        } else if (dragged) {
-          moveGhost(me.clientX, me.clientY);
-        }
-      };
-      const onCtrlUp = (me: globalThis.MouseEvent) => {
-        window.removeEventListener("mousemove", onCtrlMove);
-        window.removeEventListener("mouseup", onCtrlUp);
-        document.body.style.cursor = "";
-        removeGhost();
-        // 落とす位置＝ゴーストの左上（掴んだ相対位置を差し引く）。ポインタ位置を左上に
-        // すると、掴んだ分だけ右下へずれて見える。
-        if (dragged && onCtrlClone) onCtrlClone(id, me.clientX - grabX, me.clientY - grabY);
-        else onToggleSelect?.(id);
-      };
-      window.addEventListener("mousemove", onCtrlMove);
-      window.addEventListener("mouseup", onCtrlUp);
+      startCtrlCloneDrag(
+        e,
+        e.currentTarget as HTMLElement,
+        (cx, cy) => (onCtrlClone ? onCtrlClone(id, cx, cy) : onToggleSelect?.(id)),
+        () => onToggleSelect?.(id)
+      );
       return;
     }
 

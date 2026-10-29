@@ -636,6 +636,10 @@ pub struct NoteInfo {
     // v1.4.16 付箋の充実: 色（NULL=既定の黄）と見出し行フォントサイズ（NULL=見出しなし）。
     pub color: Option<String>,
     pub title_size: Option<f64>,
+    // v1.12.3 付箋の見た目: 傾き（度）・フォント名・文字色（NULL=既定）。
+    pub rotation: Option<f64>,
+    pub font_family: Option<String>,
+    pub text_color: Option<String>,
 }
 #[derive(Serialize)]
 pub struct RelationInfo {
@@ -812,6 +816,7 @@ pub fn run() {
             set_note_style,
             set_note_color,
             set_note_title,
+            set_note_look,
             create_note_linked,
             commit_note_to_file,
             read_text_file,

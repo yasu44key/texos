@@ -50,6 +50,13 @@ pub(crate) struct NoteStyle {
     title_size: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_ref: Option<String>,
+    // v1.12.3 付箋の見た目: 傾き（度・正=時計回り）・フォント名（CSS font-family）・文字色（hex）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rotation: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_color: Option<String>,
 }
 
 pub(crate) fn note_style_of(s: Option<&str>) -> NoteStyle {
@@ -117,6 +124,9 @@ pub(crate) fn list_notes_in(p: &Project) -> Result<Vec<NoteInfo>, String> {
                 file_ref: st.file_ref,
                 color: st.color,
                 title_size: st.title_size,
+                rotation: st.rotation,
+                font_family: st.font_family,
+                text_color: st.text_color,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -260,6 +270,31 @@ pub(crate) fn set_note_title(
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
     let mut st = read_note_style(p, &id)?;
     st.title_size = title_size;
+    write_note_style(p, &id, &st)
+}
+
+/// v1.12.3 付箋の見た目: 傾き・フォント・文字色を設定する。渡した項目だけ変える
+/// （None＝そのまま）。傾き 0・空文字は「既定に戻す」。
+#[tauri::command]
+pub(crate) fn set_note_look(
+    id: String,
+    rotation: Option<f64>,
+    font_family: Option<String>,
+    text_color: Option<String>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let guard = state.current.lock().unwrap();
+    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    let mut st = read_note_style(p, &id)?;
+    if let Some(r) = rotation {
+        st.rotation = if r == 0.0 { None } else { Some(r) };
+    }
+    if let Some(f) = font_family {
+        st.font_family = if f.trim().is_empty() { None } else { Some(f.trim().to_string()) };
+    }
+    if let Some(c) = text_color {
+        st.text_color = if c.trim().is_empty() { None } else { Some(c.trim().to_string()) };
+    }
     write_note_style(p, &id, &st)
 }
 

@@ -164,6 +164,11 @@ export interface MenuActions {
   noteColorPick: (id: string) => void;
   // v1.4.16 付箋の充実: 先頭行を見出しにするフォントサイズ（null=見出しなし）。
   noteTitle: (id: string, titleSize: number | null) => void;
+  // v1.12.3 付箋の見た目: 傾き・フォント・文字色（0・空文字=既定へ）／文字色のピッカー／
+  // 「その他の…」の自由入力（文字サイズ・傾き・フォント名）。
+  noteLook: (id: string, look: { rotation?: number; fontFamily?: string; textColor?: string }) => void;
+  noteTextColorPick: (id: string) => void;
+  noteLookPrompt: (id: string, kind: "size" | "rotation" | "font") => void;
   // v1.3.5: コメント内容から独立したテキスト仮身カードを作成（実身化の後継）。
   noteToTextCard: (id: string) => void;
   deleteNote: (id: string) => void;
@@ -294,25 +299,61 @@ export const NOTE_COLORS: [string, string][] = [
   ["グレー", "#2f3542"],
 ];
 
+// v1.12.3: 付箋のフォント（Windows 10/11 に標準で入っているもの）。値は font-family 名。
+export const NOTE_FONTS: [string, string][] = [
+  ["游ゴシック", "Yu Gothic"],
+  ["游明朝", "Yu Mincho"],
+  ["メイリオ", "Meiryo"],
+  ["BIZ UDPゴシック", "BIZ UDPGothic"],
+  ["BIZ UDP明朝", "BIZ UDPMincho"],
+  ["UD デジタル 教科書体", "UD Digi Kyokasho NK-R"],
+  ["等幅（BIZ UDゴシック）", "BIZ UDGothic"],
+];
+
+// v1.12.3: 付箋の文字色（暗い付箋でも明るい付箋でも読める、はっきりした色）。
+export const NOTE_TEXT_COLORS: [string, string][] = [
+  ["白", "#ffffff"],
+  ["黒", "#161616"],
+  ["赤", "#ff6b6b"],
+  ["オレンジ", "#ffa94d"],
+  ["黄", "#ffe066"],
+  ["緑", "#69db7c"],
+  ["青", "#74c0fc"],
+  ["紫", "#b197fc"],
+];
+
 export function buildNoteMenu(
   noteId: string,
   note: NoteInfo | undefined,
   a: MenuActions
 ): MenuItem[] {
-  const cur = note ?? { font_size: 13, bold: false, title_size: null };
+  const cur = note ?? {
+    font_size: 13, bold: false, title_size: null, rotation: null, font_family: null, text_color: null,
+  };
   const bodySizes: [string, number][] = [
     ["極小", 11],
     ["小", 13],
     ["中", 15],
     ["大", 18],
     ["特大", 24],
+    ["30", 30],
+    ["36", 36],
+    ["48", 48],
+    ["60", 60],
+    ["72", 72],
   ];
   const titleSizes: [string, number][] = [
     ["小", 18],
     ["中", 22],
     ["大", 28],
     ["特大", 36],
+    ["48", 48],
+    ["60", 60],
+    ["72", 72],
   ];
+  // 傾き: 負=左（反時計回り）・正=右（時計回り）。
+  const rotations = [-90, -45, -30, -15, -10, -5, 5, 10, 15, 30, 45, 90];
+  const rot = cur.rotation ?? 0;
   return [
     { label: note?.file_ref ? "リンクテキスト" : "コメント", onClick: () => {}, disabled: true },
     {
@@ -321,9 +362,9 @@ export function buildNoteMenu(
       onClick: () =>
         a.openSubmenu(
           bodySizes.map(([n, s]) => ({
-            label: (Math.round(cur.font_size) === s ? "✓ " : "　") + `${n}（${s}）`,
+            label: (Math.round(cur.font_size) === s ? "✓ " : "　") + (n === String(s) ? n : `${n}（${s}）`),
             onClick: () => a.noteStyle(noteId, s, cur.bold),
-          }))
+          })).concat([{ label: "　その他のサイズ...", onClick: () => a.noteLookPrompt(noteId, "size") }])
         ),
     },
     {
@@ -340,13 +381,62 @@ export function buildNoteMenu(
             onClick: () => a.noteTitle(noteId, null),
           },
           ...titleSizes.map(([n, s]) => ({
-            label: (cur.title_size === s ? "✓ " : "　") + `${n}（${s}）`,
+            label: (cur.title_size === s ? "✓ " : "　") + (n === String(s) ? n : `${n}（${s}）`),
             onClick: () => a.noteTitle(noteId, s),
           })),
         ]),
     },
     {
-      label: "色 ...",
+      label: "フォント ...",
+      hint: "付箋の書体を変えます。一覧にないフォントは「その他のフォント名...」で名前を入れます。",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: (!cur.font_family ? "✓ " : "　") + "標準",
+            onClick: () => a.noteLook(noteId, { fontFamily: "" }),
+          },
+          ...NOTE_FONTS.map(([name, family]) => ({
+            label: (cur.font_family === family ? "✓ " : "　") + name,
+            onClick: () => a.noteLook(noteId, { fontFamily: family }),
+          })),
+          { label: "　その他のフォント名...", onClick: () => a.noteLookPrompt(noteId, "font") },
+        ]),
+    },
+    {
+      label: "傾き ...",
+      hint: "付箋を傾けて置きます（見出しや貼り紙の演出に）。矢印・選択の当たりは傾けない元の四角のままです。",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: (rot === 0 ? "✓ " : "　") + "なし",
+            onClick: () => a.noteLook(noteId, { rotation: 0 }),
+          },
+          ...rotations.map((d) => ({
+            label: (rot === d ? "✓ " : "　") + (d < 0 ? `左に ${-d}°` : `右に ${d}°`),
+            onClick: () => a.noteLook(noteId, { rotation: d }),
+          })),
+          { label: "　その他の角度...", onClick: () => a.noteLookPrompt(noteId, "rotation") },
+        ]),
+    },
+    {
+      label: "文字色 ...",
+      hint: "文字の色を変えます。「自動」は背景色の明るさに合わせて読みやすい色を選びます。",
+      onClick: () =>
+        a.openSubmenu([
+          {
+            label: (!cur.text_color ? "✓ " : "　") + "自動（背景に合わせる）",
+            onClick: () => a.noteLook(noteId, { textColor: "" }),
+          },
+          ...NOTE_TEXT_COLORS.map(([name, hex]) => ({
+            label: name,
+            swatch: hex,
+            onClick: () => a.noteLook(noteId, { textColor: hex }),
+          })),
+          { label: "その他の色...", onClick: () => a.noteTextColorPick(noteId) },
+        ]),
+    },
+    {
+      label: "背景色 ...",
       hint: "付箋の色を変えます。マップの案内役として色分けできます。",
       onClick: () =>
         a.openSubmenu([
@@ -1791,7 +1881,7 @@ export function buildCanvasMenu(
     },
     {
       label: "コメントを追加...",
-      hint: "自由に書ける付箋（コメントカード）をこの場所に作ります。色・文字サイズ・見出し行は右クリックから変えられます。",
+      hint: "自由に書ける付箋（コメントカード）をこの場所に作ります。色・文字サイズ・見出し行・フォント・傾きは右クリックから変えられます。",
       onClick: () => a.addNote(pos.canvasX, pos.canvasY),
     },
     {

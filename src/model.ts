@@ -71,6 +71,10 @@ export interface NoteInfo {
   // v1.4.16 付箋の充実: 色（null=既定の黄）と見出し行フォントサイズ（null=見出しなし）。
   color: string | null;
   title_size: number | null;
+  // v1.12.3 付箋の見た目: 傾き（度）・フォント名・文字色（null=既定）。
+  rotation: number | null;
+  font_family: string | null;
+  text_color: string | null;
 }
 
 export const PROJECT_MIME = "application/vnd.texos.project";

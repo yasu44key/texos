@@ -1,5 +1,6 @@
 import { useRef, useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { startCtrlCloneDrag } from "./ctrlCloneDrag";
 
 // v1.4.16 付箋の充実: 付箋色（hex）から背景・枠・文字色を決める。色未指定（null）は
 // 従来どおりテーマ CSS 変数（fileRef 有無で黄／ティール）。明度で文字色を自動反転。
@@ -46,6 +47,10 @@ interface Props {
   color?: string | null;
   /** v1.4.16: 先頭行を見出しにするフォントサイズ（null=見出しなし）。 */
   titleSize?: number | null;
+  /** v1.12.3: 傾き（度・正=時計回り）・フォント名・文字色（null=既定）。 */
+  rotation?: number | null;
+  fontFamily?: string | null;
+  textColor?: string | null;
   fileRef?: string | null;
   startEditing?: boolean;
   /** stacking order (kept above plain cards, below expanded panels) */
@@ -54,6 +59,8 @@ interface Props {
   selected?: boolean;
   /** Ctrl+click: toggle this note in/out of the selection (v1.3 メモ２追加). */
   onToggleSelect?: (id: string) => void;
+  /** Ctrl+左ドラッグでこのコメントのコピーを作る。clientX/Y＝新コメント左上の画面座標（ゴーストの左上）。 */
+  onCtrlClone?: (id: string, clientX: number, clientY: number) => void;
   /** 素クリック（未選択時）: このコメントだけを選択（v1.3.8 マウスモデル刷新）。 */
   onSelect?: (id: string) => void;
   /** v1.5.11 UIの気づき３-2①: Alt+クリック = つながりを選択（カードと同格）。additive=Ctrl+Alt。 */
@@ -74,10 +81,13 @@ interface Props {
 export function NoteCard({
   id, text, x, y,
   width = 220, fontSize = 13, bold = false, color = null, titleSize = null, fileRef = null,
+  rotation = null, fontFamily = null, textColor = null,
   startEditing, zIndex = 0, selected = false,
-  onToggleSelect, onSelect, onSelectConnected, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onDragLive, onSave, onResize,
+  onToggleSelect, onCtrlClone, onSelect, onSelectConnected, onGroupDragStart, onStartLink, onMeasure, onMoveEnd, onDragLive, onSave, onResize,
 }: Props) {
   const c = noteColors(color, fileRef);
+  // フォント名は名前だけ保存し、無いときは既定のゴシックへ落ちるよう sans-serif を後ろに付ける。
+  const font = fontFamily ? `"${fontFamily}", sans-serif` : "sans-serif";
   const posRef = useRef({ x, y });
   posRef.current = { x, y };
   const [editing, setEditing] = useState(!!startEditing);
@@ -142,9 +152,15 @@ export function NoteCard({
     e.stopPropagation();
     e.preventDefault();
 
-    // Ctrl+クリック = 選択に個別追加／解除（ドラッグは始めない）。
+    // Ctrl+クリック = 選択に個別追加／解除。Ctrl+左ドラッグ = この場にコピーを作る（カードと同じ）。
     if (mode === "move" && (e.ctrlKey || e.metaKey)) {
-      onToggleSelect?.(id);
+      const noteEl = (e.currentTarget as HTMLElement).closest<HTMLElement>("[data-note-id]")!;
+      startCtrlCloneDrag(
+        e,
+        noteEl,
+        (cx, cy) => (onCtrlClone ? onCtrlClone(id, cx, cy) : onToggleSelect?.(id)),
+        () => onToggleSelect?.(id)
+      );
       return;
     }
 
@@ -204,24 +220,8 @@ export function NoteCard({
         top: 0,
         transform: `translate(${x}px, ${y}px)`,
         width,
-        minHeight: 40,
         zIndex,
-        background: c.bg,
-        border: `1px solid ${c.border}`,
-        borderRadius: 8,
-        boxShadow: "var(--card-shadow, 0 2px 14px #00000070)",
-        outline: selected ? "2px solid var(--accent, #4a90d9)" : "none",
-        outlineOffset: 1,
-        color: c.text,
-        fontSize,
-        fontWeight: bold ? 700 : 400,
-        fontFamily: "sans-serif",
-        lineHeight: 1.5,
-        cursor: editing ? "text" : "default", // ホバーは矢印のまま（G5）
         willChange: "transform",
-        padding: editing ? 0 : "10px 12px",
-        whiteSpace: "pre-wrap",
-        wordBreak: "break-word",
       }}
       onMouseDown={(e) => startDrag(e, "move")}
       onDoubleClick={(e) => {
@@ -230,6 +230,30 @@ export function NoteCard({
       }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+    >
+      {/* v1.12.3: 見た目は内側の箱に持たせて傾ける。外枠は位置だけ（ドラッグ中の
+          命令的な transform 書き換え・実寸計測は傾きと無関係のまま）。 */}
+      <div
+      style={{
+        position: "relative",
+        minHeight: 40,
+        transform: rotation ? `rotate(${rotation}deg)` : undefined,
+        background: c.bg,
+        border: `1px solid ${c.border}`,
+        borderRadius: 8,
+        boxShadow: "var(--card-shadow, 0 2px 14px #00000070)",
+        outline: selected ? "2px solid var(--accent, #4a90d9)" : "none",
+        outlineOffset: 1,
+        color: textColor || c.text,
+        fontSize,
+        fontWeight: bold ? 700 : 400,
+        fontFamily: font,
+        lineHeight: 1.5,
+        cursor: editing ? "text" : "default", // ホバーは矢印のまま（G5）
+        padding: editing ? 0 : "10px 12px",
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+      }}
     >
       {fileRef && !editing && (
         <div style={{ fontSize: 9, color: "#6fae9c", marginBottom: 4, fontWeight: 400 }}>
@@ -263,7 +287,7 @@ export function NoteCard({
             color: "inherit",
             fontSize,
             fontWeight: bold ? 700 : 400,
-            fontFamily: "sans-serif",
+            fontFamily: font,
             lineHeight: 1.5,
             padding: "10px 12px",
             borderRadius: 8,
@@ -348,6 +372,7 @@ export function NoteCard({
           }}
         />
       )}
+      </div>
     </div>
   );
 }

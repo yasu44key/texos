@@ -5724,6 +5724,36 @@ function App() {
     }
   }, [refresh, pushUndo, linkNewNode]);
 
+  // Ctrl+ドラッグ＝コメントのコピーをこの場に作る（カードの handleCtrlClone と対）。
+  // 中身と見た目（幅・文字サイズ・太字・色・見出し）を写す。ファイル連動（file_ref）は写さず、
+  // いまの文面を持つ普通のコメントになる。
+  const handleNoteCtrlClone = useCallback(
+    async (id: string, clientX: number, clientY: number) => {
+      const n = notesRef.current.find((it) => it.id === id);
+      if (!n) return;
+      const cp = screenToCanvas(transformRef.current, clientX, clientY);
+      try {
+        const nid = await invoke<string>("create_note", { text: n.text, x: cp.x, y: cp.y });
+        await invoke("set_note_style", { id: nid, width: n.width, fontSize: n.font_size, bold: n.bold });
+        if (n.color) await invoke("set_note_color", { id: nid, color: n.color });
+        if (n.title_size != null) await invoke("set_note_title", { id: nid, titleSize: n.title_size });
+        if (n.rotation || n.font_family || n.text_color) {
+          await invoke("set_note_look", {
+            id: nid,
+            rotation: n.rotation ?? undefined,
+            fontFamily: n.font_family ?? undefined,
+            textColor: n.text_color ?? undefined,
+          });
+        }
+        pushUndo([{ kind: "deleteNotes", ids: [nid] }]);
+        await refresh();
+      } catch (e) {
+        console.error("note ctrl-clone failed", e);
+      }
+    },
+    [refresh, pushUndo]
+  );
+
   // 後方定義のハンドラを ref に載せ、handleStartLink（前方）から呼べるようにする。
   // メニュー再編（2026-07-12）: 旧「テキストカード」（handleAddTextCard）は
   // 「新規ファイルを作成 → テキスト（.txt）」（createEmpty）に統合。
@@ -5853,6 +5883,96 @@ function App() {
       console.error("set_note_title failed", e);
     }
   }, []);
+
+  // v1.12.3 付箋の見た目: 傾き・フォント・文字色。渡した項目だけ変える（0・空文字＝既定へ）。
+  // 楽観更新＋refresh不要（色と同じ流儀）。
+  const handleNoteLook = useCallback(
+    async (id: string, look: { rotation?: number; fontFamily?: string; textColor?: string }) => {
+      try {
+        await invoke("set_note_look", { id, ...look });
+        setNotes((prev) =>
+          prev.map((n) =>
+            n.id !== id
+              ? n
+              : {
+                  ...n,
+                  ...(look.rotation !== undefined ? { rotation: look.rotation || null } : {}),
+                  ...(look.fontFamily !== undefined ? { font_family: look.fontFamily.trim() || null } : {}),
+                  ...(look.textColor !== undefined ? { text_color: look.textColor.trim() || null } : {}),
+                }
+          )
+        );
+      } catch (e) {
+        console.error("set_note_look failed", e);
+      }
+    },
+    []
+  );
+
+  // 付箋の「その他の…」入力（文字サイズ・傾き・フォント名を自由な値で）。
+  const handleNoteLookPrompt = useCallback(
+    (id: string, kind: "size" | "rotation" | "font") => {
+      const n = notesRef.current.find((it) => it.id === id);
+      if (!n) return;
+      if (kind === "size") {
+        setPrompt({
+          title: "文字サイズ（数字・例 60）",
+          initial: String(Math.round(n.font_size)),
+          onConfirm: (v) => {
+            const size = Math.round(Number(v));
+            if (size >= 6 && size <= 400) void handleNoteStyle(id, size, n.bold);
+          },
+        });
+      } else if (kind === "rotation") {
+        setPrompt({
+          title: "傾き（度・正=時計回り／負=反時計回り・0=なし）",
+          initial: String(n.rotation ?? 0),
+          onConfirm: (v) => {
+            const deg = Number(v);
+            if (!Number.isFinite(deg)) return;
+            let d = deg % 360; // -180〜180 に畳む（370 → 10、-200 → 160）
+            if (d > 180) d -= 360;
+            if (d < -180) d += 360;
+            void handleNoteLook(id, { rotation: d });
+          },
+        });
+      } else {
+        setPrompt({
+          title: "フォント名（この PC に入っているフォント名。空欄=標準）",
+          initial: n.font_family ?? "",
+          allowEmpty: true,
+          onConfirm: (v) => {
+            void handleNoteLook(id, { fontFamily: v.replace(/["']/g, "").trim() });
+          },
+        });
+      }
+    },
+    [handleNoteStyle, handleNoteLook]
+  );
+
+  // 文字色の自由なカラーピッカー（handleNoteColorPick と同じ仕組み）。
+  const handleNoteTextColorPick = useCallback(
+    (id: string) => {
+      const cur = notesRef.current.find((n) => n.id === id)?.text_color;
+      const input = document.createElement("input");
+      input.type = "color";
+      input.value = cur && /^#[0-9a-fA-F]{6}$/.test(cur) ? cur : "#f3ecd0";
+      input.style.position = "fixed";
+      input.style.left = "-9999px";
+      document.body.appendChild(input);
+      input.addEventListener(
+        "change",
+        () => {
+          const v = input.value;
+          input.remove();
+          void handleNoteLook(id, { textColor: v });
+        },
+        { once: true }
+      );
+      input.click();
+    },
+    [handleNoteLook]
+  );
 
   // 自由なカラーピッカー: 一時的な <input type=color> を生成してダイアログを開く。
   const handleNoteColorPick = useCallback(
@@ -6181,6 +6301,9 @@ function App() {
         noteColor: handleNoteColor,
         noteColorPick: handleNoteColorPick,
         noteTitle: handleNoteTitle,
+        noteLook: handleNoteLook,
+        noteTextColorPick: handleNoteTextColorPick,
+        noteLookPrompt: handleNoteLookPrompt,
         noteToTextCard: handleNoteToTextCard,
         deleteNote: handleDeleteNote,
         shapeClickSelect: handleShapeClickSelect,
@@ -6317,6 +6440,9 @@ function App() {
       handleNoteColor,
       handleNoteColorPick,
       handleNoteTitle,
+      handleNoteLook,
+      handleNoteTextColorPick,
+      handleNoteLookPrompt,
       handleEditInCanvas,
       handleExpandView,
       handleCollapse,
@@ -6656,11 +6782,15 @@ function App() {
             bold={n.bold}
             color={n.color}
             titleSize={n.title_size}
+            rotation={n.rotation}
+            fontFamily={n.font_family}
+            textColor={n.text_color}
             fileRef={n.file_ref}
             startEditing={n.id === newNoteId}
             zIndex={objects.length + 10}
             selected={selectedNotes.has(n.id)}
             onToggleSelect={handleNoteToggleSelect}
+            onCtrlClone={handleNoteCtrlClone}
             onSelect={handleNoteSelectOnly}
             onSelectConnected={handleSelectConnected}
             onGroupDragStart={handleGroupDragStart}
