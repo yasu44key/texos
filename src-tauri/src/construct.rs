@@ -71,15 +71,16 @@ struct PlanCard {
 
 /// いまのプロジェクトにあるファイルカード（AI に見せる一覧の1行）。
 #[derive(Clone)]
-struct ExFile {
-    r: String,
-    id: String,
-    label: String,
-    mime: String,
+pub(crate) struct ExFile {
+    pub(crate) r: String,
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) mime: String,
 }
 
 /// AI に見せる既存のファイルカード（新しい順・上限 80 枚）。URL・フォルダ・プロジェクトの窓は除く。
-fn existing_files(p: &Project) -> Vec<ExFile> {
+/// V1.13 エージェントカードも同じ一覧を「読む」道具の選択肢に使う（F1, F2 …）。
+pub(crate) fn existing_files(p: &Project) -> Vec<ExFile> {
     let Ok(mut st) = p.conn.prepare(
         "SELECT v.id, v.label, COALESCE(v.mime_type, r.mime_type, '') FROM virtual_bodies v
          JOIN real_bodies r ON r.id = v.real_id
@@ -252,6 +253,8 @@ struct Placed {
     notes: Vec<String>,
     relations: Vec<i64>,
     shapes: Vec<String>,
+    /// 実行するカード（ラベル, 置いたカードの id）。エージェントの「動かす」が使う。
+    terminals: Vec<(String, String)>,
 }
 
 fn notify(app: &tauri::AppHandle, root: &Path, undo: serde_json::Value, touched: Vec<String>) {
@@ -271,7 +274,8 @@ fn place(app: &tauri::AppHandle, p: &Project, fid: &str, c: &Checked, existing: 
     let fresh = || c.cards.iter().filter(|k| k.existing.is_none());
     let w = fresh().map(|k| k.x).fold(0.0, f64::max) + 300.0 + 80.0;
     let h = fresh().map(|k| k.y).fold(0.0, f64::max) + 180.0 + 100.0;
-    let mut placed = Placed { used: vec![], objects: vec![], notes: vec![], relations: vec![], shapes: vec![] };
+    let mut placed =
+        Placed { used: vec![], objects: vec![], notes: vec![], relations: vec![], shapes: vec![], terminals: vec![] };
 
     // 枠（図形）に設計図の名前。
     let sid = uuid();
@@ -339,6 +343,12 @@ fn place(app: &tauri::AppHandle, p: &Project, fid: &str, c: &Checked, existing: 
             placed.relations.push(rid);
         }
     }
+    for (label, _) in &c.terminals {
+        let hit = c.cards.iter().find(|k| &k.label == label && k.existing.is_none()).and_then(|k| ids.get(k.key.as_str()));
+        if let Some(id) = hit {
+            placed.terminals.push((label.clone(), id.clone()));
+        }
+    }
     // UNDO 1回で全部消せるように、最後にまとめて積む。
     notify(
         app,
@@ -373,7 +383,7 @@ fn free_path(p: &Path) -> PathBuf {
 /// AI に頼む。**tokio の外の素の OS スレッドで呼ぶ**（run_flow は tokio ワーカー上で走り、
 /// reqwest::blocking の内部ランタイムをそこで drop すると panic する＝flow.rs run_ai と同じ対策。
 /// 2026-10-23 実機: これを忘れて「Cannot drop a runtime…」で panic し、ジョブが「作成中」のまま残った）。
-fn ask_ai(spec: &flow::FilterSpec, messages: &[serde_json::Value], cancel: &std::sync::atomic::AtomicBool) -> Result<String, String> {
+pub(crate) fn ask_ai(spec: &flow::FilterSpec, messages: &[serde_json::Value], cancel: &std::sync::atomic::AtomicBool) -> Result<String, String> {
     std::thread::scope(|s| {
         s.spawn(|| flow::run_ai_chat_stream_rec(spec, messages, cancel, &mut |_, _| {}, &mut None))
             .join()
@@ -412,6 +422,45 @@ pub(crate) fn run_construct(
     if request.is_empty() {
         return EvalOut::failed(vec!["依頼がありません（依頼の付箋をつなぐか、音声カードから頼んでください）".into()], None, vec![]);
     }
+    match build_request(app, p, fid, spec, &extra, &request, role_system, job) {
+        Err(e) => EvalOut::failed(vec![e], None, vec![]),
+        Ok(b) if !b.ok => EvalOut {
+            payloads: vec![payload(b.md, &stem)],
+            nodata: false,
+            ok: false,
+            exit: None,
+            errors: vec![b.outcome],
+            failed_inputs: vec![],
+        },
+        Ok(b) => EvalOut::data(vec![payload(b.md, &stem)], None),
+    }
+}
+
+/// 構築の結果（V1.13: エージェントカードの「組む」もこれを呼ぶ＝ルールを2か所に置かない）。
+pub(crate) struct Built {
+    /// 検査を通って並べた（案だけのときも true）。false＝差し戻しの上限まで直らなかった。
+    pub(crate) ok: bool,
+    /// 結果の1文（レポートの冒頭・失敗なら理由）。
+    pub(crate) outcome: String,
+    pub(crate) title: String,
+    /// 構築レポート（Markdown）。
+    pub(crate) md: String,
+    /// 実行するカード（ラベル, 置いたカードの id）。
+    pub(crate) terminals: Vec<(String, String)>,
+}
+
+/// 依頼文から設計図を作り、検査し、`fid` のカードの下へ並べる。Err は AI・検査役が使えないなど。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_request(
+    app: &tauri::AppHandle,
+    p: &Project,
+    fid: &str,
+    spec: &flow::FilterSpec,
+    extra: &serde_json::Value,
+    request: &str,
+    role_system: Option<&str>,
+    job: &Job,
+) -> Result<Built, String> {
     let state: State<AppState> = app.state();
     let app_data = state.app_data.clone();
     let existing = existing_files(p);
@@ -434,17 +483,14 @@ pub(crate) fn run_construct(
     let mut last: Option<(Checked, serde_json::Value)> = None;
     for round in 1..=retries {
         if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return EvalOut::failed(vec!["中断されました".into()], None, vec![]);
+            return Err("中断されました".into());
         }
         emit_job_progress(app, job, Some(&format!("設計図を作成中（{round}回目）")), None);
-        let answer = match ask_ai(spec, &messages, &job.cancel) {
-            Ok(a) => a,
-            Err(e) => return EvalOut::failed(vec![format!("AI に頼めません: {e}")], None, vec![]),
-        };
+        let answer = ask_ai(spec, &messages, &job.cancel).map_err(|e| format!("AI に頼めません: {e}"))?;
         let problems: Vec<String> = match extract_json(&answer) {
             Err(e) => vec![e],
-            Ok(plan) => match check_plan(&app_data, &plan, spec, &extra, &existing) {
-                Err(e) => return EvalOut::failed(vec![e], None, vec![]),
+            Ok(plan) => match check_plan(&app_data, &plan, spec, extra, &existing) {
+                Err(e) => return Err(e),
                 Ok(c) if c.ok => {
                     last = Some((c, plan));
                     break;
@@ -462,18 +508,18 @@ pub(crate) fn run_construct(
     }
     let Some((mut checked, plan)) = last else {
         let md = format!("# 構築できませんでした\n\n## 依頼\n\n{request}\n\n## 検査の記録\n\n{}\n", log.join("\n"));
-        return EvalOut {
-            payloads: vec![payload(md, &stem)],
-            nodata: false,
+        return Ok(Built {
             ok: false,
-            exit: None,
-            errors: vec![format!("{retries}回直しても検査を通りませんでした（構築レポートに理由）")],
-            failed_inputs: vec![],
-        };
+            outcome: format!("{retries}回直しても検査を通りませんでした（構築レポートに理由）"),
+            title: String::new(),
+            md,
+            terminals: vec![],
+        });
     };
     let preset_notes = resolve_presets(&app_data, &mut checked);
     checked.warnings.extend(preset_notes);
-    let draft = xs(&extra, "apply") == Some("draft");
+    let draft = xs(extra, "apply") == Some("draft");
+    let mut terminals: Vec<(String, String)> = Vec::new();
     // 冒頭の1文＝結果（音声カードはレポートの最初の段落を読み上げる・計画 §5 ③）。
     let run_names: Vec<String> = checked.terminals.iter().map(|(l, _)| format!("「{l}」")).collect();
     let run_hint = if run_names.is_empty() { String::new() } else { format!("実行するのは{}です。", run_names.join("と")) };
@@ -483,6 +529,7 @@ pub(crate) fn run_construct(
         emit_job_progress(app, job, Some("カードを並べています"), None);
         match place(app, p, fid, &checked, &existing) {
             Ok(pl) => {
+                terminals = pl.terminals.clone();
                 let used = if pl.used.is_empty() {
                     String::new()
                 } else {
@@ -495,7 +542,7 @@ pub(crate) fn run_construct(
                     pl.relations.len()
                 )
             }
-            Err(e) => return EvalOut::failed(vec![format!("並べる途中で失敗しました: {e}")], None, vec![]),
+            Err(e) => return Err(format!("並べる途中で失敗しました: {e}")),
         }
     };
     let mut md = format!("# 🏗 {}\n\n{outcome}\n\n## 依頼\n\n{request}\n\n", checked.title);
@@ -533,7 +580,7 @@ pub(crate) fn run_construct(
         md.push_str(&format!("## 直した記録\n\n{}\n\n", log.join("\n")));
     }
     md.push_str(&format!("## 設計図\n\n```json\n{}\n```\n", serde_json::to_string_pretty(&plan).unwrap_or_default()));
-    EvalOut::data(vec![payload(md, &stem)], None)
+    Ok(Built { ok: true, outcome, title: checked.title.clone(), md, terminals })
 }
 
 #[cfg(test)]

@@ -128,7 +128,7 @@ pub(crate) fn render_transcript(ai_label: &str, msgs: &[&ChatMsg], with_labels: 
 }
 
 /// ログカードを置く AI カードからの横オフセット（カード幅 150＋間隔）。
-const LOG_DX: f64 = 230.0;
+pub(crate) const LOG_DX: f64 = 230.0;
 /// v1.9.2 抜粋カードの縦の間隔: カード高さ 115（ObjectCard.tsx の CARD_H）＋隙間 20＝重ならない。
 const EXCERPT_DY: f64 = 135.0;
 /// v1.9.2 チャットパネルの既定幅（ChatPanel.tsx の PANEL_W と揃える）。
@@ -136,7 +136,8 @@ const CHAT_PANEL_W: f64 = 380.0;
 
 /// 書き出した MD を実身カードにする: 同じパスのカードがあれば中身差し替え（位置・矢印維持）、
 /// 無ければ AI カードから (dx, dy) ずらして作り、AI → カードの flow 矢印を張る。返り値＝カード id。
-fn place_md_card(
+/// V1.13 エージェントカードの会話の記録も同じ置き方（agent.rs）。
+pub(crate) fn place_md_card(
     p: &Project,
     ai_id: &str,
     dest: &Path,

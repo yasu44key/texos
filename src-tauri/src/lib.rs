@@ -684,6 +684,8 @@ mod thinker;
 mod construct;
 // V1.13 P1: RAG（builtin:"rag_index" / "rag_search"）。crate::rag:: で参照。
 mod rag;
+// V1.13 P2: エージェントカード（builtin:"agent"）。crate::agent:: で参照。
+mod agent;
 // v1.11: MCP 接続（AIエージェントからの操作口・ローカル IPC）。crate::mcp_bridge:: で参照。
 mod mcp_bridge;
 pub(crate) use ai::*;
@@ -773,6 +775,13 @@ pub fn run() {
             voice::voice_retry,
             voice::voice_ensure_inbox,
             voice::voice_send_text,
+            agent::agent_send,
+            agent::agent_history,
+            agent::agent_reset,
+            agent::agent_stop,
+            agent::agent_mic_start,
+            agent::agent_mic_stop,
+            agent::agent_mic_cancel,
             delete_relation,
             set_relation_attrs,
             list_flow_inputs,

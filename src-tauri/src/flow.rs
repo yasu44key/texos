@@ -572,6 +572,12 @@ pub fn mime_matches(accept: &str, mime: &str) -> bool {
 /// OS 差はこの関数の内側に閉じ込める（カード定義は全 OS 共通＝プロジェクトの可搬性）。
 /// 本文はコマンドラインに載せず UTF-8 一時ファイルで渡す（引用符・長さ・文字化けを回避）。
 pub fn run_speak(input: &[u8]) -> Result<(), String> {
+    speak_child(input).map(|_| ())
+}
+
+/// 読み上げを始めて、そのプロセスを返す（V1.13 エージェントのおしゃべりモード: 読み上げの間は
+/// 聞き取りを止めるので、終わりを待つ・途中で止める必要がある）。
+pub fn speak_child(input: &[u8]) -> Result<std::process::Child, String> {
     let text = String::from_utf8_lossy(input);
     if text.trim().is_empty() {
         return Err("読み上げるテキストが空です".into());
@@ -584,11 +590,9 @@ pub fn run_speak(input: &[u8]) -> Result<(), String> {
         std::env::temp_dir().join(format!("texos_speak_{}_{nanos}.txt", std::process::id()));
     std::fs::write(&path, text.as_bytes())
         .map_err(|e| format!("読み上げ用の一時ファイルを書けません: {e}"))?;
-    if let Err(e) = spawn_speaker(&path) {
+    spawn_speaker(&path).inspect_err(|_| {
         let _ = std::fs::remove_file(&path);
-        return Err(e);
-    }
-    Ok(())
+    })
 }
 
 /// Windows: SAPI（COM の SpVoice）。読み上げ後の一時ファイル削除もスクリプト側で行う。
@@ -600,7 +604,7 @@ pub fn run_speak(input: &[u8]) -> Result<(), String> {
 /// （PS 5.1 実機で "Microsoft Ayumi - Japanese (Japan)" の選択を確認済み）。
 /// OneCore キーが無い等の環境では従来の既定音声のまま（try/catch で黙って続行）。
 #[cfg(windows)]
-fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
+fn spawn_speaker(path: &std::path::Path) -> Result<std::process::Child, String> {
     use std::os::windows::process::CommandExt;
     let p = path.to_string_lossy().replace('\'', "''");
     let script = format!(
@@ -624,13 +628,12 @@ fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map(|_| ())
         .map_err(|e| format!("読み上げを起動できません: {e}"))
 }
 
 /// macOS: 標準搭載の say。一時ファイルは OS の掃除に任せる（小さなテキスト）。
 #[cfg(target_os = "macos")]
-fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
+fn spawn_speaker(path: &std::path::Path) -> Result<std::process::Child, String> {
     std::process::Command::new("say")
         .arg("-f")
         .arg(path)
@@ -638,13 +641,12 @@ fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map(|_| ())
         .map_err(|e| format!("読み上げを起動できません: {e}"))
 }
 
 /// Linux 等: espeak。未導入なら spawn 失敗がそのままエラーになる（黙って失敗しない）。
 #[cfg(all(unix, not(target_os = "macos")))]
-fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
+fn spawn_speaker(path: &std::path::Path) -> Result<std::process::Child, String> {
     std::process::Command::new("espeak")
         .arg("-f")
         .arg(path)
@@ -652,7 +654,6 @@ fn spawn_speaker(path: &std::path::Path) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map(|_| ())
         .map_err(|e| format!("読み上げを起動できません（espeak の導入が必要です）: {e}"))
 }
 

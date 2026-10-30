@@ -445,6 +445,12 @@ fn acquire_node_permits(
         // 録音が終わって permit が落ちたら開き直させる。
         permit.mic_yield = Some(crate::voice::voice_mic_yield());
         permits.push(permit);
+        // 2026-10-31 実機: 実行中パネルの「⏹ 停止」は ▶ を押したカード（終端）の spec で出していたので、
+        // 下流（Whisper 等）から遡って録音が始まると停止ボタンが無く、「■ 中断」で録音ごと捨てるしか
+        // なかった。録音が始まる時点で、このジョブは stdin で止められると画面へ知らせる。
+        use tauri::Emitter;
+        let _ = app.emit("job:record", serde_json::json!({ "job_id": job.id, "stop_cmd": "q" }));
+        emit_job_progress(app, job, Some(&format!("● 録音中（{name}）— ⏹ 停止で確定")), None);
     }
     // 2) ai（AI/T2i）: 正規化エンドポイント単位（既定許可数1）。
     let endpoint = match kind {
@@ -1131,6 +1137,17 @@ pub(crate) fn eval_filter(
             Ok(_n) => EvalOut::data(vec![], None),
             Err(e) => EvalOut::failed(vec![e], None, vec![]),
         };
+        return finish_eval(p, job, fid, visited, memo, 0, out);
+    }
+
+    // V1.13 エージェントカード（builtin:"agent"）: 話しかけるのはカードの下の欄（agent.rs）。
+    // フローの中では動かない（上流を引かない・何も作らない）。
+    if spec.builtin.as_deref() == Some("agent") {
+        let out = EvalOut::failed(
+            vec!["エージェントカードはフローでは実行しません — カードの下の欄で話しかけてください".into()],
+            None,
+            vec![],
+        );
         return finish_eval(p, job, fid, visited, memo, 0, out);
     }
 
@@ -1954,7 +1971,7 @@ fn loop_should_stop(spec: &flow::FilterSpec, payloads: &[FlowPayload]) -> Result
 
 /// 反復カードの上流サブグラフ（周ごとにメモを捨てる範囲）を後ろ向きに集める。
 /// 戻り矢印（`role:"previous"`）は辿らない＝ここも DAG として歩く。
-fn upstream_ids(p: &Project, fid: &str) -> Vec<String> {
+pub(crate) fn upstream_ids(p: &Project, fid: &str) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stack = vec![fid.to_string()];
     let mut out = Vec::new();

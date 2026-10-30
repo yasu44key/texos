@@ -12,7 +12,7 @@ interface Props {
   onCancel: () => void;
   /** v1.12 ④: "construct" ＝コンストラクタカード（builtin:"construct"）を同じ画面で設定する
    * （モデルの入れ替え・調整を AI カードと同じ使い勝手に・2026-10-23 ユーザー）。 */
-  variant?: "ai" | "construct" | "voice";
+  variant?: "ai" | "construct" | "voice" | "agent";
 }
 
 // v1.7.3 サーバー選択を3択に。"lmstudio" と "openai" はワイヤ形式が同じ（バックエンドの
@@ -138,7 +138,10 @@ function parseServer(v: unknown): Server {
 }
 
 export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, variant = "ai" }: Props) {
-  const isConstruct = variant === "construct";
+  // V1.13 "agent" ＝エージェントカード（builtin:"agent"）。組む一手がコンストラクタを呼ぶので、
+  // 並べる AI カードのモデル・差し戻し回数はコンストラクタと同じ欄（agent.rs → construct.rs が読む）。
+  const isAgent = variant === "agent";
+  const isConstruct = variant === "construct" || isAgent;
   // v1.12: "voice" ＝音声カードの応答用 AI（設定キーは ai_ 接頭辞・voice.rs ai_conf が読む）。
   const isVoice = variant === "voice";
   const K = (n: string) => (isVoice ? `ai_${n}` : n);
@@ -185,6 +188,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
     typeof base.max_retries === "number" ? String(base.max_retries) : "3"
   );
   const [prefix, setPrefix] = useState(s("prefix", isConstruct ? "構築レポート" : ""));
+  const [maxSteps, setMaxSteps] = useState(typeof base.max_steps === "number" ? String(base.max_steps) : "8");
   // v1.8.6 GPU の使い方（Ollama のみ）。既定 "auto" = キーを書かない＝サーバ任せ
   // （＝VRAM に載る層は GPU。旧来の「VRAM が少ないから CPU」という既定は廃止）。
   const [gpu, setGpu] = useState<"auto" | "max" | "cpu">(
@@ -293,18 +297,24 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
       return;
     }
     const spec: Record<string, unknown> = isConstruct
-      ? { ...base, builtin: "construct", provider }
+      ? { ...base, builtin: isAgent ? "agent" : "construct", provider }
       : { ...base, builtin: "ai", provider, mode };
     if (isConstruct) {
       delete spec.mode;
       if (cardModel.trim()) spec.card_model = cardModel.trim();
       else delete spec.card_model;
-      if (apply === "draft") spec.apply = "draft";
-      else delete spec.apply;
       const r = parseInt(maxRetries, 10);
       spec.max_retries = Number.isFinite(r) ? Math.min(6, Math.max(1, r)) : 3;
+    }
+    if (isConstruct && !isAgent) {
+      if (apply === "draft") spec.apply = "draft";
+      else delete spec.apply;
       if (prefix.trim()) spec.prefix = prefix.trim();
       else delete spec.prefix;
+    }
+    if (isAgent) {
+      const n = parseInt(maxSteps, 10);
+      spec.max_steps = Number.isFinite(n) ? Math.min(16, Math.max(1, n)) : 8;
     }
     // 空欄時の既定: Ollama は導入案内が gemma3 を入れるのでそれに合わせる。
     // 他サーバーは既定名が存在しないので、取得済み一覧の先頭を使う。
@@ -338,7 +348,10 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
     // 接続時型チェック・出力の既定（未設定なら補う）。
     if (!spec.accept_mime) spec.accept_mime = !isConstruct && mode === "chat" ? "*/*" : "text/*";
     if (!spec.output_ext) spec.output_ext = "md";
-    onSave(title.trim() || (isConstruct ? "コンストラクタ" : `AI: ${spec.model}`), JSON.stringify(spec));
+    onSave(
+      title.trim() || (isAgent ? "エージェント" : isConstruct ? "コンストラクタ" : `AI: ${spec.model}`),
+      JSON.stringify(spec)
+    );
   };
 
   return (
@@ -373,8 +386,21 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
         }}
       >
         <div style={{ fontSize: 15, marginBottom: 14, textAlign: "center" }}>
-          {isConstruct ? "🏗 コンストラクタの設定" : isVoice ? "🎙 音声カードの応答 AI" : "🤖 AIカードの設定"}
+          {isAgent
+            ? "🤖 エージェントの設定"
+            : isConstruct
+              ? "🏗 コンストラクタの設定"
+              : isVoice
+                ? "🎙 音声カードの応答 AI"
+                : "🤖 AIカードの設定"}
         </div>
+        {isAgent && (
+          <div style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", marginBottom: 12, lineHeight: 1.5 }}>
+            カードの下の欄で頼むと、この AI が一手ずつ道具を選びます（答える・索引で調べる・ファイルを読む・
+            フローを組む・実行する）。組む一手はコンストラクタと同じ検査と並べ方です。外部プログラム・シェル・
+            オペレーションを含むフローは実行せず、▶ を人が押すのを待ちます。一手は形を決めた JSON で受け取ります。
+          </div>
+        )}
         {isVoice && (
           <div style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", marginBottom: 12, lineHeight: 1.5 }}>
             話しかけた内容を聞いて、返事をし、どのカードへ流すかを決める AI です。速さが大事なので軽いモデル向き
@@ -382,7 +408,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
             返事は形を決めた JSON で受け取ります（Ollama は format、OpenAI 互換は response_format）。
           </div>
         )}
-        {isConstruct && (
+        {isConstruct && !isAgent && (
           <div style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", marginBottom: 12, lineHeight: 1.5 }}>
             つないだ依頼（付箋・音声カードからの発話）を読み、AI がカードの設計図を書きます。配線の決まり
             （scripts/texos_flow.py の検査）で確かめ、違反は理由ごと AI に返して直させてから、いまのプロジェクトの
@@ -651,7 +677,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
           )}
 
         {!isVoice && row(
-          isConstruct ? "追加の\n作法" : "システム\nプロンプト",
+          isAgent ? "追加の\n指示" : isConstruct ? "追加の\n作法" : "システム\nプロンプト",
           <div>
             <textarea
               style={{ ...inp(), resize: "vertical", minHeight: 64, fontFamily: "inherit" }}
@@ -659,7 +685,9 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
               rows={4}
               onChange={(e) => setSystem(e.target.value)}
               placeholder={
-                isConstruct
+                isAgent
+                  ? "（空欄可）口調・得意分野・いつも使ってほしい索引など。道具の使い方は組み込み済み"
+                  : isConstruct
                   ? "（空欄可）設計の作法を足す。構築の要点は組み込み済み。役割の付箋をつないでも同じ"
                   : "（空欄可）AIの役割・口調・出力形式の指示"
               }
@@ -748,12 +776,26 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
                 </datalist>
               </div>
             )}
-            {row(
+            {!isAgent && row(
               "実行したら",
               <select style={inp()} value={apply} onChange={(e) => setApply(e.target.value as "place" | "draft")}>
                 <option value="place">カードを並べる（UNDO で一度に戻せる）</option>
                 <option value="draft">案だけ出す（構築レポートに設計図と検査結果）</option>
               </select>
+            )}
+            {isAgent && row(
+              "手数の\n上限",
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  style={{ ...inp(), width: 100 }}
+                  value={maxSteps}
+                  onChange={(e) => setMaxSteps(e.target.value)}
+                  inputMode="numeric"
+                />
+                <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
+                  1回の頼みで道具を使える回数（1〜16）。超えたらそこで止めて報告します
+                </span>
+              </div>
             )}
             {row(
               "差し戻す\n回数の上限",
@@ -769,7 +811,8 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
                 </span>
               </div>
             )}
-            {row("レポートの\n名前", <input style={inp()} value={prefix} onChange={(e) => setPrefix(e.target.value)} />)}
+            {!isAgent &&
+              row("レポートの\n名前", <input style={inp()} value={prefix} onChange={(e) => setPrefix(e.target.value)} />)}
           </>
         )}
 

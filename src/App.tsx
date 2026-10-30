@@ -254,7 +254,7 @@ function App() {
     spec: string;
     create?: { x: number; y: number; linkFrom?: string };
     /** v1.12 ④: コンストラクタも同じ設定画面（モデルの入れ替え・調整を AI カードと同じに）。 */
-    variant?: "ai" | "construct" | "voice";
+    variant?: "ai" | "construct" | "voice" | "agent";
   } | null>(null);
   // v1.4.8 ①: Whisper セットアップダイアログ（未導入時に開く。作成位置を保持）。
   const [whisperDlg, setWhisperDlg] = useState<{
@@ -553,6 +553,15 @@ function App() {
           j.id === e.payload.job_id
             ? { ...j, note: e.payload.note ?? j.note, percent: e.payload.percent ?? j.percent }
             : j
+        )
+      );
+    }).then((u) => (alive ? uns.push(u) : u()));
+    // 2026-10-31: 下流の ▶ から遡って録音が始まったジョブにも「⏹ 停止」を出す
+    // （終端カードの spec だけを見ていると、Whisper 等から引いた録音を止める手段が無かった）。
+    void listen<{ job_id: number; stop_cmd?: string }>("job:record", (e) => {
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.id === e.payload.job_id ? { ...j, record: true, stopCmd: e.payload.stop_cmd || j.stopCmd || "q" } : j
         )
       );
     }).then((u) => (alive ? uns.push(u) : u()));
@@ -1372,6 +1381,23 @@ function App() {
             accept_mime: "text/*",
             output_ext: "md",
             prefix: "構築レポート",
+          }),
+          create: { x: canvasX, y: canvasY, linkFrom },
+        });
+        return;
+      }
+      if (builtin === "agent") {
+        // V1.13 エージェントカード: 頭はコンストラクタと同じ既定（組む一手がコンストラクタを呼ぶ）。
+        setAiDlg({
+          variant: "agent",
+          id: null,
+          label: "エージェント",
+          spec: JSON.stringify({
+            builtin: "agent",
+            provider: "openai",
+            model: "swift-1.5-iq2_xs",
+            endpoint: "http://127.0.0.1:8080/v1",
+            max_steps: 8,
           }),
           create: { x: canvasX, y: canvasY, linkFrom },
         });
@@ -2262,8 +2288,8 @@ function App() {
         setAiDlg({ id, label, spec: current });
         return;
       }
-      if (builtin === "construct") {
-        setAiDlg({ id, label, spec: current, variant: "construct" });
+      if (builtin === "construct" || builtin === "agent") {
+        setAiDlg({ id, label, spec: current, variant: builtin === "agent" ? "agent" : "construct" });
         return;
       }
       // v1.5 Text-To-Image カードも専用設定ダイアログ（取得済みモデル一覧を添えて開く）。

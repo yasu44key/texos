@@ -1587,7 +1587,7 @@ fn result_summary(root: &Path, r: &FlowReport) -> (String, String) {
 
 /// 読み上げ用の冒頭: コードブロック・見出し記号・箇条書き記号・強調を落とし、最初の段落を最大 n 字
 /// （句点で切れるならそこで切る）。
-fn speakable_head(text: &str, n: usize) -> String {
+pub(crate) fn speakable_head(text: &str, n: usize) -> String {
     let mut in_code = false;
     let mut para: Vec<String> = Vec::new();
     for raw in text.lines() {

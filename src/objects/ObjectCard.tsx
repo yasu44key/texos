@@ -17,6 +17,7 @@ const GlbPreview = lazy(() =>
 );
 import { isTextMime, type RunAlert } from "../model";
 import { VoiceStatus } from "./VoiceStatus";
+import { AgentPanel } from "./AgentPanel";
 import { startCtrlCloneDrag } from "./ctrlCloneDrag";
 
 // Fixed card geometry so link endpoints are predictable from (x, y) alone.
@@ -209,6 +210,14 @@ const FILTER_TYPE_STYLES = {
     badge: "🏗 コンストラクタ",
     run: "▶ 構築",
   },
+  // V1.13 エージェントカード: 人と話す窓口なので声の窓口と同じ紫。▶ は無い（カードの下の欄で話す）。
+  agent: {
+    bg: "var(--card-bg-live, #221a30)",
+    border: "#7a5ab0",
+    text: "var(--card-live-text, #c8a8f0)",
+    badge: "🤖 エージェント",
+    run: "",
+  },
   // シェルカード統合（2026-07-06）: cmd/PowerShell カード。従来は「⚙ フィルタ」表示で
   // 見分けがつかなかった。配色はコマンド系を流用（テーマ変数の追加を避ける）。
   shell: {
@@ -279,6 +288,7 @@ function filterTypeOf(ref: string | null | undefined): keyof typeof FILTER_TYPE_
     }
     if (typeof s.shell === "string") return "shell";
     if (s.builtin === "construct") return "construct";
+    if (s.builtin === "agent") return "agent";
     if (!s.builtin && (s.type === "command" || s.type === "generator")) return s.type;
   } catch {
     // 壊れたJSONはフィルタ扱いで表示だけ続行（編集ダイアログ側で直せる）
@@ -990,6 +1000,8 @@ export function ObjectCard({
       {ftype === "op_voice" && !opPaused && (
         <VoiceStatus id={id} top={CARD_H + 8} threshold={voiceThresholdOf(filterRef)} />
       )}
+      {/* V1.13 エージェントカード: 会話の欄はいつもカードの下に（置いたら話せる）。 */}
+      {ftype === "agent" && <AgentPanel id={id} top={CARD_H + 8} />}
 
       {/* expansion — anchored to this card, moves with it */}
       {expanded && isAiChat && (

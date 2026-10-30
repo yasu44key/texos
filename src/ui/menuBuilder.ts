@@ -1320,6 +1320,11 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
       label: "生成（AI・画像生成）...",
       onClick: () =>
         a.openSubmenu([
+          {
+            label: "🤖 エージェント（話しかけると調べる・組む・動かす）...",
+            hint: "カードの下の欄で頼むと、AI が道具（索引で調べる・ファイルを読む・フローを組む・実行する）を選んで進めます。",
+            onClick: () => a.addFilter("agent"),
+          },
           { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog") },
           { label: "AI変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat") },
           // v1.12 ④（docs/V1.12_声の窓口と思考役計画.md §6）
@@ -1882,6 +1887,14 @@ export function buildCanvasMenu(
         }]
       : []),
     DIV,
+    // V1.13 P2（docs/V1.13_エージェントカード計画.md §4.1）: 気づけることが本題なのでいちばん上。
+    {
+      label: "🤖 エージェントを置く...",
+      hint:
+        "話しかけられるカードを置きます。カードの下の欄で頼むと、答える・手元の資料を調べる・ファイルを読む・" +
+        "カードのフローを組んで実行する、を AI が選んで進めます。組んだフローはキャンバスに残ります。",
+      onClick: () => a.addFilter("agent", pos.canvasX, pos.canvasY),
+    },
     // ── 作成・配置系（よく使う。トップに残す）──
     {
       label: "クリップボードから貼り付け",

@@ -846,43 +846,59 @@ pub(crate) fn run_rag_search(
             vec![],
         );
     }
-    let db_path = index_path(&p.root, &name);
-    if !db_path.is_file() {
-        return EvalOut::failed(
-            vec![format!("索引「{name}」がまだありません — 先に 📚 索引カードを実行してください")],
-            None,
-            vec![],
-        );
-    }
-    let model = match open_db(&db_path).map(|c| meta_get(&c, "model")) {
-        Ok(Some(m)) => m,
+    match search_md(&p.root, spec, &name, &query, top_k(spec)) {
         Ok(None) => {
-            return EvalOut::failed(vec![format!("索引「{name}」は空です — 索引カードを実行し直してください")], None, vec![])
+            report.skipped.push(format!("索引「{name}」にチャンクがありません — 下流を止めました"));
+            EvalOut::nodata_out()
         }
-        Err(e) => return EvalOut::failed(vec![e], None, vec![]),
-    };
+        Ok(Some(md)) => EvalOut::data(vec![payload(md, out_stem(spec, "検索結果"))], None),
+        Err(e) => EvalOut::failed(vec![e], None, vec![]),
+    }
+}
+
+/// 検索の芯（検索カードとエージェントの「調べる」で共有）。ヒット0件は None。
+/// 埋め込みの接続先は `spec`（provider / endpoint）、モデルは索引に記録したもの。
+pub(crate) fn search_md(
+    root: &Path,
+    spec: &flow::FilterSpec,
+    name: &str,
+    query: &str,
+    k: usize,
+) -> Result<Option<String>, String> {
+    let db_path = index_path(root, name);
+    if !db_path.is_file() {
+        return Err(format!("索引「{name}」がまだありません — 先に 📚 索引カードを実行してください"));
+    }
+    let model = open_db(&db_path)
+        .map(|c| meta_get(&c, "model"))?
+        .ok_or_else(|| format!("索引「{name}」は空です — 索引カードを実行し直してください"))?;
     // 問いは索引と同じモデルで埋め込む（違うモデルのベクトルは比べられない）。
     let emb = Embedder::from_spec(spec, Some(&model));
-    let qv = match emb.embed(&[query.clone()]) {
-        Ok(mut v) if !v.is_empty() => v.remove(0),
-        Ok(_) => return EvalOut::failed(vec!["問いを埋め込めませんでした".into()], None, vec![]),
-        Err(e) => return EvalOut::failed(vec![e], None, vec![]),
-    };
+    let qv = emb.embed(&[query.to_string()])?.into_iter().next().ok_or("問いを埋め込めませんでした")?;
     let total: usize = open_db(&db_path)
         .ok()
         .and_then(|c| c.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0)).ok())
         .unwrap_or(0) as usize;
-    match search_index(&db_path, &qv, top_k(spec)) {
-        Ok(hits) if hits.is_empty() => {
-            report.skipped.push(format!("索引「{name}」にチャンクがありません — 下流を止めました"));
-            EvalOut::nodata_out()
-        }
-        Ok(hits) => {
-            let md = search_report(&name, &model, total, &query, &hits);
-            EvalOut::data(vec![payload(md, out_stem(spec, "検索結果"))], None)
-        }
-        Err(e) => EvalOut::failed(vec![e], None, vec![]),
-    }
+    let hits = search_index(&db_path, &qv, k)?;
+    Ok((!hits.is_empty()).then(|| search_report(name, &model, total, query, &hits)))
+}
+
+/// このプロジェクトにある索引の名前（`.texos/rag/*.sqlite`・名前順）。
+pub(crate) fn list_indexes(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root.join(".texos").join("rag"))
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    (p.extension().and_then(|x| x.to_str()) == Some("sqlite"))
+                        .then(|| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+                        .flatten()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 /// preflight 用: 入力なしで成り立つか（索引＝フォルダを読む・検索＝パラメータ欄に問い）。
