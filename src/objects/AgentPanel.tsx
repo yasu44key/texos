@@ -71,6 +71,78 @@ function LevelMeter({ level }: { level: number }) {
   );
 }
 
+// v1.13.1 返事の Markdown（AI は **太字**・箇条書き・番号・見出しで返す）。吹き出しで使う分だけの小さな表示で、
+// HTML として流し込まない（要素を組み立てる＝返事の中身がそのまま実行されることはない）。
+const CODE_STYLE: React.CSSProperties = {
+  fontFamily: "Consolas, monospace",
+  fontSize: 11,
+  background: "var(--panel-input-bg)",
+  borderRadius: 3,
+  padding: "0 3px",
+};
+
+function inline(text: string): React.ReactNode[] {
+  return text.split(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/g).map((p, i) => {
+    if (p.length > 4 && p.startsWith("**") && p.endsWith("**")) return <strong key={i}>{p.slice(2, -2)}</strong>;
+    if (p.length > 2 && p.startsWith("`") && p.endsWith("`"))
+      return (
+        <code key={i} style={CODE_STYLE}>
+          {p.slice(1, -1)}
+        </code>
+      );
+    return p;
+  });
+}
+
+function MiniMd({ text }: { text: string }) {
+  const out: React.ReactNode[] = [];
+  let code: string[] | null = null;
+  text.split("\n").forEach((raw, i) => {
+    if (raw.trim().startsWith("```")) {
+      if (code) {
+        out.push(
+          <pre key={i} style={{ ...CODE_STYLE, padding: "4px 6px", margin: "2px 0", whiteSpace: "pre-wrap" }}>
+            {code.join("\n")}
+          </pre>
+        );
+        code = null;
+      } else code = [];
+      return;
+    }
+    if (code) {
+      code.push(raw);
+      return;
+    }
+    const indent = Math.min(3, Math.floor((raw.length - raw.trimStart().length) / 2));
+    const line = raw.trim();
+    let m: RegExpMatchArray | null;
+    if (!line) out.push(<div key={i} style={{ height: 4 }} />);
+    else if ((m = line.match(/^#{1,6}\s+(.*)$/)))
+      out.push(
+        <div key={i} style={{ fontWeight: 700, marginTop: 2 }}>
+          {inline(m[1])}
+        </div>
+      );
+    else if ((m = line.match(/^([-*・])\s+(.*)$/)))
+      out.push(
+        <div key={i} style={{ display: "flex", gap: 4, paddingLeft: indent * 12 }}>
+          <span>•</span>
+          <span>{inline(m[2])}</span>
+        </div>
+      );
+    else if ((m = line.match(/^(\d+)[.)．]\s+(.*)$/)))
+      out.push(
+        <div key={i} style={{ display: "flex", gap: 4, paddingLeft: indent * 12 }}>
+          <span>{m[1]}.</span>
+          <span>{inline(m[2])}</span>
+        </div>
+      );
+    else out.push(<div key={i}>{inline(line)}</div>);
+  });
+  if (code) out.push(<pre key="tail" style={{ ...CODE_STYLE, padding: "4px 6px", whiteSpace: "pre-wrap" }}>{(code as string[]).join("\n")}</pre>);
+  return <>{out}</>;
+}
+
 /** 入力欄の高さ（文字に合わせて伸びる・上限あり）。 */
 const INPUT_MIN = 36;
 const INPUT_MAX = 120;
@@ -260,9 +332,13 @@ export function AgentPanel({ id, top }: { id: string; top: number }) {
         {lines.map((l, i) => (
           <div
             key={i}
-            style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", ...(ROLE_STYLE[l.role] ?? ROLE_STYLE.tool) }}
+            style={{
+              whiteSpace: l.role === "agent" ? "normal" : "pre-wrap",
+              wordBreak: "break-word",
+              ...(ROLE_STYLE[l.role] ?? ROLE_STYLE.tool),
+            }}
           >
-            {l.role === "error" ? `⚠ ${l.text}` : l.text}
+            {l.role === "agent" ? <MiniMd text={l.text} /> : l.role === "error" ? `⚠ ${l.text}` : l.text}
           </div>
         ))}
         {busy && <div style={{ color: "var(--panel-muted)", fontStyle: "italic" }}>🤖 {status}</div>}

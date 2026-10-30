@@ -655,6 +655,46 @@ fn index_report(name: &str, model: &str, root: &Path, db_path: &Path, st: &Index
         }
     }
     md.push_str("\nこのカードを 🔎 検索カードにつなぐと、この索引から探します。\n");
+    // v1.13.1: 索引した文書の一覧（エージェントがこのカードを読めば、フォルダ全体を見渡して整理の案を作れる。
+    // 検索は問いに近い数件しか返さないので、一覧が無いと「全体を分けて」に答えられなかった）。
+    md.push_str(&doc_list_md(&indexed_docs(db_path)));
+    md
+}
+
+/// 索引にある文書（出典, チャンク数）を名前順に。
+fn indexed_docs(db_path: &Path) -> Vec<(String, i64)> {
+    let Ok(c) = open_db(db_path) else { return Vec::new() };
+    let Ok(mut st) = c.prepare("SELECT source, chunks FROM docs ORDER BY source") else { return Vec::new() };
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
+}
+
+/// 一覧に出す文書の上限（多いと読む側の AI が受け取りきれない）。
+const LIST_MAX: usize = 400;
+
+/// 文書の一覧（Markdown）。出典に共通するフォルダは見出しに一度だけ書き、各行はその下の名前にする。
+fn doc_list_md(docs: &[(String, i64)]) -> String {
+    if docs.is_empty() {
+        return String::new();
+    }
+    let norm: Vec<String> = docs.iter().map(|(s, _)| s.replace('\\', "/")).collect();
+    // 共通のフォルダ（最後の / まで）。
+    let mut base: &str = norm[0].rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    for s in &norm[1..] {
+        while !base.is_empty() && !(s.starts_with(base) && s[base.len()..].starts_with('/')) {
+            base = base.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        }
+    }
+    let mut md = format!("\n## 文書（{} 件）\n\n", docs.len());
+    if !base.is_empty() {
+        md.push_str(&format!("フォルダ: {base}\n\n"));
+    }
+    for (s, (_, chunks)) in norm.iter().zip(docs).take(LIST_MAX) {
+        let rel = if base.is_empty() { s.as_str() } else { &s[base.len() + 1..] };
+        md.push_str(&format!("- {rel}（{chunks} チャンク）\n"));
+    }
+    if docs.len() > LIST_MAX {
+        md.push_str(&format!("- …ほか {} 件\n", docs.len() - LIST_MAX));
+    }
     md
 }
 
@@ -913,6 +953,24 @@ pub(crate) fn runs_without_input(spec: &flow::FilterSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doc_list_shows_common_folder_once() {
+        let docs = vec![
+            ("X:/学習/Blender/ショートカット.docx".to_string(), 3),
+            ("X:/学習/Blender/sub/rig.md".to_string(), 1),
+            ("X:/学習/C++/1章.md".to_string(), 5),
+        ];
+        let md = doc_list_md(&docs);
+        assert!(md.contains("## 文書（3 件）"));
+        assert!(md.contains("フォルダ: X:/学習\n"));
+        assert!(md.contains("- Blender/sub/rig.md（1 チャンク）"));
+        assert!(md.contains("- C++/1章.md（5 チャンク）"));
+        // プロジェクトの中（相対・共通フォルダなし）はそのまま。
+        let md = doc_list_md(&[("a.md".to_string(), 1), ("b/c.md".to_string(), 2)]);
+        assert!(!md.contains("フォルダ:") && md.contains("- b/c.md"));
+        assert_eq!(doc_list_md(&[]), "");
+    }
 
     #[test]
     fn names_and_markers() {

@@ -28,7 +28,8 @@ const MAX_STEPS_CAP: u64 = 16;
 const HISTORY_CHARS: usize = 8000;
 /// 道具の結果を AI に返すときの上限（文字数）。
 const RESULT_CHARS: usize = 4000;
-const READ_CHARS: usize = 6000;
+/// 読むの上限（v1.13.1: 6000 → 10000。索引レポートの文書の一覧が数百件になる）。
+const READ_CHARS: usize = 10000;
 /// パネルに残す行数（画面の付け直しで戻す分）。
 const PANEL_KEEP: usize = 80;
 /// 検索で取る件数。
@@ -644,7 +645,9 @@ fn turn_inner(
             used.push(line);
         }
         scratch.push(serde_json::json!({ "role": "assistant", "content": raw }));
-        scratch.push(serde_json::json!({ "role": "user", "content": format!("【結果: {}】\n{}", st.action, cut(&result, RESULT_CHARS)) }));
+        // 読むは読む用の上限（do_read が切った長さのまま渡す・ここで RESULT_CHARS に切り直すと上限が効かなかった）。
+        let lim = if st.action == "read" { READ_CHARS + 100 } else { RESULT_CHARS };
+        scratch.push(serde_json::json!({ "role": "user", "content": format!("【結果: {}】\n{}", st.action, cut(&result, lim)) }));
     }
     let reply = reply.unwrap_or_else(|| format!("手数の上限（{max_steps}手）まで使いました。続けるなら、もう一度頼んでください。"));
     emit(app, card, "agent", &reply);
@@ -729,12 +732,25 @@ struct World {
     files: Vec<construct::ExFile>,
     runs: Vec<RunCard>,
     indexes: Vec<String>,
+    /// v1.13.1: エージェントカードへ矢印でつないだ材料（優先して使う）。ファイルカードは F 番号、
+    /// 索引レポートはその索引の名前。
+    linked: Vec<String>,
 }
 
 impl World {
     fn scan(root: &Path, card: &str) -> Result<World, String> {
         let p = open_project_at(root)?;
-        Ok(World { files: construct::existing_files(&p), runs: runnable(&p, card), indexes: rag::list_indexes(root) })
+        let files = construct::existing_files(&p);
+        let linked = linked_materials(&p, root, card, &files);
+        Ok(World { files, runs: runnable(&p, card), indexes: rag::list_indexes(root), linked })
+    }
+
+    /// 索引の既定: つないだ索引 → 索引が1つだけならそれ。
+    fn default_index(&self) -> Option<&String> {
+        self.linked
+            .iter()
+            .find(|l| self.indexes.contains(l))
+            .or(if self.indexes.len() == 1 { self.indexes.first() } else { None })
     }
 
     /// 一手の形（Ollama format / OpenAI 互換 json_schema）。target は選択肢の外を出させない。
@@ -755,6 +771,36 @@ impl World {
             "additionalProperties": false
         })
     }
+}
+
+/// エージェントカードへ入る矢印の元（ファイルカードだけ）。索引レポートなら索引の名前に読み替える
+/// （冒頭の目印行 `<!-- texos-rag-index: 名前 -->`・検索カードと同じ見分け方）。
+fn linked_materials(p: &Project, root: &Path, card: &str, files: &[construct::ExFile]) -> Vec<String> {
+    let Ok(mut st) = p.conn.prepare(
+        "SELECT rel.from_id, COALESCE(v.committed_path, v.origin_path) FROM relations rel
+         JOIN virtual_bodies v ON v.id = rel.from_id AND v.deleted_at IS NULL
+         WHERE rel.to_id = ?1 AND rel.kind = 'flow' AND rel.deleted_at IS NULL
+         ORDER BY rel.created_at",
+    ) else {
+        return Vec::new();
+    };
+    let rows: Vec<(String, Option<String>)> = st
+        .query_map(rusqlite::params![card], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (id, path) in rows {
+        let Some(f) = files.iter().find(|f| f.id == id) else { continue };
+        let head = path
+            .and_then(|s| std::fs::read(load_path(root, &s)).ok())
+            .map(|b| String::from_utf8_lossy(&b[..b.len().min(300)]).into_owned());
+        // 索引レポートは「その索引」と「文書の一覧のカード」の両方として使える。
+        if let Some(index) = head.as_deref().and_then(rag::marker_of) {
+            out.push(index);
+        }
+        out.push(f.r.clone());
+    }
+    out
 }
 
 fn kind_of(spec: &serde_json::Value) -> String {
@@ -820,6 +866,8 @@ fn system_prompt(w: &World, extra: Option<&str>) -> String {
          - 処理を頼まれたら（〜して・〜を作って・〜をまとめて など）、build で組み、run で実行し、結果を answer で伝える。\
            同じ処理をするフローが実行できるカードにすでにあれば、組まずにそれを run する。\n\
          - 手元の資料について聞かれたら search か read で調べてから answer。返事に出典（ファイル名）を添える。\n\
+         - フォルダ全体の一覧・分類・整理の案を頼まれたら、索引レポート（文書の一覧が載っている）を read してから答える。\
+           search は問いに近い数件しか返さないので、全体を見渡すのには使わない。\n\
          - 道具の結果は【結果】として届く。失敗したら理由を見て、直せるなら別の一手、無理ならそのまま伝える。\n\
          - run の結果が「▶ 待ち」なら、理由と、どのカードの ▶ を押せばよいかを answer で伝えて終える。\n\
          - answer 以外の reply は空でよい。target が要らない道具では target は なし。\n\
@@ -846,6 +894,20 @@ fn system_prompt(w: &World, extra: Option<&str>) -> String {
     }
     for r in &w.runs {
         s.push_str(&format!("- {} {}（{}）\n", r.r, r.label, r.kind));
+    }
+    if !w.linked.is_empty() {
+        let names: Vec<String> = w
+            .linked
+            .iter()
+            .map(|l| match w.files.iter().find(|f| &f.r == l) {
+                Some(f) => format!("{} {}", f.r, f.label),
+                None => format!("索引「{l}」"),
+            })
+            .collect();
+        s.push_str(&format!(
+            "このエージェントにつないだ材料（ユーザーが選んだもの。調べる・読むときはまずこれを使う）: {}\n",
+            names.join("、")
+        ));
     }
     if let Some(x) = extra.map(str::trim).filter(|x| !x.is_empty()) {
         s.push_str(&format!("\n追加の指示（カードの設定）:\n{x}\n"));
@@ -888,12 +950,12 @@ type ToolOut = Result<(String, String), String>;
 fn do_search(root: &Path, w: &World, st: &Step, text: &str) -> ToolOut {
     let name = if w.indexes.contains(&st.target) {
         st.target.clone()
+    } else if w.indexes.is_empty() {
+        return Err("索引がありません（📚 索引カードで作れます）".into());
     } else {
-        match w.indexes.as_slice() {
-            [] => return Err("索引がありません（📚 索引カードで作れます）".into()),
-            [one] => one.clone(),
-            _ => return Err(format!("索引を target で選んでください（{}）", w.indexes.join("、"))),
-        }
+        w.default_index()
+            .cloned()
+            .ok_or_else(|| format!("索引を target で選んでください（{}）", w.indexes.join("、")))?
     };
     let query = if st.input.is_empty() { text } else { st.input.as_str() };
     // 埋め込みの接続先は既定（Ollama）。モデルは索引に記録したもの。
@@ -1084,6 +1146,7 @@ mod tests {
             files: vec![construct::ExFile { r: "F1".into(), id: "a".into(), label: "資料.md".into(), mime: "text/markdown".into() }],
             runs: vec![RunCard { r: "T1".into(), id: "b".into(), label: "要約".into(), kind: "ai".into() }],
             indexes: vec!["索引".into()],
+            linked: vec![],
         };
         let s = w.schema();
         let t: Vec<&str> = s["properties"]["target"]["enum"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
@@ -1093,7 +1156,10 @@ mod tests {
     }
 
     fn project() -> (PathBuf, Project) {
-        let dir = std::env::temp_dir().join(format!("texos_agent_{}_{}", std::process::id(), db::now_ms()));
+        // 並列のテストが同じミリ秒に作っても重ならないよう通し番号も付ける。
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("texos_agent_{}_{}_{n}", std::process::id(), db::now_ms()));
         std::fs::create_dir_all(dir.join(".texos")).unwrap();
         let conn = db::open(&dir.join(".texos").join("texos.db")).unwrap();
         let p = Project { conn, root: dir.clone(), cas_root: dir.join(".texos").join("cas") };
@@ -1167,6 +1233,7 @@ mod tests {
             ],
             runs: vec![RunCard { r: "T1".into(), id: "c".into(), label: "英訳".into(), kind: "ai".into() }],
             indexes: vec!["資料".into()],
+            linked: vec![],
         };
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let cases: &[(&str, &[&str])] = &[
@@ -1203,12 +1270,41 @@ mod tests {
     }
 
     #[test]
+    fn linked_report_gives_its_index_and_the_card() {
+        let (dir, p) = project();
+        card(&p, "agent", "filter", r#"{"builtin":"agent"}"#, 1);
+        std::fs::write(dir.join("rep.md"), "<!-- texos-rag-index: 書類 -->\n# 索引「書類」\n").unwrap();
+        std::fs::write(dir.join("memo.md"), "メモ").unwrap();
+        for (id, f, t) in [("rep", "rep.md", 2), ("memo", "memo.md", 3)] {
+            p.conn
+                .execute(
+                    "INSERT INTO virtual_bodies (id, real_id, label, pos_x, pos_y, created_at, kind, committed_path)
+                     VALUES (?1, 'filter:sentinel', ?2, 0, 0, ?3, 'file', ?2)",
+                    rusqlite::params![id, f, t],
+                )
+                .unwrap();
+        }
+        arrow(&p, "rep", "agent");
+        arrow(&p, "memo", "agent");
+        let files = construct::existing_files(&p);
+        let linked = linked_materials(&p, &dir, "agent", &files);
+        let r = |label: &str| files.iter().find(|f| f.label == label).unwrap().r.clone();
+        assert_eq!(linked.len(), 3, "{linked:?}");
+        assert!(linked.contains(&"書類".to_string()) && linked.contains(&r("rep.md")) && linked.contains(&r("memo.md")));
+        let w = World { files, runs: vec![], indexes: vec!["他".into(), "書類".into()], linked };
+        assert_eq!(w.default_index().map(String::as_str), Some("書類"), "索引が複数でも、つないだ索引を使う");
+        assert!(system_prompt(&w, None).contains("つないだ材料"));
+        drop(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn vad_cuts_after_silence_and_drops_blips() {
         let quiet = vec![0i16; BLOCK];
         let loud = vec![3000i16; BLOCK];
         let mut v = Vad::default();
         let mut segs = Vec::new();
-        let mut feed = |v: &mut Vad, b: &Vec<i16>, n: usize, segs: &mut Vec<Vec<i16>>| {
+        let feed = |v: &mut Vad, b: &Vec<i16>, n: usize, segs: &mut Vec<Vec<i16>>| {
             for _ in 0..n {
                 if let Some(s) = v.push(b, rms(b)) {
                     segs.push(s);
