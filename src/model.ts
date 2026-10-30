@@ -260,6 +260,8 @@ export function filterOutputMime(filterRef: string | null): string | null {
     if (s.builtin === "web_feed") return "text/markdown";
     // Web検索 P2 web_search: 常に結果一覧（Markdown）を吐く
     if (s.builtin === "web_search") return "text/markdown";
+    // V1.13 P1 RAG: 索引レポート・検索結果は Markdown
+    if (s.builtin === "rag_index" || s.builtin === "rag_search") return "text/markdown";
     // v1.7 P4 web_capture: 常にスクリーンショット（PNG）を吐く
     if (s.builtin === "web_capture") return "image/png";
     // v1.7 P5 to_url: URL 文字列（text/plain）— 下流接続可・終端なら URL カード着地

@@ -39,6 +39,9 @@
 - Markdown: `md_codeblock`（AI の答えからコードブロックを取り出す。`lang`, `output_ext`）
 - Web: `web_search`（入力テキスト＝検索語 → 結果一覧 Markdown）・`web_fetch`（入力の URL → 本文 Markdown）・
   `web_feed`（RSS → 記事カード）・`web_capture`（URL → PNG）・`to_url`（テキスト中の URL → URL カード）
+- 手元の文書（RAG）: `rag_index`（フォルダの md / txt を索引にする。`index`＝索引の名前・`path`＝フォルダ・入力なしで動く）・
+  `rag_search`（問い → 索引から近い箇所を出典つき Markdown。**索引カードと問いの両方をつないでよい**＝ファンアウトしない）。
+  「手元の資料に基づいて答える」は rag_index → rag_search ← 問いの付箋、rag_search → AI（役割の付箋に「資料にないことは推測しない」）
 - 画像: `img_resize`（`width`）・`img_convert`（`format`）
 - 読み上げ: `speak`（入力テキストを声で読む・出力なし）
 

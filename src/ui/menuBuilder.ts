@@ -1330,6 +1330,21 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
               "音声カードからリクエスト矢印でつなげば「〜するフローを構築して」と話すだけで並びます。",
             onClick: () => a.addFilter("construct"),
           },
+          // V1.13 P1 RAG（docs/V1.13_エージェントカード計画.md §5）
+          {
+            label: "📚 文書の索引（RAG・フォルダ→索引）...",
+            hint:
+              "フォルダの文書（md / txt / PDF / Word など・下の階層まで）や、つないだカードを切り分けて埋め込み、索引にします。" +
+              "変わった文書だけ作り直します。埋め込みモデルは Ollama の bge-m3 が既定（`ollama pull bge-m3`）。",
+            onClick: () => a.addFilter("rag_index"),
+          },
+          {
+            label: "🔎 文書検索（RAG・問い→近い箇所）...",
+            hint:
+              "問いに近い箇所を索引から上位いくつか、出典つきで取り出します。索引カードをつなぐとその索引を使います。" +
+              "結果を AI カードにつなげば「手元の資料に基づいて答える」流れになります。",
+            onClick: () => a.addFilter("rag_search"),
+          },
           { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i") },
           // v2.0 t23d: G層2例目（Hunyuan3D-2・V2.0_t23d設計.md）。
           {

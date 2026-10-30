@@ -42,6 +42,8 @@ UNSUPPORTED = {
     "t23d": "3D生成（常駐デーモンが要る）",
     "web_fetch": "Web取得", "web_feed": "フィード取得", "web_capture": "ページ保存",
     "web_search": "Web検索（SearXNG デーモンが要る）",
+    "rag_index": "文書の索引（埋め込みサーバーが要る）",
+    "rag_search": "文書検索（埋め込みサーバーと索引が要る）",
     "to_url": "URLカード化", "speak": "読み上げ", "import_new": "新規カードの登録",
     "voice_send": "会話へ送る（稼働中の会話コマンドが要る）",
     "select": "セレクタ",

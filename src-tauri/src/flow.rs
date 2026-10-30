@@ -261,6 +261,18 @@ pub struct FilterSpec {
     /// その回数は叩かない）。未指定は3・1〜10 に丸める。
     #[serde(default)]
     pub max_queries: Option<u32>,
+    // --- V1.13 P1 RAG（builtin:"rag_index" / "rag_search"・rag.rs）。
+    //     path（索引するフォルダ）・query（検索の問い）・limit（上位 k 件）・model / provider /
+    //     endpoint（埋め込みモデルの呼び先）は既存のキーを共用。以下は RAG 専用。---
+    /// rag_*: 索引の名前（`.texos/rag/<名前>.sqlite`）。未指定は「索引」。
+    #[serde(default)]
+    pub index: Option<String>,
+    /// rag_index: 読む拡張子（カンマ区切り）。未指定は txt,md,markdown,csv,log。
+    #[serde(default)]
+    pub exts: Option<String>,
+    /// rag_index: 1チャンクの文字数（未指定は500・100〜4000 に丸める）。
+    #[serde(default)]
+    pub chunk_chars: Option<u32>,
     /// v1.7 P5 to_url: カード化するリンクの種類（実機FB: 全部拾うととんでもない枚数になる）。
     /// "all"（既定）| "page"（HTMLページ）| "image"（画像直リンク）| "media"（音声・動画・
     /// PDF などのファイル直リンク）。分類は URL 末尾の拡張子ベース。

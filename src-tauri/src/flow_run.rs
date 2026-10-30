@@ -1302,6 +1302,20 @@ pub(crate) fn eval_filter(
         return finish_eval(p, job, fid, visited, memo, 0, out);
     }
 
+    // V1.13 P1 RAG: 📚 索引（rag_index）と 🔎 検索（rag_search）。索引は出典名（カード名）が要り、
+    // 検索は「索引レポート＝どの索引か」と「問い」を入力から見分けるので、ファンアウトさせず
+    // 集めた入力をまとめて渡す（tap と同じ「eval 側で完結」の流儀）。
+    if spec.builtin.as_deref() == Some("rag_index") {
+        emit_job_progress(app, job, Some(&node_note(p, fid)), None);
+        let out = crate::rag::run_rag_index(app, p, fid, &spec, &collected, job);
+        return finish_eval(p, job, fid, visited, memo, 0, out);
+    }
+    if spec.builtin.as_deref() == Some("rag_search") {
+        emit_job_progress(app, job, Some(&node_note(p, fid)), None);
+        let out = crate::rag::run_rag_search(p, &spec, &collected, report);
+        return finish_eval(p, job, fid, visited, memo, 0, out);
+    }
+
     // v1.8 記録カード（builtin:"tap"）: 入力をそのまま下流へ通しつつ、通った中身を
     // プロジェクトへ書き出してカードにする。中間結果は本来メモリ上で消えるので、
     // 「1周流した後もグラフが読める」ようにするための素通しノード。

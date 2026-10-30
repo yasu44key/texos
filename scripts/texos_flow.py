@@ -82,7 +82,9 @@ CREATE INDEX IF NOT EXISTS idx_rel_from ON relations(from_id);
 
 # 集約ノード（全入力を1回で受け取る）。これ以外の builtin は入力ごとにファンアウトする。
 # t2i / t23d も集約（flow_run.rs: T2i/T23d は全入力を集めて1回＝テキスト→プロンプト・画像→元画像）。
-AGGREGATE_BUILTINS = {"text_concat", "text_diff", "text_paste", "t2i", "t23d"}
+# rag_index / rag_search も全入力をまとめて受ける（flow_run.rs: 索引＝出典つきで全部読む・
+# 検索＝索引レポートと問いを見分ける）。
+AGGREGATE_BUILTINS = {"text_concat", "text_diff", "text_paste", "t2i", "t23d", "rag_index", "rag_search"}
 # 素通し系（入力を何本受けてもファンアウトしない）。
 PASSTHROUGH_BUILTINS = {"tap", "loop", "ask"}
 

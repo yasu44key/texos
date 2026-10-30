@@ -682,6 +682,8 @@ mod voice;
 mod thinker;
 // v1.12 ④: コンストラクタ（builtin:"construct"）。crate::construct:: で参照。
 mod construct;
+// V1.13 P1: RAG（builtin:"rag_index" / "rag_search"）。crate::rag:: で参照。
+mod rag;
 // v1.11: MCP 接続（AIエージェントからの操作口・ローカル IPC）。crate::mcp_bridge:: で参照。
 mod mcp_bridge;
 pub(crate) use ai::*;

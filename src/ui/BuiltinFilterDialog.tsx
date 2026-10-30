@@ -377,6 +377,122 @@ export const BUILTIN_SCHEMAS: Record<string, BuiltinSchema> = {
     ],
     note: "検索結果を「タイトル・URL・抜粋・出典」の一覧 Markdown 1枚にします（URL は1行ずつ書くので、URLカード化に繋げばリンク集、web_fetch に繋げば本文取得へ進めます）。検索エンジンは PC 内で動く SearXNG（初回に導入・検索時に自動起動）。結果が0件のときは下流を止めます（no-data）。",
   },
+  rag_index: {
+    // V1.13 P1 RAG（docs/V1.13_エージェントカード計画.md §5）: 文書 → 切り分け → 埋め込み → 索引。
+    title: "📚 文書の索引（rag_index）",
+    // PDF・Word のカードもつなげるように全部受ける（文書でないものは索引側で読み飛ばす）。
+    fixed: { accept_mime: "*/*" },
+    fields: [
+      {
+        key: "index",
+        label: "索引の名前",
+        type: "text",
+        default: "索引",
+        hint: "検索カードと同じ名前にすると、その索引から探します（矢印で索引カードを検索カードにつないでも同じ）。保存先は .texos/rag/<名前>.sqlite。",
+      },
+      {
+        key: "path",
+        label: "対象フォルダ",
+        type: "dir",
+        optional: true,
+        placeholder: "空欄=カードをつないでいればそのカードだけ／何もつないでいなければプロジェクトフォルダ",
+        hint: "下の階層まで読みます（. で始まるフォルダ・node_modules などは除く）。相対パスはプロジェクト基準。",
+      },
+      {
+        key: "exts",
+        label: "読む拡張子",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=txt,md,markdown,csv,log,pdf,docx",
+        hint: "PDF と Word（docx）は本文を取り出して読みます。スキャン画像だけの PDF は文字が無いので読めません（索引レポートの注意に出ます）。",
+      },
+      {
+        key: "model",
+        label: "埋め込みモデル",
+        type: "text",
+        default: "bge-m3",
+        hint: "日本語なら bge-m3（約1.2GB・`ollama pull bge-m3`）。軽くしたいなら nomic-embed-text など。モデルを変えると索引は全部作り直します。",
+      },
+      {
+        key: "provider",
+        label: "サーバー",
+        type: "select",
+        default: "ollama",
+        options: [
+          { value: "ollama", label: "Ollama" },
+          { value: "lmstudio", label: "LM Studio" },
+          { value: "openai", label: "OpenAI 互換" },
+        ],
+      },
+      {
+        key: "endpoint",
+        label: "接続先",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=Ollama は http://localhost:11434／LM Studio は http://localhost:1234/v1",
+      },
+      {
+        key: "chunk_chars",
+        label: "1チャンクの文字数",
+        type: "number",
+        default: 500,
+        min: 100,
+        max: 4000,
+        hint: "長くすると文脈が多く入り、短くすると狙いが鋭くなります。変えると索引は全部作り直します。",
+      },
+    ],
+    note: "文書を段落と文の切れ目で切り分けて埋め込み、索引にします。2回目からは変わった文書だけ作り直し、消えた文書は索引からも消します。出力は索引レポート（Markdown）で、これを 🔎 文書検索カードにつなぐと「この索引から探す」になります。",
+  },
+  rag_search: {
+    // V1.13 P1 RAG: 問い → 埋め込み → 近いチャンクの上位 k 件（出典つき Markdown）。
+    title: "🔎 文書検索（rag_search）",
+    fixed: { accept_mime: "text/*" },
+    fields: [
+      {
+        key: "query",
+        label: "問い",
+        type: "text",
+        optional: true,
+        placeholder: "例: 出張の宿泊費の上限は？（問いのカードをつなぐときは空欄）",
+        hint: "つないだテキスト（索引レポート以外）があれば、そちらが問いになります。",
+      },
+      {
+        key: "index",
+        label: "索引の名前",
+        type: "text",
+        default: "索引",
+        hint: "索引カードを矢印でつないだときは、そちらの名前が優先されます。",
+      },
+      {
+        key: "limit",
+        label: "取り出す件数",
+        type: "number",
+        default: 6,
+        min: 1,
+        max: 30,
+      },
+      {
+        key: "provider",
+        label: "サーバー",
+        type: "select",
+        default: "ollama",
+        options: [
+          { value: "ollama", label: "Ollama" },
+          { value: "lmstudio", label: "LM Studio" },
+          { value: "openai", label: "OpenAI 互換" },
+        ],
+        hint: "埋め込みモデルは索引を作ったときのものを自動で使います（違うモデルでは比べられないため）。",
+      },
+      {
+        key: "endpoint",
+        label: "接続先",
+        type: "text",
+        optional: true,
+        placeholder: "空欄=Ollama は http://localhost:11434／LM Studio は http://localhost:1234/v1",
+      },
+    ],
+    note: "問いに近い箇所を、出典（ファイル名・行）と類似度つきで Markdown 1枚にまとめます。AI カードにつなげば、手元の資料に基づいて答えさせられます（役割の付箋に「資料にないことは推測しないで」と書くと効きます）。",
+  },
   web_capture: {
     // v1.7 P4（情報収集経路計画 §3）: ページのスクリーンショット実身（L2 OSアダプタ）。
     title: "ページキャプチャ（web_capture）",

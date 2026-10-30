@@ -294,6 +294,8 @@ fn filter_output_mime(spec: &flow::FilterSpec) -> Option<String> {
         Some("web_feed") => Some("text/markdown".into()),
         // Web検索 P2: web_search は常に結果一覧（Markdown）を吐く。
         Some("web_search") => Some("text/markdown".into()),
+        // V1.13 P1: RAG の索引レポート・検索結果は Markdown。
+        Some("rag_index") | Some("rag_search") => Some("text/markdown".into()),
         // v1.7 P4: web_capture は常にスクリーンショット（PNG）を吐く。
         Some("web_capture") => Some("image/png".into()),
         // v1.7 P5: to_url のペイロードは URL 文字列（text/plain）— 下流に繋げば
@@ -393,6 +395,12 @@ fn inspect(g: &Graph, project_root: &Path, app_data: &Path, filters_dir: &Path) 
                 // Web検索 P2: パラメータ欄の検索語だけで単独実行できる。
                 flow::NodeKind::Builtin if spec.builtin.as_deref() == Some("web_search") => {
                     crate::web::spec_query(&spec).is_none()
+                }
+                // V1.13 P1: 索引はフォルダを読む・検索はパラメータ欄の問いだけで動ける。
+                flow::NodeKind::Builtin
+                    if matches!(spec.builtin.as_deref(), Some("rag_index") | Some("rag_search")) =>
+                {
+                    !crate::rag::runs_without_input(&spec)
                 }
                 // v1.8 ③問い合わせカード: 材料は人の答え（役割ポート＝入力に数えない矢印で
                 // 入ってくる）なので、通常入力が0本でも成立する。

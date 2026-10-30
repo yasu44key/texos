@@ -1468,6 +1468,17 @@ function App() {
         })();
         return;
       }
+      if (builtin === "rag_index" || builtin === "rag_search") {
+        // V1.13 P1 RAG: 設定フォーム（BuiltinFilterDialog）で作成。
+        setBuiltinDlg({
+          id: null,
+          builtin,
+          label: builtin === "rag_index" ? "📚 索引" : "🔎 文書検索",
+          spec: JSON.stringify({ builtin }),
+          create: { x: canvasX, y: canvasY, linkFrom },
+        });
+        return;
+      }
       if (builtin === "t23d") {
         // v2.0 t23d: エンジン（Hunyuan3D-2 WinPortable）が未設定なら先に場所を聞く。
         // 設定済みならスキーマフォーム（BuiltinFilterDialog）で作成。
