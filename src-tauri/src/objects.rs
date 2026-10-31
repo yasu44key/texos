@@ -290,7 +290,7 @@ pub(crate) fn list_objects_in(p: &Project) -> Result<Vec<VirtualBodyInfo>, Strin
 #[tauri::command]
 pub(crate) fn get_thumbnail(id: String, state: State<AppState>) -> Result<String, String> {
     // Resolve the path then release the lock before the heavy decode.
-    let (obj_path, cache_path) = {
+    let (obj_path, cache_path, saved_path) = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
         // v1.3.9 ②: 閲覧では CAS に書き込まない（スナップは実身化時のみ）。
@@ -302,26 +302,43 @@ pub(crate) fn get_thumbnail(id: String, state: State<AppState>) -> Result<String
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        let cache = texos_dir(&p.root)
-            .join("thumbs")
-            .join(format!("{}.jpg", real_id));
-        (resolve_view_path(p, &id, &real_id), cache)
+        let thumbs = texos_dir(&p.root).join("thumbs");
+        // 画像から生成したサムネイルは <real_id>.o.jpg（EXIF の向きを反映済み）。
+        // <real_id>.jpg は 3D プレビュー等が保存したもの（save_card_thumbnail）と、
+        // 向き未反映の旧サムネイル。旧いほうは画像では使わず作り直す。
+        (
+            resolve_view_path(p, &id, &real_id),
+            thumbs.join(format!("{}.o.jpg", real_id)),
+            thumbs.join(format!("{}.jpg", real_id)),
+        )
     };
 
     // Disk cache: real bodies are content-addressed (immutable), so a cached
     // thumbnail at least as new as the source is always valid.
     let src_mtime = file_mtime_ms(&obj_path);
-    if let (Some(cache_m), Some(src_m)) = (file_mtime_ms(&cache_path), src_mtime) {
-        if cache_m >= src_m {
-            if let Ok(bytes) = std::fs::read(&cache_path) {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                return Ok(format!("data:image/jpeg;base64,{}", b64));
-            }
+    let cached = |path: &Path| -> Option<String> {
+        let (cache_m, src_m) = (file_mtime_ms(path)?, src_mtime?);
+        if cache_m < src_m {
+            return None;
         }
+        let bytes = std::fs::read(path).ok()?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Some(format!("data:image/jpeg;base64,{}", b64))
+    };
+    if let Some(url) = cached(&cache_path) {
+        return Ok(url);
+    }
+    // 画像として読めない実体（glb 等）は保存済みサムネイルを配信する。
+    let is_image = image::ImageReader::open(&obj_path)
+        .and_then(|r| r.with_guessed_format())
+        .map(|r| r.format().is_some())
+        .unwrap_or(false);
+    if !is_image {
+        return cached(&saved_path).ok_or_else(|| "画像ではありません".to_string());
     }
 
     let bytes = std::fs::read(&obj_path).map_err(|e| e.to_string())?;
-    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    let img = decode_oriented(&bytes)?;
     let thumb = image::DynamicImage::ImageRgb8(img.thumbnail(200, 200).to_rgb8());
     let mut buf: Vec<u8> = Vec::new();
     thumb
@@ -361,6 +378,23 @@ pub(crate) fn get_media_data_url(id: String, state: State<AppState>) -> Result<S
     Ok(format!("data:{};base64,{}", mime, b64))
 }
 
+/// 画像をデコードし、EXIF の向き（スマホ・カメラの縦横）を反映して返す。
+/// `image::load_from_memory` は向きを無視するので、表示用はこちらを使う。
+pub(crate) fn decode_oriented(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_decoder()
+        .map_err(|e| e.to_string())?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    Ok(img)
+}
+
 /// Larger aspect-preserving preview as a PNG data URL (max 900px side).
 #[tauri::command]
 pub(crate) fn get_preview(id: String, state: State<AppState>) -> Result<String, String> {
@@ -379,7 +413,7 @@ pub(crate) fn get_preview(id: String, state: State<AppState>) -> Result<String, 
         resolve_view_path(p, &id, &real_id)
     };
     let bytes = std::fs::read(&obj_path).map_err(|e| e.to_string())?;
-    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    let img = decode_oriented(&bytes)?;
     let preview = img.thumbnail(900, 900); // preserves aspect ratio
     let mut buf: Vec<u8> = Vec::new();
     preview
@@ -3197,5 +3231,39 @@ mod repair_links_tests {
         assert!(again.fixable.is_empty());
         assert_eq!(again.ambiguous.len() + again.missing.len(), 2);
         let _ = std::fs::remove_dir_all(&b);
+    }
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::*;
+
+    /// 横 4×縦 2 の JPEG に「時計回りに 90° 回して表示」（Orientation=6）の EXIF を付けると、
+    /// decode_oriented は縦 4×横 2 で返す（スマホで縦に撮った写真と同じ形）。
+    #[test]
+    fn exif_orientation_is_applied() {
+        let src = image::DynamicImage::new_rgb8(4, 2);
+        let mut jpeg: Vec<u8> = Vec::new();
+        src.write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .unwrap();
+        let mut exif: Vec<u8> = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(b"II*\0\x08\0\0\0"); // TIFF header (little endian), IFD0 at 8
+        exif.extend_from_slice(&[1, 0]); // 1 entry
+        exif.extend_from_slice(&[0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0]); // Orientation=6
+        exif.extend_from_slice(&[0, 0, 0, 0]); // no next IFD
+        let len = (exif.len() + 2) as u16;
+        let mut tagged = jpeg[..2].to_vec(); // SOI
+        tagged.extend_from_slice(&[0xFF, 0xE1]);
+        tagged.extend_from_slice(&len.to_be_bytes());
+        tagged.extend_from_slice(&exif);
+        tagged.extend_from_slice(&jpeg[2..]);
+
+        let raw = image::load_from_memory(&tagged).unwrap();
+        assert_eq!((raw.width(), raw.height()), (4, 2));
+        let img = decode_oriented(&tagged).unwrap();
+        assert_eq!((img.width(), img.height()), (2, 4));
+        // 向き情報の無い画像はそのまま
+        let plain = decode_oriented(&jpeg).unwrap();
+        assert_eq!((plain.width(), plain.height()), (4, 2));
     }
 }
