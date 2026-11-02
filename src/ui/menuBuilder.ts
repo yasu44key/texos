@@ -1393,6 +1393,28 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
             hint: "Markdown のコードフェンス(```)から中身を取り出します。AI出力をコンパイラ等へ渡す前段に。",
             onClick: () => a.addFilter("md_codeblock"),
           },
+          // pfpdf: Markdown を表紙・目次つきの PDF に組版（要 Node.js・npx で取得）。
+          {
+            label: "PDF組版（Markdown→PDF・pfpdf）...",
+            hint: "Markdown を表紙・目次つきの PDF に組版します（日本語組版・数式・コード・Mermaid 対応）。テンプレートを選んでください。Node.js 22.12 以降が必要で、初回は pfpdf を npm から取得します。",
+            onClick: () =>
+              a.openSubmenu(
+                (
+                  [
+                    ["default", "標準"],
+                    ["pfn", "PFN 風・青い表紙"],
+                    ["technical", "技術文書"],
+                    ["academic", "論文"],
+                    ["book", "書籍"],
+                    ["notebook", "ノート"],
+                    ["compact", "詰めた版面"],
+                  ] as const
+                ).map(([t, desc]) => ({
+                  label: `${t}（${desc}）`,
+                  onClick: () => a.addFilter(`pfpdf:${t}`),
+                }))
+              ),
+          },
         ]),
     },
     {

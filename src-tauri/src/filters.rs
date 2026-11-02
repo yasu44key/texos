@@ -90,6 +90,10 @@ pub(crate) fn helper_hint(name: &str) -> Option<&'static str> {
             "音声・動画変換。winget install Gyan.FFmpeg（導入後は PATH 反映のため TexoS を再起動）"
         }
         "jq" => "JSON加工。winget install jqlang.jq",
+        // pfpdf（Markdown→PDF 組版）は npx で取得・実行する。要るのは Node.js 22.12 以降だけ。
+        "npx" | "node" => {
+            "Node.js（22.12 以降）。winget install OpenJS.NodeJS.LTS（導入後は PATH 反映のため TexoS を再起動）"
+        }
         "nkf" | "nkf32" => "外部導入は不要です — 内蔵の「文字コード変換」(text_convert) で代替できます",
         "grep" => "外部導入は不要です — 内蔵の「テキスト抽出」(text_grep) で代替できます",
         "python" | "python3" | "py" => {
@@ -104,6 +108,16 @@ pub(crate) fn helper_hint(name: &str) -> Option<&'static str> {
 #[tauri::command]
 pub(crate) fn helper_install_hint(name: String) -> Option<String> {
     helper_hint(&name).map(str::to_string)
+}
+
+/// ヘッドレス実行できる OS のブラウザ（Edge/Chrome）のパス。見つからなければ null。
+/// pfpdf プリセットが `--browser-path` に渡す — pfpdf 既定の Chromium 取得（数百MB）を省き、
+/// ページキャプチャ（web_capture）と同じく OS 搭載のブラウザで描画する。
+#[tauri::command]
+pub(crate) fn headless_browser_path() -> Option<String> {
+    web::find_headless_browser()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// 外部フィルタの実行コマンドラインを組み立てる。
@@ -486,6 +500,8 @@ mod tests {
         assert!(helper_hint("gawk.exe").is_some());
         assert!(helper_hint("GAWK.EXE").is_some());
         assert!(helper_hint(r"C:\tools\pandoc.exe").is_some());
+        // pfpdf プリセットの npx.cmd（.cmd も file_stem で落ちる）→ Node.js の案内
+        assert!(helper_hint("npx.cmd").unwrap().contains("Node.js"));
         // 内蔵代替の案内（nkf → text_convert）
         assert!(helper_hint("nkf32.exe").unwrap().contains("text_convert"));
         // 未知の名前は案内なし（エラー文は従来どおり）。jgawk は開発停止で辞書から削除済み。

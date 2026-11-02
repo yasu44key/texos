@@ -899,6 +899,7 @@ pub fn run() {
             list_audio_devices,
             check_filter_program,
             helper_install_hint,
+            headless_browser_path,
             // v1.7 P2: URLカードの仮身昇格（更新マーク・取得系譜）
             web::web_check_update,
             web::web_refetch,

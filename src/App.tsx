@@ -128,6 +128,10 @@ interface LinkDrag {
 // 図形の対角（左上・右下）をこの格子に吸着させる。カードの配置は自由なまま。
 export const SHAPE_GRID = 38;
 
+// pfpdf プリセットが npx で呼ぶ版（固定＝結果が版上げで変わらない・2回目以降はキャッシュで動く）。
+// 版上げは実機で1回変換を確かめてから。
+const PFPDF_VERSION = "0.4.0";
+
 function App() {
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const currentProjectRef = useRef<ProjectInfo | null>(null);
@@ -1875,6 +1879,32 @@ function App() {
           timeout_secs: 0,
           note: `マイク録音（${device}）。▶実行で録音開始 → 実行中パネルの「停止」で終了し WAV を確定（16kHz mono・Whisper 直結可）。`,
         });
+      } else if (builtin.startsWith("pfpdf:")) {
+        // pfpdf（PFN の Markdown→PDF 組版ツール）。npx で版を固定して呼ぶ＝初回だけ取得、
+        // 以降はキャッシュで動く。描画は OS の Edge/Chrome を --browser-path で渡し、
+        // pfpdf 既定の Chromium 取得（数百MB）を省く。見つからなければ pfpdf に任せる。
+        // pfpdf は入力の拡張子に小文字の .md を要求する → in_exts で .md に絞る。
+        const template = builtin.slice("pfpdf:".length);
+        void (async () => {
+          const browser = await invoke<string | null>("headless_browser_path").catch(() => null);
+          create(`PDF組版（${template}）`, {
+            name: "npx.cmd",
+            type: "command",
+            cmd:
+              `-y @pfnet-research/pfpdf@${PFPDF_VERSION} --input "{in}" --output "{out}"` +
+              ` --template ${template} --log-level warn` +
+              (browser ? ` --browser-path "${browser}"` : ""),
+            output_ext: "pdf",
+            accept_mime: "text/*",
+            in_exts: ["md"],
+            timeout_secs: 900,
+            note:
+              `pfpdf ${PFPDF_VERSION}（テンプレート ${template}）で Markdown を PDF にします。Node.js 22.12 以降が必要（初回は npm から取得するのでネット接続が要ります）。` +
+              "表紙・目次・数式・コード・Mermaid に対応。front matter（title / lang など）が効きます。" +
+              "入力は一時フォルダにコピーされるため、相対パスの画像は読めません（絶対パスか URL で）。" +
+              "入力の HTML・スクリプトはそのまま実行されるので、信頼できる文書だけを渡してください。",
+          });
+        })();
       } else {
         // 外部プログラム: 設定ダイアログ（v1.5）。NAME/PATH/Type/CMD/IN/OUT/Prefix を
         // フォームで設定する — JSON直編集・プロンプト連鎖は現実的でない（実機指摘）。

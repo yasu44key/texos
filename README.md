@@ -123,3 +123,6 @@ npm run tauri build    # インストーラ（NSIS）を作る
 - TexoS（このリポジトリ）は **MIT** です（[LICENSE](LICENSE)）
 - AI モデル・画像生成モデル・ffmpeg・Whisper・ComfyUI などの外部プログラムやモデルは TexoS に**含まれていません**。
   それぞれのライセンスに従って各自で入手してください
+- PDF組版カードは [pfpdf](https://github.com/pfnet-research/pfpdf)（MIT License, Copyright (c) 2026 pfnet-research）を
+  実行時に `npx` で npm から取得して使います（TexoS には同梱していません）。pfpdf が使う Vivliostyle CLI は AGPL-3.0 です
+  （詳しくは pfpdf の [THIRD_PARTY_LICENSES.md](https://github.com/pfnet-research/pfpdf/blob/main/THIRD_PARTY_LICENSES.md)）

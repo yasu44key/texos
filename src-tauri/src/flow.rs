@@ -3154,6 +3154,29 @@ mod tests {
         assert_eq!(&out[8..12], b"WAVE", "WAVE マジックが無い");
     }
 
+    /// pfpdf プリセット（実機）: App.tsx の「PDF組版」と同じ cmdline を、解決済みの npx.cmd と
+    /// OS の Edge/Chrome で cmd /C 経由に通して、Markdown から PDF が返ること。
+    /// 実行: `cargo test --lib -- --ignored pfpdf`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "実機: Node.js 22.12+ と npm への接続（初回）が必要"]
+    fn pfpdf_preset_renders_pdf() {
+        let npx = resolve_program("npx.cmd", None, std::path::Path::new("."))
+            .expect("npx.cmd が PATH にない");
+        let browser = crate::web::find_headless_browser().expect("Edge/Chrome が無い");
+        let cmd = format!(
+            "\"{}\" -y @pfnet-research/pfpdf@0.4.0 --input \"{{in}}\" --output \"{{out}}\" \
+             --template pfn --log-level warn --browser-path \"{}\"",
+            npx.display(),
+            browser.display()
+        );
+        let md = "---\ntitle: 試験文書\nlang: ja\n---\n\n# 概要\n\n**pfpdf** の試験。$E=mc^2$\n";
+        let o = run_external_full(&cmd, &[(md.as_bytes(), "md")], "pdf", Some(900), &no_cancel(), None, None)
+            .expect("pfpdf が PDF を書けなかった");
+        let pdf = o.output.unwrap_or_else(|| panic!("{{out}} が書かれていない（stderr: {}）", o.stderr));
+        assert_eq!(&pdf[0..5], b"%PDF-", "PDF マジックが無い（stderr: {}）", o.stderr);
+    }
+
     /// v1.6 ステップ2（実機）: 進行モード＝カードの cmdline
     /// `python cli_render.py --in {in} --outdir {out*}` で複数 WAV が
     /// ファイル名の辞書順（＝進行順）で収集されること。Two-Five-One は

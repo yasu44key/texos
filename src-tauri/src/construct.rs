@@ -225,12 +225,21 @@ fn resolve_presets(app_data: &Path, c: &mut Checked) -> Vec<String> {
     if need_mic && mic.is_none() {
         notes.push("マイクが見つかりません（ffmpeg で dshow の音声デバイスを列挙できない）。録音カードの cmd の audio= を直してください".into());
     }
+    // pfpdf: OS の Edge/Chrome で描画させる（無ければ pfpdf が自前の Chromium を取りに行く）。
+    let pdf_browser = if uses("{{PFPDF_BROWSER}}") {
+        web::find_headless_browser().map(|b| format!(" --browser-path \"{}\"", b.display())).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let (cli_s, model_s) = (cli.to_string_lossy().to_string(), model.to_string_lossy().to_string());
     for k in c.cards.iter_mut() {
         let Some(spec) = k.spec.as_mut().and_then(|s| s.as_object_mut()) else { continue };
         for key in ["path", "cmd"] {
             if let Some(v) = spec.get(key).and_then(|v| v.as_str()).map(str::to_string) {
-                let mut v = v.replace("{{WHISPER_CLI}}", &cli_s).replace("{{WHISPER_MODEL}}", &model_s);
+                let mut v = v
+                    .replace("{{WHISPER_CLI}}", &cli_s)
+                    .replace("{{WHISPER_MODEL}}", &model_s)
+                    .replace("{{PFPDF_BROWSER}}", &pdf_browser);
                 if let Some(m) = &mic {
                     v = v.replace("{{MIC_DEVICE}}", m);
                 }

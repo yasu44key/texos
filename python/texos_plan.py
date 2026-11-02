@@ -41,6 +41,8 @@ DROP_KEYS = {"call", "id", "x", "y"}
 # この PC 固有の値（Whisper の場所・モデル・マイク名）が要るカード。AI には名前だけ書かせ、
 # 中身は TexoS の UI と同じ設定にする（App.tsx whisperSpec / to_wav16k / mic_record:）。
 # {{WHISPER_CLI}} {{WHISPER_MODEL}} {{MIC_DEVICE}} は並べる側（construct.rs resolve_presets）が埋める。
+PFPDF_VERSION = "0.4.0"
+PFPDF_TEMPLATES = ("default", "pfn", "technical", "academic", "book", "notebook", "compact")
 PRESETS = {
     "whisper": lambda c: dict(
         name="whisper-cli.exe", path="{{WHISPER_CLI}}", mode="command",
@@ -53,8 +55,17 @@ PRESETS = {
         name="ffmpeg.exe", mode="generator",
         cmd='-hide_banner -f dshow -i "audio={{MIC_DEVICE}}" -ar 16000 -ac 1 -y {out}',
         output_ext="wav", accept_mime="audio/*", timeout_secs=0),
+    # pfpdf（Markdown→PDF 組版）。版は App.tsx の PFPDF_VERSION と揃える。
+    # {{PFPDF_BROWSER}} は並べる側が OS の Edge/Chrome の --browser-path（無ければ空）で埋める。
+    "pdf": lambda c: dict(
+        name="npx.cmd", mode="command",
+        cmd=f'-y @pfnet-research/pfpdf@{PFPDF_VERSION} --input "{{in}}" --output "{{out}}"'
+            f' --template {c.get("template") if c.get("template") in PFPDF_TEMPLATES else "default"}'
+            ' --log-level warn{{PFPDF_BROWSER}}',
+        output_ext="pdf", accept_mime="text/*", timeout_secs=900),
 }
-PRESET_EXTRA = {"mic_record": {"record": True, "stop_cmd": "q"}}
+# pfpdf は小文字の .md しか受けない（.txt は想定拡張子外としてスキップ報告させる）。
+PRESET_EXTRA = {"mic_record": {"record": True, "stop_cmd": "q"}, "pdf": {"in_exts": ["md"]}}
 
 
 def layout(cards, edges):

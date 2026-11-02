@@ -66,6 +66,15 @@
   `op_in`（label 例「ここに音声ファイルをつなぐ」）→ `to_wav16k` → `whisper` と組む。`mic_record` を代わりに置かない。
   画像・文書など他のファイルも同じ（入口は `op_in`）。
 
+### PDF（専用の call）
+
+| call | 引数 | 何をするカードか |
+|---|---|---|
+| `pdf` | `label`, [`template`（既定 `default`）], [`prefix`] | Markdown を表紙・目次つきの PDF に組版（pfpdf）。`template` は `default` `pfn` `technical` `academic` `book` `notebook` `compact` |
+
+- 入力は **Markdown（.md）だけ**。AI カードの出力（Markdown）をそのまま `pdf` へつなげばよい。.txt はつながない。
+- 「報告書を PDF にして」「冊子にして」のように**PDF・印刷物を求められたときだけ**置く。
+
 ## 守る決まり（破ると検査で差し戻される）
 
 1. **AI カードに入力を2本以上つながない。** 入力ごとに別々に実行されてしまう。複数の材料は `cat` で束ねてから AI へ。
