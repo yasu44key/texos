@@ -27,6 +27,8 @@ interface CanvasProps {
   initialTransform?: Transform;
   /** Changing this (e.g. project path) resets the view to initialTransform. */
   viewKey?: string;
+  /** v2.1.1 表示のみ: カードへの操作を通さず、ドラッグ＝パン・ホイール＝ズームだけにする。 */
+  readOnly?: boolean;
   /** Rubber-band selection finished (canvas coords). mode: replace=置換 / add=追加 / toggle=範囲トグル(Ctrl)。 */
   onSelectRect?: (
     rect: { x: number; y: number; w: number; h: number },
@@ -60,7 +62,7 @@ export function screenToCanvas(transform: Transform, sx: number, sy: number) {
   };
 }
 
-export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTransformChange, initialTransform, viewKey, onSelectRect, onEmptyClick, getContentBounds, getSelectionBounds, apiRef }: CanvasProps) {
+export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTransformChange, initialTransform, viewKey, readOnly, onSelectRect, onEmptyClick, getContentBounds, getSelectionBounds, apiRef }: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [transform, setTransform] = useState<Transform>({ x: 0, y: 0, scale: 1 });
   const transformRef = useRef(transform);
@@ -76,6 +78,8 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
   const onSelectRectRef = useRef(onSelectRect);
   useEffect(() => { onSelectRectRef.current = onSelectRect; }, [onSelectRect]);
   const onEmptyClickRef = useRef(onEmptyClick);
+  const readOnlyRef = useRef(!!readOnly);
+  readOnlyRef.current = !!readOnly;
   useEffect(() => { onEmptyClickRef.current = onEmptyClick; }, [onEmptyClick]);
   const getContentBoundsRef = useRef(getContentBounds);
   useEffect(() => { getContentBoundsRef.current = getContentBounds; }, [getContentBounds]);
@@ -178,7 +182,8 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
   const onMouseDown = useCallback((e: MouseEvent) => {
     // v1.3.8 マウスモデル: パン = 中ボタン、または Shift+空キャンバスドラッグ。
     // （Alt+LMB パンは廃止。手のひらカーソルは onMouseMove でドラッグ開始後に出す。）
-    if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
+    // v2.1.1 表示のみ: 左ドラッグもパン（範囲選択はしない）。
+    if (e.button === 1 || (e.button === 0 && (e.shiftKey || readOnlyRef.current))) {
       e.preventDefault();
       // アニメーション中のパン開始は即座に主導権を渡す（v1.4.20）
       if (animRef.current != null) {
@@ -246,6 +251,7 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
   // Right-click → convert to canvas coords (clean: clientX/Y only, no DPR/window math)
   const handleContextMenu = useCallback((e: MouseEvent) => {
     e.preventDefault();
+    if (readOnlyRef.current) return; // 表示のみ: メニューは出さない
     const rect = containerRef.current!.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
@@ -431,6 +437,8 @@ export function Canvas({ children, onDropFiles, onDropText, onContextMenu, onTra
       >
         {children}
       </div>
+      {/* v2.1.1 表示のみ: カードの上に透明な板を置き、操作をキャンバス（パン・ズーム）へ流す。 */}
+      {readOnly && <div style={{ position: "fixed", inset: 0, cursor: "grab" }} />}
       <div
         style={{
           position: "fixed", bottom: 12, right: 16, display: "flex", gap: 6,

@@ -9,8 +9,9 @@
 //!   それでも持ち主のままなので、戻ってきて操作すればそのまま続けられる。
 //! - 持ち主でない PC は DB 接続を `PRAGMA query_only=ON` にし（書き込みを物理的に止める）、
 //!   変更を数秒おきに検知して画面を読み直す。
-//! - 持ち主でない PC で操作を始めると、持ち主が idle／生存信号切れ／不在なら**確認なしで**
-//!   引き継ぐ。持ち主がまさに操作中のときだけ画面が「〇〇で編集中です／引き継ぐ」を出す。
+//! - 持ち主でない PC は「表示のみ」。パンとズームはできる。編集するには画面の
+//!   「編集権を取得」を押す（v2.1.1。v2.1.0 は触っただけで引き継いでいた）。
+//!   持ち主が不在（ファイルが無い／生存信号切れ）のときだけ、開いた時点で自動で取る。
 //! - 引き継がれた側は次の tick（5秒以内）で気づいて「表示のみ」になる。
 //!
 //! ロック順: `EditLock.inner` → `AppState.current`。逆順（current を持ったまま inner）は
@@ -56,7 +57,9 @@ pub(crate) enum Claim {
     Free,
     /// 自分が持っている。
     Mine,
-    /// 他の PC が持っているが、手放しているか不在。
+    /// 他の PC が持っていたが、生存信号が切れている（閉じ損ね・スリープ）。
+    OtherGone,
+    /// 他の PC が持っていて動いているが、操作していない（手放している）。
     OtherIdle,
     /// 他の PC がまさに操作中。
     OtherActive,
@@ -66,7 +69,8 @@ pub(crate) fn judge(lock: Option<&LockFile>, session: &str, now_ms: i64) -> Clai
     match lock {
         None => Claim::Free,
         Some(l) if l.session == session => Claim::Mine,
-        Some(l) if l.idle || (now_ms - l.beat).abs() > STALE_MS => Claim::OtherIdle,
+        Some(l) if (now_ms - l.beat).abs() > STALE_MS => Claim::OtherGone,
+        Some(l) if l.idle => Claim::OtherIdle,
         Some(_) => Claim::OtherActive,
     }
 }
@@ -335,8 +339,9 @@ pub(crate) fn acquire(state: &AppState, force: bool) -> EditStatus {
     let claim = judge(lock.as_ref(), &ed.session, now);
     let take = match claim {
         Claim::Mine => true,
-        Claim::Free | Claim::OtherIdle => true,
-        Claim::OtherActive => force,
+        Claim::Free | Claim::OtherGone => true,
+        // v2.1.1: 動いている別の PC が持っている間は、利用者が「取得」を押すまで取らない。
+        Claim::OtherIdle | Claim::OtherActive => force,
     };
     if take {
         let keep = claim == Claim::Mine && was_owner;
@@ -613,7 +618,8 @@ mod tests {
         // 手放している → 確認なしで引き継げる
         assert_eq!(judge(Some(&lf("a", true, now)), "me", now), Claim::OtherIdle);
         // 生存信号が古い → 不在
-        assert_eq!(judge(Some(&lf("a", false, now - STALE_MS - 1)), "me", now), Claim::OtherIdle);
+        assert_eq!(judge(Some(&lf("a", false, now - STALE_MS - 1)), "me", now), Claim::OtherGone);
+        assert_eq!(judge(Some(&lf("a", true, now - STALE_MS - 1)), "me", now), Claim::OtherGone);
         // 操作中
         assert_eq!(judge(Some(&lf("a", false, now - 5_000)), "me", now), Claim::OtherActive);
         // 相手の時計が少し進んでいても操作中と見る
@@ -669,11 +675,15 @@ mod tests {
         assert!(!can_insert(&b));
         assert!(ensure_editable(&b).is_err());
 
-        // A が手放す（idle を書く）→ B は確認なしで取れる
+        // A が手放す（idle を書く）→ B は触っただけでは取らない。「取得」（force）で取れる
         let mut l = read_lock(&root).unwrap().unwrap();
         l.idle = true;
         write_lock(&root, &l).unwrap();
         let st = acquire(&b, false);
+        assert_eq!(st.mode, "view");
+        assert!(!st.holder_active);
+        assert!(!can_insert(&b));
+        let st = acquire(&b, true);
         assert_eq!(st.mode, "edit");
         assert!(st.took);
         assert!(can_insert(&b));

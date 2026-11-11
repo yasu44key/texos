@@ -2,8 +2,8 @@
 //
 // 同じプロジェクトを複数の PC で開いたままにし、座った PC で作業するための画面側。
 // - この PC を操作したら edit_touch を呼ぶ（取れるなら編集権を取る・生存の合図）。
-// - 「表示のみ」の間は透明な覆いで操作を受け止め、編集権が取れてから操作を通す。
-// - 他の PC がまさに操作中のときだけ「〇〇で編集中です／引き継ぐ」を出す。
+// - 「表示のみ」の間はパンとズームだけできる（Canvas の readOnly）。キー操作は通さない。
+// - 編集するには上部の「編集権を取得」を押す（相手が操作中なら「引き継ぐ」）。
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -19,8 +19,6 @@ export type EditStatus = {
 
 /** 編集中に生存の合図を送る間隔（ms）。 */
 const PING_MS = 10_000;
-/** 表示のみの間、操作のたびに取り直しを試す最短間隔（ms）。 */
-const RETRY_MS = 1_500;
 
 export function useEditLock(opts: {
   projectPath: string | null;
@@ -94,7 +92,9 @@ export function useEditLock(opts: {
           e.stopPropagation();
         }
       }
-      const gap = s.mode === "edit" ? PING_MS : s.mode === "idle" ? 0 : RETRY_MS;
+      // 表示のみの間は自動では取らない（「編集権を取得」を押してから）。
+      if (s.mode === "view") return;
+      const gap = s.mode === "edit" ? PING_MS : 0;
       if (Date.now() - lastTouch.current >= gap) void touch();
     };
     const evs = ["pointerdown", "keydown", "wheel", "pointermove"] as const;
@@ -142,36 +142,27 @@ export function EditLockLayer(props: {
   }
   const busy = s.holder_active && !!s.holder;
   return (
-    <>
-      {/* 操作を受け止める覆い。編集権が取れたら消える。 */}
-      <div
-        style={{ position: "fixed", inset: 0, zIndex: 99990, cursor: busy ? "not-allowed" : "progress" }}
-        onContextMenu={(e) => e.preventDefault()}
-      />
-      <div className="edit-lock-banner" style={pill}>
-        {busy ? (
-          <>
-            <span>✋ {s.holder} で編集中です（この PC は表示のみ）</span>
-            <button
-              onClick={props.takeover}
-              style={{
-                padding: "2px 10px",
-                borderRadius: 10,
-                border: "1px solid var(--accent)",
-                background: "transparent",
-                color: "var(--chrome-text)",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-              title="この PC で編集を始めます。相手の PC は数秒で「表示のみ」になります。"
-            >
-              引き継ぐ
-            </button>
-          </>
-        ) : (
-          <span>👁 表示のみ{s.holder ? `（編集権: ${s.holder}）` : ""} — 編集に切り替えています…</span>
-        )}
-      </div>
-    </>
+    <div className="edit-lock-banner" style={pill} onMouseDown={(e) => e.stopPropagation()}>
+      <span>
+        {busy
+          ? `✋ ${s.holder} で編集中です（この PC は表示のみ）`
+          : `👁 表示のみ${s.holder ? `（編集権: ${s.holder}）` : ""}`}
+      </span>
+      <button
+        onClick={props.takeover}
+        style={{
+          padding: "2px 10px",
+          borderRadius: 10,
+          border: "1px solid var(--accent)",
+          background: "transparent",
+          color: "var(--chrome-text)",
+          cursor: "pointer",
+          fontSize: 12,
+        }}
+        title="この PC で編集を始めます。最新の内容を読み直してから切り替わり、相手の PC は数秒で「表示のみ」になります。"
+      >
+        {busy ? "引き継ぐ" : "編集権を取得"}
+      </button>
+    </div>
   );
 }

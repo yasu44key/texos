@@ -6781,6 +6781,7 @@ function App() {
         onTransformChange={handleTransformChange}
         initialTransform={view?.transform}
         viewKey={view?.key}
+        readOnly={editLock.status?.mode === "view"}
         onSelectRect={handleSelectRect}
         onEmptyClick={handleClearSelection}
         getContentBounds={getContentBounds}
