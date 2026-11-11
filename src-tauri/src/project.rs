@@ -185,12 +185,28 @@ pub(crate) fn add_recent(app_data: &Path, path: &str) {
 pub(crate) fn new_project(path: String, state: State<AppState>) -> Result<ProjectInfo, String> {
     // v1.5.2 WS-C: 切替ガード撤廃（実行中ジョブは起動元プロジェクトへの専用接続で束縛済み）。
     let root = PathBuf::from(&path);
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let project = open_project_at(&root)?;
+    // 新規プロジェクトの初期カード（config.json の starter_cards。未設定=置く）
+    let starter = read_config(&state.app_data).starter_cards.unwrap_or(true);
+    let project = create_new_project_at(&root, starter)?;
     let info = project_info(&root);
     *state.current.lock().unwrap() = Some(project);
     add_recent(&state.app_data, &info.path);
     Ok(info)
+}
+
+/// new_project の本体（State と分離＝単体テスト用）。フォルダを作って開き、**この呼び出しで
+/// DB を新規作成したときだけ** `starter=true` なら初期カードを置く（starter.rs）。
+/// 初期カードは best-effort — 失敗してもプロジェクト作成自体は成功させる。
+pub(crate) fn create_new_project_at(root: &Path, starter: bool) -> Result<Project, String> {
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let fresh = !texos_dir(root).join("texos.db").exists();
+    let project = open_project_at(root)?;
+    if fresh && starter {
+        if let Err(e) = crate::starter::place_starter_cards(&project) {
+            eprintln!("[starter] 初期カードを置けませんでした: {e}");
+        }
+    }
+    Ok(project)
 }
 
 /// Open an existing TexoS project folder.

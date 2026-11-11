@@ -1159,7 +1159,7 @@ function App() {
                   ),
               },
               { label: "URLリンクを追加...", onClick: () => la.url(cp.x, cp.y, fromId) },
-              { label: "自動化カードを追加 ...", onClick: () => openSub(automationSub) },
+              { label: "カードを置く ...", onClick: () => openSub(automationSub) },
             ],
           });
         }
@@ -2560,7 +2560,7 @@ function App() {
           await reloadModuleLibrary();
           setConfirm({
             title: "ライブラリに登録しました",
-            message: `モジュール「${name}」（カード ${res.cards} 枚）を登録しました。\nキャンバス右クリック「自動化カードを追加 → ユーザーのモジュール」で、どのプロジェクトにも展開できます。`,
+            message: `モジュール「${name}」（カード ${res.cards} 枚）を登録しました。\nキャンバス右クリック「カードを置く → 自分の部品」で、どのプロジェクトにも展開できます。`,
             okLabel: "OK",
             onConfirm: () => setConfirm(null),
           });

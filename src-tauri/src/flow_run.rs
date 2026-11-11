@@ -1717,11 +1717,7 @@ fn collect_input_edges(
                 .map_err(|e| e.to_string())
             {
                 Ok(text) => {
-                    let stem = if vlabel.trim().is_empty() {
-                        "コメント".to_string()
-                    } else {
-                        vlabel.clone()
-                    };
+                    let stem = note_stem(vlabel);
                     EvalOut::data(
                         vec![FlowPayload {
                             bytes: text.into_bytes(),
@@ -1743,11 +1739,15 @@ fn collect_input_edges(
             };
             match std::fs::read(&path) {
                 Ok(d) => {
-                    let stem = std::path::Path::new(vlabel)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("output")
-                        .to_string();
+                    let name_base: Option<String> = p
+                        .conn
+                        .query_row(
+                            "SELECT name_base FROM virtual_bodies WHERE id = ?1",
+                            rusqlite::params![vid],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(None);
+                    let stem = origin_stem(vlabel, name_base.as_deref());
                     EvalOut::data(
                         vec![FlowPayload {
                             bytes: d,
@@ -2311,6 +2311,38 @@ fn create_answer_note(
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// コメント（付箋）を起点にしたときの名前の上限。文章の冒頭がそのまま長い名前になるのを防ぐ。
+const NOTE_STEM_MAX: usize = 16;
+
+/// 入力ファイルカードの「起点の名前」。出力名は「起点_札」で作る。
+///
+/// 既定の命名で生まれた出力カードは `name_base` に自分の起点を覚えている。そのカードを
+/// 次のフローの入力にしたら、ラベル（`報告書_AI変換`）ではなく起点（`報告書`）を返す。
+/// こうすると次の出力は `報告書_AI変換_コード抽出` ではなく `報告書_コード抽出` になる
+/// （札を積まずに付け替える）。
+///
+/// 人が表示名を変えたカードはその名前を尊重する: ラベルの語幹が「起点_」で始まらなく
+/// なっていたら `name_base` は使わない。
+fn origin_stem(label: &str, name_base: Option<&str>) -> String {
+    let label_stem = std::path::Path::new(label)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output")
+        .to_string();
+    match name_base.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) if label_stem.starts_with(&format!("{b}_")) => b.to_string(),
+        _ => label_stem,
+    }
+}
+
+/// コメント（付箋）を起点にしたときの名前。ファイル名に使えない文字を逃がし、短く切る。
+fn note_stem(label: &str) -> String {
+    crate::web::sanitize_stem(label)
+        .map(|s| s.chars().take(NOTE_STEM_MAX).collect::<String>().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "コメント".to_string())
 }
 
 /// カードのラベル（進捗・レポートの文言用。見つからなければ id）。
@@ -3100,8 +3132,15 @@ pub(crate) fn materialize_payloads(
     };
 
 
-    // 出力ファイル名に使えるラベル（Windowsの禁止文字を逃がす）
-    let safe_flabel: String = flabel
+    // 出力ファイル名に付ける札（Windowsの禁止文字を逃がす）。設定の tag があればそれ、
+    // 無ければカードの表示名。
+    let tag_src = term_spec
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(flabel);
+    let safe_flabel: String = tag_src
         .chars()
         .map(|c| match c {
             '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
@@ -3372,8 +3411,8 @@ pub(crate) fn materialize_payloads(
         if let Err(e) = p.conn.execute(
             "INSERT INTO virtual_bodies
                 (id, real_id, label, pos_x, pos_y, created_at,
-                 committed_path, committed_mtime, origin_path, web_meta, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'file')",
+                 committed_path, committed_mtime, origin_path, web_meta, kind, name_base)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'file', ?11)",
             rusqlite::params![
                 new_vid,
                 hash,
@@ -3384,7 +3423,10 @@ pub(crate) fn materialize_payloads(
                 committed_path,
                 committed_mtime,
                 origin_path,
-                pl.meta
+                pl.meta,
+                // 既定の命名「起点_札」のときだけ起点を覚える。固定名（prefix）は人が付けた
+                // 名前なので、次の段でもその名前がそのまま起点になる。
+                if prefix.is_none() { Some(pl.stem.as_str()) } else { None }
             ],
         ) {
             report.errors.push(format!("{}: {e}", pl.stem));
@@ -4118,6 +4160,99 @@ mod emit_mid_tests {
         let t = job.trace.snapshot();
         assert!(t[0].notes.iter().any(|(k, v)| k.starts_with("キャンバスへ出力") && v.contains("fibo001.exe")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn md_payload(stem: &str) -> Vec<FlowPayload> {
+        vec![FlowPayload {
+            bytes: b"x".to_vec(),
+            ext: "md".into(),
+            mime: "text/markdown".into(),
+            stem: stem.into(),
+            meta: None,
+        }]
+    }
+
+    fn name_base_of(p: &Project, label: &str) -> Option<String> {
+        p.conn
+            .query_row(
+                "SELECT name_base FROM virtual_bodies WHERE label = ?1",
+                rusqlite::params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// 出力名の札は積まずに付け替える: 出力カードを次のフローの入力にしても
+    /// 「起点_前の札_次の札」にはならず「起点_次の札」になる。
+    #[test]
+    fn output_tag_is_replaced_not_stacked() {
+        let (dir, p, state) = setup("naming");
+        add_filter(&p, "f1", "AI変換", "{}");
+        add_filter(&p, "f2", "コード抽出", "{}");
+        let spec = flow::parse_spec("{}").unwrap();
+
+        // 1段目: 起点「報告書」→ 報告書_AI変換.md。カードは起点を覚える。
+        let mut report = empty_report();
+        materialize_payloads(
+            &state, &p, &dir, "f1", 100.0, 200.0, "AI変換", Some("{}"), &spec,
+            md_payload("報告書"), false, &mut report,
+        )
+        .unwrap();
+        assert!(dir.join("報告書_AI変換.md").exists());
+        assert_eq!(name_base_of(&p, "報告書_AI変換.md").as_deref(), Some("報告書"));
+
+        // 2段目: そのカードを入力にすると、起点は「報告書」に戻る。
+        let stem = origin_stem("報告書_AI変換.md", Some("報告書"));
+        assert_eq!(stem, "報告書");
+        let mut report = empty_report();
+        materialize_payloads(
+            &state, &p, &dir, "f2", 100.0, 200.0, "コード抽出", Some("{}"), &spec,
+            md_payload(&stem), false, &mut report,
+        )
+        .unwrap();
+        assert!(dir.join("報告書_コード抽出.md").exists());
+        assert!(!dir.join("報告書_AI変換_コード抽出.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 設定の tag は表示名の代わりに札になる。固定名（prefix）の出力は起点を覚えない。
+    #[test]
+    fn tag_overrides_label_and_prefix_keeps_no_base() {
+        let (dir, p, state) = setup("tag");
+        add_filter(&p, "f1", "Whisper 文字起こし", r#"{"tag":"字"}"#);
+        let spec = flow::parse_spec(r#"{"tag":"字"}"#).unwrap();
+        let mut report = empty_report();
+        materialize_payloads(
+            &state, &p, &dir, "f1", 100.0, 200.0, "Whisper 文字起こし", Some(r#"{"tag":"字"}"#),
+            &spec, md_payload("録音"), false, &mut report,
+        )
+        .unwrap();
+        assert!(dir.join("録音_字.md").exists());
+
+        add_filter(&p, "f2", "まとめ", r#"{"prefix":"結果"}"#);
+        let spec = flow::parse_spec(r#"{"prefix":"結果"}"#).unwrap();
+        let mut report = empty_report();
+        materialize_payloads(
+            &state, &p, &dir, "f2", 100.0, 200.0, "まとめ", Some(r#"{"prefix":"結果"}"#),
+            &spec, md_payload("録音"), false, &mut report,
+        )
+        .unwrap();
+        assert!(dir.join("結果.md").exists());
+        assert_eq!(name_base_of(&p, "結果.md"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 人が表示名を変えたカードはその名前が起点。コメント起点は短く切る。
+    #[test]
+    fn origin_stem_respects_rename_and_note_stem_is_short() {
+        assert_eq!(origin_stem("報告書_AI変換 (2).md", Some("報告書")), "報告書");
+        assert_eq!(origin_stem("最終版.md", Some("報告書")), "最終版", "改名後は新しい名前");
+        assert_eq!(origin_stem("報告書.md", None), "報告書");
+        assert_eq!(origin_stem("報告書.md", Some("")), "報告書");
+        let long = "フィボナッチ数列を10項目出力するC言語のプログラムを書いてください";
+        assert_eq!(note_stem(long).chars().count(), NOTE_STEM_MAX);
+        assert_eq!(note_stem("  "), "コメント");
+        assert_eq!(note_stem("a/b:c"), "a_b_c");
     }
 
     /// v1.8.7 途中出力の失敗はそのカードの last_run に warning として残る（成否は ok のまま）。

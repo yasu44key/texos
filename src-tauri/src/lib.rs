@@ -562,6 +562,10 @@ struct Config {
     /// v1.11 MCP 接続（AIエージェントからの操作口）。既定オフ＝口を開かない。
     #[serde(default)]
     mcp_enabled: bool,
+    /// 新規プロジェクトに初期カード（案内の付箋・はじめに.md・文字数を数える）を置くか。
+    /// None（未設定）＝置く。false で置かない（starter.rs）。
+    #[serde(default)]
+    starter_cards: Option<bool>,
 }
 #[derive(Serialize)]
 pub struct ProjectInfo {
@@ -688,6 +692,8 @@ mod rag;
 mod agent;
 // v1.11: MCP 接続（AIエージェントからの操作口・ローカル IPC）。crate::mcp_bridge:: で参照。
 mod mcp_bridge;
+// 新規プロジェクトの初期カード。crate::starter:: で参照（入口は project::create_new_project_at）。
+mod starter;
 pub(crate) use ai::*;
 pub(crate) use clipboard_in::*;
 pub(crate) use filters::*;

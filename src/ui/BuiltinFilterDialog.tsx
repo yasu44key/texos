@@ -1233,6 +1233,9 @@ function initVals(schema: BuiltinSchema | undefined, base: Record<string, unknow
   return v;
 }
 
+// 出力名の札の欄を出さないカード（結果のファイルを「元の名前_札」で作らないもの）。
+const NO_TAG_BUILTINS = new Set(["speak", "voice_send", "import_new", "tap", "to_url"]);
+
 export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave, onCancel, projectRoot, onOpenAi }: Props) {
   const schema = BUILTIN_SCHEMAS[builtin];
 
@@ -1252,8 +1255,13 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
   const [jsonMode, setJsonMode] = useState(false);
   const [jsonText, setJsonText] = useState("");
   const [jsonErr, setJsonErr] = useState<string | null>(null);
+  // v2.0 出力名の札: 既定の出力名「元の名前_札」の札。空欄ならカード名が札になる。
+  const tagOf = (o: Record<string, unknown>) => (typeof o.tag === "string" ? o.tag : "");
+  const [tag, setTag] = useState(() => tagOf(parseSpec(initialSpec)));
 
   if (!schema) return null;
+  // ファイルの結果カードを作らないカード（発行系・読み上げ・記録など）には札の欄を出さない。
+  const showTag = !schema.opCard && !NO_TAG_BUILTINS.has(builtin);
 
   const setVal = (k: string, val: string) => setVals((prev) => ({ ...prev, [k]: val }));
 
@@ -1290,6 +1298,10 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
         spec[f.key] = raw;
       }
     }
+    if (showTag) {
+      if (tag.trim()) spec.tag = tag.trim();
+      else delete spec.tag;
+    }
     return spec;
   };
 
@@ -1311,6 +1323,7 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
     }
     setBase(parsed);
     setVals(initVals(schema, parsed));
+    setTag(tagOf(parsed));
     setJsonErr(null);
     setJsonMode(false);
   };
@@ -1405,6 +1418,23 @@ export function BuiltinFilterDialog({ builtin, initialLabel, initialSpec, onSave
             onChange={(e) => setTitle(e.target.value)}
             placeholder={schema.title}
           />
+        )}
+
+        {showTag && !jsonMode && (
+          <div>
+            {row(
+              "出力名の札",
+              <input
+                style={inputStyle()}
+                value={tag}
+                onChange={(e) => setTag(e.target.value)}
+                placeholder="空欄=カード名"
+              />
+            )}
+            <div style={{ fontSize: 11, margin: "-6px 2px 10px 0", color: "var(--panel-muted, #8a93a8)", lineHeight: 1.5 }}>
+              結果のファイル名は「元の名前_札」になります（例: 報告書_{tag.trim() || title.trim() || schema.title}）。短い札にすると名前が長くなりません。
+            </div>
+          </div>
         )}
 
         {jsonMode ? (

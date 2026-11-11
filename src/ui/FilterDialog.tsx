@@ -59,6 +59,8 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel, proj
   const [outputExt, setOutputExt] = useState(str("output_ext"));
   const [outDir, setOutDir] = useState(str("out_dir"));
   const [prefix, setPrefix] = useState(str("prefix"));
+  // v2.0 出力名の札（prefix が空のときの「元の名前_札」の札。空欄ならカード名）。
+  const [tag, setTag] = useState(str("tag"));
   // 連番は空欄を許す: 空欄=固定名（毎回同じファイルへ上書き — コンパイラ等）
   const [seq, setSeq] = useState(typeof init.seq === "number" ? String(init.seq) : "");
   const [note, setNote] = useState(str("note"));
@@ -223,6 +225,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel, proj
       // 空欄なら seq を持たせない = 固定名上書きモード
       if (seq.trim() !== "") spec.seq = Math.max(0, parseInt(seq, 10) || 0);
     }
+    if (tag.trim()) spec.tag = tag.trim();
     if (note.trim()) spec.note = note.trim();
     // v1.8.7 途中出力スイッチ（右クリックで切り替える）はこのダイアログの外の設定なので温存。
     if (init.emit_mid === "on") spec.emit_mid = "on";
@@ -492,7 +495,7 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel, proj
               style={{ ...inputStyle(), width: 160 }}
               value={prefix}
               onChange={(e) => setPrefix(e.target.value)}
-              placeholder="空欄=入力名_フィルタ名"
+              placeholder="空欄=元の名前_札"
             />
             <span style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", flex: "none" }}>連番</span>
             <input
@@ -513,6 +516,18 @@ export function FilterDialog({ initialLabel, initialSpec, onSave, onCancel, proj
                 : "—"}
             </span>
           </div>
+        )}
+
+        {row(
+          "出力名の札",
+          <input
+            style={{ ...inputStyle(), width: 160 }}
+            value={tag}
+            disabled={!!prefix.trim()}
+            onChange={(e) => setTag(e.target.value)}
+            placeholder="空欄=カード名"
+            title="Prefix が空のとき、結果のファイル名は「元の名前_札」になります。短い札にすると名前が長くなりません。"
+          />
         )}
 
         {row(

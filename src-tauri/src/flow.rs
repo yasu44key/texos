@@ -83,6 +83,10 @@ pub struct FilterSpec {
     /// stem をこの名前に差し替える（"fibo.exe" のように拡張子付きなら ext も変える）。
     #[serde(default)]
     pub prefix: Option<String>,
+    /// 出力名に付ける札（空=カードの表示名）。既定の命名「起点_札」の札だけを短くしたい
+    /// ときに使う。prefix（固定名）を指定したときは使われない。
+    #[serde(default)]
+    pub tag: Option<String>,
     /// 接頭辞使用時の次の連番。実行のたびにカードへ書き戻す
     #[serde(default)]
     pub seq: Option<u32>,

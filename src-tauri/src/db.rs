@@ -5,14 +5,90 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     // v1.5.2 WS-C: ジョブごとの専用接続（並行フロー＋UI接続）が同じ DB へ書くため、
     // 書き込みロック競合は SQLite 側で待たせる（WAL は既存＝読みは並行可）。
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
-    )?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+    // v2.0: ネットワーク上（NAS・共有フォルダ）では WAL を使わない。WAL は共有メモリ
+    // （-shm）に頼るので、SQLite はネットワークファイルシステム上での動作を保証していない
+    // （複数の PC から開くと壊れうる・-wal に変更が残ったままになる）。リモートでは
+    // ロールバックジャーナルにする。WAL のままの DB は、ここで -wal の中身を本体へ
+    // 反映してから切り替わる（他の接続が開いている間は切り替わらず WAL のまま＝次回に持ち越し）。
+    let mode = journal_mode_for(is_remote_path(db_path));
+    let _: String = conn.query_row(&format!("PRAGMA journal_mode={mode}"), [], |r| r.get(0))?;
     // v1.4.17 カード統一 §1: 付箋(notes)→virtual_bodies(kind='note') の一括変換を行う前に、
     // 変換対象がある DB だけ丸ごとバックアップ（.texos/backup/）。コストほぼゼロの保険。
     backup_before_note_unify(&conn, db_path);
     migrate(&conn)?;
     Ok(conn)
+}
+
+/// 置き場所に合わせたジャーナル方式。ローカル＝WAL（読みが並行できる）／リモート＝DELETE。
+pub(crate) fn journal_mode_for(remote: bool) -> &'static str {
+    if remote { "DELETE" } else { "WAL" }
+}
+
+/// そのパスがネットワーク上（UNC・ネットワークドライブ）にあるか。判定できなければ false。
+pub(crate) fn is_remote_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    // UNC（\\server\share\… と \\?\UNC\server\…）。\\?\C:\… はローカルの長いパス表記。
+    if s.starts_with(r"\\?\UNC\") || s.starts_with("//") {
+        return true;
+    }
+    if s.starts_with(r"\\") && !s.starts_with(r"\\?\") && !s.starts_with(r"\\.\") {
+        return true;
+    }
+    drive_is_remote(s.strip_prefix(r"\\?\").unwrap_or(&s))
+}
+
+#[cfg(windows)]
+fn drive_is_remote(s: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_REMOTE: u32 = 4;
+    let b = s.as_bytes();
+    if b.len() < 2 || b[1] != b':' || !b[0].is_ascii_alphabetic() {
+        return false;
+    }
+    let root = windows::core::HSTRING::from(format!("{}:\\", b[0] as char));
+    unsafe { GetDriveTypeW(&root) == DRIVE_REMOTE }
+}
+
+#[cfg(not(windows))]
+fn drive_is_remote(_s: &str) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn remote_paths_use_rollback_journal() {
+        assert!(is_remote_path(Path::new(r"\\landisk\disk1\p\.texos\texos.db")));
+        assert!(is_remote_path(Path::new(r"\\?\UNC\landisk\disk1\p\.texos\texos.db")));
+        assert!(!is_remote_path(Path::new(r"\\?\C:\p\.texos\texos.db")));
+        assert!(!is_remote_path(Path::new("relative/texos.db")));
+        assert_eq!(journal_mode_for(true), "DELETE");
+        assert_eq!(journal_mode_for(false), "WAL");
+    }
+
+    /// WAL で作られた DB をリモート扱いで開き直すと、中身を保ったまま DELETE に切り替わり、
+    /// -wal が残らない（NAS 上に残っていた -wal を本体へ反映する経路）。
+    #[test]
+    fn wal_db_converts_to_delete_keeping_data() {
+        let dir = std::env::temp_dir().join(format!("texos_journal_{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("texos.db");
+        {
+            let c = open(&db).unwrap();
+            c.execute("INSERT INTO meta (key, value) VALUES ('k', 'v')", []).unwrap();
+        }
+        let c = Connection::open(&db).unwrap();
+        let mode: String = c.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode.to_lowercase(), "delete");
+        let v: String = c.query_row("SELECT value FROM meta WHERE key='k'", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "v");
+        drop(c);
+        assert!(!dir.join("texos.db-wal").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// notes テーブルに行が残っている（＝これから一括変換が走る）場合のみ、texos.db を
@@ -253,6 +329,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     // style_ref(JSON)。実身は共有センチネル（url:sentinel の前例）＝CAS に載せない不変テキスト。
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN note_text TEXT", []);
     let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN style_ref TEXT", []);
+    // 出力名の起点（おおもとの名前）。既定の命名「起点_札」で生まれた出力カードにだけ入る。
+    // このカードを次のフローの入力にしたとき、札を積まずに付け替えるために使う
+    // （flow_run.rs origin_stem）。NULL＝従来どおりラベルの語幹が起点。
+    let _ = conn.execute("ALTER TABLE virtual_bodies ADD COLUMN name_base TEXT", []);
     conn.execute(
         "INSERT OR IGNORE INTO real_bodies (id, mime_type, size, created_at)
          VALUES ('note:sentinel', 'text/vnd.texos.note', 0, ?1)",

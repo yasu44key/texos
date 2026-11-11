@@ -4597,7 +4597,7 @@ dependencies = [
 
 [[package]]
 name = "texos"
-version = "1.13.3"
+version = "2.0.0"
 dependencies = [
  "arboard",
  "base64 0.22.1",

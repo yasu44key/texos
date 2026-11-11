@@ -1110,7 +1110,7 @@ export function buildShapeMenu(
     // v1.5.8 WS-M M2（§10.1）: ロック済みメンバーを名前付きモジュールとして個人ライブラリへ。
     {
       label: "ライブラリに登録（モジュール）...",
-      hint: "ロックしたメンバー（カード・矢印・設定・データの実身コピー）を名前を付けて個人ライブラリに保存します。展開は「自動化カードを追加 → ユーザーのモジュール」から（どのプロジェクトでも使えます）。",
+      hint: "ロックしたメンバー（カード・矢印・設定・データの実身コピー）を名前を付けて個人ライブラリに保存します。展開は「カードを置く → 自分の部品」から（どのプロジェクトでも使えます）。",
       onClick: () => a.saveModuleToLibrary(shapeId),
     },
     { label: "名前を変更...", onClick: () => a.shapeLabel(shapeId, sh?.label ?? "") },
@@ -1297,329 +1297,300 @@ export interface AutomationAddActions {
   };
 }
 
-// v1.4.x ③ / v1.5.12 メニュー再編: 1段階のフラットなリストにし、ランチャー → フィルタ →
-// オペレーション → ユーザーのカード をセクション見出しで区切る（旧 buildCanvasMenu 内の
-// automationAddSub を共有ビルダー化。項目・文言・構造は据え置き）。
+// v2.0 メニュー再編: 「カードを置く」を **目的別の分類** にした。
+// 原則（docs/引き継ぎ_2026-11-11_V2.0移行.md §2-3）:
+//   ・分類 → カードの2段まで（分類は8個）。分類名は作り手の用語（ランチャー／フィルタ／
+//     オペレーション）ではなく「やりたいこと」。
+//   ・並びはデータの流れ（頼む → 集める → 加工する → 仕上げる → 流れを組む）。
+//   ・設定（検索エンジンの管理など）はカードの一覧に混ぜない（表示・設定へ）。
+//   ・openSubmenu はその場差し替えで戻る導線が無いので、各分類の先頭に「← 分類へ戻る」を置く。
+// 項目の addFilter / addLauncher の引数は従来のまま（置かれるカードは変わらない）。
 export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddActions): MenuItem[] {
-  return [
-    // ── ランチャー（プログラム起動）──
-    { label: "── ランチャー ──", onClick: () => {}, disabled: true },
-    { label: "インストール済みアプリから選択...", onClick: () => a.addLauncher("installed") },
-    { label: "一般プログラム（.exe を選択）...", onClick: () => a.addLauncher("program") },
+  const back: MenuItem = {
+    label: "← 分類へ戻る",
+    onClick: () => a.openSubmenu(buildAutomationAddSub(ctx, a)),
+  };
+  // 分類を開く。中の入れ子（PDF のテンプレート・マイクの選択）からも同じ分類へ戻れるよう、
+  // 入れ子は nested() で開く。
+  const open = (items: MenuItem[]) => a.openSubmenu([back, DIV, ...items]);
+  const nested = (parent: () => MenuItem[], items: MenuItem[]) =>
+    a.openSubmenu([{ label: "← 戻る", onClick: () => open(parent()) }, DIV, ...items]);
+
+  // ── AI に頼む ──
+  const askAi = (): MenuItem[] => [
+    {
+      label: "🤖 エージェント（話しかけると調べる・組む・動かす）...",
+      hint: "カードの下の欄で頼むと、AI が道具（索引で調べる・ファイルを読む・フローを組む・実行する）を選んで進めます。",
+      onClick: () => a.addFilter("agent"),
+    },
+    { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog") },
+    { label: "AI変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat") },
+    // v1.12 ④（docs/V1.12_声の窓口と思考役計画.md §6）
+    {
+      label: "コンストラクタ（依頼からカードフローを組む）...",
+      hint:
+        "つないだ依頼を読み、AI がカードの設計図を書いて、配線の決まりで検査し、このプロジェクトに並べます。" +
+        "音声カードからリクエスト矢印でつなげば「〜するフローを構築して」と話すだけで並びます。",
+      onClick: () => a.addFilter("construct"),
+    },
+  ];
+
+  // ── 調べる・集める（Web と手元の文書）──
+  const gather = (): MenuItem[] => [
+    {
+      label: "Web検索（キーワード→結果一覧）...",
+      hint: "検索語（1行=1検索語）で検索し、タイトル・URL・抜粋の一覧を Markdown 1枚にします。検索語はパラメータ欄に書くか、テキストカードや AI の出力を接続します。結果を AI カードに渡せばレポートに、URLカード化に繋げばリンク集になります。初回は検索エンジンの導入から（キャンバス右クリック → 表示・設定 → Web検索エンジンの管理）。",
+      onClick: () => a.addFilter("web_search"),
+    },
+    {
+      label: "ページ取得（URL→Markdown実身）...",
+      hint: "URLの本文を抽出して Markdown 実身にします（タイトル=カード名）。URLはパラメータ欄に直書きするか、URLを書いたテキストカードを接続します。画像・CSV などの直リンクはそのままの形式で取り込みます。",
+      onClick: () => a.addFilter("web_fetch"),
+    },
+    {
+      label: "フィード取得（RSS/Atom→記事カード）...",
+      hint: "フィードの記事ごとに「タイトル＋概要＋記事リンク」の Markdown 実身を作ります（1記事=1カード）。再実行すると新着だけを取り込みます（差分取得）。本文が欲しい記事は web_fetch で。",
+      onClick: () => a.addFilter("web_feed"),
+    },
+    {
+      label: "ページキャプチャ（URL→PNG実身）...",
+      hint: "ページの見た目をそのまま PNG 実身にします（OS 搭載の Edge/Chrome をヘッドレスで使用・同梱しません）。ページ取得が本文（テキスト）、こちらは見た目（画像）。",
+      onClick: () => a.addFilter("web_capture"),
+    },
+    {
+      label: "URLカード化（テキスト→リンク）",
+      hint: "入力テキストの中の URL を全部拾って、URL リンクカードにします（1 URL = 1カード・出したことのあるリンクは増やしません）。フィード取得と繋ぐと記事のリンク集に。1枚のリンクカードを更新し続けたいときは、フィルタから既存の URL カードへ矢印を引いてください。",
+      onClick: () => a.addFilter("to_url"),
+    },
+    DIV,
+    // V1.13 P1 RAG（docs/V1.13_エージェントカード計画.md §5）
+    {
+      label: "📚 文書の索引（フォルダ→索引）...",
+      hint:
+        "フォルダの文書（md / txt / PDF / Word など・下の階層まで）や、つないだカードを切り分けて埋め込み、索引にします。" +
+        "変わった文書だけ作り直します。埋め込みモデルは Ollama の bge-m3 が既定（`ollama pull bge-m3`）。",
+      onClick: () => a.addFilter("rag_index"),
+    },
+    {
+      label: "🔎 文書検索（問い→近い箇所）...",
+      hint:
+        "問いに近い箇所を索引から上位いくつか、出典つきで取り出します。索引カードをつなぐとその索引を使います。" +
+        "結果を AI カードにつなげば「手元の資料に基づいて答える」流れになります。",
+      onClick: () => a.addFilter("rag_search"),
+    },
+  ];
+
+  // ── 文章を加工する（抜き出す／まとめる／仕上げる）──
+  const text = (): MenuItem[] => [
+    { label: "grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep") },
+    { label: "置換（正規表現）...", onClick: () => a.addFilter("text_replace") },
+    { label: "先頭N行（head）...", onClick: () => a.addFilter("text_head") },
+    { label: "末尾N行（tail）...", onClick: () => a.addFilter("text_tail") },
+    { label: "並べ替え（sort）", onClick: () => a.addFilter("text_sort") },
+    { label: "行数・単語数・文字数（wc）", onClick: () => a.addFilter("text_count") },
+    { label: "列の取り出し（cut）...", onClick: () => a.addFilter("text_cut") },
+    {
+      label: "コードブロック抽出（MD→ソース）...",
+      hint: "Markdown のコードフェンス(```)から中身を取り出します。AI出力をコンパイラ等へ渡す前段に。",
+      onClick: () => a.addFilter("md_codeblock"),
+    },
+    DIV,
+    {
+      label: "連結（cat・複数入力）",
+      hint: "接続したすべてのテキストを矢印の接続順に連結します。区切り（改行/空行/---）は設定で。",
+      onClick: () => a.addFilter("text_concat"),
+    },
+    {
+      label: "差分（diff・2入力）",
+      hint: "2つのテキストの差分を unified 形式で出します。接続順が 入力1=旧・入力2=新。",
+      onClick: () => a.addFilter("text_diff"),
+    },
+    {
+      label: "行の横結合（paste・複数入力）",
+      hint: "各入力の同じ行番号を区切り文字で横に並べます（TSV/CSV の列組み立て）。",
+      onClick: () => a.addFilter("text_paste"),
+    },
+    DIV,
+    { label: "文字コード変換（→UTF-8）", onClick: () => a.addFilter("text_convert") },
+    // pfpdf: Markdown を表紙・目次つきの PDF に組版（要 Node.js・npx で取得）。
+    {
+      label: "PDF組版（Markdown→PDF・pfpdf）...",
+      hint: "Markdown を表紙・目次つきの PDF に組版します（日本語組版・数式・コード・Mermaid 対応）。テンプレートを選んでください。Node.js 22.12 以降が必要で、初回は pfpdf を npm から取得します。",
+      onClick: () =>
+        nested(
+          text,
+          (
+            [
+              ["default", "標準"],
+              ["pfn", "PFN 風・青い表紙"],
+              ["technical", "技術文書"],
+              ["academic", "論文"],
+              ["book", "書籍"],
+              ["notebook", "ノート"],
+              ["compact", "詰めた版面"],
+            ] as const
+          ).map(([t, desc]) => ({
+            label: `${t}（${desc}）`,
+            onClick: () => a.addFilter(`pfpdf:${t}`),
+          }))
+        ),
+    },
+  ];
+
+  // ── 画像・3D を作る ──
+  const image = (): MenuItem[] => [
+    { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i") },
+    // v2.0 t23d: G層2例目（Hunyuan3D-2・V2.0_t23d設計.md）。
+    {
+      label: "3D生成 Image-To-3D（画像→3Dモデル）...",
+      hint: "接続した画像から 3D モデル（.glb）を生成します。エンジンは Hunyuan3D-2 WinPortable（初回に場所を設定）。",
+      onClick: () => a.addFilter("t23d"),
+    },
+    DIV,
+    { label: "画像のリサイズ（幅指定）...", onClick: () => a.addFilter("img_resize") },
+    { label: "画像の形式変換...", onClick: () => a.addFilter("img_convert") },
+  ];
+
+  // ── 音声・動画（要 ffmpeg のものを含む）──
+  const media = (): MenuItem[] => [
+    // v1.4.9: マイク録音（録音→「停止」で確定。デバイスはサブメニューで選ぶ）。
+    {
+      label: "マイク録音（録音→停止で確定）...",
+      onClick: () =>
+        nested(
+          media,
+          ctx.audioDevices.length
+            ? ctx.audioDevices.map((d) => ({
+                label: `🎙 ${d}`,
+                onClick: () => a.addFilter(`mic_record:${d}`),
+              }))
+            : [
+                {
+                  label: "（マイクが見つかりません／ffmpeg 未検出）",
+                  onClick: () => {},
+                  disabled: true,
+                },
+              ]
+        ),
+    },
+    { label: "Whisper用WAVに変換（16kHz mono）", onClick: () => a.addFilter("to_wav16k") },
+    { label: "Whisper 文字起こし（音声→テキスト）...", onClick: () => a.addFilter("whisper") },
+    {
+      label: "読み上げ（テキスト→声）",
+      hint: "テキストを OS の音声合成で読み上げます（Windows=SAPI / macOS=say / Linux=espeak）。読み上げるだけで完結し、出力カードは作りません。",
+      onClick: () => a.addFilter("speak"),
+    },
+    DIV,
+    { label: "音声を長さでクリップ...", onClick: () => a.addFilter("audio_clip") },
+    { label: "音声のノーマライズ", onClick: () => a.addFilter("audio_norm") },
+    { label: "動画を長さでクリップ...", onClick: () => a.addFilter("video_clip") },
+  ];
+
+  // ── 流れを組む（途中の制御／きっかけ）──
+  const control = (): MenuItem[] => [
+    {
+      label: "セレクタ（最初の有データ枝を採用）",
+      hint: "入力の順に見て、最初にデータを返した枝を採用します。成功枝/失敗枝の合流点（矢印の通過条件と組み合わせて使います）。",
+      onClick: () => a.addFilter("select"),
+    },
+    {
+      label: "記録（途中を残す・素通し）",
+      hint:
+        "矢印の途中に置きます。データはそのまま下流へ通しながら、通った中身を" +
+        "ファイルに書き出してカードにします（同じ名前で毎回上書き）。\n" +
+        "フローの途中の結果はふつう残らないので、1周流したあとに「何がどう変わったか」を" +
+        "読み返したいところに置いてください。",
+      onClick: () => a.addFilter("tap"),
+    },
+    {
+      label: "問い合わせ（途中で人に聞く）",
+      hint:
+        "実行がここまで来たら、いったん人の答えを待ちます。矢印は2種類つなぎます — " +
+        "ふつうの矢印で「何について聞くか（材料）」を送り、付箋を「役割＝答え」の矢印で" +
+        "繋いでそこに答えを書きます（答えの付箋を用意していなければ、最初の実行で" +
+        "作られます）。書いてから、もう一度 ▶ を押してください。\n" +
+        "前か後ろでしか口を挟めなかったフローに、途中で判断を入れるためのカードです。",
+      onClick: () => a.addFilter("ask"),
+    },
+    {
+      label: "反復（納得するまで繰り返す）",
+      hint:
+        "上流のカードをもう一度たどり直します。判定 → 直して判定、のように" +
+        "「練り直す」流れが描けます。\n" +
+        "作り方: ①このカードの入力に、繰り返したい流れの出口をつなぐ ②このカードから" +
+        "戻したい上流のカードへ矢印を引き、その矢印を「役割＝前周の結果」にする。\n" +
+        "止まり方は、最大周回数（暴走止め・必須）と、出力に現れたら終わりにする語です。",
+      onClick: () => a.addFilter("loop"),
+    },
+    DIV,
+    // ── きっかけ（フローを起動するカード）──
+    {
+      label: "トリガ（設置型▶・一括発行）",
+      hint: "▶を押すと、リクエスト矢印の先につないだフィルタを実行します。複数につなげば一括発行できます。",
+      onClick: () => a.addFilter("op_trigger"),
+    },
+    {
+      label: "タイマ（周期・時刻で発行）...",
+      hint: "指定した周期（秒）または時刻（HH:MM）に、矢印の先のフィルタを自動実行します。発火間隔の下限と累計回数の上限（ヒューズ）付き。",
+      onClick: () => a.addFilter("op_timer"),
+    },
+    {
+      label: "ウォッチャ（ファイル監視で発行）...",
+      hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
+      onClick: () => a.addFilter("op_watch"),
+    },
+    {
+      label: "ドロップポイント（データ入口・自動実行）",
+      hint: "ファイルやカードを落とすと、つないだ下流フローを自動実行するデータ投入口です。",
+      onClick: () => a.addFilter("drop_point"),
+    },
+    {
+      label: "音声（話しかけて発行・声で報告）...",
+      hint: "稼働中はマイクで聞き取り、リクエスト矢印の先のカード名（言い回し）を含む発話でそのフローを実行し、完了・失敗を声で報告します。言い回しを除いた中身は書き出し先のファイル（既定 音声/発話.txt）に入ります。",
+      onClick: () => a.addFilter("op_voice"),
+    },
+    {
+      label: "会話へ送る（テキストを会話コマンドへ）",
+      hint: "フローの終端に置くと、流れてきたテキストを話しかけたのと同じ扱いで稼働中の会話コマンドへ渡します。音声ファイル→文字起こし→ここ、で録音も扱えます。",
+      onClick: () => a.addFilter("voice_send"),
+    },
+  ];
+
+  // ── プログラムを動かす ──
+  const programs = (): MenuItem[] => [
+    // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
+    {
+      label: "外部プログラム（データを通す）...",
+      hint: "手持ちのコマンドラインツールをカードにします。入力を受けて結果を返すフィルタ・単発のコマンド・ジェネレータの別は設定で選びます。",
+      onClick: () => a.addFilter("external"),
+    },
     // シェルカード統合（2026-07-06）: シェル種別・コマンド・ウィンドウは設定ダイアログで選ぶ。
     {
       label: "コマンドプロンプト / PowerShell ...",
       hint: "シェルでコマンドを実行するカードを追加します。ウィンドウを開いたまま対話・実行して閉じる・ウィンドウなしで結果をパネル表示、を設定で選べます。",
       onClick: () => a.addFilter("shell"),
     },
-    // ── フィルタ（データ→フィルタ→結果のパイプ）──
-    // v1.5.12 メニュー再編: 役割別（生成/テキスト/メディア）のサブメニューを第一階層に。
-    // 「生成」は t2x ファミリー（3D/音源/動画）の受け皿（docs/生成カード群企画.md）。
-    { label: "── フィルタ ──", onClick: () => {}, disabled: true },
+    DIV,
+    { label: "アプリを起動（インストール済みから選択）...", onClick: () => a.addLauncher("installed") },
+    { label: "アプリを起動（.exe を選択）...", onClick: () => a.addLauncher("program") },
+    DIV,
     {
-      label: "生成（AI・画像生成）...",
-      onClick: () =>
-        a.openSubmenu([
-          {
-            label: "🤖 エージェント（話しかけると調べる・組む・動かす）...",
-            hint: "カードの下の欄で頼むと、AI が道具（索引で調べる・ファイルを読む・フローを組む・実行する）を選んで進めます。",
-            onClick: () => a.addFilter("agent"),
-          },
-          { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog") },
-          { label: "AI変換（一発・MD出力）...", onClick: () => a.addFilter("ai_chat") },
-          // v1.12 ④（docs/V1.12_声の窓口と思考役計画.md §6）
-          {
-            label: "コンストラクタ（依頼からカードフローを組む）...",
-            hint:
-              "つないだ依頼を読み、AI がカードの設計図を書いて、配線の決まりで検査し、このプロジェクトに並べます。" +
-              "音声カードからリクエスト矢印でつなげば「〜するフローを構築して」と話すだけで並びます。",
-            onClick: () => a.addFilter("construct"),
-          },
-          // V1.13 P1 RAG（docs/V1.13_エージェントカード計画.md §5）
-          {
-            label: "📚 文書の索引（RAG・フォルダ→索引）...",
-            hint:
-              "フォルダの文書（md / txt / PDF / Word など・下の階層まで）や、つないだカードを切り分けて埋め込み、索引にします。" +
-              "変わった文書だけ作り直します。埋め込みモデルは Ollama の bge-m3 が既定（`ollama pull bge-m3`）。",
-            onClick: () => a.addFilter("rag_index"),
-          },
-          {
-            label: "🔎 文書検索（RAG・問い→近い箇所）...",
-            hint:
-              "問いに近い箇所を索引から上位いくつか、出典つきで取り出します。索引カードをつなぐとその索引を使います。" +
-              "結果を AI カードにつなげば「手元の資料に基づいて答える」流れになります。",
-            onClick: () => a.addFilter("rag_search"),
-          },
-          { label: "画像生成 Text-To-Image（テキスト→画像）...", onClick: () => a.addFilter("t2i") },
-          // v2.0 t23d: G層2例目（Hunyuan3D-2・V2.0_t23d設計.md）。
-          {
-            label: "3D生成 Image-To-3D（画像→3Dモデル）...",
-            hint: "接続した画像から 3D モデル（.glb）を生成します。エンジンは Hunyuan3D-2 WinPortable（初回に場所を設定）。",
-            onClick: () => a.addFilter("t23d"),
-          },
-        ]),
+      label: "新規カードを登録（フォルダの未登録ファイル）",
+      hint: "フォルダ直下の未登録ファイルをカードとして登録します。ウォッチャのリクエスト矢印の先に置くと、アプリの書き出しやドロップされたファイルが自動でキャンバスに現れます。",
+      onClick: () => a.addFilter("import_new"),
     },
-    {
-      label: "テキスト ...",
-      onClick: () =>
-        a.openSubmenu([
-          { label: "grep（正規表現で行を抽出）...", onClick: () => a.addFilter("text_grep") },
-          { label: "置換（正規表現）...", onClick: () => a.addFilter("text_replace") },
-          // v1.5.12 P1: Unix標準テキストフィルタ（標準フィルタ充実検討 §3）。
-          { label: "先頭N行（head）...", onClick: () => a.addFilter("text_head") },
-          { label: "末尾N行（tail）...", onClick: () => a.addFilter("text_tail") },
-          { label: "並べ替え（sort）", onClick: () => a.addFilter("text_sort") },
-          { label: "行数・単語数・文字数（wc）", onClick: () => a.addFilter("text_count") },
-          { label: "列の取り出し（cut）...", onClick: () => a.addFilter("text_cut") },
-          { label: "文字コード変換（→UTF-8）", onClick: () => a.addFilter("text_convert") },
-          // v1.5.17 P2: 集約系（複数入力を1回で受ける。標準フィルタ充実検討 §3 第2候補）。
-          {
-            label: "連結（cat・複数入力）",
-            hint: "接続したすべてのテキストを矢印の接続順に連結します。区切り（改行/空行/---）は設定で。",
-            onClick: () => a.addFilter("text_concat"),
-          },
-          {
-            label: "差分（diff・2入力）",
-            hint: "2つのテキストの差分を unified 形式で出します。接続順が 入力1=旧・入力2=新。",
-            onClick: () => a.addFilter("text_diff"),
-          },
-          {
-            label: "行の横結合（paste・複数入力）",
-            hint: "各入力の同じ行番号を区切り文字で横に並べます（TSV/CSV の列組み立て）。",
-            onClick: () => a.addFilter("text_paste"),
-          },
-          {
-            label: "コードブロック抽出（MD→ソース）...",
-            hint: "Markdown のコードフェンス(```)から中身を取り出します。AI出力をコンパイラ等へ渡す前段に。",
-            onClick: () => a.addFilter("md_codeblock"),
-          },
-          // pfpdf: Markdown を表紙・目次つきの PDF に組版（要 Node.js・npx で取得）。
-          {
-            label: "PDF組版（Markdown→PDF・pfpdf）...",
-            hint: "Markdown を表紙・目次つきの PDF に組版します（日本語組版・数式・コード・Mermaid 対応）。テンプレートを選んでください。Node.js 22.12 以降が必要で、初回は pfpdf を npm から取得します。",
-            onClick: () =>
-              a.openSubmenu(
-                (
-                  [
-                    ["default", "標準"],
-                    ["pfn", "PFN 風・青い表紙"],
-                    ["technical", "技術文書"],
-                    ["academic", "論文"],
-                    ["book", "書籍"],
-                    ["notebook", "ノート"],
-                    ["compact", "詰めた版面"],
-                  ] as const
-                ).map(([t, desc]) => ({
-                  label: `${t}（${desc}）`,
-                  onClick: () => a.addFilter(`pfpdf:${t}`),
-                }))
-              ),
-          },
-        ]),
-    },
-    {
-      label: "メディア（画像・音声・動画）...",
-      onClick: () =>
-        a.openSubmenu([
-          { label: "画像: リサイズ（幅指定）...", onClick: () => a.addFilter("img_resize") },
-          { label: "画像: 形式変換...", onClick: () => a.addFilter("img_convert") },
-          // v1.3.11 #4/#5: ffmpeg を使う音声/動画の簡易編集（要 ffmpeg）。
-          { label: "音声: 長さでクリップ...", onClick: () => a.addFilter("audio_clip") },
-          { label: "音声: ノーマライズ", onClick: () => a.addFilter("audio_norm") },
-          // v1.4.9: マイク録音（録音→「停止」で確定。デバイスはサブメニューで選ぶ）。
-          {
-            label: "音声: マイク録音（録音→停止で確定）...",
-            onClick: () =>
-              a.openSubmenu(
-                ctx.audioDevices.length
-                  ? ctx.audioDevices.map((d) => ({
-                      label: `🎙 ${d}`,
-                      onClick: () => a.addFilter(`mic_record:${d}`),
-                    }))
-                  : [
-                      {
-                        label: "（マイクが見つかりません／ffmpeg 未検出）",
-                        onClick: () => {},
-                        disabled: true,
-                      },
-                    ]
-              ),
-          },
-          // v1.4.8 ①: Whisper の入力アダプタ（m4a/動画/ステレオ → 16kHz mono WAV）と本体。
-          { label: "音声: Whisper用WAVに変換（16kHz mono）", onClick: () => a.addFilter("to_wav16k") },
-          { label: "音声: Whisper 文字起こし（→テキスト）...", onClick: () => a.addFilter("whisper") },
-          { label: "動画: 長さでクリップ...", onClick: () => a.addFilter("video_clip") },
-        ]),
-    },
-    // v1.7 P1 情報収集経路（Webの実身化）。「OS機能 ...」と同格のグループ。
-    // P3 web_feed（RSS）・P4 web_capture（スクショ）はこのサブメニューに追記していく。
-    {
-      label: "Web ...",
-      onClick: () =>
-        a.openSubmenu([
-          // Web検索 P2: 検索語 → 結果一覧 Markdown（検索エンジンは SearXNG・未導入なら先に導入）。
-          {
-            label: "Web検索（キーワード→結果一覧）...",
-            hint: "検索語（1行=1検索語）で検索し、タイトル・URL・抜粋の一覧を Markdown 1枚にします。検索語はパラメータ欄に書くか、テキストカードや AI の出力を接続します。結果を AI カードに渡せばレポートに、URLカード化に繋げばリンク集になります。初回は検索エンジンの導入（1クリック）から。",
-            onClick: () => a.addFilter("web_search"),
-          },
-          // Web検索 P1: 検索エンジン（SearXNG）の導入・管理。
-          {
-            label: "Web検索エンジンの管理（SearXNG）...",
-            hint: "キーワード検索に使う検索エンジン（SearXNG）を、この PC の中だけで動かします。未導入なら「導入する」1回で自動で組み立てます（約200MB・API キー／Docker 不要）。試験検索・停止・入れ直しもここから。",
-            onClick: () => a.addFilter("searxng_manage"),
-          },
-          {
-            label: "ページ取得（URL→Markdown実身）...",
-            hint: "URLの本文を抽出して Markdown 実身にします（タイトル=カード名）。URLはパラメータ欄に直書きするか、URLを書いたテキストカードを接続します。画像・CSV などの直リンクはそのままの形式で取り込みます。",
-            onClick: () => a.addFilter("web_fetch"),
-          },
-          // v1.7 P3: RSS/Atom → 記事カード群（1記事=1カード・再実行は新着のみ）。
-          {
-            label: "フィード取得（RSS/Atom→記事カード）...",
-            hint: "フィードの記事ごとに「タイトル＋概要＋記事リンク」の Markdown 実身を作ります（1記事=1カード）。再実行すると新着だけを取り込みます（差分取得）。本文が欲しい記事は web_fetch で。",
-            onClick: () => a.addFilter("web_feed"),
-          },
-          // v1.7 P4: ページのスクリーンショット（L2・OS の Edge/Chrome をヘッドレスで使用）。
-          {
-            label: "ページキャプチャ（URL→PNG実身）...",
-            hint: "ページの見た目をそのまま PNG 実身にします（OS 搭載の Edge/Chrome をヘッドレスで使用・同梱しません）。ページ取得が本文（テキスト）、こちらは見た目（画像）。",
-            onClick: () => a.addFilter("web_capture"),
-          },
-          // v1.7 P5: テキスト→URLカード群（リンクの量産）。受け皿（1枚更新）は
-          // フィルタ→URLカードへ矢印を引くだけ（フィルタ不要）。
-          {
-            label: "URLカード化（テキスト→リンク）",
-            hint: "入力テキストの中の URL を全部拾って、URL リンクカードにします（1 URL = 1カード・出したことのあるリンクは増やしません）。フィード取得と繋ぐと記事のリンク集に。1枚のリンクカードを更新し続けたいときは、フィルタから既存の URL カードへ矢印を引いてください。",
-            onClick: () => a.addFilter("to_url"),
-          },
-        ]),
-    },
-    // v1.5.15 L2 OSアダプタ・ビルトイン（標準フィルタ充実検討 §4: OS差はbuiltinの内側に閉じ込める）。
-    {
-      label: "OS機能 ...",
-      onClick: () =>
-        a.openSubmenu([
-          {
-            label: "読み上げ（speak）",
-            hint: "テキストを OS の音声合成で読み上げます（Windows=SAPI / macOS=say / Linux=espeak）。読み上げるだけで完結し、出力カードは作りません。",
-            onClick: () => a.addFilter("speak"),
-          },
-          {
-            label: "新規カードを登録",
-            hint: "フォルダ直下の未登録ファイルをカードとして登録します。ウォッチャのリクエスト矢印の先に置くと、アプリの書き出しやドロップされたファイルが自動でキャンバスに現れます。",
-            onClick: () => a.addFilter("import_new"),
-          },
-        ]),
-    },
-    // v1.5: フィルタ/コマンド/ジェネレータの別は設定ダイアログの Type で選ぶ
-    { label: "外部プログラム...", onClick: () => a.addFilter("external") },
-    // ── オペレーション（v1.5.4 WS-P2: 発行系 — フローを「起動する」カード）──
-    { label: "── オペレーション ──", onClick: () => {}, disabled: true },
-    {
-      label: "制御（セレクタ・ドロップポイント）...",
-      onClick: () =>
-        a.openSubmenu([
-          {
-            label: "セレクタ（最初の有データ枝を採用）",
-            hint: "入力の順に見て、最初にデータを返した枝を採用します。成功枝/失敗枝の合流点（矢印の通過条件と組み合わせて使います）。",
-            onClick: () => a.addFilter("select"),
-          },
-          {
-            label: "ドロップポイント（データ入口・自動実行）",
-            hint: "ファイルやカードを落とすと、つないだ下流フローを自動実行するデータ投入口です。",
-            onClick: () => a.addFilter("drop_point"),
-          },
-          {
-            label: "記録（途中を残す・素通し）",
-            hint:
-              "矢印の途中に置きます。データはそのまま下流へ通しながら、通った中身を" +
-              "ファイルに書き出してカードにします（同じ名前で毎回上書き）。\n" +
-              "フローの途中の結果はふつう残らないので、1周流したあとに「何がどう変わったか」を" +
-              "読み返したいところに置いてください。",
-            onClick: () => a.addFilter("tap"),
-          },
-          {
-            label: "問い合わせ（途中で人に聞く）",
-            hint:
-              "実行がここまで来たら、いったん人の答えを待ちます。矢印は2種類つなぎます — " +
-              "ふつうの矢印で「何について聞くか（材料）」を送り、付箋を「役割＝答え」の矢印で" +
-              "繋いでそこに答えを書きます（答えの付箋を用意していなければ、最初の実行で" +
-              "作られます）。書いてから、もう一度 ▶ を押してください。\n" +
-              "前か後ろでしか口を挟めなかったフローに、途中で判断を入れるためのカードです。",
-            onClick: () => a.addFilter("ask"),
-          },
-          {
-            label: "反復（納得するまで繰り返す）",
-            hint:
-              "上流のカードをもう一度たどり直します。判定 → 直して判定、のように" +
-              "「練り直す」流れが描けます。\n" +
-              "作り方: ①このカードの入力に、繰り返したい流れの出口をつなぐ ②このカードから" +
-              "戻したい上流のカードへ矢印を引き、その矢印を「役割＝前周の結果」にする。\n" +
-              "止まり方は、最大周回数（暴走止め・必須）と、出力に現れたら終わりにする語です。",
-            onClick: () => a.addFilter("loop"),
-          },
-        ]),
-    },
-    {
-      label: "発行（トリガ・タイマ・ウォッチャ・音声）...",
-      onClick: () =>
-        a.openSubmenu([
-          {
-            label: "トリガ（設置型▶・一括発行）",
-            hint: "▶を押すと、リクエスト矢印の先につないだフィルタを実行します。複数につなげば一括発行できます。",
-            onClick: () => a.addFilter("op_trigger"),
-          },
-          {
-            label: "タイマ（周期・時刻で発行）...",
-            hint: "指定した周期（秒）または時刻（HH:MM）に、矢印の先のフィルタを自動実行します。発火間隔の下限と累計回数の上限（ヒューズ）付き。",
-            onClick: () => a.addFilter("op_timer"),
-          },
-          {
-            label: "ウォッチャ（ファイル監視で発行）...",
-            hint: "ファイルやフォルダを監視し、作成・更新を検出したら矢印の先のフィルタを自動実行します。静穏時間（debounce）とヒューズ付き。",
-            onClick: () => a.addFilter("op_watch"),
-          },
-          {
-            label: "音声（話しかけて発行・声で報告）...",
-            hint: "稼働中はマイクで聞き取り、リクエスト矢印の先のカード名（言い回し）を含む発話でそのフローを実行し、完了・失敗を声で報告します。言い回しを除いた中身は書き出し先のファイル（既定 音声/発話.txt）に入ります。",
-            onClick: () => a.addFilter("op_voice"),
-          },
-          {
-            label: "会話へ送る（テキストを会話コマンドへ）",
-            hint: "フローの終端に置くと、流れてきたテキストを話しかけたのと同じ扱いで稼働中の会話コマンドへ渡します。音声ファイル→文字起こし→ここ、で録音も扱えます。",
-            onClick: () => a.addFilter("voice_send"),
-          },
-        ]),
-    },
-    // v1.5.6 WS-M M1（§9.1 手動設置）: 先に入口・出口を置いて中を組む。
-    {
-      label: "モジュールの口（IN・OUT）...",
-      onClick: () =>
-        a.openSubmenu([
-          {
-            label: "IN（モジュールの入口）",
-            hint: "データの入口カード。外から来るフロー矢印をここに受け、中のフィルタへ流します（素通し）。モジュールの差し替え可能な口になります。",
-            onClick: () => a.addFilter("op_in"),
-          },
-          {
-            label: "OUT（モジュールの出口・▶実行）",
-            hint: "データの出口カード。▶を押すと上流をさかのぼって実行し、結果カードが横に生まれます（何度でも押せる口）。",
-            onClick: () => a.addFilter("op_out"),
-          },
-        ]),
-    },
-    // ── ユーザーのカード（ライブラリ登録済み・登録があるときだけ）──
-    ...(ctx.launcherLibrary.length || ctx.library.length
+  ];
+
+  // ── 自分の部品（ライブラリ・モジュールの口）──
+  const hasCards = ctx.launcherLibrary.length > 0 || ctx.library.length > 0;
+  const hasModules = ctx.moduleLibrary.length > 0;
+  const editHint = a.manage
+    ? "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。"
+    : undefined;
+  const mine = (): MenuItem[] => [
+    ...(hasCards
       ? [
-          {
-            label: "── ユーザーのカード ──",
-            hint: a.manage
-              ? "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。"
-              : undefined,
-            onClick: () => {},
-            disabled: true,
-          },
+          { label: "── 登録したカード ──", hint: editHint, onClick: () => {}, disabled: true },
           ...groupBySlash(
             [
               ...ctx.launcherLibrary.map((name) => ({
@@ -1635,21 +1606,14 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
                 alt: a.manage ? (n: string) => a.manage!.libAlt("filter", n) : undefined,
               })),
             ],
-            (items) => a.openSubmenu(items)
+            (items) => nested(mine, items)
           ),
         ]
       : []),
-    // ── ユーザーのモジュール（v1.5.8 WS-M M2・§10.1）──
-    ...(ctx.moduleLibrary.length
+    // ── モジュール（v1.5.8 WS-M M2・§10.1）──
+    ...(hasModules
       ? [
-          {
-            label: "── ユーザーのモジュール ──",
-            hint: a.manage
-              ? "項目を右クリックすると名前の編集ができます（「カテゴリ/名前」でメニューを畳む・既存カテゴリへ移動）。"
-              : undefined,
-            onClick: () => {},
-            disabled: true,
-          },
+          { label: "── モジュール ──", hint: editHint, onClick: () => {}, disabled: true },
           ...groupBySlash(
             ctx.moduleLibrary.map((name) => ({
               name,
@@ -1658,17 +1622,40 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
               pick: (n: string) => a.addLibraryModule(n),
               alt: a.manage ? (n: string) => a.manage!.libAlt("module", n) : undefined,
             })),
-            (items) => a.openSubmenu(items)
+            (items) => nested(mine, items)
           ),
         ]
       : []),
-    ...(a.manage && (ctx.launcherLibrary.length || ctx.library.length || ctx.moduleLibrary.length)
+    ...(!hasCards && !hasModules
       ? [
+          {
+            label: "（まだ登録がありません）",
+            hint: "カードを右クリック →「ライブラリに登録」で、ここに自分の部品として並びます。",
+            onClick: () => {},
+            disabled: true,
+          },
+        ]
+      : []),
+    // v1.5.6 WS-M M1（§9.1 手動設置）: 先に入口・出口を置いて中を組む。
+    { label: "── モジュールの口 ──", onClick: () => {}, disabled: true },
+    {
+      label: "IN（モジュールの入口）",
+      hint: "データの入口カード。外から来るフロー矢印をここに受け、中のフィルタへ流します（素通し）。モジュールの差し替え可能な口になります。",
+      onClick: () => a.addFilter("op_in"),
+    },
+    {
+      label: "OUT（モジュールの出口・▶実行）",
+      hint: "データの出口カード。▶を押すと上流をさかのぼって実行し、結果カードが横に生まれます（何度でも押せる口）。",
+      onClick: () => a.addFilter("op_out"),
+    },
+    ...(a.manage && (hasCards || hasModules)
+      ? [
+          DIV,
           {
             label: "ライブラリから削除 ...",
             danger: true,
             onClick: () =>
-              a.openSubmenu([
+              nested(mine, [
                 ...ctx.launcherLibrary.map((name) => ({
                   label: `🚀 ${name} を削除`,
                   danger: true,
@@ -1688,6 +1675,49 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
           },
         ]
       : []),
+  ];
+
+  return [
+    {
+      label: "🤖 AI に頼む ...",
+      hint: "エージェント・AI との対話・AI による変換・依頼からフローを組むコンストラクタ。",
+      onClick: () => open(askAi()),
+    },
+    {
+      label: "🔎 調べる・集める ...",
+      hint: "Web 検索・ページやフィードの取得・手元の文書の索引と検索。",
+      onClick: () => open(gather()),
+    },
+    {
+      label: "📝 文章を加工する ...",
+      hint: "行の抽出・置換・並べ替え・連結・差分・文字コード変換・PDF 組版など。",
+      onClick: () => open(text()),
+    },
+    {
+      label: "🖼 画像・3D を作る ...",
+      hint: "画像生成・3D 生成・画像のリサイズと形式変換。",
+      onClick: () => open(image()),
+    },
+    {
+      label: "🎙 音声・動画 ...",
+      hint: "録音・文字起こし・読み上げ・クリップ・ノーマライズ。",
+      onClick: () => open(media()),
+    },
+    {
+      label: "🔀 流れを組む ...",
+      hint: "途中の制御（セレクタ・記録・問い合わせ・反復）と、フローを起動するきっかけ（トリガ・タイマ・ウォッチャ・音声）。",
+      onClick: () => open(control()),
+    },
+    {
+      label: "⚙ プログラムを動かす ...",
+      hint: "外部プログラム・コマンドプロンプト / PowerShell・アプリの起動・フォルダの新規ファイルの登録。",
+      onClick: () => open(programs()),
+    },
+    {
+      label: "📦 自分の部品 ...",
+      hint: "ライブラリに登録したカードとモジュール、モジュールの入口・出口（IN / OUT）。",
+      onClick: () => open(mine()),
+    },
   ];
 }
 
@@ -1870,6 +1900,12 @@ export function buildCanvasMenu(
     },
 
     {
+      // v2.0 メニュー再編: 設定はカードの一覧に混ぜない（旧「Web ...」から移動）。
+      label: "Web検索エンジンの管理（SearXNG）...",
+      hint: "キーワード検索に使う検索エンジン（SearXNG）を、この PC の中だけで動かします。未導入なら「導入する」1回で自動で組み立てます（約200MB・API キー／Docker 不要）。試験検索・停止・入れ直しもここから。",
+      onClick: () => a.addFilter("searxng_manage", pos.canvasX, pos.canvasY),
+    },
+    {
       label: "ショートカット一覧（?）",
       hint: "キーボードショートカットの一覧を表示します（? または F1 キーでも開閉できます）。",
       onClick: () => a.showHelp(),
@@ -1980,8 +2016,8 @@ export function buildCanvasMenu(
     // v1.4.x ③: 自動化系（ランチャー／フィルタ／ユーザーのカード）は既に2〜3段深いので
     // トップに残す（追加サブへ畳むと最悪パスが4段になり「戻る」不在では使いにくい）。
     {
-      label: "自動化カードを追加 ...",
-      hint: "プログラムを起動するランチャーカードや、データを処理するフィルタカードを追加します。",
+      label: "カードを置く ...",
+      hint: "やりたいこと（AI に頼む・調べる・文章を加工する・流れを組む など）から選んで、処理のカードを置きます。",
       onClick: () => a.openSubmenu(automationAddSub),
     },
     DIV,
