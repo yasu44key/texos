@@ -89,6 +89,7 @@ import {
 } from "./model";
 import { useUndo, type UndoAction } from "./hooks/useUndo";
 import { useSelection } from "./hooks/useSelection";
+import { useEditLock, EditLockLayer } from "./hooks/useEditLock";
 import {
   buildAlignItems,
   buildAutomationAddSub,
@@ -688,6 +689,19 @@ function App() {
       setView(null);
     }
   }, [project, refresh, resetStacks, loadStacks]);
+
+  // v2.1 編集権と「表示のみ」: 複数の PC で同じプロジェクトを開いたままにする運用。
+  // 操作した PC が編集権を取り、他の PC は読み取り専用で変更を追いかける。
+  const editLock = useEditLock({
+    projectPath: project?.path ?? null,
+    refresh,
+    onTook: () => {
+      // 他の PC が進めた内容とアンドゥ履歴を読み直してから編集を始める。
+      resetStacks();
+      loadStacks();
+      void refresh();
+    },
+  });
 
   // v1.4.22 ②: プロジェクト間コピー/移動の後、送り先プロジェクトを開いたら送った物を
   // 選択状態で迎えてビューを寄せる。元の座標のまま既存カードと重なっていても、選択
@@ -6281,6 +6295,23 @@ function App() {
             localStorage.setItem("texos-debug-trace", nv ? "1" : "0");
             return nv;
           }),
+        // v2.1: 操作が無いとき「表示のみ」へ切り替わるまでの時間。
+        setEditIdle: () => {
+          void invoke<number>("edit_get_idle_minutes")
+            .catch(() => 5)
+            .then((cur) =>
+              setPrompt({
+                title: "操作が無いとき「表示のみ」に切り替わるまでの時間（分・1〜240）",
+                initial: String(cur),
+                onConfirm: (v) => {
+                  const n = parseInt(v.trim(), 10);
+                  if (Number.isFinite(n) && n > 0) {
+                    void invoke("edit_set_idle_minutes", { minutes: n }).catch(() => {});
+                  }
+                },
+              })
+            );
+        },
         // v1.5.4 WS-P2: リクエスト矢印（req）の表示トグル（永続化）。
         toggleReqArrows: () =>
           setShowReqArrows((v) => {
@@ -7326,6 +7357,7 @@ function App() {
       {/* v1.5.2 WS-C 背景ジョブパネル: 実行中ジョブの一覧＋個別停止/中断＋Stop-all。
           プロジェクト切替後も残る（最後の物理停止＝自律安全 §6.3）。 */}
       <JobsPanel jobs={jobs} />
+      <EditLockLayer status={editLock.status} takeover={editLock.takeover} />
       {prompt && (
         <PromptDialog
           title={prompt.title}

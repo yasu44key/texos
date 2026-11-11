@@ -544,11 +544,13 @@ pub(crate) fn set_expanded(id: String, expanded: bool, state: State<AppState>) -
 /// Save the canvas view transform (pan/zoom) for this project.
 #[tauri::command]
 pub(crate) fn set_view_transform(x: f64, y: f64, scale: f64, state: State<AppState>) -> Result<(), String> {
-    let guard = state.current.lock().unwrap();
-    let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
-    let json = serde_json::to_string(&ViewTransform { x, y, scale }).map_err(|e| e.to_string())?;
-    db::meta_set(&p.conn, "view_transform", &json).map_err(|e| e.to_string())?;
-    Ok(())
+    // v2.1: 表示位置・倍率は PC ごと（app_data/viewports.json）。プロジェクトの DB へは
+    // 書かない＝見るだけで書き込みが起きず、別の PC の表示位置も動かない。
+    let root = {
+        let guard = state.current.lock().unwrap();
+        guard.as_ref().ok_or("プロジェクトが開かれていません")?.root.clone()
+    };
+    crate::editlock::viewport_set(&state.app_data, &root, &ViewTransform { x, y, scale })
 }
 
 /// Load the saved canvas view transform, if any.
@@ -556,6 +558,10 @@ pub(crate) fn set_view_transform(x: f64, y: f64, scale: f64, state: State<AppSta
 pub(crate) fn get_view_transform(state: State<AppState>) -> Result<Option<ViewTransform>, String> {
     let guard = state.current.lock().unwrap();
     let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
+    // v2.1: この PC の保存値が先。無ければ従来の DB の値（旧版で保存した位置）で始める。
+    if let Some(t) = crate::editlock::viewport_get(&state.app_data, &p.root) {
+        return Ok(Some(t));
+    }
     match db::meta_get(&p.conn, "view_transform").map_err(|e| e.to_string())? {
         Some(s) => Ok(serde_json::from_str(&s).ok()),
         None => Ok(None),

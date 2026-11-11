@@ -189,7 +189,7 @@ pub(crate) fn new_project(path: String, state: State<AppState>) -> Result<Projec
     let starter = read_config(&state.app_data).starter_cards.unwrap_or(true);
     let project = create_new_project_at(&root, starter)?;
     let info = project_info(&root);
-    *state.current.lock().unwrap() = Some(project);
+    crate::editlock::set_current_project(state.inner(), project);
     add_recent(&state.app_data, &info.path);
     Ok(info)
 }
@@ -219,7 +219,7 @@ pub(crate) fn open_project(path: String, state: State<AppState>) -> Result<Proje
     }
     let project = open_project_at(&root)?;
     let info = project_info(&root);
-    *state.current.lock().unwrap() = Some(project);
+    crate::editlock::set_current_project(state.inner(), project);
     add_recent(&state.app_data, &info.path);
     Ok(info)
 }
@@ -827,7 +827,7 @@ pub(crate) fn open_project_object(id: String, state: State<AppState>) -> Result<
     }
     let project = open_project_at(&root)?;
     let info = project_info(&root);
-    *state.current.lock().unwrap() = Some(project);
+    crate::editlock::set_current_project(state.inner(), project);
     add_recent(&state.app_data, &info.path);
     Ok(info)
 }
@@ -854,7 +854,7 @@ pub(crate) fn open_origin_project(
             let root = d.to_path_buf();
             let project = open_project_at(&root)?;
             let info = project_info(&root);
-            *state.current.lock().unwrap() = Some(project);
+            crate::editlock::set_current_project(state.inner(), project);
             add_recent(&state.app_data, &info.path);
             return Ok(Some(info));
         }

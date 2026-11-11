@@ -587,6 +587,17 @@ fn idempotent(b: &Bridge, method: &str, params: &Value, f: impl FnOnce() -> R) -
 }
 
 fn dispatch(b: &Bridge, method: &str, params: &Value) -> R {
+    // v2.1: この PC が「表示のみ」（編集権は別の PC）の間、書き込む操作は受けない。
+    const WRITES: &[&str] = &[
+        "create_note", "update_note", "create_card", "update_card", "move_card", "connect",
+        "update_relation", "disconnect", "import_file", "run_card",
+    ];
+    if WRITES.contains(&method) {
+        use tauri::Manager;
+        let state: tauri::State<AppState> = b.app.state();
+        crate::editlock::ensure_editable(state.inner())
+            .map_err(|m| McpErr::new("view_only", &m))?;
+    }
     match method {
         "ping" => Ok(json!({ "pong": true })),
         "status" => status(b),

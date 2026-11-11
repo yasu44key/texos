@@ -2732,6 +2732,8 @@ pub(crate) fn run_flow_job(
 ) -> Result<FlowReport, String> {
     use tauri::Manager;
     let state: State<AppState> = app.state();
+    // v2.1: 表示のみの PC からはフローを走らせない（結果を書けない）。
+    crate::editlock::ensure_editable(state.inner())?;
     let id = id.to_string();
     // v1.5.2 WS-C 並行解禁: 短ロックで終端カードとルートを読み、**同一終端カード**の Flow
     // だけを拒否して登録（v1.4.10 再入エラーの一般化）。別フローとは並行し、資源の
@@ -4082,6 +4084,7 @@ mod emit_mid_tests {
             write_locks: Mutex::new(std::collections::HashMap::new()),
             t2i_server: Mutex::new(None),
             t23d_server: Mutex::new(None),
+            edit: crate::editlock::EditLock::new(crate::editlock::DEFAULT_IDLE_SECS),
         };
         (dir, p, state)
     }

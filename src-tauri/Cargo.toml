@@ -1,6 +1,6 @@
 [package]
 name = "texos"
-version = "2.0.0"
+version = "2.1.0"
 description = "TexoS - 織り紡ぐ者たち"
 authors = ["Yoshiki Yasunaga"]
 edition = "2021"
@@ -82,6 +82,8 @@ windows = { version = "0.61", features = [
   # v1.4.28 WS3: GlobalMemoryStatusEx（RAM 総量検出）。
   "Win32_System_SystemInformation",
   "Win32_System_SystemServices",
+  # v2.1 編集権: 同じ PC の残骸ロックの見分け（OpenProcess / GetExitCodeProcess）。
+  "Win32_System_Threading",
   "Win32_UI_Shell",
   # v1.8.1 ドラッグアウト: SHCreateDataObject（シェル既製の IDataObject）が
   # ITEMIDLIST を引数に取るため Shell_Common が要る。SHDoDragDrop は Ole 側。

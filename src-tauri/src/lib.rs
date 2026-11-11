@@ -48,6 +48,8 @@ pub struct AppState {
     pub t2i_server: Mutex<Option<std::process::Child>>,
     /// v2.0 t23d: Hunyuan3D-2 常駐デーモン（t23d_server.py）の子プロセスハンドル。
     pub t23d_server: Mutex<Option<std::process::Child>>,
+    /// v2.1 編集権と「表示のみ」（editlock.rs）。
+    pub edit: editlock::EditLock,
 }
 
 /// プロジェクトルート単位の書き込み直列化ロックを取得（無ければ作る）。
@@ -566,6 +568,9 @@ struct Config {
     /// None（未設定）＝置く。false で置かない（starter.rs）。
     #[serde(default)]
     starter_cards: Option<bool>,
+    /// v2.1: 操作が無いと編集権を手放すまでの秒数。None＝既定（300秒）。
+    #[serde(default)]
+    edit_idle_secs: Option<u64>,
 }
 #[derive(Serialize)]
 pub struct ProjectInfo {
@@ -694,6 +699,8 @@ mod agent;
 mod mcp_bridge;
 // 新規プロジェクトの初期カード。crate::starter:: で参照（入口は project::create_new_project_at）。
 mod starter;
+// v2.1 編集権と「表示のみ」
+mod editlock;
 pub(crate) use ai::*;
 pub(crate) use clipboard_in::*;
 pub(crate) use filters::*;
@@ -735,8 +742,10 @@ pub fn run() {
                 .as_ref()
                 .filter(|p| texos_dir(Path::new(p)).join("texos.db").exists())
                 .and_then(|p| open_project_at(Path::new(p)).ok());
+            let idle_secs = config.edit_idle_secs.unwrap_or(editlock::DEFAULT_IDLE_SECS);
             app.manage(AppState {
                 current: Mutex::new(current),
+                edit: editlock::EditLock::new(idle_secs),
                 app_data: app_dir,
                 jobs: Jobs::new(),
                 resources: ResourceLimits::new(),
@@ -747,6 +756,12 @@ pub fn run() {
             // v1.5.4 WS-P2: オペ層スケジューラ（タイマ/ウォッチャの発火判定・tick 1秒・
             // 現在開いているプロジェクトの op カードだけが対象）。
             start_op_scheduler(app.handle().clone());
+            // v2.1 編集権: 起動時に開いたプロジェクトの編集権を（取れるなら）取り、見張りを始める。
+            {
+                let state: tauri::State<AppState> = app.state();
+                editlock::acquire(state.inner(), false);
+            }
+            editlock::start(app.handle().clone());
             // v1.11 MCP 接続: 設定でオンのときだけローカル IPC の口を開く（既定オフ）。
             mcp_bridge::init(app.handle().clone());
             Ok(())
@@ -948,10 +963,22 @@ pub fn run() {
             os_icon::get_os_icon,
             mcp_bridge::mcp_status,
             mcp_bridge::mcp_set_enabled,
+            editlock::edit_status,
+            editlock::edit_touch,
+            editlock::edit_takeover,
+            editlock::edit_get_idle_minutes,
+            editlock::edit_set_idle_minutes,
             install_drop_target
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // v2.1: 閉じるときに編集権を手放す（他の PC がすぐ引き継げるように）。
+            if let tauri::RunEvent::Exit = event {
+                let state: tauri::State<AppState> = app.state();
+                editlock::release(state.inner());
+            }
+        });
 }
 #[cfg(test)]
 mod text_decode_tests {

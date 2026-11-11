@@ -99,6 +99,8 @@ export interface MenuActions {
   toggleCardHints: () => void;
   /// v1.5.4 WS-P2: リクエスト矢印（req・破線琥珀）の表示トグル。
   toggleReqArrows: () => void;
+  /// v2.1: 操作が無いとき「表示のみ」へ切り替わるまでの時間を変える。
+  setEditIdle: () => void;
   switchProject: () => void;
   // v1.4.12: キーボードショートカット一覧（? / F1 でも開閉）。
   showHelp: () => void;
@@ -1883,6 +1885,12 @@ export function buildCanvasMenu(
       label: (ctx.showReqArrows ? "✓ " : "　") + "リクエスト矢印を表示",
       hint: "トリガ・タイマ・ウォッチャから引いたリクエスト矢印（破線）の表示/非表示を切り替えます。非表示でも発行は動き続けます。",
       onClick: () => a.toggleReqArrows(),
+    },
+    {
+      // v2.1 編集権: 複数の PC で開いたままにする運用向け。
+      label: "「表示のみ」になるまでの時間 ...",
+      hint: "しばらく操作が無いと、この PC は「表示のみ」になり編集権を手放します（別の PC でそのまま編集を始められます）。その時間を分で指定します。既定は5分。",
+      onClick: () => a.setEditIdle(),
     },
     {
       // v1.8.7 実行トレース: オンの間の実行は、各カードの入出力の中身（テキスト先頭4KB）・

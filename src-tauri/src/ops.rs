@@ -330,6 +330,7 @@ pub(crate) fn toggle_op_paused(id: String, state: State<AppState>) -> Result<boo
 #[tauri::command(async)]
 pub(crate) fn fire_op(id: String, app: tauri::AppHandle) -> Result<usize, String> {
     let state: State<AppState> = app.state();
+    crate::editlock::ensure_editable(state.inner())?;
     let targets = {
         let guard = state.current.lock().unwrap();
         let p = guard.as_ref().ok_or("プロジェクトが開かれていません")?;
@@ -601,6 +602,10 @@ pub(crate) fn start_op_scheduler(app: tauri::AppHandle) {
 
 fn tick(app: &tauri::AppHandle, rt: &mut HashMap<String, OpRuntime>) {
     let state: State<AppState> = app.state();
+    // v2.1: タイマ／ウォッチャを発火させるのは編集権を持つ PC だけ（表示のみの PC は発火しない）。
+    if !state.edit.can_write() {
+        return;
+    }
     // 短ロック①: op 一覧だけ読んですぐ放す。
     let ops: Vec<(String, String, String)> = {
         let guard = match state.current.lock() {
