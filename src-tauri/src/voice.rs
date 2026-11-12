@@ -1147,21 +1147,14 @@ fn stop_proc(app: &tauri::AppHandle, rt: &mut VoiceRt) {
     emit_event(app, &p.card, serde_json::json!({ "ev": "state", "state": "stopped" }));
 }
 
-fn spawn_proc(
-    app: &tauri::AppHandle,
-    rt: &mut VoiceRt,
-    root: &str,
-    card: &str,
-    sig: &str,
-    args: &[String],
-) -> Result<(), String> {
-    let state: State<AppState> = app.state();
-    let app_data = state.app_data.clone();
-    let py = env_python(&app_data, VOICE_ENV);
+/// 音声プロセス（voice_server.py）を起動する。音声カードとエージェントカードの聞き取りで共用
+/// （stdin / stdout は呼び出し側が取る・stderr は voice/<log_name>）。環境が無ければ Err("no_env")。
+pub(crate) fn spawn_server(app_data: &Path, args: &[String], log_name: &str) -> Result<Child, String> {
+    let py = env_python(app_data, VOICE_ENV);
     if !py.is_file() {
         return Err("no_env".into());
     }
-    let home = voice_home(&app_data);
+    let home = voice_home(app_data);
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let script = home.join("voice_server.py");
     std::fs::write(&script, VOICE_SERVER_PY)
@@ -1174,7 +1167,7 @@ fn spawn_proc(
         .env("PYTHONIOENCODING", "utf-8")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
-    match std::fs::File::create(home.join("server.log")) {
+    match std::fs::File::create(home.join(log_name)) {
         Ok(f) => c.stderr(std::process::Stdio::from(f)),
         Err(_) => c.stderr(std::process::Stdio::null()),
     };
@@ -1183,7 +1176,25 @@ fn spawn_proc(
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = c.spawn().map_err(|e| format!("音声プロセスの起動に失敗: {e}"))?;
+    c.spawn().map_err(|e| format!("音声プロセスの起動に失敗: {e}"))
+}
+
+/// 音声カードがマイクを使っているか（エージェントの聞き取りと同時には開かない）。
+pub(crate) fn voice_running() -> bool {
+    rt().lock().unwrap().proc.is_some()
+}
+
+fn spawn_proc(
+    app: &tauri::AppHandle,
+    rt: &mut VoiceRt,
+    root: &str,
+    card: &str,
+    sig: &str,
+    args: &[String],
+) -> Result<(), String> {
+    let state: State<AppState> = app.state();
+    let app_data = state.app_data.clone();
+    let mut child = spawn_server(&app_data, args, "server.log")?;
     let stdin = child.stdin.take().ok_or("音声プロセスの stdin を取れません")?;
     let stdout = child.stdout.take().ok_or("音声プロセスの stdout を取れません")?;
     rt.gen += 1;

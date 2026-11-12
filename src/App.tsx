@@ -7,6 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Canvas, screenToCanvas, type Transform, type CanvasApi } from "./canvas/Canvas";
 import { LinkLayer, center as nodeCenter, edgePoint as nodeEdgePoint, type NodeBox, type RelationInfo } from "./canvas/LinkLayer";
 import { ObjectCard, CARD_W, CARD_H } from "./objects/ObjectCard";
+import { AGENT_PANEL_W } from "./objects/AgentPanel";
 import { NoteCard } from "./objects/NoteCard";
 import { ShapeCard, type ShapeInfo } from "./objects/ShapeCard";
 import { ContextMenu, type MenuItem } from "./ui/ContextMenu";
@@ -1405,7 +1406,7 @@ function App() {
         return;
       }
       if (builtin === "agent") {
-        // V1.13 エージェントカード: 頭はコンストラクタと同じ既定（組む一手がコンストラクタを呼ぶ）。
+        // エージェントカード（声で壁打ち）: 頭の既定はコンストラクタと同じ接続先。
         setAiDlg({
           variant: "agent",
           id: null,
@@ -1415,7 +1416,7 @@ function App() {
             provider: "openai",
             model: "swift-1.5-iq2_xs",
             endpoint: "http://127.0.0.1:8080/v1",
-            max_steps: 8,
+            max_lookups: 3,
           }),
           create: { x: canvasX, y: canvasY, linkFrom },
         });
@@ -2943,7 +2944,8 @@ function App() {
       if (obj?.filter_ref) {
         try {
           const s = JSON.parse(obj.filter_ref);
-          if ((s.builtin === "ai" && s.mode === "chat") || s.builtin === "t2i") {
+          // エージェントカードも同じ流儀＝ダブルクリックで会話のパネルをトグル。
+          if ((s.builtin === "ai" && s.mode === "chat") || s.builtin === "t2i" || s.builtin === "agent") {
             const isOpen = expandedRef.current.has(id);
             invoke("set_expanded", { id, expanded: !isOpen }).catch(() => {});
             setExpanded((prev) => {
@@ -4485,6 +4487,8 @@ function App() {
   const layoutSize = useCallback(
     (o: VirtualBodyInfo): { w: number; h: number } => {
       if (!expanded.has(o.id)) return { w: CARD_W, h: CARD_H };
+      // エージェントカードの会話のパネル（AgentPanel.tsx・高さは会話の量で変わるので概算）。
+      if (o.filter_ref?.includes('"builtin":"agent"')) return { w: AGENT_PANEL_W, h: CARD_H + 8 + 480 };
       const isPdf = o.mime_type === "application/pdf" || (o.ext ?? "").toLowerCase() === "pdf";
       // v1.5.16: プレビューがリサイズ可能になったので panel_w/panel_h を反映
       // （画像・動画の高さはアスペクト追従＝幅からの概算。従来の既定比率を維持）。

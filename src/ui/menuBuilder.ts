@@ -1321,8 +1321,8 @@ export function buildAutomationAddSub(ctx: AutomationAddCtx, a: AutomationAddAct
   // ── AI に頼む ──
   const askAi = (): MenuItem[] => [
     {
-      label: "🤖 エージェント（話しかけると調べる・組む・動かす）...",
-      hint: "カードの下の欄で頼むと、AI が道具（索引で調べる・ファイルを読む・フローを組む・実行する）を選んで進めます。",
+      label: "🤖 エージェント（声で壁打ち・調べる・カードにまとめる）...",
+      hint: "話しかけると AI がすぐ返す壁打ちの相手です。必要なら手元の資料やウェブを調べ、会話のまとめをカードにして次のフローやコンストラクタへ渡せます。",
       onClick: () => a.addFilter("agent"),
     },
     { label: "AI対話（チャットパネル）...", onClick: () => a.addFilter("ai_dialog") },
@@ -1957,8 +1957,8 @@ export function buildCanvasMenu(
     {
       label: "🤖 エージェントを置く...",
       hint:
-        "話しかけられるカードを置きます。カードの下の欄で頼むと、答える・手元の資料を調べる・ファイルを読む・" +
-        "カードのフローを組んで実行する、を AI が選んで進めます。組んだフローはキャンバスに残ります。",
+        "声で壁打ちできるカードを置きます。話しかけると AI がすぐ返し、必要なら手元の資料やウェブを調べます。" +
+        "会話のまとめや返事の切り出しをカードにして、次のフローやコンストラクタへ渡せます。",
       onClick: () => a.addFilter("agent", pos.canvasX, pos.canvasY),
     },
     // ── 作成・配置系（よく使う。トップに残す）──

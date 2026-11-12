@@ -17,7 +17,7 @@ const GlbPreview = lazy(() =>
 );
 import { isTextMime, type RunAlert } from "../model";
 import { VoiceStatus } from "./VoiceStatus";
-import { AgentPanel } from "./AgentPanel";
+import { AgentBadge, AgentPanel } from "./AgentPanel";
 import { startCtrlCloneDrag } from "./ctrlCloneDrag";
 
 // Fixed card geometry so link endpoints are predictable from (x, y) alone.
@@ -210,7 +210,7 @@ const FILTER_TYPE_STYLES = {
     badge: "🏗 コンストラクタ",
     run: "▶ 構築",
   },
-  // V1.13 エージェントカード: 人と話す窓口なので声の窓口と同じ紫。▶ は無い（カードの下の欄で話す）。
+  // エージェントカード: 人と話す窓口なので声の窓口と同じ紫。▶ は無い（💬 話す でパネルを開いて話す）。
   agent: {
     bg: "var(--card-bg-live, #221a30)",
     border: "#7a5ab0",
@@ -381,6 +381,7 @@ export function ObjectCard({
   const isOpSched = ftype === "op_timer" || ftype === "op_watch" || ftype === "op_voice";
   const opPaused = isOpSched && opPausedOf(filterRef);
   const isAiChat = aiModeOf(filterRef) === "chat"; // v1.4.1 対話パネルを持つAIカード
+  const isAgent = ftype === "agent"; // 会話のパネルを持つ（ダブルクリックで開閉）
   const isT2i = isT2iOf(filterRef); // v1.4.17 インライン生成パネルを持つ画像生成カード
   const posRef = useRef({ x, y });
   posRef.current = { x, y };
@@ -645,6 +646,8 @@ export function ObjectCard({
           ? undefined
           : isAiChat
           ? `🤖 AI対話\nダブルクリック / 💬チャット: パネルを開く\n右クリック → 設定: モデル・システム変更${memo ? `\n\n${memo}` : ""}`
+          : isAgent
+          ? `🤖 エージェント（声で壁打ち）\nダブルクリック / 💬話す: パネルを開閉（聞き取りは閉じても続きます）\n右クリック → 設定: モデル・聞き取り・ウェブ検索${memo ? `\n\n${memo}` : ""}`
           : isT2i
           ? `🎨 画像生成\nダブルクリック: 生成パネル（プロンプト編集＋実行） ／ ボタン: フローを実行\n右クリック → 設定: モデル・パラメータ変更${memo ? `\n\n${memo}` : ""}`
           : isFilter
@@ -789,16 +792,16 @@ export function ObjectCard({
             {/* v1.3.9: 実行は明示ボタンで（ダブルクリックは設定）。誤爆を防ぐ。
                 v1.4.1: AI対話カードは「実行」ではなくチャットパネルを開く。
                 v1.5.4: op カードの▶はトリガのみ（run が空のタイマ/ウォッチャはボタンなし）。 */}
-            {isFilter && (isAiChat || fstyle.run) && (
+            {isFilter && (isAiChat || isAgent || fstyle.run) && (
               <button
                 onMouseDown={(e) => e.stopPropagation()}
                 onDoubleClick={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (isAiChat) onOpen?.(id);
+                  if (isAiChat || isAgent) onOpen?.(id);
                   else onRunFlow?.(id);
                 }}
-                title={isAiChat ? "チャットパネルを開きます" : "このフローを実行します"}
+                title={isAiChat ? "チャットパネルを開きます" : isAgent ? "会話のパネルを開閉します" : "このフローを実行します"}
                 style={{
                   marginTop: 2,
                   padding: "2px 12px",
@@ -812,7 +815,7 @@ export function ObjectCard({
                   fontFamily: "sans-serif",
                 }}
               >
-                {isAiChat ? "💬 チャット" : fstyle.run}
+                {isAiChat ? "💬 チャット" : isAgent ? "💬 話す" : fstyle.run}
               </button>
             )}
             {/* v1.5.5: タイマ/ウォッチャの稼働/停止トグル（構成中の誤発火防止スイッチ）。
@@ -1000,8 +1003,10 @@ export function ObjectCard({
       {ftype === "op_voice" && !opPaused && (
         <VoiceStatus id={id} top={CARD_H + 8} threshold={voiceThresholdOf(filterRef)} />
       )}
-      {/* V1.13 エージェントカード: 会話の欄はいつもカードの下に（置いたら話せる）。 */}
-      {ftype === "agent" && <AgentPanel id={id} top={CARD_H + 8} />}
+      {/* エージェントカード: ダブルクリックで会話のパネルを開閉（AI 対話と同じ流儀）。聞き取りは閉じても
+          続くので、閉じている間はカードの下に小さな印を出す。 */}
+      {isAgent && expanded && <AgentPanel id={id} label={label} top={CARD_H + 8} onClose={() => onCollapse?.(id)} />}
+      {isAgent && !expanded && <AgentBadge id={id} top={CARD_H + 4} />}
 
       {/* expansion — anchored to this card, moves with it */}
       {expanded && isAiChat && (

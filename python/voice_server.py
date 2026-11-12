@@ -212,6 +212,30 @@ def transcriber(model, jobs, hotwords):
         emit("state", state="listening")
 
 
+def load_model(name, compute, root):
+    """聞き取りのモデルを載せる。返り値＝(model, "cuda" | "cpu")。
+
+    auto は GPU を試し、実際に1回動かして確かめる（CUDA の DLL が欠けていると、読み込みは通って
+    文字起こしの時点で落ちる）。だめなら CPU に下げる。
+    """
+    import numpy as np
+    from faster_whisper import WhisperModel
+
+    if compute in ("auto", "cuda"):
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                m = WhisperModel(name, device="cuda", compute_type="float16", download_root=root)
+                segs, _ = m.transcribe(np.zeros(RATE, dtype="float32"), language="ja", beam_size=1)
+                list(segs)
+                return m, "cuda"
+            if compute == "cuda":
+                log("GPU（CUDA）が見つからないので CPU で聞き取ります")
+        except Exception as e:
+            log(f"GPU で聞き取れないので CPU に切り替えます: {e}")
+    return WhisperModel(name, device="cpu", compute_type="int8", download_root=root), "cpu"
+
+
 def parse_device(s):
     if s is None or str(s).strip() == "":
         return None
@@ -230,6 +254,10 @@ def main():
     ap.add_argument("--max-seconds", type=float, default=30)
     ap.add_argument("--report-gap", type=float, default=1.0)
     ap.add_argument("--hotwords", default="", help="聞き取りを寄せる語（コマンドの言い回し等・空白区切り）")
+    ap.add_argument("--compute", default="auto", choices=["auto", "cuda", "cpu"],
+                    help="聞き取りを動かす場所（auto＝GPU が使えれば GPU）")
+    ap.add_argument("--no-interrupt", action="store_true",
+                    help="読み上げ中は聞かない（スピーカーの音を自分で拾う環境向け）")
     a = ap.parse_args()
 
     home = Path(a.home)
@@ -243,8 +271,7 @@ def main():
         emit("error", message=f"音声ライブラリが未導入です（環境を構築してください）: {e}")
         return 2
     try:
-        model = WhisperModel(a.whisper_model, device="cpu", compute_type="int8",
-                             download_root=str(home / "models"))
+        model, where = load_model(a.whisper_model, a.compute, str(home / "models"))
     except Exception as e:
         emit("error", message=f"音声認識モデルを準備できません（初回はネット接続が必要）: {e}")
         return 1
@@ -283,7 +310,7 @@ def main():
     except Exception as e:
         emit("error", message=f"マイクを開けません: {e}")
         return 1
-    emit("ready", model=a.whisper_model)
+    emit("ready", model=a.whisper_model, device=where)
     emit("state", state="listening")
 
     pre = deque(maxlen=6)  # 冒頭の取りこぼし防止（最大300ms）
@@ -347,7 +374,11 @@ def main():
             voiced = level >= thr
             if voiced:
                 last_voice = now
-            if not recording:
+            if speaking and a.no_interrupt and not recording:
+                # 読み上げ中は聞かない（自分の声を発話と取り違えない）。
+                pre.clear()
+                voiced_blocks = 0
+            elif not recording:
                 pre.append(data)
                 voiced_blocks = voiced_blocks + 1 if voiced else 0
                 # 読み上げ中は自分の声を拾わないよう 3 ブロック（約150ms）続いたら割り込みとみなす。

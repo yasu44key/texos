@@ -579,8 +579,7 @@ pub fn run_speak(input: &[u8]) -> Result<(), String> {
     speak_child(input).map(|_| ())
 }
 
-/// 読み上げを始めて、そのプロセスを返す（V1.13 エージェントのおしゃべりモード: 読み上げの間は
-/// 聞き取りを止めるので、終わりを待つ・途中で止める必要がある）。
+/// 読み上げを始めて、そのプロセスを返す（呼び出し側が終わりを待つ・途中で止めるため）。
 pub fn speak_child(input: &[u8]) -> Result<std::process::Child, String> {
     let text = String::from_utf8_lossy(input);
     if text.trim().is_empty() {

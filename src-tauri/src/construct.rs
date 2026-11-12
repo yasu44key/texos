@@ -79,7 +79,7 @@ pub(crate) struct ExFile {
 }
 
 /// AI に見せる既存のファイルカード（新しい順・上限 80 枚）。URL・フォルダ・プロジェクトの窓は除く。
-/// V1.13 エージェントカードも同じ一覧を「読む」道具の選択肢に使う（F1, F2 …）。
+/// エージェントカードも同じ一覧を「読む」の相手に使う（名前で選ぶ・agent.rs）。
 pub(crate) fn existing_files(p: &Project) -> Vec<ExFile> {
     let Ok(mut st) = p.conn.prepare(
         "SELECT v.id, v.label, COALESCE(v.mime_type, r.mime_type, '') FROM virtual_bodies v
@@ -445,16 +445,18 @@ pub(crate) fn run_construct(
     }
 }
 
-/// 構築の結果（V1.13: エージェントカードの「組む」もこれを呼ぶ＝ルールを2か所に置かない）。
+/// 構築の結果。title・terminals は、構築を外から呼ぶ側のために残してある（いまは読み手がいない）。
 pub(crate) struct Built {
     /// 検査を通って並べた（案だけのときも true）。false＝差し戻しの上限まで直らなかった。
     pub(crate) ok: bool,
     /// 結果の1文（レポートの冒頭・失敗なら理由）。
     pub(crate) outcome: String,
+    #[allow(dead_code)]
     pub(crate) title: String,
     /// 構築レポート（Markdown）。
     pub(crate) md: String,
     /// 実行するカード（ラベル, 置いたカードの id）。
+    #[allow(dead_code)]
     pub(crate) terminals: Vec<(String, String)>,
 }
 

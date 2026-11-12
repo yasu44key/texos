@@ -596,6 +596,8 @@ pub(crate) fn start_op_scheduler(app: tauri::AppHandle) {
             tick(&app, &mut rt);
             // v1.10: 音声カードの生死を突き合わせる（稼働中なら音声プロセスを持つ）。
             crate::voice::voice_tick(&app);
+            // エージェントカードの聞き取り: プロジェクトを替えた・カードを消したら止める。
+            crate::agent::agent_tick(&app);
         }
     });
 }

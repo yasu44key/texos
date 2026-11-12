@@ -138,8 +138,8 @@ function parseServer(v: unknown): Server {
 }
 
 export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, variant = "ai" }: Props) {
-  // V1.13 "agent" ＝エージェントカード（builtin:"agent"）。組む一手がコンストラクタを呼ぶので、
-  // 並べる AI カードのモデル・差し戻し回数はコンストラクタと同じ欄（agent.rs → construct.rs が読む）。
+  // "agent" ＝エージェントカード（builtin:"agent"・声で壁打ち）。保存の形はコンストラクタと同じ枝を通るが、
+  // 組む・並べる設定は持たない（組むのはコンストラクタ）。固有の欄は聞き取りと調べ方（agent.rs が読む）。
   const isAgent = variant === "agent";
   const isConstruct = variant === "construct" || isAgent;
   // v1.12: "voice" ＝音声カードの応答用 AI（設定キーは ai_ 接頭辞・voice.rs ai_conf が読む）。
@@ -188,7 +188,13 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
     typeof base.max_retries === "number" ? String(base.max_retries) : "3"
   );
   const [prefix, setPrefix] = useState(s("prefix", isConstruct ? "構築レポート" : ""));
-  const [maxSteps, setMaxSteps] = useState(typeof base.max_steps === "number" ? String(base.max_steps) : "8");
+  // エージェント固有（agent.rs が読む）: 調べる回数・ウェブ検索・聞き取り。
+  const [maxLookups, setMaxLookups] = useState(typeof base.max_lookups === "number" ? String(base.max_lookups) : "3");
+  const [web, setWeb] = useState(base.web === true);
+  const [sttModel, setSttModel] = useState(s("stt_model", "small"));
+  const [silence, setSilence] = useState(typeof base.silence === "number" ? String(base.silence) : "");
+  const [bargeIn, setBargeIn] = useState(base.barge_in !== false);
+  const [micDevice, setMicDevice] = useState(s("mic_device"));
   // v1.8.6 GPU の使い方（Ollama のみ）。既定 "auto" = キーを書かない＝サーバ任せ
   // （＝VRAM に載る層は GPU。旧来の「VRAM が少ないから CPU」という既定は廃止）。
   const [gpu, setGpu] = useState<"auto" | "max" | "cpu">(
@@ -299,8 +305,8 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
     const spec: Record<string, unknown> = isConstruct
       ? { ...base, builtin: isAgent ? "agent" : "construct", provider }
       : { ...base, builtin: "ai", provider, mode };
-    if (isConstruct) {
-      delete spec.mode;
+    if (isConstruct) delete spec.mode;
+    if (isConstruct && !isAgent) {
       if (cardModel.trim()) spec.card_model = cardModel.trim();
       else delete spec.card_model;
       const r = parseInt(maxRetries, 10);
@@ -313,8 +319,24 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
       else delete spec.prefix;
     }
     if (isAgent) {
-      const n = parseInt(maxSteps, 10);
-      spec.max_steps = Number.isFinite(n) ? Math.min(16, Math.max(1, n)) : 8;
+      // 作り直す前の設定（組む・一手ずつ進める・ffmpeg のマイク名）は捨てる。
+      delete spec.max_steps;
+      delete spec.card_model;
+      delete spec.max_retries;
+      delete spec.mic;
+      const n = parseInt(maxLookups, 10);
+      spec.max_lookups = Number.isFinite(n) ? Math.min(8, Math.max(1, n)) : 3;
+      if (web) spec.web = true;
+      else delete spec.web;
+      if (sttModel.trim() && sttModel.trim() !== "small") spec.stt_model = sttModel.trim();
+      else delete spec.stt_model;
+      const sl = parseFloat(silence);
+      if (silence.trim() !== "" && Number.isFinite(sl) && sl > 0) spec.silence = Math.min(3, Math.max(0.3, sl));
+      else delete spec.silence;
+      if (!bargeIn) spec.barge_in = false;
+      else delete spec.barge_in;
+      if (micDevice.trim()) spec.mic_device = micDevice.trim();
+      else delete spec.mic_device;
     }
     // 空欄時の既定: Ollama は導入案内が gemma3 を入れるのでそれに合わせる。
     // 他サーバーは既定名が存在しないので、取得済み一覧の先頭を使う。
@@ -396,9 +418,9 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
         </div>
         {isAgent && (
           <div style={{ fontSize: 12, color: "var(--panel-muted, #8a93a8)", marginBottom: 12, lineHeight: 1.5 }}>
-            カードの下の欄で頼むと、この AI が一手ずつ道具を選びます（答える・索引で調べる・ファイルを読む・
-            フローを組む・実行する）。組む一手はコンストラクタと同じ検査と並べ方です。外部プログラム・シェル・
-            オペレーションを含むフローは実行せず、▶ を人が押すのを待ちます。一手は形を決めた JSON で受け取ります。
+            声や文字で話しかけると、この AI がすぐ短く返す壁打ちの相手です。必要なときだけ手元の資料（索引・
+            ファイルカード）やウェブを調べます。カードを並べたり実行したりはしません — 会話の「まとめ」をカードにして
+            コンストラクタにつなぐと組めます。返事の速さが大事なので、軽いモデルで思考は「使わない」が向きます。
           </div>
         )}
         {isVoice && (
@@ -686,7 +708,7 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
               onChange={(e) => setSystem(e.target.value)}
               placeholder={
                 isAgent
-                  ? "（空欄可）口調・得意分野・いつも使ってほしい索引など。道具の使い方は組み込み済み"
+                  ? "（空欄可）口調・得意分野・いつも使ってほしい索引など。話し方と調べ方は組み込み済み"
                   : isConstruct
                   ? "（空欄可）設計の作法を足す。構築の要点は組み込み済み。役割の付箋をつないでも同じ"
                   : "（空欄可）AIの役割・口調・出力形式の指示"
@@ -757,7 +779,98 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
           </div>
         )}
 
-        {isConstruct && (
+        {isAgent && (
+          <>
+            {row(
+              "調べる\n回数の上限",
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  style={{ ...inp(), width: 100 }}
+                  value={maxLookups}
+                  onChange={(e) => setMaxLookups(e.target.value)}
+                  inputMode="numeric"
+                />
+                <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
+                  1回の返事までに資料やウェブを調べられる回数（1〜8）。ふつうの会話では調べません
+                </span>
+              </div>
+            )}
+            {row(
+              "ウェブ検索",
+              <label style={{ display: "flex", alignItems: "flex-start", gap: 6, cursor: "pointer" }}>
+                <input type="checkbox" checked={web} onChange={(e) => setWeb(e.target.checked)} style={{ marginTop: 3 }} />
+                <span style={{ fontSize: 12 }}>
+                  必要なときにウェブも調べる
+                  <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
+                    この PC で動かす検索エンジン（SearXNG）を使います。外へ出るのは検索語だけで、使った検索語は会話の記録に
+                    残ります。パネルの 🌐 でも切り替えられます
+                  </div>
+                </span>
+              </label>
+            )}
+            {row(
+              "聞き取りの\nモデル",
+              <div>
+                <select style={inp()} value={sttModel} onChange={(e) => setSttModel(e.target.value)}>
+                  <option value="base">base（軽い・聞き違いは多め）</option>
+                  <option value="small">small（既定・聞き違いが減る・約 0.5GB）</option>
+                  <option value="medium">medium（さらに正確・約 1.5GB）</option>
+                  <option value="large-v3-turbo">large-v3-turbo（GPU 向け・約 1.6GB）</option>
+                  {!["base", "small", "medium", "large-v3-turbo"].includes(sttModel) && (
+                    <option value={sttModel}>{sttModel}</option>
+                  )}
+                </select>
+                <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)", marginTop: 3 }}>
+                  声はこの PC の中だけで文字にします（GPU があれば GPU）。まだ手元に無いモデルは、最初の「💬 おしゃべり」の
+                  ときにダウンロードします
+                </div>
+              </div>
+            )}
+            {row(
+              "区切りの\n無音",
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  style={{ ...inp(), width: 100 }}
+                  value={silence}
+                  onChange={(e) => setSilence(e.target.value)}
+                  placeholder="1.0"
+                  inputMode="decimal"
+                />
+                <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
+                  秒。話し終えてこれだけ黙ると頼みます（0.3〜3）。短いほど速く返り、考えながら話すと途中で切れやすい
+                </span>
+              </div>
+            )}
+            {row(
+              "割り込み",
+              <label style={{ display: "flex", alignItems: "flex-start", gap: 6, cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={bargeIn}
+                  onChange={(e) => setBargeIn(e.target.checked)}
+                  style={{ marginTop: 3 }}
+                />
+                <span style={{ fontSize: 12 }}>
+                  読み上げ中に話しかけたら、読み上げを止めて聞く
+                  <div style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
+                    スピーカーの音をマイクが拾って勝手に止まるときは外します（読み上げ中は聞かなくなります）
+                  </div>
+                </span>
+              </label>
+            )}
+            {row(
+              "マイク",
+              <input
+                style={inp()}
+                value={micDevice}
+                onChange={(e) => setMicDevice(e.target.value)}
+                placeholder="空欄＝Windows の既定のマイク（名前の一部か番号で指定）"
+              />
+            )}
+          </>
+        )}
+
+        {isConstruct && !isAgent && (
           <>
             {row(
               "並べる AI\nカードの\nモデル",
@@ -782,20 +895,6 @@ export function AiSettingsDialog({ initialLabel, initialSpec, onSave, onCancel, 
                 <option value="place">カードを並べる（UNDO で一度に戻せる）</option>
                 <option value="draft">案だけ出す（構築レポートに設計図と検査結果）</option>
               </select>
-            )}
-            {isAgent && row(
-              "手数の\n上限",
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <input
-                  style={{ ...inp(), width: 100 }}
-                  value={maxSteps}
-                  onChange={(e) => setMaxSteps(e.target.value)}
-                  inputMode="numeric"
-                />
-                <span style={{ fontSize: 11, color: "var(--panel-muted, #8a93a8)" }}>
-                  1回の頼みで道具を使える回数（1〜16）。超えたらそこで止めて報告します
-                </span>
-              </div>
             )}
             {row(
               "差し戻す\n回数の上限",
